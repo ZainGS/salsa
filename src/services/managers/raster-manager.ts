@@ -70,7 +70,7 @@ export class RasterManager {
 
     enableSelection(tool: 'rect' | 'ellipse' | 'lasso' | 'magic-wand' = 'rect'): void {
         const info = this._rasterSelectionService?.getSelectionInfo();
-        if (info?.isTransforming) this._rasterSelectionService?.commitTransform();
+        if (info?.isTransforming) void this._rasterSelectionService?.commitTransform();
         this._rasterDrawingService?.disable();
         this._rasterMoveService?.disable();
         this._rasterSelectionService?.setTool(tool);
@@ -80,13 +80,13 @@ export class RasterManager {
 
     disableSelection(): void {
         const info = this._rasterSelectionService?.getSelectionInfo();
-        if (info?.isTransforming) this._rasterSelectionService?.commitTransform();
+        if (info?.isTransforming) void this._rasterSelectionService?.commitTransform();
         this._rasterSelectionService?.disable();
     }
 
     enableMove(): void {
         const info = this._rasterSelectionService?.getSelectionInfo();
-        if (info?.isTransforming) this._rasterSelectionService?.commitTransform();
+        if (info?.isTransforming) void this._rasterSelectionService?.commitTransform();
         this._rasterDrawingService?.disable();
         this._rasterSelectionService?.disable();
         this._rasterMoveService?.enable();
@@ -266,19 +266,19 @@ export class RasterManager {
 
     private getSelectionEngine() { return this.renderer?.rasterSelectionEngine; }
 
-    selectRect(x: number, y: number, w: number, h: number, feather = 0): void { this.getSelectionEngine()?.selectRect({ x, y, w, h }, feather); }
-    selectEllipse(x: number, y: number, w: number, h: number, feather = 0): void { this.getSelectionEngine()?.selectEllipse({ x, y, w, h }, feather); }
-    selectLasso(points: Array<{ x: number; y: number }>): void { this.getSelectionEngine()?.selectLasso(points); }
-    selectAll(): void { this.getSelectionEngine()?.selectAll(); }
-    deselectAll(): void { this.getSelectionEngine()?.deselectAll(); }
-    invertSelection(): void { this.getSelectionEngine()?.invertSelection(); }
-    deleteSelection(): void { this.getSelectionEngine()?.deleteSelection(); }
+    selectRect(x: number, y: number, w: number, h: number, feather = 0): void { void this.getSelectionEngine()?.selectRect({ x, y, w, h }, feather); }
+    selectEllipse(x: number, y: number, w: number, h: number, feather = 0): void { void this.getSelectionEngine()?.selectEllipse({ x, y, w, h }, feather); }
+    selectLasso(points: Array<{ x: number; y: number }>): void { void this.getSelectionEngine()?.selectLasso(points); }
+    selectAll(): void { void this.getSelectionEngine()?.selectAll(); }
+    deselectAll(): void { void this.getSelectionEngine()?.deselectAll(); }
+    invertSelection(): void { void this.getSelectionEngine()?.invertSelection(); }
+    deleteSelection(): void { void this.getSelectionEngine()?.deleteSelection(); }
     async cutSelection(): Promise<void> { await this.getSelectionEngine()?.cutSelection(); }
     async copySelection(): Promise<void> { await this.getSelectionEngine()?.copySelection(); }
     paste(): void { this.getSelectionEngine()?.paste(); }
-    beginTransform(): void { this.getSelectionEngine()?.beginTransform(); }
+    beginTransform(): void { void this.getSelectionEngine()?.beginTransform(); }
     updateTransform(dx: number, dy: number, scaleX?: number, scaleY?: number, rotation?: number): void { this.getSelectionEngine()?.updateTransform(dx, dy, scaleX, scaleY, rotation); }
-    commitTransform(): void { this.getSelectionEngine()?.commitTransform(); }
+    commitTransform(): void { void this.getSelectionEngine()?.commitTransform(); }
     cancelTransform(): void { this.getSelectionEngine()?.cancelTransform(); }
 
     getSelectionInfo() {

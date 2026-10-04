@@ -6,7 +6,7 @@
 
 import type { WorldGraph, LayoutPreviewLayer, V2, Shotengai, Block } from './types';
 import { makeRng, Rng, hash2 } from './util';
-import { polysToGeometry } from './preview';
+import { groundTess, emitGround } from './ground-mesh';
 import { Accum3D } from './meshbuild';
 
 type V3 = [number, number, number];
@@ -27,7 +27,7 @@ export function placeShotengai(graph: WorldGraph): Shotengai | null {
     const byCell = new Map<string, Block>();
     for (const b of graph.blocks) byCell.set(b.sector + ',' + b.ring, b);
     const claimed = new Set(graph.landmarks.map(l => l.block));
-    const usable = (ci: number, ri: number): Block | null => { const b = byCell.get(ci + ',' + ri); return b && b.zone !== 'water' && b.level !== -1 && !claimed.has(b.id) ? b : null; };
+    const usable = (ci: number, ri: number): Block | null => { const b = byCell.get(ci + ',' + ri); return b && b.zone !== 'water' && b.level !== -1 && !b.viaduct && !b.localLine && !claimed.has(b.id) ? b : null; };
     const pool = graph.blocks.filter(b => (b.district === 'market' || b.zone === 'commercial') && usable(b.sector, b.ring));
     if (!pool.length) return null;
     const market = pool.filter(b => b.district === 'market');
@@ -102,7 +102,9 @@ export function buildShotengai(graph: WorldGraph, keep?: ((region: number) => bo
     }
 
     const layers: LayoutPreviewLayer[] = [];
-    layers.push({ name: 'world:sg-paving', color: PAVING, y: py, geometry: polysToGeometry(cellPolys, py), pattern: { color: [0.56, 0.44, 0.37], freq: 44, scale: 0.5, mode: 'checker' } });   // fine, subtle brick paving (NOT a giant checkerboard)
+    // city-quality S8: split on the exact ground lattice (levels + ramps baked) and drape smooth, so the paving
+    // sits ON the ground on hills like the roads / pavements (corner-only triangles floated / sank off it).
+    layers.push({ name: 'world:sg-paving', color: PAVING, y: py, drape: 'smooth', geometry: emitGround(groundTess(graph), cellPolys, { y: py }), pattern: { color: [0.56, 0.44, 0.37], freq: 44, scale: 0.5, mode: 'checker' } });   // fine, subtle brick paving (NOT a giant checkerboard)
     if (!struct.empty) layers.push({ name: 'world:sg-struct', color: STRUCT, y: gy, geometry: struct.geometry() });
     fabric.forEach((a, i) => { if (!a.empty) layers.push({ name: 'world:sg-' + NAMES[i], color: FABRIC[i], y: gy, geometry: a.geometry() }); });
     if (!lantern.empty) layers.push({ name: 'world:sg-lantern', color: LANTERN, y: gy, geometry: lantern.geometry(), emissive: p.nightMode ? 1.4 : 0.95 });

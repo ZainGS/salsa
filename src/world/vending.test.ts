@@ -10,7 +10,8 @@
 import { describe, it, expect } from 'vitest';
 import { buildVendingMachine, resolveVendingParams, DEFAULT_VENDING_PARAMS, VENDING_BRANDS, vendingGarpPool, vendingSkinKey,
     vendingShellGeometry, vendingShellTransform, VENDING_BODY_UV_REGIONS, vendingProductsGeometry, vendingProductsTransform,
-    emitVending, newVendingAccum } from './vending';
+    emitVending, newVendingAccum, vendingLayout, vendingLabelCell, VENDING_LABEL_CELLS, vendingStockGeometry, vendingStockVariant,
+    VENDING_STOCK_VARIANTS, vendingFootTransform, vendingCanCell } from './vending';
 import { validateGarpPool, pickSkin, skinSlot } from './garp';
 import type { LayoutPreviewLayer } from './types';
 
@@ -48,9 +49,18 @@ describe('vending machine — a real prop, not a box', () => {
     }
   });
 
-  it('stays within a small triangle budget — a city plants hundreds', () => {
-    expect(tris(buildVendingMachine().layers)).toBeLessThan(200);
-    expect(tris(buildVendingMachine().layers)).toBeGreaterThan(60);
+  it('stays within a triangle budget — a city plants hundreds', () => {
+    // ~24 cans × 40 tris + the frame / shelves / strips / controls / bay. (The city instances the cans.)
+    expect(tris(buildVendingMachine().layers)).toBeLessThan(1600);
+    expect(tris(buildVendingMachine().layers)).toBeGreaterThan(400);
+  });
+
+  it('has the jihanki parts: chrome controls, a dark pickup bay, price strips, LED buttons', () => {
+    const L = buildVendingMachine().layers, by = (n: string) => L.find((x) => x.name === n);
+    expect(by('world:vending-chrome')?.metal).toBeTruthy();
+    expect(by('world:vending-bay')).toBeTruthy();
+    expect(by('world:vending-strip')).toBeTruthy();
+    expect(by('world:vending-buttons')?.emissive ?? 0).toBeGreaterThan(0);
   });
 
   it('is deterministic per params', () => {
@@ -70,21 +80,27 @@ describe('vending params drive the shape', () => {
     expect(resolveVendingParams()).toEqual(DEFAULT_VENDING_PARAMS);
     expect(resolveVendingParams({ brand: VENDING_BRANDS.length }).brand).toBe(0);   // wraps
     expect(resolveVendingParams({ brand: -1 }).brand).toBe(VENDING_BRANDS.length - 1);
-    expect(resolveVendingParams({ productCols: 99 }).productCols).toBe(4);          // clamped
-    expect(resolveVendingParams({ productCols: 0 }).productCols).toBe(1);
+    expect(resolveVendingParams({ cansPerShelf: 99 }).cansPerShelf).toBe(12);       // clamped
+    expect(resolveVendingParams({ cansPerShelf: 0 }).cansPerShelf).toBe(2);
+    expect(resolveVendingParams({ shelves: 9 }).shelves).toBe(5);
+    expect(resolveVendingParams({ stock: 'weird' as never }).stock).toBe('cans');
+    // a pre-redesign save's box-grid params are dropped, not carried along
+    expect('productCols' in resolveVendingParams({ productCols: 3 } as never)).toBe(false);
     expect(resolveVendingParams({ heightM: 0.1 }).heightM).toBe(0.6);               // floored
   });
 
-  it('the product grid size actually changes the geometry', () => {
-    const small = tris(buildVendingMachine({ productCols: 1, productRows: 1 }).layers);
-    const big = tris(buildVendingMachine({ productCols: 4, productRows: 4 }).layers);
+  it('shelves × cans per shelf actually change the geometry; stock:image drops the cans', () => {
+    const small = tris(buildVendingMachine({ shelves: 1, cansPerShelf: 2 }).layers);
+    const big = tris(buildVendingMachine({ shelves: 5, cansPerShelf: 12 }).layers);
     expect(big).toBeGreaterThan(small);
+    const img = buildVendingMachine({ stock: 'image' }).layers;
+    expect(img.some((L) => /vending-product-/.test(L.name))).toBe(false);
   });
 
-  it('a 1x1 product grid does not divide by zero (centres the single box)', () => {
-    // productCols/Rows === 1 makes the `/(cols-1)` grid term a divide-by-zero — the guard must centre it.
-    const layers = buildVendingMachine({ productCols: 1, productRows: 1 }).layers;
-    for (const L of layers) for (const v of L.geometry.vertices) expect(Number.isFinite(v)).toBe(true);
+  it('the smallest + largest grids stay finite', () => {
+    for (const q of [{ shelves: 1, cansPerShelf: 2 }, { shelves: 5, cansPerShelf: 12 }]) {
+      for (const L of buildVendingMachine(q).layers) for (const v of L.geometry.vertices) expect(Number.isFinite(v)).toBe(true);
+    }
   });
 
   it('meta reports real height + a footprint sized from the params (metres)', () => {
@@ -110,10 +126,11 @@ describe('vending params drive the shape', () => {
 });
 
 describe('vendingGarpPool — the GARP consumer pool', () => {
-    it('is a valid pool: one skin per brand, each supplying both body + products slots', () => {
+    it('is a valid pool: one skin per brand, each supplying body + products + labels', () => {
         const pool = vendingGarpPool();
         expect(validateGarpPool(pool)).toEqual([]);
-        expect(pool.slots).toEqual(['body', 'products']);
+        expect(pool.slots).toEqual(['body', 'products', 'labels']);
+        expect(pool.defaults?.labels).toBeTruthy();   // body-only user skins still get cans
         expect(pool.skins.map((s) => s.name)).toEqual(VENDING_BRANDS.map((b) => b.name));
     });
 
@@ -124,6 +141,7 @@ describe('vendingGarpPool — the GARP consumer pool', () => {
             // Both slot keys embed the brand name — a machine can't wear brand A's body over brand B's products.
             expect(skinSlot(pool, skin, 'body')).toBe(vendingSkinKey(skin.name, 'body'));
             expect(skinSlot(pool, skin, 'products')).toBe(vendingSkinKey(skin.name, 'products'));
+            expect(skinSlot(pool, skin, 'labels')).toBe(vendingSkinKey(skin.name, 'labels'));
         }
     });
 });
@@ -171,13 +189,28 @@ describe('vending body shell — the instanced GARP surface (city integration)',
         expect(t.ry).toBeCloseTo(Math.PI / 2, 6); // atan2(1,0) — +Z rotates to +X
     });
 
-    it('products panel: a flat 0..1-UV quad in the window, placed between the backing and the glass', () => {
-        const g = vendingProductsGeometry({}, 1);
-        expect(g.indices.length).toBe(6);         // one quad (flat display panel)
+    it('backdrop panel: one 0..1-UV quad, its window offset BAKED IN (origin = the foot)', () => {
+        const g = vendingProductsGeometry({}, 1), L = vendingLayout(resolveVendingParams());
+        expect(g.indices.length).toBe(6);
+        for (let i = 0; i < g.vertices.length; i += 12) {
+            expect(g.vertices[i + 1]).toBeGreaterThanOrEqual(L.win.y0 - 1e-6);   // window height, from the foot
+            expect(g.vertices[i + 1]).toBeLessThanOrEqual(L.win.y1 + 1e-6);
+            expect(g.vertices[i + 2]).toBeGreaterThan(L.hd);                    // in front of the cabinet face
+            expect(g.vertices[i + 2]).toBeLessThan(L.hd + L.z.can);             // …and behind the cans
+        }
         const t = vendingProductsTransform([10, 0, 5], [1, 0], {}, 1);
-        expect(t.x).toBeGreaterThan(10);          // pushed out along the facing dir (in front of the cabinet)
-        expect(t.y).toBeGreaterThan(0.9);         // upper-middle window (cabinet centre + the window shift)
+        expect([t.x, t.y, t.z]).toEqual([10, 0, 5]);   // the FOOT
         expect(t.ry).toBeCloseTo(Math.PI / 2, 6);
+    });
+
+    it('★ every per-machine instanced part picks its skin at the SAME (x,z) → one skin per machine', () => {
+        const base: [number, number, number] = [3.21, 0.4, -7.77], dir: [number, number] = [0.6, 0.8];
+        const shell = vendingShellTransform(base, dir, {}, 0.07), foot = vendingFootTransform(base, dir), prod = vendingProductsTransform(base, dir);
+        const pool = vendingGarpPool();
+        const pick = (t: { x: number; z: number }) => pickSkin(pool, t.x, t.z, 11)!.name;
+        expect([foot.x, foot.z]).toEqual([shell.x, shell.z]);
+        expect(pick(prod)).toBe(pick(shell));
+        expect(pick(foot)).toBe(pick(shell));
     });
 
     it('emitVending skipProducts drops the merged product boxes (the city instances a panel instead)', () => {
@@ -191,3 +224,106 @@ describe('vending body shell — the instanced GARP surface (city integration)',
 
 // tiny helper so the meta test reads cleanly
 function buildVendingMachine_meta(): ReturnType<typeof buildVendingMachine> { return buildVendingMachine(); }
+
+// ── The redesign: label sheet + 3D cans (docs/specs/vending-machine-redesign.md) ─────────────────────────────────
+describe('vending label sheet — 8 padded cells, rim band over the label', () => {
+    it('cells are inside the sheet, disjoint, padded, and the rim sits above the label', () => {
+        const cells = Array.from({ length: VENDING_LABEL_CELLS }, (_, i) => vendingLabelCell(i));
+        expect(cells).toHaveLength(8);
+        for (const { cell, rim, label } of cells) {
+            for (const v of cell) { expect(v).toBeGreaterThan(0); expect(v).toBeLessThan(1); }   // padded off the sheet edge
+            expect(rim[3]).toBeCloseTo(label[1], 9);                  // rim directly above the label
+            expect(rim[1]).toBeCloseTo(cell[1], 9); expect(label[3]).toBeCloseTo(cell[3], 9);
+            expect((label[3] - label[1]) / (label[2] - label[0])).toBeGreaterThan(1.5);   // portrait (a can front)
+        }
+        for (let i = 0; i < 8; i++) for (let j = i + 1; j < 8; j++) {
+            const a = cells[i].cell, b = cells[j].cell;
+            expect(a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]).toBe(false);
+        }
+        expect(vendingLabelCell(8).cell).toEqual(vendingLabelCell(0).cell);   // wraps
+    });
+});
+
+describe('vending 3D cans — the instanced, label-textured stock', () => {
+    const P = resolveVendingParams(), L = vendingLayout(P);
+    const g = vendingStockGeometry({}, 1, 0);
+    const verts = (geo: typeof g) => { const out: { p: number[]; n: number[]; uv: number[] }[] = []; for (let i = 0; i < geo.vertices.length; i += 12) out.push({ p: [geo.vertices[i], geo.vertices[i + 1], geo.vertices[i + 2]], n: [geo.vertices[i + 3], geo.vertices[i + 4], geo.vertices[i + 5]], uv: [geo.vertices[i + 6], geo.vertices[i + 7]] }); return out; };
+
+    it('one can per slot at 40 tris each', () => {
+        expect(g.indices.length / 3).toBe(P.shelves * P.cansPerShelf * 40);
+        expect(vendingStockGeometry({ shelves: 2, cansPerShelf: 5 }, 1, 0).indices.length / 3).toBe(2 * 5 * 40);
+    });
+
+    it('every can sits inside the window, between the backdrop and the glass', () => {
+        for (const v of verts(g)) {
+            expect(Math.abs(v.p[0])).toBeLessThanOrEqual(L.win.x + 1e-6);
+            expect(v.p[1]).toBeGreaterThanOrEqual(L.win.y0 - 1e-6);
+            expect(v.p[1]).toBeLessThanOrEqual(L.win.y1 + 1e-6);
+            expect(v.p[2]).toBeGreaterThan(L.hd + L.z.backdrop);
+            expect(v.p[2]).toBeLessThan(L.hd + L.z.glass);
+        }
+    });
+
+    it('every UV lands inside a single label cell (no bleed across cells)', () => {
+        const cells = Array.from({ length: VENDING_LABEL_CELLS }, (_, i) => vendingLabelCell(i).cell);
+        for (const v of verts(g)) {
+            const inside = cells.some((c) => v.uv[0] >= c[0] - 1e-6 && v.uv[0] <= c[2] + 1e-6 && v.uv[1] >= c[1] - 1e-6 && v.uv[1] <= c[3] + 1e-6);
+            expect(inside).toBe(true);
+        }
+    });
+
+    it('triangle winding agrees with the vertex normals (lit + culled correctly)', () => {
+        const V = verts(g), ix = g.indices;
+        for (let t = 0; t < ix.length; t += 3) {
+            const a = V[ix[t]].p, b = V[ix[t + 1]].p, c = V[ix[t + 2]].p;
+            const e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            const gn = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+            const n = V[ix[t]].n;
+            expect(gn[0] * n[0] + gn[1] * n[1] + gn[2] * n[2]).toBeGreaterThanOrEqual(-1e-12);
+        }
+    });
+
+    it('the front of each can shows the label left→right, NOT mirrored (viewer-left = the cell\'s left edge)', () => {
+        // Seen from the front of a +Z-facing machine the viewer's right is +X (like a sprite: u grows along +X).
+        const cell = vendingLabelCell(vendingCanCell(0, 0, 0, P.seed)).label;
+        const can = verts(g).slice(0, 8);   // the first ring = can 0's bottom ring
+        const left = can.reduce((m, v) => (v.p[0] < m.p[0] ? v : m));   // −X = viewer's left
+        const right = can.reduce((m, v) => (v.p[0] > m.p[0] ? v : m));
+        expect(right.uv[0]).toBeCloseTo(cell[2], 6);
+        expect(left.uv[0]).toBeCloseTo(cell[0], 6);
+    });
+
+    it('arrangement variants differ, and each machine picks one deterministically', () => {
+        const cellsOf = (v: number) => Array.from({ length: P.shelves * P.cansPerShelf }, (_, i) => vendingCanCell(Math.floor(i / P.cansPerShelf), i % P.cansPerShelf, v, P.seed)).join(',');
+        const all = new Set(Array.from({ length: VENDING_STOCK_VARIANTS }, (_, v) => cellsOf(v)));
+        expect(all.size).toBe(VENDING_STOCK_VARIANTS);
+        const used = new Set(Array.from({ length: 200 }, (_, i) => vendingStockVariant(i * 0.37, i * 0.11, 5)));
+        expect(used.size).toBe(VENDING_STOCK_VARIANTS);
+        expect(vendingStockVariant(1.23, 4.56, 5)).toBe(vendingStockVariant(1.23, 4.56, 5));
+        // a machine shows a mix of designs, not one can repeated
+        expect(new Set(cellsOf(0).split(',')).size).toBeGreaterThan(4);
+    });
+});
+
+describe('nothing is mirrored (u grows along the viewer\'s right, like sprites)', () => {
+    const uvAt = (geo: { vertices: Float32Array }, pick: (x: number, y: number, z: number, nz: number) => boolean) => {
+        const out: number[][] = [];
+        for (let i = 0; i < geo.vertices.length; i += 12) if (pick(geo.vertices[i], geo.vertices[i + 1], geo.vertices[i + 2], geo.vertices[i + 5])) out.push([geo.vertices[i], geo.vertices[i + 6], geo.vertices[i + 7]]);
+        return out;
+    };
+    it('shell FRONT: the +X (viewer-right) edge maps to the region\'s right (u1)', () => {
+        const g = vendingShellGeometry({}, 1), hz = 0.3, front = VENDING_BODY_UV_REGIONS.find((r) => r.label === 'front')!.rect;
+        const vs = uvAt(g, (_x, _y, z, nz) => Math.abs(z - hz) < 1e-6 && nz > 0.9);
+        expect(vs.length).toBe(4);
+        for (const v of vs) expect(v[1]).toBeCloseTo(v[0] > 0 ? front[2] : front[0], 6);
+    });
+    it('backdrop: +X (viewer-right) → u 1', () => {
+        for (const v of uvAt(vendingProductsGeometry({}, 1), () => true)) expect(v[1]).toBeCloseTo(v[0] > 0 ? 1 : 0, 6);
+    });
+    it('the control column sits on the viewer\'s RIGHT of a +Z-facing machine', () => {
+        const acc = newVendingAccum(); emitVending(acc, [0, 0, 0], [0, 1], resolveVendingParams(), 1, 1, true, true);
+        const v = acc.chrome.geometry().vertices; let mx = 0, n = 0;
+        for (let i = 0; i < v.length; i += 12) if (v[i + 1] > 0.7) { mx += v[i]; n++; }   // coin / bill / lever (above the bay)
+        expect(mx / n).toBeGreaterThan(0.1);
+    });
+});

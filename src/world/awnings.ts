@@ -8,6 +8,7 @@ import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { makeRng, Rng, centroid, frontageEdge, hash2, graphLookups } from './util';
 import { Accum3D } from './meshbuild';
 import { makeElevation } from './elevation';
+import { lotMeta } from './lot-meta';
 
 type V3 = [number, number, number];
 
@@ -38,6 +39,21 @@ export function buildAwnings(graph: WorldGraph, keep?: ((region: number) => bool
         if (lot.slot !== 'building') continue;
         if (keep && !keep(regionByBlock.get(lot.block) ?? -1)) continue;
         const downtown = distById.get(lot.block) === 'downtown';
+        // ★ DETAILED buildings dress their OWN shopfront (awnings / noren / fascia / lit shop glass — B3). Dressing
+        // them again here gave a second awning set, and the dark "shopfront glass" strip landed over the building's
+        // own door (also on houses). Only the SIDEWALK life stays: cafe tables + A-boards, placed off the
+        // building's real entrance (lot.door / doorOut, stamped by buildStreets) instead of a re-derived frontage.
+        if (p.detailedBuildings) {
+            const m = lotMeta(lot);
+            const shopLot = m ? m.shopfront : lot.zone !== 'residential';
+            if (!shopLot || !lot.door || !lot.doorOut) continue;
+            const o = lot.doorOut, eDir: V2 = [-o[1], o[0]];
+            const gyD = gy + elev(lot.center[0], lot.center[1]);
+            const ai = (rng.next() * AWN.length) | 0;
+            if (rng.chance(0.16)) addCafeTerrace(cafe, awn[ai], [lot.door[0] + o[0] * 0.17 * s + eDir[0] * 0.09 * s, lot.door[1] + o[1] * 0.17 * s + eDir[1] * 0.09 * s], eDir, gyD, s, rng);
+            if (rng.chance(0.3)) addSandwichBoard(awn[(ai + 1) % AWN.length], [lot.door[0] + eDir[0] * 0.06 * s + o[0] * 0.05 * s, lot.door[1] + eDir[1] * 0.06 * s + o[1] * 0.05 * s], eDir, gyD, s);
+            continue;
+        }
         if (lot.zone === 'residential' && !downtown && !rng.chance(0.2)) continue;   // shops = commercial/civic/downtown + a few houses
         const foot = insetToward(lot.poly, lot.center, 0.12);
         if (foot.length < 3) continue;

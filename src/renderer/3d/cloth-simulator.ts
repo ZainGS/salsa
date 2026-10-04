@@ -25,6 +25,7 @@
  *   sim.destroy();
  */
 
+import { PipelineSet, PIPELINE_PRIORITY, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import {
   CLOTH_INTEGRATE_SHADER,
   CLOTH_CONSTRAIN_SHADER,
@@ -77,6 +78,19 @@ export class ClothSimulator {
   private constrainPipeline: GPUComputePipeline | null = null;
   private collidePipeline:   GPUComputePipeline | null = null;
   private posePipeline:      GPUComputePipeline | null = null;
+  // P2: the four compute pipelines compile asynchronously through GPUPipelineCache; the resolved pipelines above
+  // are filled by _pipesReady(). Until then step() is a no-op (the cloth holds its pose) and runToConvergence awaits.
+  private _pipes!: PipelineSet;
+  private _integrateH!: PipelineHandle<GPUComputePipeline>;
+  private _constrainH!: PipelineHandle<GPUComputePipeline>;
+  private _collideH!:   PipelineHandle<GPUComputePipeline>;
+  private _poseH!:      PipelineHandle<GPUComputePipeline>;
+  private _pipesReady(): boolean {
+    if (!this._pipes.ready()) return false;
+    this.integratePipeline = this._integrateH.get(); this.constrainPipeline = this._constrainH.get();
+    this.collidePipeline = this._collideH.get(); this.posePipeline = this._poseH.get();
+    return true;
+  }
 
   // BGLs
   private integrateBGL: GPUBindGroupLayout | null = null;
@@ -321,6 +335,7 @@ export class ClothSimulator {
    */
   step(dt = 0.016, stepCount = 1): void {
     if (!this._ready) throw new Error('ClothSimulator: call init() before step()');
+    if (!this._pipesReady()) return;   // P2: pipelines still compiling → hold this frame
 
     const enc = this.device.createCommandEncoder();
 
@@ -375,6 +390,8 @@ export class ClothSimulator {
     epsilon       = 1e-4,
     dt            = 0.016,
   ): Promise<Float32Array> {
+    await this._pipes.whenReady();   // P2: offline bake — wait for the async compile instead of blocking
+    if (!this._pipesReady()) throw new Error("ClothSimulator: compute pipelines failed to compile");
     let total = 0;
     let prev: Float32Array | null = null;
 
@@ -509,6 +526,7 @@ export class ClothSimulator {
 
   private _buildPipelines(): void {
     const dev = this.device;
+    this._pipes = new PipelineSet(dev, PIPELINE_PRIORITY.NOW);
     const visibility = GPUShaderStage.COMPUTE;
 
     // ── Integrate ────────────────────────────────────────────────────────────
@@ -519,7 +537,7 @@ export class ClothSimulator {
       { binding: 3, visibility, buffer: { type: 'uniform' } },
       { binding: 4, visibility, buffer: { type: 'read-only-storage' } },
     ]});
-    this.integratePipeline = dev.createComputePipeline({
+    this._integrateH = this._pipes.compute({ label: 'Cloth.integrate',
       layout: dev.createPipelineLayout({ bindGroupLayouts: [this.integrateBGL] }),
       compute: { module: dev.createShaderModule({ code: CLOTH_INTEGRATE_SHADER }), entryPoint: 'main' },
     });
@@ -532,7 +550,7 @@ export class ClothSimulator {
       { binding: 3, visibility, buffer: { type: 'uniform', hasDynamicOffset: true } },
       { binding: 4, visibility, buffer: { type: 'read-only-storage' } },
     ]});
-    this.constrainPipeline = dev.createComputePipeline({
+    this._constrainH = this._pipes.compute({ label: 'Cloth.constrain',
       layout: dev.createPipelineLayout({ bindGroupLayouts: [this.constrainBGL] }),
       compute: { module: dev.createShaderModule({ code: CLOTH_CONSTRAIN_SHADER }), entryPoint: 'main' },
     });
@@ -544,7 +562,7 @@ export class ClothSimulator {
       { binding: 2, visibility, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility, buffer: { type: 'uniform' } },
     ]});
-    this.collidePipeline = dev.createComputePipeline({
+    this._collideH = this._pipes.compute({ label: 'Cloth.collide',
       layout: dev.createPipelineLayout({ bindGroupLayouts: [this.collideBGL] }),
       compute: { module: dev.createShaderModule({ code: CLOTH_COLLIDE_SHADER }), entryPoint: 'main' },
     });
@@ -556,7 +574,7 @@ export class ClothSimulator {
       { binding: 2, visibility, buffer: { type: 'read-only-storage' } }, // neighbors
       { binding: 3, visibility, buffer: { type: 'uniform' } },           // params
     ]});
-    this.posePipeline = dev.createComputePipeline({
+    this._poseH = this._pipes.compute({ label: 'Cloth.pose',
       layout: dev.createPipelineLayout({ bindGroupLayouts: [this.poseBGL] }),
       compute: { module: dev.createShaderModule({ code: CLOTH_POSE_SHADER }), entryPoint: 'main' },
     });

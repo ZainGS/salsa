@@ -47,6 +47,9 @@ type TransformSnapshot = {
 };
 
 export interface TransformControllerCallbacks {
+  /** Round 8: true while ALL pointer input must be ignored (3D Play mode — the click is the pointer-lock grab, and a
+   *  select / gizmo drag would move objects under the running game). Optional; absent = never. */
+  isInputSuppressed?(): boolean;
   getMeshes(): Mesh3D[];
   getCamera(): Camera3D;
   getCanvasSize(): { width: number; height: number };
@@ -59,6 +62,10 @@ export interface TransformControllerCallbacks {
     before: Map<string, TransformSnapshot>,
     after: Map<string, TransformSnapshot>,
   ): void;
+  /** Character scale (2026-10-04): called after every scale step (gizmo axis / centre / corner drag, S-shortcut) with
+   *  the mesh's drag-start transform; may rewrite its scale / position (a procedural character body scales UNIFORMLY
+   *  from its FEET; a part riding its skeleton keeps its transform). `corner` = an OBB corner drag. Optional. */
+  constrainScale?(mesh: Mesh3D, init: TransformSnapshot, corner: boolean): void;
   /** Called when a gizmo drag begins (for visual feedback). */
   onGizmoDragStart?(axis: GizmoAxis): void;
   /** Called when a gizmo drag ends. */
@@ -353,7 +360,9 @@ export class TransformController3D {
   // ── Event handlers ─────────────────────────────────────────────
 
   private handlePointerDown(e: PointerEvent): void {
-    if (!this._canvas || e.button !== 0) return;
+    // Plain LEFT click only: Alt+left is ORBIT (every 3D nav scheme), middle = pan, right = look/pan — none of those
+    // may select or grab the gizmo (2026-09-29: starting an Alt-orbit on a mesh selected it).
+    if (!this._canvas || e.button !== 0 || e.altKey || this.cb.isInputSuppressed?.()) return;
     this._ctrlHeld  = e.ctrlKey;
     this._shiftHeld = e.shiftKey;
     const { x, y } = this.canvasPos(e);
@@ -627,7 +636,7 @@ export class TransformController3D {
   }
 
   private handlePointerMove(e: PointerEvent): void {
-    if (!this._canvas) return;
+    if (!this._canvas || this.cb.isInputSuppressed?.()) return;
     this._ctrlHeld  = e.ctrlKey;
     this._shiftHeld = e.shiftKey;
     const { x, y } = this.canvasPos(e);
@@ -956,6 +965,8 @@ export class TransformController3D {
       mesh.x = tx;
       mesh.y = ty;
       mesh.z = tz;
+      const init = this._drag.initialTransforms.get(mesh.id);
+      if (init) this.cb.constrainScale?.(mesh, init, true);
     }
   }
 
@@ -1225,6 +1236,7 @@ export class TransformController3D {
         if (uniform || axis === 'y') mesh.y = gizmoCenter[1] + (init.y - gizmoCenter[1]) * factor;
         if (uniform || axis === 'z') mesh.z = gizmoCenter[2] + (init.z - gizmoCenter[2]) * factor;
       }
+      this.cb.constrainScale?.(mesh, init, false);
     }
   }
 
@@ -1497,6 +1509,7 @@ export class TransformController3D {
           else if (axis === 'y') mesh.y = cy + (sn.y - cy) * value;
           else mesh.z = cz + (sn.z - cz) * value;
         }
+        this.cb.constrainScale?.(mesh, sn, false);
       }
     }
   }

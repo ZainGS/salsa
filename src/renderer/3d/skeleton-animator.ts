@@ -300,6 +300,48 @@ export function evaluateNLAAtFrame(
  *
  * Interpolation: quaternion slerp for 'rotation', linear for 'translation' / 'scale'.
  */
+/**
+ * A copy of `clip` carried over onto the character's CURRENT pose: on each rotation track whose joint is in `base`, the
+ * whole track is pre-multiplied by the offset (base · first⁻¹) between where the clip starts (its first keyframe = the
+ * default stance it was authored from) and where this character actually stands. So a one-shot authored from the
+ * default stance (stretch, scratch head) leaves from and settles back to THIS character's stance — e.g. arms fitted
+ * wider on a heavier body. The offset FADES OUT as a key moves away from the rest pose (full at the rest keys, none
+ * past ~60°): the correction that widens a hanging arm would, applied to an overhead arm, tip it into the head.
+ * Tracks already starting at `base` are returned untouched. `onlyFrom` (optional): rebase a track ONLY if its first
+ * keyframe equals this rotation for its joint (i.e. it really starts from the default stance) — other tracks keep their
+ * authored values. Pure.
+ */
+/** Beyond this rotation away from a track's rest key, rebaseClipRest applies no offset. */
+const REBASE_FADE_RAD = Math.PI / 3;
+
+export function rebaseClipRest(clip: SkeletonAnimClip, base: Map<number, readonly number[]>, onlyFrom?: (jointIndex: number) => readonly number[] | undefined): SkeletonAnimClip {
+  const off = quat.create(), inv = quat.create(), tmp = quat.create();
+  return {
+    ...clip,
+    tracks: clip.tracks.map(t => {
+      const b = base.get(t.jointIndex);
+      if (t.channel !== 'rotation' || !b || t.keyframes.length === 0) return t;
+      const first = t.keyframes[0].value;
+      if (first.every((v, i) => Math.abs(v - b[i]) < 1e-6)) return t;
+      const from = onlyFrom?.(t.jointIndex);
+      if (onlyFrom && !(from && first.every((v, i) => Math.abs(v - from[i]) < 1e-6))) return t;
+      quat.invert(inv, first as unknown as quat);
+      quat.multiply(off, b as unknown as quat, inv);          // off · first = base
+      const id = quat.create(), part = quat.create();
+      return {
+        ...t,
+        keyframes: t.keyframes.map(k => {
+          const away = quat.getAngle(first as unknown as quat, k.value as unknown as quat);   // rad from the rest key
+          const w = Math.max(0, 1 - away / REBASE_FADE_RAD);
+          quat.slerp(part, id, off, w);
+          quat.multiply(tmp, part, k.value as unknown as quat);
+          return { ...k, value: [tmp[0], tmp[1], tmp[2], tmp[3]] };
+        }),
+      };
+    }),
+  };
+}
+
 export function applySkeletonClipAtFrame(
   clip: SkeletonAnimClip,
   skeleton: Skeleton3D,

@@ -11,6 +11,7 @@
  *   ghostRenderer.draw(pass, camera)
  */
 
+import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { mat4 } from 'gl-matrix';
 import { Camera3D } from './camera-3d';
 
@@ -114,8 +115,8 @@ export interface GhostPreviewData {
 
 export class GhostPreviewRenderer {
   private device: GPUDevice;
-  private pipeline: GPURenderPipeline | null = null;
-  private pipelineOnTop: GPURenderPipeline | null = null;   // depth-always variant for the spawn reveal
+  private pipeline: PipelineHandle<GPURenderPipeline> | null = null;        // P2: non-blocking cache handles
+  private pipelineOnTop: PipelineHandle<GPURenderPipeline> | null = null;   // depth-always variant for the spawn reveal
   private bgl: GPUBindGroupLayout | null = null;
 
   private _vertBuf!:  GPUBuffer;
@@ -190,7 +191,7 @@ export class GhostPreviewRenderer {
   private _pendingOnTop   = false;
 
   draw(pass: GPURenderPassEncoder, camera: Camera3D): void {
-    const pipeline = this._pendingOnTop ? this.pipelineOnTop : this.pipeline;
+    const pipeline = (this._pendingOnTop ? this.pipelineOnTop : this.pipeline)?.get() ?? null;   // null while compiling → skip
     if (!pipeline || !this.bgl || this._currentIndexCount === 0 || this._currentInstCount === 0) return;
 
     // Build uniform: viewProj + alpha + padding
@@ -251,7 +252,8 @@ export class GhostPreviewRenderer {
     const vsModule = d.createShaderModule({ code: GHOST_VERTEX_SHADER });
     const fsModule = d.createShaderModule({ code: GHOST_FRAGMENT_SHADER });
 
-    const makePipeline = (depthCompare: GPUCompareFunction) => d.createRenderPipeline({
+    const makePipeline = (depthCompare: GPUCompareFunction) => GPUPipelineCache.for(d).render({
+      label: `GhostPreview-${depthCompare}`,
       layout,
       vertex: {
         module:     vsModule,

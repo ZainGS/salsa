@@ -8,21 +8,17 @@
 
 import {
     LayoutParams, DEFAULT_LAYOUT_PARAMS, WorldGraph, Block, Lot, RoadSegment, Zone, V2, Intersection, JunctionType, DistrictType,
+    cityMetresPerUnit,
 } from './types';
 import {
-    makeRng, Rng, borderPolygon, maxRadius, bounds, clipConvex, clipSegmentToConvex, polyArea, centroid, annulusSector, pointInPolygon, hash2, valueNoise2D,
+    makeRng, Rng, borderPolygon, maxRadius, bounds, clipConvex, clipSegmentToConvex, polyArea, centroid, annulusSector, pointInPolygon, hash2,
 } from './util';
-import { streetBandHalf, computeRamps } from './elevation';
+import { streetBandHalf, computeRamps, rawTerraceLevels } from './elevation';
+import { gridLotRegion } from './street-layout';
 import { placeLandmarks } from './landmarks';
 import { placeShotengai } from './shotengai';
-
-/** Smooth value noise over grid-cell coordinates → contiguous terrace patches (thresholded by the caller).
- *  Thin wrapper over the shared valueNoise2D — the 0.34 cell pre-scale is the only difference (bit-exact:
- *  ci·f is computed identically before the shared body runs). */
-function cellNoise(ci: number, ri: number, seed: number): number {
-    const f = 0.34;
-    return valueNoise2D(ci * f, ri * f, seed);
-}
+import { claimViaductLots } from './rail-layout';
+import { planLocalLine, applyLocalLineRoads, carveLocalLineLots, finishLocalLine, type LocalGridCtx } from './local-line';
 
 /** Public entry: build a full city layout graph from (partial) params. Deterministic in `seed`.
  *  `opts.layoutOnly` skips the district / landmark / shotengai / pond PLACEMENT passes — the flat-map tiles of a
@@ -30,6 +26,7 @@ function cellNoise(ci: number, ri: number, seed: number): number {
  *  win when generating dozens of neighbour tiles (regions/landmarks/etc. stay the empty arrays gridLayout set). */
 export function generateCityLayout(partial: Partial<LayoutParams> = {}, opts?: { layoutOnly?: boolean }): WorldGraph {
     const params: LayoutParams = { ...DEFAULT_LAYOUT_PARAMS, ...partial };
+    scaleStreetWidths(params, partial);
     const rng = makeRng(params.seed);
     const border = borderPolygon(params.border, params.radius, params.borderSides);
     const Rmax = maxRadius(border) * 1.02;
@@ -37,12 +34,35 @@ export function generateCityLayout(partial: Partial<LayoutParams> = {}, opts?: {
         ? gridLayout(params, rng, border, Rmax)
         : radialLayout(params, rng, border, Rmax);
     graph.bounds = bounds(border);
-    if (opts?.layoutOnly) return graph;   // flat-map neighbour tiles: skip the expensive placement passes below
+    if (opts?.layoutOnly) { claimViaductLots(graph); return graph; }   // flat-map neighbour tiles: skip the expensive placement passes below
     assignDistricts(graph);
+    claimViaductLots(graph);   // railway-upgrade R3.1: `railViaduct: 'arcade'` claims the lot strip beside the rail road (before landmarks / shotengai)
     graph.landmarks = placeLandmarks(graph);   // claims civic/market blocks + tags their lots (before builders run)
     graph.shotengai = placeShotengai(graph);   // a pedestrian street through the market (tags its corridor lots)
     graph.ponds = buildPonds(graph);
     return graph;
+}
+
+/** ★ Street widths follow the diorama scale (E14). Every prop, kerb and marking offset is `k * s` (s = radius/10),
+ *  but `streetWidth` used to be ABSOLUTE — a radius-20 city got radius-10 streets with radius-20 props on them.
+ *  Omitted widths are derived from the radius (0.40·s / 0.5·s, so the default radius-10 city is unchanged) and
+ *  the radius they were derived for is stamped in `streetWidthRadius`; a later regen at a different radius (the
+ *  live editor merges the previous params) rescales them. Explicit widths with no stamp are left absolute. */
+function scaleStreetWidths(params: LayoutParams, partial: Partial<LayoutParams>): void {
+    const s = params.radius / 10;
+    if (partial.streetWidthRadius === undefined && (partial.streetWidth === undefined || partial.arterialWidth === undefined)) {
+        if (partial.streetWidth === undefined) params.streetWidth = DEFAULT_LAYOUT_PARAMS.streetWidth * s;
+        if (partial.arterialWidth === undefined) params.arterialWidth = DEFAULT_LAYOUT_PARAMS.arterialWidth * s;
+        params.streetWidthRadius = params.radius;
+        return;
+    }
+    const ref = params.streetWidthRadius;
+    if (ref && ref > 0 && Math.abs(ref - params.radius) > 1e-9) {
+        const k = params.radius / ref;
+        params.streetWidth *= k;
+        params.arterialWidth *= k;
+        params.streetWidthRadius = params.radius;
+    }
 }
 
 /** Voronoi districts: a central DOWNTOWN core + scattered residential/civic/market seeds → each block takes the
@@ -76,6 +96,7 @@ function buildPonds(graph: WorldGraph): V2[][] {
     const out: V2[][] = [];
     for (const b of graph.blocks) {
         if (b.zone !== 'park' || b.poly.length < 3 || !rng.chance(0.55)) continue;
+        if (b.localLine) continue;   // (the local line's track runs through this park — after the roll, so other ponds keep theirs)
         const c = centroid(b.poly), bb = bounds(b.poly);
         const rx = (bb.max[0] - bb.min[0]) * 0.34, ry = (bb.max[1] - bb.min[1]) * 0.34;
         if (rx < 0.03 || ry < 0.03) continue;
@@ -188,7 +209,6 @@ function gridLayout(params: LayoutParams, rng: Rng, border: V2[], _Rmax: number)
     const cols = Math.max(2, params.gridCols | 0), rows = Math.max(2, params.gridRows | 0);
     const cw = (2 * R) / cols, ch = (2 * R) / rows;
     const half = params.streetWidth * 0.5;
-    const alley = params.streetWidth * 0.6;
     const x0 = (c: number): number => -R + c * cw, y0 = (r: number): number => -R + r * ch;
 
     // Road-segment presence grids. Border segments always survive; interior ones are removed (seeded) to make
@@ -233,14 +253,35 @@ function gridLayout(params: LayoutParams, rng: Rng, border: V2[], _Rmax: number)
     // Terrace levels — a smooth-noise threshold gives a few CONTIGUOUS raised patches; boundaries fall on grid roads
     // (so retaining walls + stairs land cleanly on streets, not diagonally through blocks). Outside-border cells stay 0.
     const terraceOn = params.terraces ?? true;
-    const levels: number[][] = [];
-    const tseed = (params.seed ^ 0x7e44ace) >>> 0;
-    for (let ci = 0; ci < cols; ci++) {
-        levels[ci] = [];
-        for (let ri = 0; ri < rows; ri++) { const nz = terraceOn && cellInside(ci, ri) ? cellNoise(ci, ri, tseed) : 0; levels[ci][ri] = nz > 0.78 ? (nz > 0.92 ? 2 : 1) : 0; }
-    }
+    const levels: number[][] = rawTerraceLevels(params, border);   // (elevation.ts — params-pure, the railway reads it too)
     // Canals sit a LEVEL BELOW the street (a cut canal) → the terrace pass gives the embankment walls + stairs down for free.
     if (terraceOn) for (const key of canal) { const p = key.split(',').map(Number); if (levels[p[0]]) levels[p[0]][p[1]] = -1; }
+    // railway-upgrade R3.2/R3.3: the optional AT-GRADE local line picks its row / curve / stations here and FLATTENS the
+    // cells it runs through (before the S9 fix-ups below, so they re-add any road a level step now needs). Off by default.
+    const localCtx: LocalGridCtx = { params, R, cols, rows, cw, ch, hSeg, vSeg, levels, canal, removed, cellInside };
+    const localPlan = planLocalLine(localCtx);
+    // ★ S9: a removed road MERGES its two cells into one block — which is only sound if they share a level. The
+    // removal pass runs before levels exist, so it could merge a raised cell with a low one, and the retaining
+    // wall (drawn on every level boundary) then cut straight through the merged block's buildings. Put the road
+    // back wherever the two sides differ. (Re-adding after the fact consumes no RNG, so every later seeded pick
+    // — canals, zones — is unchanged.)
+    if (terraceOn) {
+        for (let ci = 0; ci < cols; ci++) for (let r = 1; r < rows; r++) {
+            if (!hSeg[ci][r] && levels[ci][r - 1] !== levels[ci][r]) { hSeg[ci][r] = true; removed[ci][r - 1]--; removed[ci][r]--; }
+        }
+        for (let c = 1; c < cols; c++) for (let ri = 0; ri < rows; ri++) {
+            if (!vSeg[c][ri] && levels[c - 1][ri] !== levels[c][ri]) { vSeg[c][ri] = true; removed[c - 1][ri]--; removed[c][ri]--; }
+        }
+        // A grid NODE whose four cells are not all one level is a junction box that sinks to the lowest of them
+        // (cellLevelAt). Keep every road arm into it, or a merged block's corner lot would reach into that box.
+        for (let c = 1; c < cols; c++) for (let r = 1; r < rows; r++) {
+            const a = levels[c - 1][r - 1], b = levels[c][r - 1], d = levels[c - 1][r], e = levels[c][r];
+            if (a === b && b === d && d === e) continue;
+            hSeg[c - 1][r] = true; hSeg[c][r] = true; vSeg[c][r - 1] = true; vSeg[c][r] = true;
+        }
+    }
+    // The local line's merges: no road through a station platform, and the curve's row junctions become pass-throughs.
+    if (localPlan) applyLocalLineRoads(localPlan, localCtx);
 
     // Roads = the surviving segments, CLIPPED to the border (everything downstream — paint, poles, trees, guardrails,
     // traffic routes — follows the roads array, so nothing escapes a circular border any more).
@@ -258,6 +299,7 @@ function gridLayout(params: LayoutParams, rng: Rng, border: V2[], _Rmax: number)
     const lots: Lot[] = [];
     let blockId = 0;
     const maxD = Math.hypot(R, R);
+    const mpu = cityMetresPerUnit(R);
     for (let ci = 0; ci < cols; ci++) for (let ri = 0; ri < rows; ri++) {
         const S = hSeg[ci][ri], N = hSeg[ci][ri + 1], W = vSeg[ci][ri], E = vSeg[ci + 1][ri];
         const bx0 = x0(ci) + (W ? half : 0), bx1 = x0(ci + 1) - (E ? half : 0);
@@ -267,21 +309,14 @@ function gridLayout(params: LayoutParams, rng: Rng, border: V2[], _Rmax: number)
         const zone: Zone = canal.has(ci + ',' + ri) ? 'water' : pickZone(Math.hypot(cxm, cym) / maxD, rng.next(), { ...params, waterChance: 0 });
         const blockPoly = clipConvex([[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]], border);
         const block: Block = { id: blockId, poly: blockPoly, ring: ri, sector: ci, zone, level: levels[ci][ri], lots: [] };
-        const nx = Math.max(1, params.lotsAngular | 0), ny = Math.max(1, params.lotsRadial | 0);
-        for (let iy = 0; iy < ny; iy++) for (let ix = 0; ix < nx; ix++) {
-            const lx0 = bx0 + ((bx1 - bx0) * ix) / nx + alley * 0.5, lx1 = bx0 + ((bx1 - bx0) * (ix + 1)) / nx - alley * 0.5;
-            const ly0 = by0 + ((by1 - by0) * iy) / ny + alley * 0.5, ly1 = by0 + ((by1 - by0) * (iy + 1)) / ny - alley * 0.5;
-            if (lx1 <= lx0 || ly1 <= ly0) continue;
-            const poly = clipConvex([[lx0, ly0], [lx1, ly0], [lx1, ly1], [lx0, ly1]], border);
-            if (poly.length < 3) continue;
-            const area = polyArea(poly); if (area < MIN_LOT_AREA) continue;
-            const id = `L${blockId}_${ix}_${iy}`;
-            lots.push({ id, poly, center: centroid(poly), zone, slot: zoneToSlot(zone), block: blockId, area });
-            block.lots.push(id);
+        if (blockPoly.length >= 3) {
+            for (const lot of streetWallLots(params, block, blockId, zone, mpu, border)) { lots.push(lot); block.lots.push(lot.id); }
+            blocks.push(block);
         }
-        if (blockPoly.length >= 3) blocks.push(block);
         blockId++;
     }
+    // The local line's corridor: split the lots it crosses into the parts either side of it (or drop them).
+    if (localPlan) { const carved = carveLocalLineLots(localPlan, lots, blocks); lots.length = 0; lots.push(...carved); }
 
     // Bridges — a deck wherever a surviving road runs BETWEEN two canal cells (a cross-street over the water).
     const bridges: V2[][] = [];
@@ -338,7 +373,77 @@ function gridLayout(params: LayoutParams, rng: Rng, border: V2[], _Rmax: number)
     // No central plaza octagon in GRID cities (it read as an odd white disc under downtown) — radial keeps its hub.
     const graph: WorldGraph = { params, border, center: [0, 0], radius: R, roads, blocks, lots, intersections, regions: [], landmarks: [], shotengai: null, levels: terraceOn ? levels : null, ponds: [], bridges, plaza: null, bounds: bounds(border) };
     graph.ramps = computeRamps(graph);   // road ramps between terrace levels (so cars climb instead of falling off)
+    if (localPlan) { finishLocalLine(localPlan, graph); graph.localLine = localPlan; }   // level crossings (need the roads)
     return graph;
+}
+
+/**
+ * ★ A STREET WALL (B1): cut a grid block into narrow street FRONTAGES instead of a fixed 3×2 grid with 3.6 m
+ * alleys between every lot. The lot region starts at the lot line (`gridLotRegion` — the same line the
+ * retaining wall stands on). It is split into one or two strips back to back, each fronting a road; each strip
+ * is cut into random-width frontages of ~4–12 m (commercial runs wider) with 0–0.5 m slivers between them, so
+ * the buildings form a continuous wall along the pavement. Some strips — and some whole blocks, more often
+ * downtown — stay as one MERGED parcel (`lot.merged`) for towers / malls / civic buildings.
+ *
+ * Every lot stays a convex quad (clipped to the border); `streetEdges` lists the poly edges that face a road.
+ * Seeded per block (its own RNG), so the layout's main RNG stream — zones, canals — is untouched.
+ */
+function streetWallLots(params: LayoutParams, block: Block, blockId: number, zone: Zone, mpu: number, border: V2[]): Lot[] {
+    const reg = gridLotRegion(params, block);
+    if (!reg) return [];
+    const [x0, z0, x1, z1] = reg.rect, road = reg.road;
+    const rng = makeRng(((params.seed ^ 0x5eed107) + Math.imul(blockId + 1, 0x9e3779b1)) >>> 0);
+    const m = 1 / mpu;                                           // one metre in world units
+    const out: Lot[] = [];
+    const busy = zone === 'commercial' || zone === 'civic';
+    const push = (rx0: number, rz0: number, rx1: number, rz1: number, ix: number, iy: number, merged: boolean): void => {
+        if (rx1 - rx0 < 1e-6 || rz1 - rz0 < 1e-6) return;
+        const poly = clipConvex(clipConvex([[rx0, rz0], [rx1, rz0], [rx1, rz1], [rx0, rz1]], block.poly), border);
+        if (poly.length < 3) return;
+        const area = polyArea(poly);
+        if (area < MIN_LOT_AREA) return;
+        const e = 1e-6, streetEdges: number[] = [];
+        for (let i = 0; i < poly.length; i++) {
+            const a = poly[i], b = poly[(i + 1) % poly.length];
+            if ((road.W && Math.abs(a[0] - x0) < e && Math.abs(b[0] - x0) < e) || (road.E && Math.abs(a[0] - x1) < e && Math.abs(b[0] - x1) < e)
+                || (road.S && Math.abs(a[1] - z0) < e && Math.abs(b[1] - z0) < e) || (road.N && Math.abs(a[1] - z1) < e && Math.abs(b[1] - z1) < e)) streetEdges.push(i);
+        }
+        const lot: Lot = { id: `L${blockId}_${ix}_${iy}`, poly, center: centroid(poly), zone, slot: zoneToSlot(zone), block: blockId, area, streetEdges };
+        if (merged) lot.merged = true;
+        out.push(lot);
+    };
+    // Parks / water keep one parcel (the biome / water passes fill them as a whole).
+    if (zone === 'park' || zone === 'water') { push(x0, z0, x1, z1, 0, 0, false); return out; }
+    // Whole-block merge: a tower / mall / civic site.
+    if (rng.chance(busy ? 0.14 : 0.05)) { push(x0, z0, x1, z1, 0, 0, true); return out; }
+    // Frontage runs ALONG the longer side (the strips' outer edges face the two long-side roads).
+    const W = x1 - x0, H = z1 - z0;
+    const alongX = Math.abs(W - H) < 1e-6 ? rng.chance(0.5) : W > H;
+    const L0 = alongX ? x0 : z0, L1 = alongX ? x1 : z1, Dp0 = alongX ? z0 : x0, Dp1 = alongX ? z1 : x1;
+    const roadLo = alongX ? road.S : road.W, roadHi = alongX ? road.N : road.E;
+    const depth = Dp1 - Dp0;
+    const two = depth >= 10 * m && (roadLo === roadHi || depth >= 16 * m);
+    const back = two ? rng.range(0, 0.5) * m : 0;                // the back-to-back gap (a drain / 0.5 m sliver)
+    const strips: [number, number][] = two
+        ? [[Dp0, (Dp0 + Dp1) * 0.5 - back * 0.5], [(Dp0 + Dp1) * 0.5 + back * 0.5, Dp1]]
+        : [[Dp0, Dp1]];
+    const wMin = (busy ? 5 : 4) * m, wMax = (busy ? 12 : 9) * m, minW = 3 * m;
+    strips.forEach(([d0, d1], iy) => {
+        const lot = (a0: number, a1: number, ix: number, merged: boolean): void => {
+            if (alongX) push(a0, d0, a1, d1, ix, iy, merged); else push(d0, a0, d1, a1, ix, iy, merged);
+        };
+        if (rng.chance(0.08)) { lot(L0, L1, 0, true); return; }   // a wide single frontage (supermarket, hall, parking)
+        let a = L0, ix = 0;
+        while (a < L1 - 1e-9) {
+            let w = rng.range(wMin, wMax);
+            const gap = rng.chance(0.6) ? 0 : rng.range(0, 0.5) * m;
+            if (L1 - (a + w) < wMin) w = L1 - a;                 // the remainder would be a sliver → absorb it
+            const b = Math.min(L1, a + w);
+            if (b - a >= minW || ix === 0) lot(a, b, ix++, false);
+            a = b + gap;
+        }
+    });
+    return out;
 }
 
 /** Junction type from its surviving arms: 4 = cross · 3 = tee · 2 perpendicular = corner · else = not a junction. */

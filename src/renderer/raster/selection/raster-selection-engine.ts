@@ -642,7 +642,7 @@ export class RasterSelectionEngine {
   }
 
   private updateBoundsAsync(): void {
-    this.mask.getBounds().then(b => {
+    void this.mask.getBounds().then(b => {
       this.selectionBounds = b;
       this.scheduleRender();
     });

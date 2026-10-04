@@ -20,6 +20,13 @@ import type {
   UILayerData, UIStateMachine, UIEffect, UIEvent, UIValue, ShapeInteractionProps,
   TransitionAnimation, InteractionTrigger, UIOverlayState, HtmlFormElement,
 } from '../../ui/ui-types';
+import { UIKitRuntime, kitMenuTakesKeys, type KitLayerView } from '../../ui/kit/kit-runtime';
+import { UIKitRenderer } from '../../ui/kit/kit-renderer';
+import { isKitTransition, UI_KIT_CLIPS, type UIKitWidget, type UIKitClip, type UIKitKind, type UIKitTransitionType } from '../../ui/kit/kit-types';
+import { kitDefaults, kitStr } from '../../ui/kit/kit-schema';
+import { menuItems, menuItemId } from '../../ui/kit/kit-layout';
+import { kitPreset, personaHudDemo, personaPauseDemo, type KitWidgetDraft, type KitDemo } from '../../ui/kit/kit-presets';
+import type { KitTextProvider } from '../../ui/kit/kit-prims';
 
 function uid(): string {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
@@ -324,7 +331,12 @@ export class UIManager {
       const prev = (this._padPrev[p] ??= { buttons: [], axes: [] });
       for (let i = 0; i < pad.buttons.length; i++) {
         const pressed = pad.buttons[i].pressed;
-        if (pressed && !(prev.buttons[i] ?? false)) this.dispatchTrigger(this._activeLayerId, { type: 'gamepadButton', button: i });
+        if (pressed && !(prev.buttons[i] ?? false)) {
+          // standard mapping: d-pad up/down (12/13) move a shown kit menu, A (0) confirms it
+          if (i === 12 || i === 13) this.kitMenuMove(i === 12 ? -1 : 1);
+          else if (i === 0) this.kitMenuActivate();
+          this.dispatchTrigger(this._activeLayerId, { type: 'gamepadButton', button: i });
+        }
         prev.buttons[i] = pressed;
       }
       const TH = 0.5;
@@ -407,6 +419,12 @@ export class UIManager {
   handleKey(key: string, shift = false): boolean {
     if (!this._interactive) return false;
     if (key === 'Tab') { if (shift) this.focusPrev(); else this.focusNext(); return true; }
+    // A shown kit menu takes the arrow keys (+ W/S) and Enter/Space (when no authored focus ring is active).
+    if (this._kitActiveMenu()) {
+      const up = key === 'ArrowUp' || key === 'w' || key === 'W', down = key === 'ArrowDown' || key === 's' || key === 'S';
+      if (up || down) { this.kitMenuMove(up ? -1 : 1); this.keyDown(key); return true; }
+      if ((key === 'Enter' || key === ' ' || key === 'Spacebar') && !this._focusedShapeId) { this.kitMenuActivate(); return true; }
+    }
     if (key === 'Enter' || key === ' ' || key === 'Spacebar') { this.activateFocused(); return true; }
     this.keyDown(key);   // author-bound key transition (e.g. Escape → pause); does not consume other keys
     return false;
@@ -573,8 +591,10 @@ export class UIManager {
    *  first, then (if canvas coords given) a 3D-mesh pick. */
   pointerMove(worldX: number, worldY: number, canvasX?: number, canvasY?: number, layerId = this._activeLayerId): string | null {
     if (!this._interactive) return null;
-    // Ephemera (top overlay) first, then 2D shapes, then a 3D-mesh pick — matches the app's own pick order.
-    let hit = this.hitTestEphemera(worldX, worldY, layerId) ?? this.hitTest(worldX, worldY, layerId);
+    // Kit widgets (screen overlay, topmost) first, then ephemera, then 2D shapes, then a 3D-mesh pick.
+    const kh = this._kitHit(canvasX, canvasY);
+    if (kh) { const mi = this._kitMenuItem(kh); if (mi && this.kit.menuState(mi.w).sel !== mi.index) this._kitMenuSelect(mi.w, mi.index); }
+    let hit = kh ?? this.hitTestEphemera(worldX, worldY, layerId) ?? this.hitTest(worldX, worldY, layerId);
     if (!hit && canvasX != null && canvasY != null) hit = this.hitTestMesh(canvasX, canvasY, layerId);
     if (hit !== this._hoverShapeId) {
       const prev = this._hoverShapeId;
@@ -592,6 +612,13 @@ export class UIManager {
     if (!this._interactive) return false;
     const rec = layerId ? this._layers.get(layerId) : null;
     if (!rec || !rec.data.visible) return false;
+    const kh = this._kitHit(canvasX, canvasY);
+    if (kh) {
+      const mi = this._kitMenuItem(kh);
+      if (mi) { this._kitMenuSelect(mi.w, mi.index); this.kit.play(mi.w.id, 'pulse'); }
+      this.clickShape(kh, this.findKitWidget(mi ? mi.w.id : kh)?.layerId ?? layerId);
+      return true;
+    }
     let hit = this.hitTestEphemera(worldX, worldY, layerId) ?? this.hitTest(worldX, worldY, layerId);
     if (!hit && canvasX != null && canvasY != null) hit = this.hitTestMesh(canvasX, canvasY, layerId);
     if (hit) { this.clickShape(hit, layerId); return true; }
@@ -629,6 +656,7 @@ export class UIManager {
   restore(datas: UILayerData[]): void {
     this._layers.clear();
     this._activeLayerId = null;
+    this.kit.clearVisibleOverrides();   // runtime-only kit state never crosses documents
     for (const data of datas) {
       const runtime = data.stateMachine.initialStateId
         ? new UIStateMachineRuntime(data.stateMachine, { formValid: (fid) => this.isFormValid(fid) })
@@ -661,15 +689,25 @@ export class UIManager {
         case 'setShapeVisible':    this._setShapeVisible(e.shapeId, e.visible); break;
         case 'toggleShapeVisible': this._setShapeVisible(e.shapeId, !this._shapeVisible(e.shapeId)); break;
         case 'openUrl':            if (typeof window !== 'undefined') window.open(e.url, e.target); break;
-        case 'transition':         this._startTransition(e.animation); break;   // masked reveal over the scrim
+        case 'transition':
+          if (isKitTransition(e.animation.type)) {   // UI-kit transition: drawn by the kit over everything
+            if (this._interactive) this.kit.startTransition(e.animation.type, e.animation.duration, e.from, e.to);
+            this._transition = null;
+          } else this._startTransition(e.animation);   // masked reveal over the scrim
+          break;
         // World-control effects (Phase 3): applied through the host-wired world hook; ALSO forwarded to the
         // effectHook so observers (analytics, the Player postMessage bridge) still see them.
         case 'freezeWorld':        this._world?.setFrozen?.(e.frozen); this._effectHook?.(e); break;
         case 'setWorldSpeed':      this._world?.setSpeed?.(e.speed); this._effectHook?.(e); break;
         case 'setWorldBlur':       this._dynamicBlur = Math.max(0, Math.min(1, e.amount)); this._effectHook?.(e); break;
         case 'setCamera':          this._world?.setCamera?.(e.position, e.target, e.duration); this._effectHook?.(e); break;
-        case 'playAnimation':      this._world?.playAnimation?.(e.targetId, e.clipId, e.loop, e.blendFrames); this._effectHook?.(e); break;
-        case 'stopAnimation':      this._world?.stopAnimation?.(e.targetId); this._effectHook?.(e); break;
+        case 'playAnimation':
+          if (this.findKitWidget(e.targetId)) this.kit.play(e.targetId, kitClipName(e.clipId));   // kit widget clip
+          else this._world?.playAnimation?.(e.targetId, e.clipId, e.loop, e.blendFrames);
+          this._effectHook?.(e); break;
+        case 'stopAnimation':
+          if (this.findKitWidget(e.targetId)) this.kit.stop(e.targetId); else this._world?.stopAnimation?.(e.targetId);
+          this._effectHook?.(e); break;
         case 'pauseAnimation':     this._world?.pauseAnimation?.(e.targetId); this._effectHook?.(e); break;
         case 'seekAnimation':      this._world?.seekAnimation?.(e.targetId, e.frame); this._effectHook?.(e); break;
         // Form effects (Phase 4): applied via the form adapter.
@@ -696,11 +734,223 @@ export class UIManager {
   }
   private _setShapeVisible(shapeId: string, visible: boolean): void {
     if (this._ephemera?.has(shapeId)) { this._ephemera.setVisible(shapeId, visible); return; }
+    if (this.findKitWidget(shapeId)) { this.kit.setVisibleOverride(shapeId, visible); return; }
     const node = this.ctx.sceneGraph.findNodeById(shapeId);
     if (node) node.visible = visible;
   }
   private _shapeVisible(shapeId: string): boolean {
     if (this._ephemera?.has(shapeId)) return this._ephemera.isVisible(shapeId);
+    const kw = this.findKitWidget(shapeId);
+    if (kw) return this.kit.visibleOverride(shapeId) ?? (kw.widget.visible !== false);
     return this.ctx.sceneGraph.findNodeById(shapeId)?.visible ?? true;
   }
+
+  // ── UI KIT (docs/ui/persona-ui-kit.md) ─────────────────────────────────────────────────────────────────────
+  // Screen-space widgets stored on each layer (`data.kit`), laid out by src/ui/kit and drawn by one instanced SDF
+  // shader on the final swapchain image (post-process immune, full resolution). A widget id behaves like a shape id:
+  // state shapeVisibility, show/hide/toggle actions, ShapeInteractionProps (click/hover triggers) and playAnimation.
+
+  /** Kit runtime (visibility, intros, menus, transitions, last frame's pointer targets). */
+  readonly kit = new UIKitRuntime();
+  private _kitRenderer: UIKitRenderer | null = null;
+  private _kitHoverItem: string | null = null;
+
+  /** Find a kit widget (and its layer) by id. */
+  findKitWidget(id: string): { layerId: string; widget: UIKitWidget } | null {
+    if (!id) return null;
+    for (const rec of this._layers.values()) {
+      const w = rec.data.kit?.find((k) => k.id === id);
+      if (w) return { layerId: rec.data.id, widget: w };
+    }
+    return null;
+  }
+  /** Widgets on a layer (the live array — treat as read-only; edit through updateKitWidget). */
+  listKitWidgets(layerId = this._activeLayerId): UIKitWidget[] {
+    const rec = layerId ? this._layers.get(layerId) : null;
+    return rec?.data.kit ?? [];
+  }
+  /** Add a widget (a kind with schema defaults, or a full draft). Defaults to the active UI layer, creating one
+   *  ("UI Kit") when there is none. Returns the new widget. */
+  addKitWidget(draft: UIKitKind | KitWidgetDraft, layerId = this._activeLayerId): UIKitWidget {
+    const lid = layerId && this._layers.has(layerId) ? layerId : this.createUILayer('UI Kit');
+    const rec = this._layers.get(lid)!;
+    const d: KitWidgetDraft = typeof draft === 'string' ? { kind: draft, anchor: 'c', x: 0, y: 0, props: kitDefaults(draft) } : draft;
+    const w: UIKitWidget = { ...structuredCloneSafe(d), id: `kit-${uid().slice(0, 8)}` };
+    (rec.data.kit ??= []).push(w);
+    this.ctx.scheduleRender();
+    return w;
+  }
+  /** Merge a patch into a widget (`props` merges key by key). Returns false when the id is unknown. */
+  updateKitWidget(id: string, patch: Partial<Omit<UIKitWidget, 'id' | 'props'>> & { props?: Record<string, number | string | boolean> }): boolean {
+    const f = this.findKitWidget(id);
+    if (!f) return false;
+    const { props, ...rest } = patch;
+    Object.assign(f.widget, rest);
+    if (props) f.widget.props = { ...f.widget.props, ...props };
+    this.ctx.scheduleRender();
+    return true;
+  }
+  removeKitWidget(id: string): boolean {
+    for (const rec of this._layers.values()) {
+      const i = rec.data.kit?.findIndex((k) => k.id === id) ?? -1;
+      if (i >= 0) {
+        rec.data.kit!.splice(i, 1);
+        if (rec.data.shapeInteractions[id]) delete rec.data.shapeInteractions[id];
+        this.kit.forget(id);
+        this.ctx.scheduleRender();
+        return true;
+      }
+    }
+    return false;
+  }
+  /** Insert a single-piece preset (UI_KIT_PRESETS id). Returns the widget, or null for an unknown preset. */
+  insertKitPreset(presetId: string, layerId = this._activeLayerId): UIKitWidget | null {
+    const p = kitPreset(presetId);
+    return p ? this.addKitWidget(p.make(), layerId) : null;
+  }
+
+  /** Insert a demo: 'hud' → a new "Persona HUD" layer (HUD + splash states); 'pause' → the pause menu, merged into
+   *  the active layer when it is a HUD demo layer (Escape opens it from 'hud'), else a new "Pause Menu" layer.
+   *  Commits the merged state machine (re-enters its initial state — insert while NOT previewing). */
+  insertKitDemo(kind: 'hud' | 'pause'): { layerId: string; widgetIds: string[] } {
+    let layerId: string;
+    let demo: KitDemo;
+    if (kind === 'hud') {
+      demo = personaHudDemo();
+      layerId = this.createUILayer(demo.name);
+    } else {
+      const act = this._activeLayerId ? this._layers.get(this._activeLayerId) : null;
+      const hasHud = !!act?.data.stateMachine.states.some((s) => s.id === 'hud');
+      demo = personaPauseDemo(hasHud ? 'hud' : 'play');
+      layerId = hasHud && act ? act.data.id : this.createUILayer(demo.name);
+    }
+    const rec = this._layers.get(layerId)!;
+    const widgetIds: string[] = [];
+    let menuId = '';
+    for (const d of demo.widgets) {
+      const w = this.addKitWidget(d, layerId);
+      widgetIds.push(w.id);
+      if (w.kind === 'menu' && !menuId) menuId = w.id;
+    }
+    const m = structuredCloneSafe(rec.data.stateMachine);
+    for (const s of demo.states) if (!m.states.some((x) => x.id === s.id)) m.states.push(s);
+    for (const v of demo.variables) if (!m.variables.some((x) => x.id === v.id)) m.variables.push(v);
+    for (const t of demo.transitions) {
+      const tt = structuredCloneSafe(t);
+      if ('targetId' in tt.trigger && tt.trigger.targetId.startsWith('@menu')) tt.trigger.targetId = menuId + tt.trigger.targetId.slice(5);
+      m.transitions = m.transitions.filter((x) => x.id !== tt.id);
+      m.transitions.push(tt);
+    }
+    if (!m.initialStateId) m.initialStateId = demo.initialStateId;
+    if (demo.states.some((s) => s.worldBlur)) rec.data.backgroundOverlay ??= { color: [0.06, 0.0, 0.02, 0.38] };
+    this.setStateMachine(layerId, m);
+    this._activeLayerId = layerId;
+    return { layerId, widgetIds };
+  }
+
+  /** Play a kit transition right now (authoring preview — works outside interactive mode too). */
+  previewKitTransition(type: UIKitTransitionType, durationMs?: number): void {
+    this.kit.startTransition(type, durationMs ?? 0, null, '');
+    if (type === 'panelSlide' || type === 'zoomPunch') this.kit.replayEntrances();
+    this.ctx.scheduleRender();
+  }
+  /** Play a clip on a kit widget (also reachable from a playAnimation action whose targetId is the widget id). */
+  playKitClip(id: string, clip: UIKitClip = 'intro'): void { this.kit.play(id, clip); this.ctx.scheduleRender(); }
+
+  /** Layer views for a kit build. */
+  private _kitViews(): KitLayerView[] {
+    const out: KitLayerView[] = [];
+    for (const rec of this._layers.values()) {
+      if (!rec.data.kit?.length) continue;
+      out.push({
+        id: rec.data.id, visible: rec.data.visible, kit: rec.data.kit,
+        currentState: rec.runtime?.currentStateId ?? null,
+        interactive: (id) => !!rec.data.shapeInteractions[id],
+        vars: (id) => rec.runtime?.getVariable(id),
+      });
+    }
+    return out;
+  }
+  /** Is there anything for the kit to draw (widgets or a transition)? */
+  get hasKitContent(): boolean {
+    if (this.kit.transition) return true;
+    for (const rec of this._layers.values()) if (rec.data.kit?.length) return true;
+    return false;
+  }
+  /** Lay the kit out for a W x H (device px) frame. Returns true while anything animates. */
+  buildKitFrame(W: number, H: number, text: KitTextProvider, cssToDevice = 1): boolean {
+    this.kit.cssToDevice = cssToDevice;
+    return this.kit.build(this._kitViews(), W, H, text, this._interactive);
+  }
+  /** Wire the kit's GPU overlay into the renderer (post-process immune, full resolution). */
+  attachKitOverlay(renderer: { setUIKitOverlayDrawer?: (fn: ((device: GPUDevice, encoder: GPUCommandEncoder, view: GPUTextureView, w: number, h: number, format: GPUTextureFormat, cssToDevice: number, generation: number) => boolean) | null) => void }): void {
+    renderer.setUIKitOverlayDrawer?.((device, encoder, view, w, h, format, cssToDevice, generation) => {
+      if (!this.hasKitContent) return false;
+      const r = (this._kitRenderer ??= new UIKitRenderer());
+      r.prepare(device, format, generation);
+      const more = this.buildKitFrame(w, h, r.atlas, cssToDevice);
+      r.draw(encoder, view, w, h, this.kit.list, this.kit.now());
+      return more;
+    });
+  }
+
+  /** The topmost visible keyboard-driven menu on the active layer (arrow keys / d-pad / Enter go to it). */
+  private _kitActiveMenu(): UIKitWidget | null {
+    const rec = this._activeLayerId ? this._layers.get(this._activeLayerId) : null;
+    if (!rec?.data.kit?.length || !rec.data.visible) return null;
+    const view = this._kitViews().find((v) => v.id === rec.data.id);
+    if (!view) return null;
+    let best: UIKitWidget | null = null;
+    for (const w of rec.data.kit) {
+      if (!kitMenuTakesKeys(w) || !this.kit.isShown(view, w, view.currentState)) continue;
+      if (!best || (w.z ?? 0) >= (best.z ?? 0)) best = w;
+    }
+    return best;
+  }
+  /** Move a menu's selection by delta (wraps); writes its selectedVar binding. Returns the new index. */
+  kitMenuMove(delta: number, menuId?: string): number | null {
+    const w = menuId ? this.findKitWidget(menuId)?.widget ?? null : this._kitActiveMenu();
+    if (!w) return null;
+    const vars = (id: string) => this._layers.get(this.findKitWidget(w.id)!.layerId)?.runtime?.getVariable(id);
+    const cur = this.kit.menuState(w, vars).sel;
+    return this._kitMenuSelect(w, cur + delta);
+  }
+  private _kitMenuSelect(w: UIKitWidget, index: number): number {
+    const i = this.kit.setMenuSelection(w, index);
+    const vid = kitStr(w, 'selectedVar');
+    const lid = this.findKitWidget(w.id)?.layerId;
+    if (vid && lid && this._layers.get(lid)?.runtime?.getVariable(vid) !== undefined) this.setUIVariable(lid, vid, i);
+    this.ctx.scheduleRender();
+    return i;
+  }
+  /** Activate (click) the selected item of the active / given menu. */
+  kitMenuActivate(menuId?: string): boolean {
+    const w = menuId ? this.findKitWidget(menuId)?.widget ?? null : this._kitActiveMenu();
+    if (!w) return false;
+    const lid = this.findKitWidget(w.id)!.layerId;
+    const sel = this.kit.menuState(w, (id) => this._layers.get(lid)?.runtime?.getVariable(id)).sel;
+    if (sel < 0 || sel >= menuItems(w).length) return false;
+    this.kit.play(w.id, 'pulse');
+    this.clickShape(menuItemId(w, sel), lid);
+    return true;
+  }
+  /** Kit pointer target under a CSS-px canvas point: a menu item id, or a widget with interaction props. */
+  private _kitHit(canvasX?: number, canvasY?: number): string | null {
+    if (canvasX == null || canvasY == null) return null;
+    return this.kit.hitTest(canvasX, canvasY)?.id ?? null;
+  }
+  /** Is `id` a menu item id ("<menuWidgetId>#<slug>")? → the menu + item index. */
+  private _kitMenuItem(id: string): { w: UIKitWidget; index: number } | null {
+    const hash = id.indexOf('#');
+    if (hash < 0) return null;
+    const w = this.findKitWidget(id.slice(0, hash))?.widget;
+    if (!w || w.kind !== 'menu') return null;
+    const n = menuItems(w).length;
+    for (let i = 0; i < n; i++) if (menuItemId(w, i) === id) return { w, index: i };
+    return null;
+  }
 }
+
+function structuredCloneSafe<T>(v: T): T { return JSON.parse(JSON.stringify(v)) as T; }
+/** A playAnimation clipId → a kit clip ('intro' when omitted / unknown). */
+function kitClipName(clipId?: string): UIKitClip { return (UI_KIT_CLIPS as readonly string[]).includes(clipId ?? '') ? clipId as UIKitClip : 'intro'; }

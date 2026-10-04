@@ -91,18 +91,96 @@ describe('DocumentPersistence load guard (audit 2026-09-28 P1)', () => {
 });
 
 describe('busy predicate (Play / UI preview / Player mode — audit P11)', () => {
-  it('blocks AUTOMATIC saves while busy; an explicit saveNow still runs', async () => {
+  it('blocks AUTOMATIC saves while busy', async () => {
     const gather = failingProvider();
     const p = make(gather);
     let busy = true;
     p.setBusyPredicate(() => busy);
     expect(await p.triggerSave()).toBe(false);
     expect(gather).not.toHaveBeenCalled();
-    await p.saveNow();                                   // deliberate user save is honoured
-    expect(gather).toHaveBeenCalledTimes(1);
     busy = false;                                        // preview ended → autosave resumes
     await p.triggerSave();
-    expect(gather).toHaveBeenCalledTimes(2);
+    expect(gather).toHaveBeenCalledTimes(1);
+  });
+
+  // bug-hunt 2026-10-01 D-P2: an explicit save during Play used to serialize the IN-GAME frame (walked-to transforms,
+  // hidden first-person player, mid-stride pose). It is now DEFERRED until Play stops and then saves the restored
+  // editor state; concurrent saveNow calls while busy share the one deferred save.
+  it('defers an explicit saveNow while busy, then saves once the busy period ends', async () => {
+    vi.useFakeTimers();
+    const gather = failingProvider();
+    const p = make(gather);
+    let busy = true;
+    p.setBusyPredicate(() => busy);
+    const a = p.saveNow(), b = p.saveNow();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(gather).not.toHaveBeenCalled();               // nothing gathered mid-Play
+    busy = false;                                        // Stop → the editor state is restored
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.all([a, b]);
+    expect(gather).toHaveBeenCalledTimes(1);             // ONE save for both requests
+  });
+
+  it('a save whose gather finishes after Play started is not written (deferred instead)', async () => {
+    vi.useFakeTimers();
+    let busy = false;
+    let n = 0;
+    const gather = vi.fn(async (): Promise<DocumentSavePayload> => {
+      n++;
+      if (n === 1) busy = true;                           // Play started while this save was gathering
+      return { manifest: { docId: 'd', name: 'd', version: 3, layers: [], createdAt: 0, updatedAt: 0 }, layers: [] } as unknown as DocumentSavePayload;
+    });
+    const p = make(gather);
+    p.setBusyPredicate(() => busy);
+    const s = p.saveNow();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(gather).toHaveBeenCalledTimes(1);
+    busy = false;
+    await vi.advanceTimersByTimeAsync(1000);
+    await s;
+    expect(gather).toHaveBeenCalledTimes(2);             // re-gathered from the restored editor state
+  });
+
+  it('a save whose gather spanned a device loss AND recovery is not written (the busy epoch moved)', async () => {
+    vi.useFakeTimers();
+    let lost = 0, n = 0;
+    const gather = vi.fn(async (): Promise<DocumentSavePayload> => {
+      n++;
+      if (n === 1) lost++;                                // lost + recovered while the pixels were read back
+      return { manifest: { docId: 'd', name: 'd', version: 3, layers: [], createdAt: 0, updatedAt: 0 }, layers: [] } as unknown as DocumentSavePayload;
+    });
+    const p = make(gather);
+    p.setBusyPredicate(() => false);                      // idle again by the time the gather returns
+    p.setBusyEpochProvider(() => lost);
+    const s = p.saveNow();
+    await vi.advanceTimersByTimeAsync(1000);
+    await s;
+    expect(gather).toHaveBeenCalledTimes(2);             // the first gather was dropped, the save re-gathered
+  });
+
+  it('an explicit save that has to wait notifies the host once per busy period', async () => {
+    vi.useFakeTimers();
+    let busy = true;
+    const onDeferred = vi.fn();
+    const p = make(failingProvider());
+    p.setBusyPredicate(() => busy);
+    p.setDeferredCallback(onDeferred);
+    const a = p.saveNow(), b = p.saveNow();
+    expect(onDeferred).toHaveBeenCalledTimes(1);
+    busy = false;
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.all([a, b]);
+    await p.saveNow();                                    // idle: no notice
+    expect(onDeferred).toHaveBeenCalledTimes(1);
+  });
+
+  it('destroy() settles a pending deferred save with false', async () => {
+    vi.useFakeTimers();
+    const p = make(failingProvider());
+    p.setBusyPredicate(() => true);
+    const s = p.saveNow();
+    p.destroy();
+    expect(await s).toBe(false);
   });
 });
 

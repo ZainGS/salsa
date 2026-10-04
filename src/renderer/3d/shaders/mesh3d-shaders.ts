@@ -26,6 +26,7 @@
  */
 
 import { STYLE_WGSL_FUNCTIONS } from './style-shaders';
+import { CROWD_PALETTE_WGSL } from '../crowd-palette';
 
 // ── Shared PBR + IBL WGSL (included in both fragment shader variants) ──────
 
@@ -639,132 +640,388 @@ fn patternMask(uv: vec2<f32>, mode: u32, params: vec4<f32>, time: f32) -> f32 {
     // mode 6 params.y is wallStyle (not an angle), so the rotated p above must not drive the window grid.
     let pw = uv * freq;
     let fw = fract(pw);
-    let ins = clamp(params.z, 0.05, 0.45);
-    let iwx = smoothstep(ins - w, ins + w, fw.x) * (1.0 - smoothstep(1.0 - ins - w, 1.0 - ins + w, fw.x));
-    let iwy = smoothstep(ins - w, ins + w, fw.y) * (1.0 - smoothstep(1.0 - ins - w, 1.0 - ins + w, fw.y));
+    let ins = winInsets(params);                                  // the SAME opening windowsPattern paints (sash / shop aware)
+    let iwx = smoothstep(ins.x - w, ins.x + w, fw.x) * (1.0 - smoothstep(1.0 - ins.x - w, 1.0 - ins.x + w, fw.x));
+    let iwy = smoothstep(ins.y - w, ins.y + w, fw.y) * (1.0 - smoothstep(1.0 - ins.z - w, 1.0 - ins.z + w, fw.y));
     return iwx * iwy;
   }
   return 0.0;
 }
 
+// AD SCREEN (pattern mode 7 with patternScale > 1.5, visual-polish #6): designed advert loops for the big building
+// LED screens instead of the freq-9 waves that aliased into TV static. The CPU normalises each screen face to
+// u = id + 0..1 across, v = 0..1 up (id = a per-building integer), so the layout fits the screen. Three layouts
+// (product + slash + copy bars, bold blocky type + scrolling ticker, a split with a starburst) in a punchy Persona
+// palette cut every ~6 s with a short flash. Every shape is an SDF anti-aliased by the uv footprint (fw = fwidth(uv),
+// taken by the caller in uniform flow), and once the details go sub-pixel the screen settles to its average colour,
+// so a distant screen is a clean coloured panel, never noise. No derivatives inside -> safe in branches.
+fn ad_hash(n: f32) -> f32 { return fract(sin(n * 91.345 + 3.17) * 47453.5453); }
+fn ad_pal(i: i32) -> vec3<f32> {
+  var pal = array<vec3<f32>, 7>(
+    vec3<f32>(0.90, 0.08, 0.12), vec3<f32>(0.06, 0.05, 0.07), vec3<f32>(0.96, 0.94, 0.90), vec3<f32>(1.0, 0.80, 0.10),
+    vec3<f32>(0.10, 0.72, 0.90), vec3<f32>(0.92, 0.22, 0.62), vec3<f32>(1.0, 0.48, 0.10));
+  return pal[((i % 7) + 7) % 7];
+}
+fn ad_box(p: vec2<f32>, c: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+  let q = abs(p - c) - b + vec2<f32>(r);
+  return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+fn ad_fill(d: f32, w: f32) -> f32 { return 1.0 - smoothstep(-w, w, d); }
+fn adScreen(uv: vec2<f32>, fw: vec2<f32>, aspect: f32, time: f32) -> vec3<f32> {
+  let id = floor(uv.x);
+  let A = aspect;
+  let p = vec2<f32>(clamp(uv.x - id, 0.0, 1.0) * A, clamp(uv.y, 0.0, 1.0));   // screen-height units
+  let w = max(max(fw.x * A, fw.y), 1e-4) * 1.2;                  // AA half-width in the same units
+  let tt = time / 6.0 + ad_hash(id) * 7.0;
+  let slot = floor(tt);
+  let ph = tt - slot;
+  let s = ad_hash(id * 13.1 + slot * 7.7);
+  let lay = i32(floor(s * 3.0));
+  let ia = i32(floor(ad_hash(s * 31.7) * 7.0));
+  let ib = ia + 1 + i32(floor(ad_hash(s * 57.3) * 5.0));
+  let ic = ib + 1 + i32(floor(ad_hash(s * 11.9) * 5.0));
+  let ca = ad_pal(ia); let cb = ad_pal(ib); var cc = ad_pal(ic);
+  if (all(cc == ca)) { cc = ad_pal(ic + 1); }
+  let white = vec3<f32>(0.96, 0.94, 0.90);
+  let black = vec3<f32>(0.05, 0.04, 0.06);
+  let lumA = dot(ca, vec3<f32>(0.3, 0.55, 0.15));
+  let ink = select(white, black, lumA > 0.5);                    // copy colour that reads on the background
+  var col = ca;
+  if (lay == 0) {
+    // PRODUCT: a diagonal slash band, a big product disc with a white rim, three copy bars
+    let n = normalize(vec2<f32>(0.55, -1.0));
+    col = mix(col, cb, ad_fill(abs(dot(p - vec2<f32>(A * 0.5, 0.5), n)) - 0.11, w));
+    let dc = length(p - vec2<f32>(A * 0.27, 0.52)) - 0.3;
+    col = mix(col, white, ad_fill(dc - 0.035, w));
+    col = mix(col, cc, ad_fill(dc, w));
+    col = mix(col, white, ad_fill(length(p - vec2<f32>(A * 0.27 - 0.1, 0.62)) - 0.06, w));   // a highlight
+    for (var i = 0; i < 3; i = i + 1) {
+      let fi = f32(i);
+      let d = ad_box(p, vec2<f32>(A * 0.7, 0.72 - fi * 0.18), vec2<f32>(A * (0.2 - 0.04 * fi), 0.045 + 0.02 * select(0.0, 1.0, i == 0)), 0.02);
+      col = mix(col, select(ink, cc, i == 2), ad_fill(d, w));
+    }
+  } else if (lay == 1) {
+    // BOLD TYPE: blocky glyphs with a hard drop shadow over a scrolling ticker band
+    col = cb;
+    let inkB = select(white, black, dot(cb, vec3<f32>(0.3, 0.55, 0.15)) > 0.5);
+    let n = 4;
+    for (var i = 0; i < n; i = i + 1) {
+      let fi = f32(i);
+      let gx = A * (0.16 + 0.68 * fi / 3.0);
+      let gh = ad_hash(s * 3.3 + fi);
+      let c0 = vec2<f32>(gx, 0.56);
+      let hb = vec2<f32>(min(A * 0.085, 0.16), 0.24);
+      var d = ad_box(p, c0, hb, 0.015);
+      let notchY = select(0.1, -0.1, gh > 0.5);
+      d = max(d, -ad_box(p, c0 + vec2<f32>(0.0, notchY), vec2<f32>(hb.x * 0.4, 0.07), 0.0));   // a counter / notch
+      let dsh = ad_box(p, c0 + vec2<f32>(0.03, -0.03), hb, 0.015);
+      col = mix(col, black, ad_fill(dsh, w) * 0.85);
+      col = mix(col, select(cc, inkB, gh > 0.7), ad_fill(d, w));
+    }
+    let band = ad_fill(p.y - 0.15, w);
+    col = mix(col, black, band);
+    let tick = abs(fract((p.x + time * 0.35) * 2.2) - 0.5) - 0.2;   // dashes scrolling along the ticker
+    col = mix(col, ca, band * ad_fill(max(tick / 2.2, abs(p.y - 0.075) - 0.025), w));
+  } else {
+    // SPLIT + STARBURST: a slanted two-colour split, a sunburst of rays behind a badge
+    let ds = (p.x - A * 0.55) + (p.y - 0.5) * 0.45;
+    col = mix(ca, cb, ad_fill(-ds, w));
+    let q = p - vec2<f32>(A * 0.3, 0.5);
+    let rr = length(q);
+    let ang = atan2(q.y, q.x) / 6.2831853 * 14.0 + time * 0.08;
+    let rayW = max(w / max(rr, 0.05) * 14.0 / 6.2831853, 1e-3);
+    let ray = 1.0 - smoothstep(0.25 - rayW, 0.25 + rayW, abs(fract(ang) - 0.5));
+    col = mix(col, cc, ray * ad_fill(rr - 0.46, w) * 0.85);
+    col = mix(col, white, ad_fill(rr - 0.21, w));
+    col = mix(col, ca, ad_fill(rr - 0.15, w));
+    col = mix(col, ink, ad_fill(ad_box(p, vec2<f32>(A * 0.78, 0.32), vec2<f32>(A * 0.14, 0.06), 0.02), w));
+  }
+  col = mix(col, white, (1.0 - smoothstep(0.0, 0.02, ph)) * 0.55);   // the cut flash
+  let avg = ca * 0.55 + cb * 0.27 + cc * 0.18;                   // what the screen reads as from far away
+  return mix(col, avg, smoothstep(0.03, 0.12, w));
+}
+
 // WINDOWS pattern (mode 6): the UV grid becomes window CELLS (inset rectangles) and a per-cell hash decides
-// which are LIT. Returns (isWindow, isLit, wallShade, 0). params = (freq, wallStyle, inset 0..0.45, lit fraction
-// 0..1) — wallStyle < 0.5 = running-bond BRICK courses, else CONCRETE panel speckle: a per-texel albedo
-// multiplier for the wall BETWEEN the windows, so facades read as material instead of flat paint up close.
-// The lit set slowly reshuffles over scene time. Wall UVs are world-proportional (walls()).
-fn windowsPattern(uv: vec2<f32>, params: vec4<f32>, time: f32) -> vec4<f32> {
+// which are LIT. Returns (isWindow, isLit, wallShade, 0). params = (freq, facade code, inset 0..0.45, lit fraction
+// 0..1). FACADE CODE (params.y): 0 running-bond BRICK · 1 CONCRETE panels · 2 CURTAIN glass · 3 RIBBON glazing ·
+// 4 small square TILE · 5 lap SIDING · 6 SHOP window (one cell per bay, lit shop interior) · 7 smooth PLASTER;
+// plus 10 = Japanese sliding SASH openings (wide, low, a centre meeting rail). World-gen makes ONE CELL PER STOREY
+// vertically, and offsets each face's u by whole cells (a per-building band of 128 cells + a per-face hash), so
+// faces / buildings light different windows and the band index gives a per-building lit fraction.
+fn winBase(ws: f32) -> f32 { return select(ws, ws - 10.0, ws > 9.5); }
+fn winIsMasonry(b: f32) -> bool { return b < 1.5 || (b > 3.5 && b < 5.5) || b > 6.5; }
+// Opening insets as cell fractions: (x each side, bottom, top). Mirrored on the CPU by windowInsets() in
+// building-parts.ts (juliet / trim / window-box placement) - change both together.
+fn winInsets(params: vec4<f32>) -> vec3<f32> {
+  let ws = params.y;
+  let b = winBase(ws);
+  if (ws > 9.5) { return vec3<f32>(0.13, 0.30, 0.16); }
+  if (b > 5.5 && b < 6.5) { return vec3<f32>(0.03, 0.03, 0.03); }
+  if (b > 1.5 && b < 2.5) { return vec3<f32>(0.05, 0.05, 0.05); }
+  if (b > 2.5 && b < 3.5) { return vec3<f32>(0.04, 0.22, 0.22); }
+  let ix = max(clamp(params.z, 0.05, 0.45), 0.2);                // masonry: PORTRAIT windows (tall rectangles)
+  return vec3<f32>(ix, ix * 0.5, ix * 0.5);
+}
+// Per-BUILDING hash from the cell column (the u offset band - see above).
+fn winBandHash(cellX: f32) -> f32 { return fract(sin(floor(cellX / 128.0) * 57.31 + 3.7) * 43758.5453); }
+
+// FACADE MATERIALS of windowsPattern (persona polish B4 - fewer, finer, lower-contrast joints: the old coarse joint
+// grids read as "graph paper" across the whole city). Every joint pattern is fwidth-AA'd and settles to its flat
+// AVERAGE once a unit is under ~2 px, so mid-distance walls read as clean material + the floor bands, never as noise.
+// Pure functions of the material coordinates and their fwidths (taken by the caller in uniform control flow), so
+// they may run inside a branch.
+// BRICK: small running-bond bricks (about 1/9 of a window cell wide, 26 courses per storey) with LIGHT,
+// low-contrast mortar and a per-brick tint spread.
+fn wpBrick(bc: vec2<f32>, db: vec2<f32>) -> f32 {
+  let brow = floor(bc.y);
+  let bx = bc.x + fract(brow * 0.5);                   // running bond: alternate rows shift half a brick
+  let bf = vec2<f32>(fract(bx), fract(bc.y));
+  let mw = vec2<f32>(max(db.x * 1.5, 0.07), max(db.y * 1.5, 0.12));
+  let brickMask = min(smoothstep(0.0, mw.x, bf.x) * (1.0 - smoothstep(1.0 - mw.x, 1.0, bf.x)),
+                      smoothstep(0.0, mw.y, bf.y) * (1.0 - smoothstep(1.0 - mw.y, 1.0, bf.y)));
+  let btint = fract(sin(dot(vec2<f32>(floor(bx), brow), vec2<f32>(41.3, 289.1))) * 34761.77);
+  // Joints DARKER + brick faces LIGHTER - paint polarity matches the RELIEF so they reinforce into one 3-D brick.
+  return mix(mix(0.9, 0.98 + 0.1 * btint, brickMask), 0.99, smoothstep(0.35, 0.8, max(db.x, db.y)));
+}
+// CONCRETE: cast / precast panels TWO BAYS x ONE STOREY (seams on every other pier centre + the floor line, so a
+// seam never crosses a window), faint seams, a per-panel value shift and a soft low-frequency staining.
+fn wpConc(p: vec2<f32>, cpan: vec2<f32>, dc: vec2<f32>, bh: f32) -> f32 {
+  let cf = vec2<f32>(fract(cpan.x), fract(cpan.y));
+  let cw = vec2<f32>(max(dc.x * 1.5, 0.012), max(dc.y * 1.5, 0.016));
+  let seam = min(smoothstep(0.0, cw.x, cf.x) * (1.0 - smoothstep(1.0 - cw.x, 1.0, cf.x)),
+                 smoothstep(0.0, cw.y, cf.y) * (1.0 - smoothstep(1.0 - cw.y, 1.0, cf.y)));
+  let stain = pg_vnoise(p * vec2<f32>(0.8, 0.55) + vec2<f32>(bh * 23.0, 0.0)) - 0.5;
+  return mix(0.955, 1.0, seam) * (0.975 + 0.05 * fract(sin(dot(floor(cpan), vec2<f32>(12.99, 78.23))) * 43758.5453)) * (1.0 + stain * 0.06);
+}
+// TILE: fine glazed facade tiles (22 across a cell, 30 up a storey - about 11 x 10 cm), pale grout, a small
+// per-tile value spread. Fades to the average once a tile is under ~2 px (no moire, no grid at the overview).
+fn wpTile(tc: vec2<f32>, dt: vec2<f32>) -> f32 {
+  let tf = fract(tc);
+  let tw = vec2<f32>(max(dt.x * 1.5, 0.08), max(dt.y * 1.5, 0.08));
+  let tileMask = min(smoothstep(0.0, tw.x, tf.x) * (1.0 - smoothstep(1.0 - tw.x, 1.0, tf.x)),
+                     smoothstep(0.0, tw.y, tf.y) * (1.0 - smoothstep(1.0 - tw.y, 1.0, tf.y)));
+  let ttint = fract(sin(dot(floor(tc), vec2<f32>(17.3, 91.7))) * 5413.7);
+  return mix(mix(1.05, 0.975 + 0.05 * ttint, tileMask), 0.995, smoothstep(0.25, 0.6, max(dt.x, dt.y)));
+}
+// SIDING: horizontal lap boards (about 12 per storey) - each board lighter at its top, a shadow line under it.
+fn wpLap(sc: f32, dsd: f32) -> f32 {
+  return mix(mix(0.8, 1.02, smoothstep(0.0, max(0.3, dsd * 1.5), fract(sc))), 0.93, smoothstep(0.3, 0.7, dsd));
+}
+// PLASTER / painted RENDER: smooth, with soft organic blotches (value noise - the old floor(p) hash painted a
+// grid of flat squares).
+fn wpPlaster(p: vec2<f32>, bh: f32) -> f32 {
+  return 0.985 + 0.06 * (pg_vnoise(p * vec2<f32>(1.6, 1.2) + vec2<f32>(bh * 17.0, 3.1)) - 0.5);
+}
+// METAL PANEL cladding (code 8): aluminium composite panels, 2 per bay x 2 per storey, thin dark open joints,
+// each panel its own sheen value plus a faint vertical oil-can gradient.
+fn wpPanel(pc: vec2<f32>, dpc: vec2<f32>) -> f32 {
+  let pcf = fract(pc);
+  let pjw = vec2<f32>(max(dpc.x * 1.5, 0.02), max(dpc.y * 1.5, 0.025));
+  let pMask = min(smoothstep(0.0, pjw.x, pcf.x) * (1.0 - smoothstep(1.0 - pjw.x, 1.0, pcf.x)),
+                  smoothstep(0.0, pjw.y, pcf.y) * (1.0 - smoothstep(1.0 - pjw.y, 1.0, pcf.y)));
+  let pval = 0.955 + 0.09 * fract(sin(dot(floor(pc), vec2<f32>(63.7, 17.9))) * 24634.63) + 0.035 * (pcf.y - 0.5);
+  return mix(mix(0.7, pval, pMask), 0.97, smoothstep(0.3, 0.7, max(dpc.x, dpc.y)));
+}
+
+fn windowsPattern(uv: vec2<f32>, params: vec4<f32>, time: f32, full: bool, fast: bool) -> vec4<f32> {
   let freq = max(params.x, 0.001);
   let p = uv * freq;
   let cell = floor(p);
   let f = fract(p);
-  let ws = params.y;                                   // FACADE TYPE: 0 brick · 1 concrete · 2 CURTAIN wall · 3 RIBBON
-  let inset = clamp(params.z, 0.05, 0.45);
+  let ws = params.y;
+  let b = winBase(ws);
+  let sash = ws > 9.5;
+  let isCurtain = b > 1.5 && b < 2.5;
+  let isShop = b > 5.5 && b < 6.5;
+  let masonry = winIsMasonry(b);
   let dp = fwidth(p);
   let w = max(dp.x, dp.y) + 1e-4;
-  // glazing MASK insets vary by facade type: masonry = punched windows; curtain = thin mullions (near-full glass
-  // panels); ribbon = thin VERTICAL mullions + tall spandrel bands (continuous horizontal glazing strips).
-  var insetX = inset; var insetY = inset;
-  if (ws < 1.5) { insetX = max(inset, 0.2); insetY = insetX * 0.5; }   // masonry: PORTRAIT windows (tall rectangles, not squares)
-  if (ws > 1.5 && ws < 2.5) { insetX = 0.05; insetY = 0.05; }
-  if (ws > 2.5) { insetX = 0.04; insetY = 0.22; }
-  let inX = smoothstep(insetX - w, insetX + w, f.x) * (1.0 - smoothstep(1.0 - insetX - w, 1.0 - insetX + w, f.x));
-  let inY = smoothstep(insetY - w, insetY + w, f.y) * (1.0 - smoothstep(1.0 - insetY - w, 1.0 - insetY + w, f.y));
-  let slot = floor(time * 0.02);                       // the lit set drifts every ~50 s
-  let h = fract(sin(dot(cell + vec2<f32>(slot), vec2<f32>(127.1, 311.7))) * 43758.5453);
-  let litFrac = clamp(params.w, 0.0, 1.0);
-  // CURTAIN towers light whole FLOORS (per-row hash → glowing horizontal floor bands, the NTE glass-tower look);
-  // masonry lights individual windows (per-cell hash).
-  let hRow = fract(sin((cell.y + slot) * 91.7 + 12.3) * 43758.5453);
-  let lit = select(step(1.0 - litFrac, h), step(1.0 - litFrac, hRow), ws > 1.5 && ws < 2.5);
-  // BRICK: realistically SMALL running-bond bricks (≈1/8 of a window cell wide) with LIGHT mortar joints and a
-  // per-brick tint spread — the red-brick/rowhouse look. fwidth-AA'd so it settles to a clean average far away.
-  let bc = vec2<f32>(p.x * 8.0, p.y * 18.0);
-  let brow = floor(bc.y);
-  let bx = bc.x + fract(brow * 0.5);                   // running bond: alternate rows shift half a brick
-  let bf = vec2<f32>(fract(bx), fract(bc.y));
+  // P8 FAST PATH (fast = scene.cascadeBias.z, Renderer3D.shaderFastPaths): every fwidth below is taken HERE, in
+  // uniform control flow, so the rest may branch. Only a FACADE (full = patMode 6) reads .xyz, every other patterned
+  // mesh (ground, roofs, paving) only the footprint .w, so they return now; a facade evaluates only ITS material.
+  // Same expressions, same values: the output is bit-identical to the slow path.
+  let bc = vec2<f32>(p.x * 9.0, p.y * 26.0);
   let db = fwidth(bc);
-  let mw = vec2<f32>(max(db.x * 1.5, 0.08), max(db.y * 1.5, 0.14));
-  let brickMask = min(smoothstep(0.0, mw.x, bf.x) * (1.0 - smoothstep(1.0 - mw.x, 1.0, bf.x)),
-                      smoothstep(0.0, mw.y, bf.y) * (1.0 - smoothstep(1.0 - mw.y, 1.0, bf.y)));
-  let btint = fract(sin(dot(vec2<f32>(floor(bx), brow), vec2<f32>(41.3, 289.1))) * 34761.77);
-  // Joints DARKER + brick faces LIGHTER — PAINT polarity matches the RELIEF (mortar recessed/dark, brick proud/
-  // light) so they REINFORCE into one coherent 3-D brick instead of competing. Restored the per-brick tint spread
-  // (0.14) + a bit more contrast than the muddy first attempt so individual bricks read crisply, not blurry.
-  let brick = mix(0.85, 1.0 + 0.14 * btint, brickMask);
-  // CONCRETE: large panels with faint seams + per-panel value speckle (office/civic).
-  let cpan = p * vec2<f32>(1.0, 1.5);
-  let cf = vec2<f32>(fract(cpan.x), fract(cpan.y));
+  let cpan = vec2<f32>(p.x * 0.5, p.y);
   let dc = fwidth(cpan);
-  let cw = vec2<f32>(max(dc.x * 1.5, 0.02), max(dc.y * 1.5, 0.03));
-  let seam = min(smoothstep(0.0, cw.x, cf.x) * (1.0 - smoothstep(1.0 - cw.x, 1.0, cf.x)),
-                 smoothstep(0.0, cw.y, cf.y) * (1.0 - smoothstep(1.0 - cw.y, 1.0, cf.y)));
-  let conc = mix(0.9, 1.0, seam) * (0.96 + 0.06 * fract(sin(dot(floor(cpan), vec2<f32>(12.99, 78.23))) * 43758.5453));
-  var shade = select(brick, conc, ws >= 0.5);
-  // STONE PLINTH: the ground-floor band (below the first window row) reads as a darker masonry base course.
-  let plinth = 1.0 - smoothstep(0.85, 1.0, p.y);
+  let tc = vec2<f32>(p.x * 22.0, p.y * 30.0);
+  let dt = fwidth(tc);
+  let sc = p.y * 12.0;
+  let dsd = fwidth(sc);
+  let pc = p * 2.0;
+  let dpc = fwidth(pc);
+  if (fast && !full) { return vec4<f32>(0.0, 0.0, 0.0, w); }
+  let ins = winInsets(params);
+  let insetX = ins.x;
+  let inX = smoothstep(insetX - w, insetX + w, f.x) * (1.0 - smoothstep(1.0 - insetX - w, 1.0 - insetX + w, f.x));
+  let inY = smoothstep(ins.y - w, ins.y + w, f.y) * (1.0 - smoothstep(1.0 - ins.z - w, 1.0 - ins.z + w, f.y));
+  // LIT SET: each cell reshuffles on its OWN phase (was one city-wide 50 s clock - every lit window in town
+  // flipped on the same frame); the per-building band scales the lit fraction (some blocks dark, some bright).
+  let ph = fract(sin(dot(cell, vec2<f32>(19.19, 47.73))) * 24634.63);
+  let slot = floor(time * 0.02 + ph);
+  let h = fract(sin(dot(cell + vec2<f32>(slot), vec2<f32>(127.1, 311.7))) * 43758.5453);
+  let bh = winBandHash(cell.x);
+  let lf0 = clamp(params.w, 0.0, 1.0);
+  // shops: ~90% of bays lit as soon as dusk starts (a lit shop street); homes / offices: 0.3x .. 1.7x per building
+  let litFrac = select(clamp(lf0 * (0.3 + 1.4 * bh), 0.0, 1.0), clamp(lf0 * 4.0, 0.0, 0.92), isShop);
+  // CURTAIN towers light whole FLOORS (per-row hash -> glowing floor bands), each tower on its own set + phase.
+  let rslot = floor(time * 0.02 + fract(sin(cell.y * 13.7 + bh * 71.0) * 9173.1));
+  let hRow = fract(sin((cell.y + rslot) * 91.7 + 12.3 + bh * 37.0) * 43758.5453);
+  // TRANSIT glazing (world/train.ts EMU side glass): curtain code with scale > 0.9 = every cell on the plain lit
+  // fraction (a commuter train is lit end to end) - no per-building band or per-floor gating.
+  let transit = isCurtain && params.z > 0.9;
+  let lit = select(select(step(1.0 - litFrac, h), step(1.0 - litFrac, hRow), isCurtain), step(1.0 - lf0, h), transit);
+  // FACADE MATERIALS (persona polish B4 - fewer, finer, lower-contrast joints: the old coarse joint grids read as
+  // "graph paper" across the whole city). Every joint pattern is fwidth-AA'd and settles to its flat AVERAGE once a
+  // unit is under ~2 px, so mid-distance walls read as clean material + the floor bands below, never as noise.
+  // (each material is a pure function of the coordinates + the fwidths taken above - see wpBrick .. wpPanel)
+  var shade: f32;
+  if (fast) {
+    // P8: evaluate only this facade's material (the slow path below computes all six and selects one).
+    if (b < 0.5) { shade = wpBrick(bc, db); }
+    else if (b > 3.5 && b < 4.5) { shade = wpTile(tc, dt); }
+    else if (b > 4.5 && b < 5.5) { shade = wpLap(sc, dsd); }
+    else if (b > 6.5 && b < 7.5) { shade = wpPlaster(p, bh); }
+    else if (b > 7.5 && b < 8.5) { shade = wpPanel(pc, dpc); }
+    else { shade = wpConc(p, cpan, dc, bh); }
+  } else {
+    let brick = wpBrick(bc, db);
+    let conc = wpConc(p, cpan, dc, bh);
+    let tile = wpTile(tc, dt);
+    let lap = wpLap(sc, dsd);
+    let plaster = wpPlaster(p, bh);
+    let panelC = wpPanel(pc, dpc);
+    shade = conc;
+    if (b < 0.5) { shade = brick; }
+    if (b > 3.5 && b < 4.5) { shade = tile; }
+    if (b > 4.5 && b < 5.5) { shade = lap; }
+    if (b > 6.5 && b < 7.5) { shade = plaster; }
+    if (b > 7.5 && b < 8.5) { shade = panelC; }
+  }
+  // RAIN STREAKS under the sills of render / concrete fronts: a faint darkening below some windows, strongest just
+  // under the sill and fading toward the floor (the lived-in Tokyo front, kept subtle).
+  let stX = smoothstep(insetX - w, insetX + 0.06, f.x) * (1.0 - smoothstep(1.0 - insetX - 0.06, 1.0 - insetX + w, f.x));
+  let stH = step(0.55, fract(sin(dot(cell, vec2<f32>(3.1, 17.7))) * 9137.1));
+  let streak = stX * stH * smoothstep(0.0, max(ins.y, 0.05), f.y) * (1.0 - step(ins.y, f.y));
+  let streaky = select(0.0, 1.0, (b > 0.5 && b < 1.5) || (b > 6.5 && b < 7.5));
+  shade = shade * (1.0 - 0.07 * streak * streaky);
+  // FLOOR BANDS (B4 / D2): a slab-edge band along the bottom of every upper storey - the horizontal rhythm of a
+  // real block, and the far-distance stand-in for the geometric floor-band ledges (which cull with the DETAIL
+  // tier). Darker spandrel on tile / brick / render, a paler slab edge on concrete and metal panel. Not on the
+  // ground row (the plinth owns it) and not on siding.
+  let bandH = min(0.075, ins.y * 0.6);
+  let fBand = (1.0 - smoothstep(bandH - w, bandH + w, f.y)) * step(1.0, p.y) * select(1.0, 0.0, b > 4.5 && b < 5.5);
+  let bandK = select(0.88, 1.07, (b > 0.5 && b < 1.5) || (b > 7.5 && b < 8.5));
+  shade = mix(shade, shade * bandK, fBand * select(1.0, 0.0, !masonry));
+  // STONE PLINTH: a darker base course on the GROUND storey only (row 0 - world-gen restarts v at the section's
+  // storey index, so an upper / setback section never gets one; it was landing over every shop). Sash facades
+  // keep it below the ground-floor sill only.
+  let row0 = 1.0 - step(1.0, p.y);
+  let plinthFull = 1.0 - smoothstep(0.85, 1.0, p.y);
+  let plinthSill = row0 * (1.0 - smoothstep(ins.y * 0.55 - w, ins.y * 0.55 + w, f.y));
+  let plinth = select(select(plinthFull, plinthSill, sash), 0.0, !masonry);
   shade = mix(shade, min(shade, 1.0) * 0.8, plinth * 0.9);
-  // WINDOW FRAME: a light stone SILL below + HEADER above + thin JAMBS at the sides, hugging each opening — so a
-  // window reads as a framed window, not a hole. (Masonry only — curtain/ribbon override the shade below.)
-  let onBot  = inX * (1.0 - smoothstep(0.0, 0.055, abs(f.y - insetY)));
-  let onTop  = inX * (1.0 - smoothstep(0.0, 0.045, abs(f.y - (1.0 - insetY))));
+  // WINDOW FRAME: a light SILL below + HEADER above + thin JAMBS at the sides, hugging each opening (masonry only;
+  // softer on sash facades, whose frames are thin aluminium drawn on the glass in windowShade).
+  let onBot  = inX * (1.0 - smoothstep(0.0, 0.055, abs(f.y - ins.y)));
+  let onTop  = inX * (1.0 - smoothstep(0.0, 0.045, abs(f.y - (1.0 - ins.z))));
   let onSide = inY * (1.0 - smoothstep(0.0, 0.03, min(abs(f.x - insetX), abs(f.x - (1.0 - insetX)))));
   let frame  = clamp(max(max(onBot, onTop * 0.7), onSide * 0.55), 0.0, 1.0) * (1.0 - inX * inY);
-  shade = mix(shade, 1.24, frame * 0.85 * (1.0 - plinth));
-  // CURTAIN / RIBBON override the between-glass shade: curtain = clean metal MULLION grid (no masonry/plinth/sill);
-  // ribbon = solid SPANDREL bands in the wall colour (the horizontal strips between glazing).
-  if (ws > 1.5) { shade = select(0.58, 1.0, ws > 2.5); }
-  return vec4<f32>(inX * inY, lit, shade, 0.0);
+  shade = mix(shade, 1.24, frame * select(0.85, 0.35, sash) * (1.0 - plinth));
+  // CURTAIN / RIBBON / SHOP override the between-glass shade: curtain = clean metal MULLION grid; ribbon = solid
+  // SPANDREL bands in the wall colour; shop = the bay frame is real geometry, so no painted wall at all.
+  if (!masonry) { shade = select(select(0.58, 1.0, b > 2.5), 1.0, isShop); }
+  // .w = the pixel footprint in CELLS (fwidth of the cell coords): the FS relief + windowShade fade their
+  // sub-pixel grain with it (no fwidth needed down there - it runs in non-uniform control flow).
+  return vec4<f32>(inX * inY, lit, shade, w);
 }
 
 // Structured MASONRY HEIGHT for the wall BETWEEN the windows (facade relief normal). Returns 0..1 where the brick
-// faces / concrete panel faces stand PROUD and the mortar joints / panel seams RECESS, so a facade reads as real
-// material instead of flat paint. NO fwidth (fixed joint widths) — the FS samples this at a fine FIXED eps, so it
-// stays uniform-safe in a possibly-batched draw, and the eps is brick-scale (finer than the window-cell relief eps
-// which is too coarse to resolve courses). wallStyle (params.y): <0.5 running-bond BRICK · <1.5 CONCRETE/precast
-// panels · else curtain / ribbon (a flat glass skin, no relief).
+// faces / panel faces / tiles / siding boards stand PROUD and the joints RECESS. NO fwidth (fixed joint widths) -
+// the FS samples this at a fine FIXED eps, so it stays uniform-safe. Facade code as windowsPattern (+10 sash
+// flag decoded); curtain / ribbon / shop / plaster are flat. The cell math MUST MATCH windowsPattern's albedo
+// joints exactly (same counts, same bond offset) so every groove lands on a painted joint.
 fn wallMasonryH(uv: vec2<f32>, params: vec4<f32>) -> f32 {
   let freq = max(params.x, 0.001);
   let pw = uv * freq;
-  let ws = params.y;
-  if (ws < 0.5) {
-    // BRICK: full running-bond relief — bed joints (horizontal) AND head joints (vertical) recessed, brick faces
-    // proud, so it reads as real 3-D brick. ★ The cell math MUST MATCH windowsPattern's albedo bricks EXACTLY
-    // (bc = (p.x*8, p.y*18), half-brick row offset fract(brow*0.5), p = uv*freq) so every groove lands on a
-    // painted mortar line. The earlier "basket-weave" was a course MOIRÉ (relief 14 vs albedo 18) + a coarse eps
-    // undersampling the courses — both fixed here (exact 8x18 match + the finer FS eps).
-    let bc = vec2<f32>(pw.x * 8.0, pw.y * 18.0);
+  let b = winBase(params.y);
+  if (b < 0.5) {
+    // BRICK: running-bond relief (bc = (p.x*9, p.y*26), half-brick row offset fract(brow*0.5), p = uv*freq)
+    let bc = vec2<f32>(pw.x * 9.0, pw.y * 26.0);
     let brow = floor(bc.y);
-    let bx = bc.x + fract(brow * 0.5);                                // running bond: alternate rows shift half a brick
+    let bx = bc.x + fract(brow * 0.5);
     let bf = vec2<f32>(fract(bx), fract(bc.y));
-    // Joint widths MATCHED to windowsPattern's albedo mortar (mw floors 0.08 x / 0.14 y) so the relief groove and
-    // the painted mortar band are the SAME width + position — one line, not a thin groove inside a fat paint band.
-    let hx = smoothstep(0.0, 0.08, bf.x) * (1.0 - smoothstep(0.92, 1.0, bf.x));   // head joint (vertical)
-    let hy = smoothstep(0.0, 0.14, bf.y) * (1.0 - smoothstep(0.86, 1.0, bf.y));   // bed joint (horizontal)
-    return min(hx, hy);                                               // brick FACE proud, ANY joint recessed
+    let hx = smoothstep(0.0, 0.07, bf.x) * (1.0 - smoothstep(0.93, 1.0, bf.x));   // head joint (vertical)
+    let hy = smoothstep(0.0, 0.12, bf.y) * (1.0 - smoothstep(0.88, 1.0, bf.y));   // bed joint (horizontal)
+    return min(hx, hy);
   }
-  if (ws < 1.5) {
-    // Concrete / precast panels — the panel FACE proud, the seams recessed. A DENSER panel grid (was 1x1.5) +
-    // full depth (was 0.7) so grey/stone facades read as material like the brick ones, not flat paint.
-    let cpan = pw * vec2<f32>(2.0, 3.0);
-    let cf = vec2<f32>(fract(cpan.x), fract(cpan.y));
-    let seam = min(smoothstep(0.0, 0.05, cf.x) * (1.0 - smoothstep(0.95, 1.0, cf.x)),
-                   smoothstep(0.0, 0.06, cf.y) * (1.0 - smoothstep(0.94, 1.0, cf.y)));
+  if (b < 1.5) {
+    // Concrete / precast panels (two bays x one storey) - the panel FACE proud, the seams recessed.
+    let cf = fract(vec2<f32>(pw.x * 0.5, pw.y));
+    let seam = min(smoothstep(0.0, 0.014, cf.x) * (1.0 - smoothstep(0.986, 1.0, cf.x)),
+                   smoothstep(0.0, 0.018, cf.y) * (1.0 - smoothstep(0.982, 1.0, cf.y)));
     return seam;
+  }
+  if (b > 3.5 && b < 4.5) {
+    // TILE: grout lines recessed (matches the 22 x 30 albedo tiles)
+    let tf = fract(pw * vec2<f32>(22.0, 30.0));
+    return min(smoothstep(0.0, 0.08, tf.x) * (1.0 - smoothstep(0.92, 1.0, tf.x)),
+               smoothstep(0.0, 0.08, tf.y) * (1.0 - smoothstep(0.92, 1.0, tf.y)));
+  }
+  if (b > 4.5 && b < 5.5) {
+    // SIDING: each lap board a ramp (thin at its top edge, thick at the drip edge) -> a stepped shadow per board
+    return smoothstep(0.0, 0.9, fract(pw.y * 12.0));
+  }
+  if (b > 7.5 && b < 8.5) {
+    // METAL PANEL: the open joints between the composite panels recess (matches the 2 x 2 albedo panels)
+    let pf = fract(pw * 2.0);
+    return min(smoothstep(0.0, 0.03, pf.x) * (1.0 - smoothstep(0.97, 1.0, pf.x)),
+               smoothstep(0.0, 0.035, pf.y) * (1.0 - smoothstep(0.965, 1.0, pf.y)));
   }
   return 0.0;
 }
 
 // ── INTERIOR MAPPING ────────────────────────────────────────────────────────────
-// Raycast a fake unit ROOM behind a window opening (the Spider-Man / Cities: Skylines trick): the view ray
-// enters at the glass plane and hits the back wall / floor / ceiling / side walls of a virtual box, giving
-// true PARALLAX depth per window for zero geometry. Hashed per room: depth, warm-home vs cool-office light,
-// a furniture silhouette band and wall hangings on the back wall. No fwidth inside → safe in branches.
-fn interiorRoom(win: vec2<f32>, rd0: vec3<f32>, seed: f32, time: f32) -> vec3<f32> {
+// Raycast a fake ROOM behind each window cell (the Spider-Man / Cities: Skylines trick): the view ray enters at
+// the glass plane and hits the back wall / floor / ceiling / side walls of a virtual box, giving true PARALLAX
+// depth per window for zero geometry. Hashed per room: depth, warm-home vs cool-office light, a furniture band
+// and wall hangings on the back wall. No fwidth inside, so these are safe in branches.
+// The box is METRIC (polish round 7): it spans the whole window CELL (one storey tall, one bay wide; curtain /
+// ribbon floors are open plan, 3 bays wide) and a hashed depth in STOREY heights, and the ray arrives expressed
+// in the cell's own uv axes (windowShade derives them from uv derivatives), so the parallax runs the right way on
+// every face and is exactly as strong as a real room behind real glass. Units: storey heights (cell height = 1);
+// x along +u, y along +v (up), z along the outward normal (the room is z < 0).
+// CPU mirror + world-space ground truth: src/renderer/3d/interior-mapping.test.ts (change both together).
+struct RoomHit { p: vec3<f32>, face: f32, dist: f32 }
+
+// face: 0 side wall, 1 ceiling, 2 floor, 3 back wall. p = the hit in BOX coords: x, y in -1..1 across the room
+// (floor -1, ceiling +1), z in half-storey units (0 at the glass, -2 * depth at the back wall). dist in storeys.
+fn roomTrace(ro: vec3<f32>, rd0: vec3<f32>, xLo: f32, xHi: f32, depth: f32) -> RoomHit {
+  var rd = rd0;
+  rd.z = min(rd.z, -0.08);                                       // guard grazing rays
+  let sx = select(-1.0, 1.0, rd.x >= 0.0) * max(abs(rd.x), 1e-5);
+  let sy = select(-1.0, 1.0, rd.y >= 0.0) * max(abs(rd.y), 1e-5);
+  let tx = (select(xLo, xHi, sx > 0.0) - ro.x) / sx;
+  let ty = (select(0.0, 1.0, sy > 0.0) - ro.y) / sy;
+  let tz = -depth / rd.z;
+  let t = max(min(tx, min(ty, tz)), 0.0);
+  let h = ro + rd * t;
+  var face = 0.0;
+  if (tz <= min(tx, ty)) { face = 3.0; } else if (ty <= tx) { face = select(2.0, 1.0, sy > 0.0); }
+  var o: RoomHit;
+  o.p = vec3<f32>(2.0 * (h.x - xLo) / max(xHi - xLo, 1e-4) - 1.0, 2.0 * h.y - 1.0, 2.0 * h.z);
+  o.face = face;
+  o.dist = t;
+  return o;
+}
+
+fn interiorRoom(win: vec2<f32>, ro: vec3<f32>, rd: vec3<f32>, xLo: f32, xHi: f32, seed: f32, time: f32) -> vec3<f32> {
   let h1 = fract(sin(seed * 12.9898) * 43758.5453);              // depth
   let h2 = fract(h1 * 91.17 + 0.37);                             // room TYPE (warm home vs cool office)
   let h3 = fract(h2 * 137.31 + 0.71);                            // dressing (blinds / curtains / TV)
-  let depth = 1.3 + h1 * 1.4;                                    // room depth, in half-window units
   let office = h2 > 0.55;
+  // room depth in STOREYS: homes ~3.4..5.3 m, offices ~4.3..7 m behind the glass (at a ~3.1 m storey)
+  let depth = select(1.1 + h1 * 0.6, 1.4 + h1 * 0.9, office);
 
   // WINDOW DRESSING at the glass plane: 18% horizontal BLINDS (slat stripes), 16% side CURTAINS.
   let blinds = step(0.82, h3);
@@ -772,102 +1029,302 @@ fn interiorRoom(win: vec2<f32>, rd0: vec3<f32>, seed: f32, time: f32) -> vec3<f3
   let blindMask = blinds * smoothstep(0.35, 0.65, fract(win.y * 7.0));
   let curtainMask = curtains * (1.0 - smoothstep(0.14, 0.30, min(win.x, 1.0 - win.x)));
 
-  var rd = rd0;
-  rd.z = min(rd.z, -0.08);                                       // guard grazing rays
-  let ro = vec3<f32>(win * 2.0 - 1.0, 0.0);
-  let tx = (select(-1.0, 1.0, rd.x > 0.0) - ro.x) / rd.x;
-  let ty = (select(-1.0, 1.0, rd.y > 0.0) - ro.y) / rd.y;
-  let tz = -depth / rd.z;
-  let t = min(tx, min(ty, tz));
-  let hit = ro + rd * t;
+  let r = roomTrace(ro, rd, xLo, xHi, depth);
+  let hit = r.p;
   let tint = select(vec3<f32>(1.0, 0.80, 0.55), vec3<f32>(0.80, 0.88, 1.0), office);
 
-  var c = tint * 0.48;                                           // side walls…
-  if (office && t < tz - 1e-4 && t < ty - 1e-4) {
-    // …offices get SHELF rows on the side walls (horizontal darker bands with depth)
+  var c = tint * 0.48;                                           // side walls...
+  if (office && r.face < 0.5) {
+    // ...offices get SHELF rows on the side walls (horizontal darker bands with depth)
     c = c * mix(0.62, 1.0, smoothstep(0.1, 0.28, abs(fract(hit.y * 1.6) - 0.5)));
   }
-  if (t >= tz - 1e-4) {
+  if (r.face > 2.5) {
     if (office) {
-      // OFFICE back wall: a cubicle/desk band + a row of small MONITOR glows above it
-      let desk = smoothstep(0.1, -0.2, hit.y);
+      // OFFICE back wall: a desk band (desk top ~0.75 m) + a row of small MONITOR glows standing on it
+      let desk = smoothstep(-0.45, -0.6, hit.y);
       c = tint * mix(0.68, 0.30, desk);
       let mcol = fract(hit.x * 2.6 + seed);
-      let mrow = smoothstep(0.02, 0.12, hit.y) * (1.0 - smoothstep(0.22, 0.32, hit.y));
+      let mrow = smoothstep(-0.54, -0.48, hit.y) * (1.0 - smoothstep(-0.3, -0.24, hit.y));
       let monOn = step(0.5, fract(sin(floor(hit.x * 2.6 + seed) * 47.3) * 761.7));
       let mon = monOn * step(0.3, mcol) * (1.0 - step(0.7, mcol)) * mrow;
       c = mix(c, vec3<f32>(0.55, 0.85, 1.0) * 1.6, mon);
     } else {
       // HOME back wall: sofa band + hashed wall hangings; ~35% have a flickering TV
-      let band = smoothstep(0.15, -0.25, hit.y);
+      let band = smoothstep(-0.38, -0.55, hit.y);
       let pic = fract(sin(dot(floor(hit.xy * 1.8 + vec2<f32>(seed)), vec2<f32>(31.7, 71.3))) * 4571.7);
       c = tint * mix(0.72, 0.28, band) * (0.8 + 0.35 * pic);
       let tvOn = step(0.65, fract(h3 * 51.7));
-      let tv = tvOn * step(abs(hit.x + 0.25), 0.28) * step(abs(hit.y - 0.12), 0.2);
+      let tv = tvOn * step(abs(hit.x + 0.25), 0.28) * step(abs(hit.y + 0.2), 0.15);
       let flick = 0.75 + 0.25 * sin(time * 9.0 + seed * 6.28) * sin(time * 23.0 + seed);
       c = mix(c, vec3<f32>(0.6, 0.7, 1.0) * (1.2 * flick), tv);
     }
-  } else if (t >= ty - 1e-4 && rd.y > 0.0) {
-    // CEILING: offices get repeating strip fixtures; homes one round fixture near the centre
-    var fix = max(0.0, 1.0 - length(hit.xz) * 0.8);
-    if (office) { fix = step(abs(fract(hit.x * 1.4) - 0.5), 0.12) * step(abs(hit.z * 0.5), 0.6); }
+  } else if (r.face > 0.5 && r.face < 1.5) {
+    // CEILING: offices get repeating strip fixtures; homes one round fixture over the middle of the room
+    var fix = max(0.0, 1.0 - length(vec2<f32>(hit.x, (hit.z + depth) * 0.6)) * 1.1);
+    if (office) { fix = step(abs(fract(hit.z * 0.7) - 0.5), 0.1); }
     c = tint * (0.6 + 0.7 * fix);
-  } else if (t >= ty - 1e-4) {
+  } else if (r.face > 1.5) {
     // FLOOR: warm wood in homes, grey carpet in offices
     c = select(tint * vec3<f32>(0.52, 0.38, 0.26), tint * 0.30, office);
   }
-  var room = c / (1.0 + t * 0.45);                               // deep rooms fall off
+  var room = c / (1.0 + r.dist * 0.5);                           // deep rooms fall off
   room = mix(room, tint * 0.22, clamp(blindMask + curtainMask, 0.0, 1.0));   // dressing occludes the view
   return room;
+}
+
+// SHOP INTERIOR (facade code 6): the interior-mapped room behind a shop window - a deep lit sales floor: ceiling
+// strip lights, shelf rows of small products on the back + side walls, a floor, and a poster / sale sticker stuck
+// on the inside of the glass. visual-polish #3 (2026-10-03): the shelves were huge rainbow "book" blocks on pale
+// shelves (the most saturated thing in every street shot). Now each shop takes one of four CONTROLLED palettes
+// (warm kraft + wood, greige + teal, cream + brick, a dark boutique), products are a third of the size with a value
+// jitter and only ~1 in 10 is the palette's accent colour, the light falls off from the ceiling, and past a few
+// pixels per product (fp = the pixel footprint in bay cells, from windowsPattern) the shelves settle to their
+// average colour instead of sparkling. No fwidth inside -> safe in branches.
+fn shopInterior(win: vec2<f32>, ro: vec3<f32>, rd: vec3<f32>, xLo: f32, xHi: f32, seed: f32, fp: f32) -> vec3<f32> {
+  let h1 = fract(sin(seed * 12.9898) * 43758.5453);
+  let h2 = fract(h1 * 91.17 + 0.37);
+  let h3 = fract(h2 * 137.31 + 0.71);
+  let depth = 1.6 + h1 * 1.2;                                    // in bay-glass heights: a ~5..9 m sales floor
+  let r = roomTrace(ro, rd, xLo, xHi, depth);
+  let hit = r.p;
+  // The shop's palette (h2): shelf / wall, two product bases, one accent.
+  var shelf = vec3<f32>(0.56, 0.46, 0.36); var pa = vec3<f32>(0.70, 0.58, 0.42); var pb = vec3<f32>(0.46, 0.34, 0.26); var acc = vec3<f32>(0.78, 0.22, 0.16);
+  if (h2 > 0.25 && h2 <= 0.5) { shelf = vec3<f32>(0.68, 0.66, 0.62); pa = vec3<f32>(0.72, 0.68, 0.58); pb = vec3<f32>(0.42, 0.47, 0.49); acc = vec3<f32>(0.16, 0.50, 0.54); }
+  else if (h2 > 0.5 && h2 <= 0.78) { shelf = vec3<f32>(0.70, 0.64, 0.55); pa = vec3<f32>(0.62, 0.36, 0.28); pb = vec3<f32>(0.80, 0.74, 0.60); acc = vec3<f32>(0.88, 0.66, 0.18); }
+  else if (h2 > 0.78) { shelf = vec3<f32>(0.30, 0.27, 0.25); pa = vec3<f32>(0.52, 0.44, 0.36); pb = vec3<f32>(0.26, 0.23, 0.25); acc = vec3<f32>(0.66, 0.16, 0.28); }
+  let lightV = mix(0.68, 1.0, clamp((hit.y + 1.0) * 0.5, 0.0, 1.0));   // brighter near the ceiling lights
+  var c = shelf;
+  let backHit = r.face > 2.5;
+  if (r.face < 0.5 || backHit) {
+    // SHELVES: ~5 rows up the wall; each a run of small product blocks of varied height
+    let sy = (hit.y + 1.0) * 2.4;
+    let sf = fract(sy);
+    let lane = select(hit.z * 1.3, hit.x, backHit);
+    let prod = fract(sin((floor(lane * 15.0) + floor(sy) * 17.0 + seed) * 78.233) * 43758.5453);
+    var prodCol = mix(pa, pb, fract(prod * 7.31)) * (0.78 + 0.34 * fract(prod * 13.7));
+    prodCol = select(prodCol, acc, fract(prod * 29.7) > 0.86);
+    let top = 0.42 + 0.3 * fract(prod * 5.13);
+    let onShelf = step(0.16, sf) * (1.0 - step(top, sf)) * step(0.22, prod);
+    let avg = mix(shelf, (pa + pb) * 0.45, 0.4);                 // what a shelf reads as from a distance
+    c = mix(shelf * 0.82, prodCol, onShelf);
+    c = mix(c, shelf * 0.45, 1.0 - step(0.1, sf));              // the shelf edge shadow line
+    c = mix(c, avg * 0.85, smoothstep(0.012, 0.05, fp));        // sub-pixel products -> their average (no sparkle)
+    c = c * lightV;
+  } else if (r.face < 1.5) {
+    // CEILING: warm white strip lights
+    let strip = step(abs(fract(hit.z * 0.9 + h2) - 0.5), 0.09);
+    c = vec3<f32>(1.0, 0.95, 0.86) * (0.62 + 0.7 * strip);
+  } else {
+    c = mix(shelf, vec3<f32>(0.60, 0.57, 0.52), 0.6) * 0.8;      // floor
+  }
+  var room = c / (1.0 + r.dist * 0.3);                           // a lit shop falls off gently toward the back
+  // POSTERS / sale stickers on the inside of the glass (about 60% of bays): off-white or the shop's accent
+  let px = 0.2 + 0.6 * h3;
+  let poster = step(abs(win.x - px), 0.14) * step(abs(win.y - 0.64), 0.2) * step(0.4, h2);
+  let pcol = select(vec3<f32>(0.90, 0.88, 0.82), acc, fract(h3 * 17.3) > 0.5);
+  let band = step(abs(win.y - 0.93), 0.05) * step(0.7, h1);      // a sale banner along the top of the glass
+  room = mix(room, pcol, max(poster, band));
+  return room;
+}
+
+// World-space surface axes per uv unit (dP/du, dP/dv) from screen-space derivatives - the same cotangent-frame
+// solve as gr_uvMetres, but keeping the DIRECTIONS - plus a NOISE estimate: the relative f32 error of those
+// derivatives (one ulp of the uv / position varyings over their per-pixel change, x4 for interpolation). Facade
+// u runs into the thousands (per-building 128-cell bands), so up close the derivative LENGTHS are pure noise.
+// Zero axes when the uv is degenerate (callers fall back). dpdx/dpdy need UNIFORM control flow: call at fragment
+// top level only (PATTERN_BLOCK_FULL does).
+struct UvAxes { u: vec3<f32>, v: vec3<f32>, noise: f32 }
+fn uvWorldAxes(uv: vec2<f32>, worldPos: vec3<f32>) -> UvAxes {
+  let dpx = dpdx(worldPos);
+  let dpy = dpdy(worldPos);
+  let dux = dpdx(uv);
+  let duy = dpdy(uv);
+  var o: UvAxes;
+  o.u = vec3<f32>(0.0);
+  o.v = vec3<f32>(0.0);
+  o.noise = 1.0;
+  let det = dux.x * duy.y - dux.y * duy.x;
+  if (abs(det) < 1e-16) { return o; }
+  let inv = 1.0 / det;
+  o.u = (dpx * duy.y - dpy * dux.y) * inv;
+  o.v = (dpy * dux.x - dpx * duy.x) * inv;
+  let eps = 4.8e-7;                                              // 4 ulp at 1.0
+  let stepU = max(length(vec2<f32>(dux.x, duy.x)), 1e-30);
+  let stepV = max(length(vec2<f32>(dux.y, duy.y)), 1e-30);
+  let stepP = max(min(length(dpx), length(dpy)), 1e-30);
+  let pMax = max(max(abs(worldPos.x), abs(worldPos.y)), abs(worldPos.z));
+  o.noise = eps * max(max(abs(uv.x) / stepU, abs(uv.y) / stepV), pMax / stepP);
+  return o;
 }
 
 struct WinShade { base: vec3<f32>, emk: vec3<f32> }
 
 // Window-cell SURFACE: wall shade outside the opening; inside it, the interior-mapped room seen through the
-// glass — faint behind dark day glass, GLOWING per-texel when the cell is lit (the glow itself carries the
-// room's parallax: bright ceilings, dark furniture bands). Tangent frame derived from the wall normal.
-fn windowShade(uv: vec2<f32>, params: vec4<f32>, winWL: vec4<f32>, worldPos: vec3<f32>, N0: vec3<f32>,
-               camPos: vec3<f32>, diffuse: vec3<f32>, patCol: vec3<f32>, emisIn: vec3<f32>, time: f32) -> WinShade {
+// glass - faint behind dark day glass, GLOWING per-texel when the cell is lit (the glow carries the room's
+// parallax). The LIT COLOUR follows the room type: warm homes (patCol), cool fluorescent offices, the blue of a
+// TV-only room; shops are bright cool white. Sash facades draw a thin aluminium frame + centre meeting rail.
+// uvAx = uvWorldAxes(uv, worldPos) (world vectors per uv unit along u and v), computed in uniform control flow.
+fn windowShade(uv: vec2<f32>, params: vec4<f32>, winWL: vec4<f32>, worldPos: vec3<f32>, N0: vec3<f32>, uvAx: UvAxes,
+               camPos: vec3<f32>, diffuse: vec3<f32>, patCol: vec3<f32>, emisIn: vec3<f32>, time: f32, fast: bool, glowIn: f32) -> WinShade {
   let freq = max(params.x, 0.001);
   let p = uv * freq;
   let cell = floor(p);
   let f = fract(p);
-  let inset = clamp(params.z, 0.05, 0.45);
-  let winUV = clamp((f - vec2<f32>(inset)) / max(1.0 - 2.0 * inset, 1e-3), vec2<f32>(0.0), vec2<f32>(1.0));
+  let b = winBase(params.y);
+  let sash = params.y > 9.5;
+  let isShop = b > 5.5 && b < 6.5;
+  let isCurtain = b > 1.5 && b < 2.5;
+  let openPlan = b > 1.5 && b < 3.5;                             // curtain + ribbon: continuous glazing, open floors
+  let clean = !winIsMasonry(b);                                  // curtain / ribbon / shop: modern glazed skin
+  // WALL GRAIN: a world-stable micro value noise over the masonry (NOT the glass). Its 3 mm cells are sub-pixel
+  // past a couple of metres, where they only shimmer (the "noise at mid distance"): faded out by the pixel
+  // footprint (winWL.w, in cells), and gentler (+-4 %) where it does show.
+  let grainFade = 1.0 - smoothstep(0.0015, 0.006, winWL.w);
+  let grain = 1.0 + 0.08 * grainFade * (fract(sin(dot(floor(uv * 300.0), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5);
+  let g = select(grain, 1.0, clean);
+  let wallBase = select(diffuse, vec3<f32>(0.50, 0.52, 0.56), isCurtain);
+  let wallCol = wallBase * winWL.z * g;
+  // P8 FAST PATH: a WALL pixel (outside every opening, winWL.x exactly 0) ends as mix(wall, glass, 0) = the wall, so
+  // the room trace, reveal and glass below cannot change it - return the wall now (bit-identical; no derivatives
+  // below, so the branch is safe). Roughly half of every facade, and from the air most of the city's pixels.
+  if (fast && winWL.x <= 0.0) {
+    var ow: WinShade;
+    ow.base = wallCol;
+    ow.emk = emisIn * winWL.z;
+    return ow;
+  }
+  let ins = winInsets(params);
+  let winUV = clamp(vec2<f32>((f.x - ins.x) / max(1.0 - 2.0 * ins.x, 1e-3), (f.y - ins.y) / max(1.0 - ins.y - ins.z, 1e-3)), vec2<f32>(0.0), vec2<f32>(1.0));
   let N = normalize(N0);
-  var T = cross(vec3<f32>(0.0, 1.0, 0.0), N);
-  let tl = length(T);
-  T = select(vec3<f32>(1.0, 0.0, 0.0), T / max(tl, 1e-4), tl > 1e-3);
-  let B = cross(N, T);
   let Vv = normalize(camPos - worldPos);
-  let rd = vec3<f32>(-dot(Vv, T), -dot(Vv, B), -dot(Vv, N));     // the view ray INTO the room
+  let Nf = select(N, -N, dot(Vv, N) < 0.0);                      // the room is always BEHIND the glass
+  // CELL FRAME = the uv axes themselves, so the box's +x is the direction u grows and +y the direction v grows on
+  // EVERY face, whatever its winding / orientation / uv layout. (The old frame T = cross(up, N) pointed AGAINST u
+  // on every wallsWin face, which MIRRORED the horizontal parallax - the room slid the wrong way.) Degenerate uv
+  // falls back to the wallsWin convention: u along cross(N, up), v up, one uv unit = one world unit.
+  var Tu = uvAx.u;
+  var Tv = uvAx.v;
+  let T0 = cross(N, vec3<f32>(0.0, 1.0, 0.0));                   // the wallsWin u convention (horizontal, in-plane)
+  let Ta = select(vec3<f32>(1.0, 0.0, 0.0), T0 / max(length(T0), 1e-6), dot(T0, T0) > 1e-6);
+  let Ba = cross(Ta, N);
+  if (dot(Tu, Tu) < 1e-24 || dot(Tv, Tv) < 1e-24) { Tu = Ta; Tv = Ba; }
+  // ASPECT = cell width in storeys (the box's x extent). Measured from the derivative lengths where they are
+  // trustworthy; where they are f32 noise (close up on a big-u facade) it eases to a nominal bay (2.6 m / 3.1 m) -
+  // a per-pixel noisy aspect made every side wall a speckled mess. Clamped to plausible cells.
+  let aspMeas = clamp(length(Tu) / max(length(Tv), 1e-12), 0.2, 5.0);
+  let aspect = mix(aspMeas, 0.85, smoothstep(0.004, 0.02, uvAx.noise));
+  // DIRECTIONS: uv derivatives are noisy up close (f32 uv / position varyings - wall u runs into the thousands), so
+  // an axis within ~25 deg of the analytic facade frame (horizontal Ta / in-plane Ba) SNAPS to it, keeping only the
+  // derivative's SIGN - which is what fixes the mirroring. Genuinely rotated / sheared uv keeps the raw axis.
+  var Uh = normalize(Tu);
+  var Vh = normalize(Tv);
+  let cu = dot(Uh, Ta);
+  let cv = dot(Vh, Ba);
+  // Past ~30% derivative noise (a camera almost touching the glass) even the SIGN is unreliable: use the wallsWin
+  // convention outright (u along Ta, v up) rather than a per-pixel coin flip.
+  let dirOk = uvAx.noise < 0.3;
+  if (abs(cu) > 0.9 || !dirOk) { Uh = Ta * select(1.0, sign(cu), dirOk); }
+  if (abs(cv) > 0.9 || !dirOk) { Vh = Ba * select(1.0, sign(cv), dirOk); }
+  // The view ray INTO the room in the cell frame, METRIC (every axis in the same world unit, so the box has the real
+  // window's proportions; the storey scale cancels in the normalize). In-plane part solved on the Gram matrix of
+  // the unit axes, so a sheared uv is exact too.
+  let r = -Vv;
+  let gb = dot(Uh, Vh);
+  let ru = dot(r, Uh);
+  let rv = dot(r, Vh);
+  let gdet = max(1.0 - gb * gb, 1e-6);
+  let rd = normalize(vec3<f32>((ru - gb * rv) / gdet, (rv - gb * ru) / gdet, dot(r, Nf)));
+  let ro = vec3<f32>(f.x * aspect, f.y, 0.0);
+  let xLo = select(0.0, -aspect, openPlan);
+  let xHi = select(aspect, 2.0 * aspect, openPlan);
   let seed = dot(cell, vec2<f32>(7.13, 3.71)) + freq;
-  let room = interiorRoom(winUV, rd, seed, time);
-  // curtain / ribbon (params.y > 1.5) use lighter, cleaner glass (a modern glazed skin) vs masonry punched-window glass.
-  let glass = select(vec3<f32>(0.09, 0.10, 0.13), vec3<f32>(0.20, 0.27, 0.36), params.y > 1.5);
-  // DAY interior: desaturate the room so it reads as dim glass, not a glowing yellow square (the warm home tint was
-  // showing through as a yellow block). NIGHT (lit) keeps the full warm glow.
-  let roomDay = mix(room, vec3<f32>(dot(room, vec3<f32>(0.34, 0.5, 0.16))), 0.5);
-  let unlitC = mix(glass, roomDay, 0.32);                        // faint, subdued interior behind day glass
-  let litC = mix(room, patCol, 0.2) * 1.1;                       // warm-lit interior (night)
+  // RECESSED OPENING (persona polish D2): masonry windows sit in a REVEAL (a hole ~15 cm deep; aluminium sash
+  // ~10 cm; flush curtain / ribbon / shop glazing none). windowReveal traces the same view ray from the wall-plane
+  // entry point: rays that leave the opening before reaching the glass hit a jamb / the head soffit / the sill
+  // reveal (wall material, shaded); the rest land on the glass at winG, where the sash bars, the frame and the room
+  // dressing are drawn - so they slide behind the reveal with true parallax. The ROOM trace below is unchanged
+  // (same ro / rd / box - the reveal only occludes its edges).
+  let revDepth = select(select(0.05, 0.034, sash), 0.0, clean);
+  let rev = windowReveal(ro, rd, ins.x * aspect, (1.0 - ins.x) * aspect, ins.y, 1.0 - ins.z, revDepth);
+  let onReveal = select(0.0, 1.0, rev.x > 0.5);
+  let winG = select(winUV, clamp(rev.yz, vec2<f32>(0.0), vec2<f32>(1.0)), revDepth > 0.0);
+  var room: vec3<f32>;
+  if (isShop) { room = shopInterior(winG, ro, rd, xLo, xHi, seed, winWL.w); } else { room = interiorRoom(winG, ro, rd, xLo, xHi, seed, time); }
+  // ROOM TYPE -> lit colour (the same hashes interiorRoom uses, so a cool office interior glows cool)
+  let h1 = fract(sin(seed * 12.9898) * 43758.5453);
+  let h2 = fract(h1 * 91.17 + 0.37);
+  let h3 = fract(h2 * 137.31 + 0.71);
+  let office = h2 > 0.55;
+  let tvOnly = !office && fract(h3 * 51.7) > 0.88;               // lights off, TV on: a blue flicker
+  let flick = 0.8 + 0.2 * sin(time * 7.0 + seed * 6.28) * sin(time * 17.0 + seed);
+  var litTint = patCol * mix(0.92, 1.08, h1);                    // warm home (the layer's lit colour)
+  if (office || isCurtain) { litTint = vec3<f32>(0.80, 0.91, 1.0); }
+  if (tvOnly && !isCurtain) { litTint = vec3<f32>(0.32, 0.46, 1.0) * 0.7 * flick; }
+  if (isShop) { litTint = vec3<f32>(1.0, 0.9, 0.74) * 1.05; }      // visual-polish #3: warm shop light (was a cool white -> lavender)
+  let glassDark = select(vec3<f32>(0.09, 0.10, 0.13), vec3<f32>(0.20, 0.27, 0.36), clean);
+  // SKY REFLECTION (D2): the glass mirrors a soft sky gradient (street below the horizon) with a Fresnel lift -
+  // stronger at grazing angles, faint head-on - plus a per-pane value shift, so a facade of windows reads as glass
+  // catching the sky instead of flat dark rectangles. It is ALBEDO, so night dims it with everything else.
+  let refl = reflect(-Vv, Nf);
+  let skyRefl = select(vec3<f32>(0.20, 0.20, 0.22), mix(vec3<f32>(0.50, 0.55, 0.60), vec3<f32>(0.36, 0.45, 0.58), clamp(refl.y * 1.6, 0.0, 1.0)), refl.y > -0.05);
+  let cosV = clamp(dot(Vv, Nf), 0.0, 1.0);
+  let fres = (0.10 + 0.45 * pow(1.0 - cosV, 3.0)) * (0.75 + 0.5 * h3);
+  let glass = mix(glassDark, skyRefl, fres * select(0.8, 0.45, clean));
+  // DAY interior: desaturate the room so it reads as dim glass, not a glowing yellow square. Shops show their
+  // interior more (a bright shop reads through the glass even by day).
+  let roomDay = mix(room, vec3<f32>(dot(room, vec3<f32>(0.34, 0.5, 0.16))), select(0.5, 0.1, isShop));
+  // visual-polish #3: shops 0.55 by day (was 0.6 with the rainbow shelves; 0.45 read as a flat grey void after the retone)
+  let unlitC = mix(glass, roomDay, select(0.32, 0.55, isShop));
+  let litC = mix(room, litTint, 0.2) * 1.1;
   var o: WinShade;
-  // WALL GRAIN: a world-stable micro value noise over the masonry (NOT the glass) — subtle roughness.
-  let grain = 0.94 + 0.12 * fract(sin(dot(floor(uv * 300.0), vec2<f32>(12.9898, 78.233))) * 43758.5453);
-  // The between-glass colour: masonry = the wall colour + grain; CURTAIN = a clean METAL mullion (grey, no grain);
-  // ribbon = the solid spandrel in the wall colour (no grain).
-  let isCurtain = params.y > 1.5 && params.y < 2.5;
-  let g = select(grain, 1.0, params.y > 1.5);
-  let wallCol = select(diffuse, vec3<f32>(0.50, 0.52, 0.56), isCurtain) * winWL.z * g;
-  o.base = mix(wallCol, mix(unlitC, litC, winWL.y), winWL.x);
+  // (WALL GRAIN / wallCol: computed at the top, before the P8 wall early-out)
+  var glassC = mix(unlitC, litC, winWL.y);
   let roomLum = dot(room, vec3<f32>(0.35, 0.5, 0.15));
-  // LIT glass glows with the warm LIT colour (patCol) at fixed strength — NOT scaled by the wall's
-  // emissive. emisIn is the night-dimmed wall emissive (~diffuse x 0.13 at full night), so the old
-  // emisIn-proportional glow made lit windows unreadably dim once the city moved to the darker
-  // Building-Generator facades ("night windows don't light up"). Day stays unchanged: litFrac is 0
-  // by day, so no cell takes this branch. Walls + unlit glass keep the emisIn scaling.
-  let litGlow = patCol * (0.5 + roomLum * 0.85);   // peak ~1.0 — warm amber, not bloom-blown white
-  o.emk = mix(emisIn * winWL.z, mix(emisIn * 0.35, litGlow, winWL.y), winWL.x);
+  // Shops glow with the ROOM itself (shelves / products / strip lights through the glass) at a moderate strength -
+  // a flat ~1.2x white made every lit shopfront a blown-out white slab at night (bloom clipped it).
+  var glow = select(litTint * (0.5 + roomLum * 0.85), mix(room, litTint, 0.15) * 0.62, isShop);
+  // SASH: a thin aluminium frame round the opening + the centre MEETING RAIL where the two sashes overlap. Masonry
+  // (non-sash) windows get a slim dark frame at the glass line. Both at the GLASS plane (winG), behind the reveal.
+  let fe = min(min(winG.x, 1.0 - winG.x), min(winG.y, 1.0 - winG.y));
+  let sashBar = select(0.0, max(1.0 - step(0.035, fe), 1.0 - step(0.018, abs(winG.x - 0.5))), sash);
+  let mFrame = select(0.0, 1.0 - step(0.028, fe), !sash && !clean);
+  glassC = mix(glassC, vec3<f32>(0.47, 0.49, 0.52), sashBar);
+  glassC = mix(glassC, vec3<f32>(0.24, 0.25, 0.27), mFrame);
+  // visual-polish #8: the city look's lit-window glow multiplier (patternColor.a; 0 = unset = 1x, the built glow)
+  let glowK = select(glowIn, 1.0, glowIn <= 0.0);
+  glow = glow * (1.0 - max(sashBar, mFrame)) * glowK;
+  // The REVEAL faces: wall material, darker the more they face away from the sky - the head soffit (faces down)
+  // darkest, the jambs mid, the sill reveal (faces up) lightest. A lit room spills a little light onto them.
+  let revK = select(select(0.97, 0.56, rev.x > 1.5 && rev.x < 2.5), 0.76, rev.x < 1.5);
+  glassC = mix(glassC, wallBase * revK * g, onReveal);
+  glow = mix(glow, glow * 0.22, onReveal);
+  o.base = mix(wallCol, glassC, winWL.x);
+  // LIT glass glows at a fixed strength (NOT scaled by the night-dimmed wall emissive, which made lit windows
+  // unreadably dim). Day is unchanged: the lit fraction is 0 by day, so no cell takes this branch.
+  // visual-polish #3: a shop is lit inside by DAY too - a soft self-glow of the room (behind the glass Fresnel) keeps
+  // the retoned shelves from reading as a dark grey void in shade / under awnings. Night (winWL.y = 1) is unchanged.
+  let shopDayGlow = select(vec3<f32>(0.0), mix(room, litTint, 0.25) * 0.3 * (1.0 - fres) * (1.0 - onReveal), isShop);
+  o.emk = mix(emisIn * winWL.z, mix(emisIn * 0.35 + shopDayGlow, glow, winWL.y), winWL.x);
   return o;
+}
+
+// WINDOW REVEAL (persona polish D2): the opening is a real HOLE, depth storeys deep, in front of the glass. From the
+// view ray's wall-plane entry point ro (the room trace's cell coords: x along +u, y up, both in storeys; z along the
+// outward normal, the glass at z = -depth), find whether the ray leaves the opening's x / y span before it reaches
+// the glass. Returns (face, gu, gv, 0): face 0 = it reaches the GLASS at (gu, gv) (opening-normalised 0..1),
+// 1 = a side JAMB, 2 = the HEAD soffit (a ray climbing into the hole), 3 = the SILL reveal (a ray dropping into it).
+// depth 0 = flush (always face 0 at the entry point). No derivatives inside - safe in branches.
+// CPU mirror + orientation checks: src/renderer/3d/interior-mapping.test.ts (windowReveal) - change both together.
+fn windowReveal(ro: vec3<f32>, rd: vec3<f32>, x0: f32, x1: f32, y0: f32, y1: f32, depth: f32) -> vec4<f32> {
+  let rz = min(rd.z, -0.08);                                     // the same grazing guard as roomTrace
+  let tg = depth / -rz;                                          // ray length to the glass plane
+  let tx = select(select(1e9, (x1 - ro.x) / rd.x, rd.x > 1e-6), (x0 - ro.x) / rd.x, rd.x < -1e-6);
+  let ty = select(select(1e9, (y1 - ro.y) / rd.y, rd.y > 1e-6), (y0 - ro.y) / rd.y, rd.y < -1e-6);
+  var face = 0.0;
+  if (min(tx, ty) < tg) { face = select(1.0, select(3.0, 2.0, rd.y > 0.0), ty < tx); }
+  let gu = (ro.x + rd.x * tg - x0) / max(x1 - x0, 1e-4);
+  let gv = (ro.y + rd.y * tg - y0) / max(y1 - y0, 1e-4);
+  return vec4<f32>(face, gu, gv, 0.0);
 }
 
 // ── PAPERBOARD GRAIN (packaging boardShade) — fine paper TOOTH (the original two-scale value noise
@@ -1494,9 +1951,38 @@ fn groundConcrete(p: vec2<f32>, base: vec3<f32>, seam: vec3<f32>, jointW: f32,
 }
 // ASPHALT (mode 4): loose AGGREGATE, not a tiled surface. Dense stone speckle at two scales, a few
 // bright chips, low-freq patch/repair drift, and a thin crack network from ridged noise.
-fn groundAsphalt(p: vec2<f32>, base: vec3<f32>, jitter: f32) -> GroundOut {
+// clean = the tile slot p0 (unused by asphalt, 0 by default): 0 = full cracks, 1 = fresh crack-free road.
+// extra = the tile slot p1 (0 by default = the original look, bit for bit): the persona-polish B1 street
+// asphalt, i.e. very broad tonal drift plus sparse rectangular REPAIR PATCHES with a thin sealant seam.
+// REPAIR PATCH field for asphalt: one candidate per 5 m cell, about 1 cell in 3 patched, a 0.9 to 3.3 m box kept
+// inside its cell (so no neighbour search). Returns (inside 0..1, sealant seam 0..1, tone hash 0..1).
+fn gr_asphaltPatch(p: vec2<f32>) -> vec3<f32> {
+  let cs = 5.0;
+  let cell = floor(p / cs);
+  let h0 = pg_hash21(cell + vec2<f32>(3.7, 8.1));
+  let h1 = pg_hash21(cell + vec2<f32>(11.3, 2.9));
+  let h2 = pg_hash21(cell + vec2<f32>(5.9, 14.2));
+  let h3 = pg_hash21(cell + vec2<f32>(17.1, 6.6));
+  let h4 = pg_hash21(cell + vec2<f32>(1.3, 19.7));
+  let sz = vec2<f32>(1.2 + h1 * 2.1, 0.9 + h2 * 1.6);
+  let ctr = (cell + vec2<f32>(0.5)) * cs + (vec2<f32>(h3, h4) - vec2<f32>(0.5)) * (vec2<f32>(cs) - sz);
+  let d = abs(p - ctr) - sz * 0.5;
+  let sd = max(d.x, d.y);                                     // box distance: negative inside
+  let on = step(h0, 0.33);
+  let inside = (1.0 - smoothstep(-0.01, 0.01, sd)) * on;
+  let seam = (1.0 - smoothstep(0.0, 0.03, abs(sd))) * on;
+  return vec3<f32>(inside, seam, pg_hash21(cell + vec2<f32>(7.7, 3.3)));
+}
+fn groundAsphalt(p: vec2<f32>, base: vec3<f32>, jitter: f32, clean: f32, extra: f32) -> GroundOut {
   var col = base;
   col = col * (1.0 + (gr_fbm2(p * 0.35) - 0.5) * 0.22 * jitter);      // age / patch repairs
+  // B1 extras (all scaled by ex, so ex = 0 leaves col untouched). Broad drift first: whole stretches of road
+  // a shade lighter or darker, far larger than the 3 m age mottle above.
+  let ex = clamp(extra, 0.0, 1.0);
+  col = col * (1.0 + (gr_fbm2(p * 0.06 + vec2<f32>(2.3, 7.7)) - 0.5) * 0.14 * ex);
+  let pt = gr_asphaltPatch(p);
+  col = mix(col, col * mix(0.82, 1.09, step(0.65, pt.z)), pt.x * ex); // fresher (darker) or, 1 in 3, sun-bleached
+  col = mix(col, col * 0.66, pt.y * 0.8 * ex);                         // tar sealant around the patch
   let a1 = pg_vnoise(p * 60.0);
   let a2 = pg_vnoise(p * 150.0 + vec2<f32>(5.1, 2.3));
   let agg = a1 * 0.6 + a2 * 0.4;
@@ -1505,14 +1991,14 @@ fn groundAsphalt(p: vec2<f32>, base: vec3<f32>, jitter: f32) -> GroundOut {
   let cc = p * 85.0;
   let chh = pg_hash21(floor(cc));
   let cdd = 1.0 - smoothstep(0.10, 0.32, length(fract(cc) - vec2<f32>(0.5)));
-  col = mix(col, col * 2.1, step(0.978, chh) * cdd * 0.75);
+  col = mix(col, col * 2.1, step(0.978, chh) * cdd * 0.75 * min(jitter, 1.0));
   // CRACKS — ridged noise: |n - 0.5| is near zero along a whole contour, i.e. a LINE network.
   let cr = abs(gr_fbm2(p * 1.6 + vec2<f32>(9.9, 1.7)) - 0.5) * 2.0;
-  let crack = 1.0 - smoothstep(0.0, 0.055, cr);
+  let crack = (1.0 - smoothstep(0.0, 0.055, cr)) * (1.0 - clamp(clean, 0.0, 1.0));
   col = col * mix(1.0, 0.42, crack * 0.85);
   var o: GroundOut;
   o.rgb = col;
-  o.height = (agg - 0.5) * 0.10 - crack * 0.55;
+  o.height = (agg - 0.5) * 0.10 - crack * 0.55 - pt.y * 0.25 * ex;
   o.rough = clamp(0.84 + (agg - 0.5) * 0.12, 0.04, 1.0);
   o.grout = crack;
   return o;
@@ -1540,6 +2026,77 @@ fn groundDirt(p: vec2<f32>, base: vec3<f32>, jitter: f32) -> GroundOut {
   o.height = (lump - 0.5) * 0.5 + (broad - 0.5) * 0.3 - crack * 0.35;
   o.rough = 0.95;
   o.grout = 0.0;
+  return o;
+}
+
+// ROAD PAINT (mode 20, persona-polish B2): a matte marking laid over asphalt. roadpaint.ts lays the uv in each
+// stripe's OWN frame: u runs along the stripe, and the RAW v packs the stripe width with the across position, so no
+// mesh split is needed: v = widthCm + 0.1 + across (across in uv units, always under 0.9). gr_paintLocal decodes it
+// from the RAW uv (p / uvM), never from the metric p, whose per-mesh scale is an estimate: a few percent off on a
+// warped or draped road, which would scramble a packed metric offset. p0 = wear amount; 0 = the base colour exactly
+// (flat paint). seam = the asphalt tone that shows through where the paint has worn thin.
+// Returns (along m, across m, metres to the NEAREST long edge).
+fn gr_paintLocal(p: vec2<f32>, uvM: vec2<f32>) -> vec3<f32> {
+  let v = p.y / max(uvM.y, 1e-6);
+  let cls = floor(v);
+  let across = (v - cls - 0.1) * uvM.y;
+  return vec3<f32>(p.x, across, max(min(across, cls * 0.01 - across), 0.0));
+}
+// Returns (show, thin): show = aggregate peaks poking through, thin = how worn the paint is here.
+fn gr_paintWear(p: vec2<f32>, uvM: vec2<f32>, wear: f32) -> vec2<f32> {
+  let w = clamp(wear, 0.0, 1.0);
+  let lc = gr_paintLocal(p, uvM);
+  let q = lc.xy;
+  let rag = gr_fbm2(vec2<f32>(q.x * 2.6, q.y * 0.5 + 3.1));
+  let band = 0.006 + rag * 0.028;                                   // worn edge band 0.6 to 3 cm, ragged along it
+  let edge = 1.0 - smoothstep(0.0, band, lc.z);
+  let blot = smoothstep(0.64, 0.88, gr_fbm2(q * vec2<f32>(0.8, 2.2) + vec2<f32>(4.1, 7.3)));   // tyre scuffs
+  let thin = clamp(edge * 0.8 + blot * 0.35, 0.0, 1.0) * w;
+  let agg = pg_vnoise(q * 60.0) * 0.6 + pg_vnoise(q * 150.0 + vec2<f32>(5.1, 2.3)) * 0.4;
+  let show = smoothstep(0.80 - thin * 0.6, 0.94 - thin * 0.6, agg) * thin;
+  return vec2<f32>(show, thin);
+}
+fn groundPaint(p: vec2<f32>, uvM: vec2<f32>, base: vec3<f32>, seam: vec3<f32>, wear: f32) -> GroundOut {
+  let pw = gr_paintWear(p, uvM, wear);
+  let w = clamp(wear, 0.0, 1.0);
+  var col = base * (1.0 + (pg_vnoise(gr_paintLocal(p, uvM).xy * 18.0) - 0.5) * 0.05 * w);   // bead / roller tooth
+  col = mix(col, col * 0.92, pw.y * 0.3);                              // thin paint greys slightly
+  col = mix(col, seam, pw.x * 0.85);                                   // asphalt showing through
+  var o: GroundOut;
+  o.rgb = col;
+  o.height = -pw.x * 0.3;
+  o.rough = 1.0;                                                       // matte: never a sky mirror
+  o.grout = 0.0;
+  return o;
+}
+
+// PAVER TILES (mode 21, persona-polish B3): square stack-bond pavement tiles. A clear per-tile VALUE step (what
+// makes a tiled pavement read as tiles from a distance), a faint warm/cool drift per tile, a very soft broad
+// mottle, and a THIN SOFT joint that fades into the tile instead of a hard dark line. p0/p1 = tile size (m),
+// groutW = joint width (m), jitter = per-tile variation, seam = joint colour.
+fn gr_tileJoint(edge: f32, jointW: f32) -> vec2<f32> {
+  let joint = 1.0 - smoothstep(jointW * 0.35, jointW * 1.6, edge);
+  let bevel = 1.0 - smoothstep(jointW, jointW + 0.015, edge);         // arris: the last 1.5 cm rolls off
+  return vec2<f32>(joint, bevel);
+}
+fn groundTiles(p: vec2<f32>, base: vec3<f32>, seam: vec3<f32>, jointW: f32,
+               tileW: f32, tileH: f32, jitter: f32) -> GroundOut {
+  let c = groundCellGrid(p, tileW, tileH);
+  let id = vec2<f32>(c.x, c.y);
+  let hv = pg_hash21(id + vec2<f32>(4.4, 9.2));
+  let hh = pg_hash21(id * 1.9 + vec2<f32>(2.2, 0.7));
+  var col = base * (1.0 + (hv - 0.5) * 0.10 * jitter);
+  col = col * (vec3<f32>(1.0) + vec3<f32>(1.0, 0.0, -1.0) * (hh - 0.5) * 0.03 * jitter);
+  col = col * (1.0 + (gr_fbm2(p * 0.4) - 0.5) * 0.06);
+  col = col * (1.0 + (pg_vnoise(p * 30.0) - 0.5) * 0.04);
+  let jb = gr_tileJoint(c.z, jointW);
+  col = col * (1.0 - jb.y * 0.05);
+  col = mix(col, seam, jb.x * 0.55);
+  var o: GroundOut;
+  o.rgb = col;
+  o.height = -jb.x * 0.45 - jb.y * 0.1;
+  o.rough = clamp(0.82 + (hv - 0.5) * 0.06, 0.04, 1.0);
+  o.grout = jb.x * 0.5;
   return o;
 }
 
@@ -1851,7 +2408,7 @@ fn groundSurface(uv: vec2<f32>, uvM: vec2<f32>, mc: vec2<f32>, mode: f32, base: 
   if (mi == 1) { return groundRadial(p, uvM * 0.5, base, seam, groutW, p0, p1, jitter); }
   if (mi == 2) { return groundBorder(p, uvM, base, seam, groutW, p0, p1, jitter); }
   if (mi == 3) { return groundGrass(p, mc, base, seam, jitter, wpc, wpr); }
-  if (mi == 4) { return groundAsphalt(p, base, jitter); }
+  if (mi == 4) { return groundAsphalt(p, base, jitter, p0, p1); }
   if (mi == 5) { return groundConcrete(p, base, seam, groutW, p0, p1, jitter); }
   if (mi == 6) { return groundDirt(p, base, jitter); }
   if (mi == 7) {
@@ -1870,6 +2427,8 @@ fn groundSurface(uv: vec2<f32>, uvM: vec2<f32>, mc: vec2<f32>, mode: f32, base: 
   if (mi == 17) { return groundFabric(p, base, p0, jitter); }
   if (mi == 18) { return groundWicker(p, base, seam, groutW, p0, jitter); }
   if (mi == 19) { return groundRope(p, base, seam, groutW, p0, jitter); }
+  if (mi == 20) { return groundPaint(p, uvM, base, seam, p0); }
+  if (mi == 21) { return groundTiles(p, base, seam, groutW, p0, p1, jitter); }
   return groundAshlar(p, base, seam, groutW, p0, p1, jitter);
 }
 // Mode-aware height field for the ±eps relief normal (matches whichever tiler groundSurface used).
@@ -1882,7 +2441,13 @@ fn groundHeightM(p: vec2<f32>, uvM: vec2<f32>, mode: f32, groutW: f32, p0: f32, 
   if (mi == 4) {
     let agg = pg_vnoise(p * 60.0) * 0.6 + pg_vnoise(p * 150.0 + vec2<f32>(5.1, 2.3)) * 0.4;
     let cr = abs(gr_fbm2(p * 1.6 + vec2<f32>(9.9, 1.7)) - 0.5) * 2.0;
-    return (agg - 0.5) * 0.10 - (1.0 - smoothstep(0.0, 0.055, cr)) * 0.55;
+    return (agg - 0.5) * 0.10 - (1.0 - smoothstep(0.0, 0.055, cr)) * 0.55 * (1.0 - clamp(p0, 0.0, 1.0))
+         - gr_asphaltPatch(p).y * 0.25 * clamp(p1, 0.0, 1.0);
+  }
+  if (mi == 20) { return -gr_paintWear(p, uvM, p0).x * 0.3; }                 // road paint: worn-through aggregate
+  if (mi == 21) {                                                        // paver tiles: soft joint + arris
+    let jb = gr_tileJoint(groundCellGrid(p, p0, p1).z, groutW);
+    return -jb.x * 0.45 - jb.y * 0.1;
   }
   if (mi == 6) {
     let broad = gr_fbm2(p * 0.5);
@@ -2034,6 +2599,42 @@ fn foliageBase(albedo: vec3<f32>, localY01: f32, aoAmount: f32, blend: f32, grou
 // Included by EVERY vertex shader foliage renders through (mesh3d, vertex-color, and the shadow DEPTH
 // pass — a swaying plant whose shadow is static looks broken). Displacement is computed in LOCAL space
 // and added BEFORE the model transform, so each instanced copy bends about its own base.
+/** Fog-horizon fade band helpers (fhCoverage / fhDitherKeep / fhFades), spliced into every pass that dissolves the
+ *  faders: the mesh fragment shaders, the shadow depth pass and the outline depth pre-pass. */
+export const FOG_FADE_WGSL = /* wgsl */ `
+// FOG HORIZON FADE BAND (docs/specs/fog-horizon.md P2; shared by the colour, shadow-depth and outline passes).
+// coverage = smoothstep(edge, edge - band, dist), written out because WGSL smoothstep wants low < high:
+// 1 inside the clear zone, 0 at the fog edge. A screen-door dither keeps a pixel while coverage beats its
+// 4x4 Bayer threshold; coarse = the same pattern in 2x2-pixel cells (an 8x8-pixel tile). Opaque, no sorting.
+const fhBayer = array<u32, 16>(0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u, 3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
+fn fhCoverage(dist: f32, edge: f32, band: f32) -> f32 {
+  let t = clamp((edge - dist) / max(band, 1e-6), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+fn fhDitherKeep(cov: f32, fragXY: vec2<f32>, coarse: bool) -> bool {
+  var p = vec2<u32>(max(fragXY, vec2<f32>(0.0)));
+  if (coarse) { p = p / 2u; }
+  return cov > (f32(fhBayer[(p.y % 4u) * 4u + (p.x % 4u)]) + 0.5) / 16.0;
+}
+// TEMPORAL AA (temporal-aa.ts): the colour passes shift the dither pattern by a whole-pixel offset every frame
+// (scene.cascadeParams.w = 0..15, 0 = off), so the resolve averages the screen door into a smooth fade. coarse cells
+// shift by whole cells.
+fn fhTaaShift(v: f32, coarse: bool) -> vec2<f32> {
+  let k = u32(max(v, 0.0));
+  return vec2<f32>(f32(k % 4u), f32((k / 4u) % 4u)) * select(1.0, 2.0, coarse);
+}
+// Whether a mesh fades: flags2 bit 0 (distanceFade) always, bit 1 (distanceFadeAttach) unless the scene keeps
+// attachments (scene flag bit 3). fhFlags = u32(scene.toonParams.w).
+fn fhFades(flags2: u32, fhFlags: u32) -> bool {
+  return (flags2 & 1u) != 0u || ((flags2 & 2u) != 0u && (fhFlags & 8u) == 0u);
+}
+// Whether a mesh ignores the fog (Material3D.noFog): flags2 bit 2 always, bit 3 only while Hard edge is on (scene
+// flag bit 4). Such a mesh takes no fog, no height fog / aerial haze, no silhouette fast path, no outline cut.
+fn fhNoFog(flags2: u32, fhFlags: u32) -> bool {
+  return (flags2 & 4u) != 0u || ((flags2 & 8u) != 0u && (fhFlags & 16u) != 0u);
+}
+`;
+
 export const FOLIAGE_WIND_WGSL = /* wgsl */ `
 fn fq_hash12(p: vec2<f32>) -> f32 {
   return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
@@ -2072,6 +2673,7 @@ fn foliageWindOffset(localPos: vec3<f32>, originWorld: vec3<f32>, windHeight: f3
 
 export const MESH3D_VERTEX_SHADER = /* wgsl */ `
 ${FOLIAGE_WIND_WGSL}
+${CROWD_PALETTE_WGSL}
 
 // ── Per-mesh instance data (storage buffer) ─────────────────────
 
@@ -2114,6 +2716,7 @@ struct SceneUniforms {
                                   //            .y = WIND direction (radians, xz) .z = wind strength .w = wind speed)
   pointLights:      array<vec4<f32>, 32>,   // 16 lights x 2 vec4s: (pos.xyz, radius) + (color.rgb, intensity)
   skinRampParams:   vec4<f32>,              // skin toon-ramp: .x=bands .y=softness .z=shadowFloor .w=tint rgb packed 8:8:8
+  styleParams:      vec4<f32>,              // render-style knobs: .x = Sketch paper amount (0 colour .. 1 paper)
 };
 
 @group(0) @binding(1)
@@ -2220,7 +2823,10 @@ fn vs_main(
 
   // ── Gouraud lighting (always computed; used when hasNormalMap = 0) ──
 
-  var lit = inst.diffuseColor.rgb * scene.ambientColor.rgb * scene.ambientColor.a;
+  // CROWD PALETTE (flags2 bit 4, performance-plan P12): the per-vertex palette code tints diffuse + emissive.
+  let crowdK = crowdTint(u32(inst.normalMatrix[3].x), in.uv, inst.patternColor.xyz);
+  let vDiffuse = inst.diffuseColor.rgb * crowdK;
+  var lit = vDiffuse * scene.ambientColor.rgb * scene.ambientColor.a;
   let L = normalize(-scene.lightDirection.xyz);
   // SOFT LIGHTING (bit 28): wrap diffuse toward half-Lambert by scene.lightColor.w (no-op when the flag/strength is 0).
   let softS = select(0.0, scene.lightColor.w, (bitcast<u32>(inst.emissiveColor.a) & 268435456u) != 0u);
@@ -2228,7 +2834,7 @@ fn vs_main(
   let softNdL = mix(max(rawNdL, 0.0), rawNdL * 0.5 + 0.5, softS);
   // SKIN TOON-RAMP (bit 29): band the diffuse + warm the shadow (no-op when the flag is off). Applied AFTER soft.
   let ramp = skinRamp(softNdL, bitcast<u32>(inst.emissiveColor.a), scene.skinRampParams);
-  lit += inst.diffuseColor.rgb * ramp.rgb * scene.lightColor.rgb * scene.lightDirection.w * ramp.a;
+  lit += vDiffuse * ramp.rgb * scene.lightColor.rgb * scene.lightDirection.w * ramp.a;
   // Orthographic view = PARALLEL rays: use the constant camera forward (not a finite eye) so specular/fresnel/rim
   // don't wander as the ortho view pans/zooms. cameraPosition.w = 1 in ortho; forward = the depth-increasing
   // direction = row 2 of viewProjection (V points surface -> eye, i.e. -forward). select(persp, ortho, isOrtho).
@@ -2237,8 +2843,8 @@ fn vs_main(
   let shininess = inst.specularColor.a;
   let spec = pow(max(dot(worldNormal, H), 0.0), max(shininess, 1.0));
   lit += inst.specularColor.rgb * scene.lightColor.rgb * spec;
-  lit += inst.emissiveColor.rgb;
-  let colorDepth = scene.ps1Config.w;
+  lit += inst.emissiveColor.rgb * crowdK;
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = quantizeColor(lit, colorDepth); }
 
   // ── TBN for normal mapping ──────────────────────────────────
@@ -2304,6 +2910,16 @@ struct SceneUniforms {
   ps1Config2:       vec4<f32>,  // .x=ditherStrength .y=uvQuantizeSteps
   lightCounts:      vec4<f32>,  // .x = point-light count
   pointLights:      array<vec4<f32>, 32>,
+  skinRampParams:   vec4<f32>,  // (declared so styleParams lands at its buffer offset, floats 208-211)
+  styleParams:      vec4<f32>,  // .x = Sketch paper amount, .y = toon shadow tint (rgb8), .z = toon saturation
+  toonParams:       vec4<f32>,  // toon shadows: .x bands .y softness .z shadow value
+  rimParams:        vec4<f32>,  // rim light: .x strength (0 = original rim) .y width .z hardness .w colour (rgb8)
+  heightFog:        vec4<f32>,  // height fog (city-quality P9): .x density (0 = off) .y base height .z falloff per unit .w distance reach
+  cascadeMatrices:  array<mat4x4<f32>, 2>,  // persona-polish A2: the near shadow cascades (nearest first)
+  cascadeParams:    vec4<f32>,  // .x cascade count (0 = off) .y cascade map size .z blend band (fraction of the box)
+  cascadeBias:      vec4<f32>,  // .x / .y depth bias of cascade 0 / 1
+  aerialParams:     vec4<f32>,  // persona-polish A5 aerial haze: .x strength (0 = off) .y 1/reach .z contrast share .w tint share
+  fogEye:           vec4<f32>,  // fog-horizon: .xyz the point fog is measured from (perspective = cameraPosition) .w fade band width
 };
 
 @group(0) @binding(1)
@@ -2326,6 +2942,8 @@ var<uniform> scene: SceneUniforms;
 @group(1) @binding(4) var garpTexture: texture_2d_array<f32>;
 
 //__SHADOW_BINDINGS__
+${FOG_FADE_WGSL}
+${CROWD_PALETTE_WGSL}
 
 const bayer4 = array<f32, 16>(
    0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
@@ -2368,11 +2986,21 @@ fn fs_main(
   let alphaCutout  = (flags & 32u) != 0u;
   let hairSheen    = (flags & 64u) != 0u;
   let rimEnabled   = (flags & 128u) != 0u;
+  let toonOn       = (flags & 1073741824u) != 0u;   // bit 30 — toon shadows (Cel styles)
+  let skinToonOn   = (flags & 536870912u) != 0u;    // bit 29 — skin ramp → per-pixel in Cel styles
   let sparkleOn    = (flags & 256u) != 0u;
   let starSparkle  = (flags & 4096u) != 0u;
   let patMode      = (flags >> 9u) & 7u;
   let texOverBase  = (flags & 32768u) != 0u;
   let garpTex      = (flags & 16777216u) != 0u;   // bit 24: sample the dedicated GARP pool atlas, not diffuse
+  // FOG HORIZON fast path (fog-horizon.ts; scene.toonParams.w bit 0, set only with Hard edge on and a linear fog, so
+  // aerial haze and height fog are off): a pixel at or past the fog edge ends exactly as the fog colour, so it skips
+  // the window interiors (pattern block) and returns right after the texture samples and the alpha cutout, before
+  // lighting, shadows, ground shading and IBL. Unlit UI cards (style 6) take no fog, so never this path.
+  let fhFlags = u32(scene.toonParams.w);
+  let fhNoFogM = fhNoFog(u32(inst.normalMatrix[3].x), fhFlags);   // Material3D.noFog (flags2 bits 2 / 3)
+  let fhSkip = (fhFlags & 1u) != 0u && u32(scene.fogParams.w) == 1u && renderStyle != 6u && !fhNoFogM
+    && length(scene.fogEye.xyz - worldPos) >= scene.fogParams.x + max(scene.fogParams.y - scene.fogParams.x, 0.001);
 
   //__PATTERN_BLOCK__
 
@@ -2420,6 +3048,32 @@ fn fs_main(
   // Samples above are unconditional → uniform; the discard after them is fine.
   if (alphaCutout && texSample.a < 0.5) { discard; }
 
+  // FOG HORIZON FADE BAND (P2; scene flag bit 1, flags2 in normalMatrix column 3 .x): a fading family dissolves over
+  // the band before the fog edge with a screen-door dither (here, after the samples, like every discard in this FS).
+  if ((fhFlags & 2u) != 0u && fhFades(u32(inst.normalMatrix[3].x), fhFlags)) {
+    let fhEdge = scene.fogParams.x + max(scene.fogParams.y - scene.fogParams.x, 0.001);
+    if (!fhDitherKeep(fhCoverage(length(scene.fogEye.xyz - worldPos), fhEdge, scene.fogEye.w), fragPos.xy + fhTaaShift(scene.cascadeParams.w, (fhFlags & 4u) != 0u), (fhFlags & 4u) != 0u)) { discard; }
+  }
+  // HLOD CROSS-FADE (performance-plan P17; flags2 bit 5): a streamed HLOD tile dissolving in / out over its tier
+  // swap; the coverage rides in normalMatrix column 3 .y (multiplied by 0 in every normal transform).
+  if ((u32(inst.normalMatrix[3].x) & 32u) != 0u && !fhDitherKeep(inst.normalMatrix[3].y, fragPos.xy + fhTaaShift(scene.cascadeParams.w, false), false)) { discard; }
+
+  // FOG HORIZON fast path (see fhSkip): after every implicit-derivative sample and the alpha cutout, so the cut-outs
+  // keep their holes and nothing below runs in non-uniform control flow that needs derivatives. Same alpha, the same
+  // alpha discard and the same PS1 quantization as the slow path's tail; the colour is the fog colour the slow path's
+  // mix(colour, fog, 1.0) ends at.
+  if (fhSkip) {
+    var fhA = inst.diffuseColor.a;
+    if (hasTexture && !texOverBase && renderStyle != 7u) { fhA = fhA * texSample.a; }
+    if (fhA < 0.01) { discard; }
+    var fhC = scene.fogColor.rgb;
+    let fhCd = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (flags & 2147483648u) != 0u);
+    if (fhCd > 0.0) {
+      if (scene.ps1Config2.x > 0.0) { fhC = quantizeColorDithered(fhC, fhCd, fragPos); } else { fhC = quantizeColor(fhC, fhCd); }
+    }
+    return vec4<f32>(fhC, fhA);
+  }
+
   // Resolve surface normal
   var N = normalize(worldNormal);
   if (hasNormalMap) {
@@ -2440,7 +3094,10 @@ fn fs_main(
     let reliefK = select(1.3, 0.85, patMode == 6u);
     N = normalize(N + (Tb * (patMask - patMaskR) + Bb * (patMask - patMaskU)) * reliefK);
     if (patMode <= 5u) {
-      patBase = patBase * (0.95 + 0.10 * fract(sin(dot(floor(uv * 260.0), vec2<f32>(12.9898, 78.233))) * 43758.5453));
+      // (B4: the 260-per-uv grain cells go sub-pixel fast - winWL.w is the pixel footprint in THIS pattern's cells, so
+      // w * 260 / freq = grain cells per pixel; fade it out past ~1 so roofs / trim stop shimmering at mid distance.)
+      let grainK = 1.0 - smoothstep(0.6, 2.0, winWL.w * 260.0 / max(inst.patternParams.x, 0.001));
+      patBase = patBase * (1.0 + grainK * 0.10 * (fract(sin(dot(floor(uv * 260.0), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5));
     }
   }
   if (patMode == 6u) {
@@ -2454,7 +3111,8 @@ fn fs_main(
       let gc = floor(uv * 140.0);
       let g1 = fract(sin(dot(gc, vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5;
       let g2 = fract(sin(dot(gc, vec2<f32>(39.3468, 11.135))) * 24634.6345) - 0.5;
-      N = normalize(N + (Tw2 * g1 + Bw2 * g2) * 0.22 * (1.0 - winWL.x));
+      // (B4: the 7 mm facets are sub-pixel past a few metres, where they only sparkle - faded by the cell footprint.)
+      N = normalize(N + (Tw2 * g1 + Bw2 * g2) * 0.16 * (1.0 - winWL.x) * (1.0 - smoothstep(0.0015, 0.005, winWL.w)));
       // STRUCTURED MASONRY RELIEF: brick courses / concrete panel seams GROOVE so the wall reads as 3-D material,
       // not painted brick. Sampled at a fine FIXED eps (brick-scale; no fwidth → uniform-safe) — the window-cell
       // relief eps above is far too coarse to resolve courses. On the masonry only (1 - winWL.x = not the glass).
@@ -2466,7 +3124,8 @@ fn fs_main(
       let mhR = wallMasonryH(uv + vec2<f32>(mEps, 0.0), inst.patternParams);
       let mhD = wallMasonryH(uv - vec2<f32>(0.0, mEps), inst.patternParams);
       let mhU = wallMasonryH(uv + vec2<f32>(0.0, mEps), inst.patternParams);
-      N = normalize(N + (Tw2 * (mhL - mhR) + Bw2 * (mhD - mhU)) * (0.42 * (1.0 - winWL.x)));
+      // (B4: joint relief fades once a joint is sub-pixel - past that it only aliases into a moire grid.)
+      N = normalize(N + (Tw2 * (mhL - mhR) + Bw2 * (mhD - mhU)) * (0.42 * (1.0 - winWL.x) * (1.0 - smoothstep(0.01, 0.04, winWL.w))));
     }
   }
 
@@ -2525,7 +3184,11 @@ fn fs_main(
     let gUnitM = select(1.0, gScale10 * 0.1, gIsWorld);   // metres per world unit
     let gMaskC = select(uv, uv * 0.02, gIsWorld);         // world mode: ~1 mask cycle per 45 m
     let gEdgeAmt = select(1.0, 0.0, gIsWorld);            // a continuous ground has no region border
-    let gUvMs = gUvM * gUnitM;                            // METRES per uv unit (uvM alone is world units)
+    // ★ The per-mesh scale computed on the CPU (renderer _writeGroundUvScale; uvTransform.z = the marker) replaces
+    //   the per-pixel derivative estimate, whose f32 rounding noise speckled + shimmered the grout (2026-09-29).
+    //   Untextured ground only (nothing else reads its uvTransform); anything else keeps the estimate.
+    let gUvMw = select(gUvM, inst.uvTransform.xy, inst.uvTransform.z < -12000.0);
+    let gUvMs = gUvMw * gUnitM;                           // METRES per uv unit (uvM alone is world units)
     // P2 WEATHERING — specularColor repurposed: .r = profile (0-4), .gba = wear center uv + radius.
     let gPc = vec2<f32>(inst.specularColor.g, inst.specularColor.b);
     let gPr = inst.specularColor.a;
@@ -2537,6 +3200,15 @@ fn fs_main(
     // per-fragment MATERIAL occlusion from the pattern, not geometry).
     patBase = gW.rgb * (1.0 - gW.grout * 0.22);
     roughOverride = clamp(gW.rough + gW.grout * 0.12, 0.04, 1.0);
+    // WET SHEEN (visual-polish #5): a material roughness under 0.3 (only the city's wet-sheen look sets one on its
+    // rain-slick roads; ground materials default to 0.5) glosses the procedural surface down to it, with ~4 m
+    // PUDDLES near mirror-smooth and the asphalt a little darker, so SSR + lamp light streak. Others keep their own.
+    if (inst.roughness < 0.3) {
+      let wetK = clamp((0.3 - inst.roughness) / 0.26, 0.0, 1.0);
+      let pud = smoothstep(0.52, 0.72, pg_vnoise(worldPos.xz * gUnitM * 0.25));
+      roughOverride = min(roughOverride, mix(max(inst.roughness, 0.04) * 1.5, 0.04, pud) + gW.grout * 0.12);
+      patBase = patBase * (1.0 - 0.18 * wetK);
+    }
     // HEIGHT -> NORMAL relief. ★ The epsilon must resolve the GROUT GROOVE, not the tile. It used to be a
     // fraction of the tile size (0.15 * 0.6 m = 9 cm, against a 1.5 cm seam), and the difference was
     // ONE-SIDED — so the shading responded both where this fragment sat in the groove AND where the
@@ -2547,16 +3219,23 @@ fn fs_main(
     // so the seam still reads recessed and bevelled — just once.
     let gP = uv * gUvMs;
     let gE = max(gGroutW * 0.9, 0.002);
-    let hL = groundHeightM(gP - vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
-    let hR = groundHeightM(gP + vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
-    let hD = groundHeightM(gP - vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
-    let hU = groundHeightM(gP + vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
-    var Tg = cross(vec3<f32>(0.0, 1.0, 0.0), N);
-    let tgl = length(Tg);
-    let gflat = tgl <= 1e-3;
-    Tg = select(Tg / max(tgl, 1e-4), vec3<f32>(1.0, 0.0, 0.0), gflat);
-    let Bg = select(cross(N, Tg), vec3<f32>(0.0, 0.0, 1.0), gflat);
-    N = normalize(N + (Tg * (hL - hR) + Bg * (hD - hU)) * 0.45);   // deepened relief (was 0.3 — stronger surface normal)
+    // P8 GROUND RELIEF LOD (scene.cascadeBias.w = Renderer3D.groundReliefLod; off by default): the relief normal comes
+    // from heights a grout width apart, so once a pixel spans many grout widths it is per-pixel noise. It fades out
+    // between a 4 and an 8 cm pixel footprint, and the four height samples are skipped where it is gone.
+    let gFootM = max(gUvFw.x * gUvMs.x, gUvFw.y * gUvMs.y);
+    let gReliefK = select(1.0, 1.0 - smoothstep(0.04, 0.08, gFootM), scene.cascadeBias.w > 0.5);
+    if (gReliefK > 0.0) {
+      let hL = groundHeightM(gP - vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
+      let hR = groundHeightM(gP + vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
+      let hD = groundHeightM(gP - vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
+      let hU = groundHeightM(gP + vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
+      var Tg = cross(vec3<f32>(0.0, 1.0, 0.0), N);
+      let tgl = length(Tg);
+      let gflat = tgl <= 1e-3;
+      Tg = select(Tg / max(tgl, 1e-4), vec3<f32>(1.0, 0.0, 0.0), gflat);
+      let Bg = select(cross(N, Tg), vec3<f32>(0.0, 0.0, 1.0), gflat);
+      N = normalize(N + (Tg * (hL - hR) + Bg * (hD - hU)) * (0.45 * gReliefK));   // deepened relief (was 0.3 — stronger surface normal)
+    }
   }
 
   // PAINTED METAL (metalShade, bit 23) — albedo + roughness; lighting does the rest.
@@ -2607,10 +3286,30 @@ fn fs_main(
   }
 
   var lit: vec3<f32>;
+  // Procedural GROUND meshes (bit 18) repurpose specularColor for their weathering data (r = profile, g/b/a =
+  // wear path), so it is NOT a colour: the default worn profile packs (1, 0, 0) and Cel / Cel-HD / toon lit the
+  // whole ground with a RED highlight. Ground is matte dielectric here, so the stylised paths get no specular.
+  let styleSpec = select(inst.specularColor, vec4<f32>(0.0, 0.0, 0.0, 1.0), groundShade);
 
-  if (renderStyle == 1u) {
+  // Toon shadows (film-look-and-toon-shadows.md §B): a Cel / Cel-HD material with bit 30 (or the skin ramp, bit 29)
+  // gets the banded COLOURED shadow. Skin uses the skin ramp's bands / softness / floor / tint; everything else the
+  // scene toon look. Neither flag → the original cel paths below, unchanged.
+  let toonSkin  = skinToonOn;
+  let toonP     = select(scene.toonParams.xyz, scene.skinRampParams.xyz, toonSkin);
+  let toonTint  = select(scene.styleParams.y, scene.skinRampParams.w, toonSkin);
+  let toonSat   = select(scene.styleParams.z, 0.0, toonSkin);
+  if ((renderStyle == 1u || renderStyle == 5u) && (toonOn || skinToonOn)) {
+    lit = toon_lighting(
+      patBase, styleSpec.rgb, styleSpec.a,
+      N, L, V,
+      scene.ambientColor.rgb, scene.ambientColor.a,
+      scene.lightColor.rgb,   scene.lightDirection.w,
+      emissiveRGB,
+      toonP, toonTint, toonSat, renderStyle == 5u,
+    );
+  } else if (renderStyle == 1u) {
     lit = cel_lighting(
-      patBase, inst.specularColor.rgb, inst.specularColor.a,
+      patBase, styleSpec.rgb, styleSpec.a,
       N, L, V,
       scene.ambientColor.rgb, scene.ambientColor.a,
       scene.lightColor.rgb,   scene.lightDirection.w,
@@ -2620,6 +3319,7 @@ fn fs_main(
     lit = sketch_lighting(
       patBase, N, L, worldPos,
       scene.ambientColor.a, scene.lightDirection.w,
+      scene.styleParams.x,
     );
   } else if (renderStyle == 3u) {
     lit = ink_lighting(
@@ -2632,7 +3332,7 @@ fn fs_main(
   } else if (renderStyle == 5u) {
     // ── Cel-HD — cel's flat stepped diffuse + a smooth glossy specular ──
     lit = cel_hd_lighting(
-      patBase, inst.specularColor.rgb, inst.specularColor.a,
+      patBase, styleSpec.rgb, styleSpec.a,
       N, L, V,
       scene.ambientColor.rgb, scene.ambientColor.a,
       scene.lightColor.rgb,   scene.lightDirection.w,
@@ -2706,6 +3406,11 @@ fn fs_main(
   // tangent (= the hair generator's stored flow direction — meridian on the cap → the crown highlight ring,
   // spine along the tails; transformed by the skin so it tracks the posed head). Intensity = specularColor.rgb,
   // tightness = specularColor.a; only on the lit side.
+  // HAIR HIGHLIGHT BAND (flags2 bit 7, Material3D.hairBand; Cel / Cel-HD only): the sheen becomes ONE crisp flat
+  // band (the anime angel ring) instead of a soft gloss. Applied AFTER the texture multiply below (a lit cel hair is
+  // already at 1.0 before it, so an added sheen clamps away), as a lift of the hair's own colour.
+  var hairBandK = 0.0;
+  let hairBandOn = hairSheen && (u32(inst.normalMatrix[3].x) & 128u) != 0u && (renderStyle == 1u || renderStyle == 5u);
   if (hairSheen) {
     let tl = length(worldTangent);
     let strandT = worldTangent / max(tl, 1e-4);
@@ -2713,15 +3418,21 @@ fn fs_main(
     let tDotH = dot(strandT, Hs);
     let sinTH = sqrt(max(0.0, 1.0 - tDotH * tDotH));
     let sheenAmt = pow(sinTH, max(1.0, inst.specularColor.a)) * max(dot(N, L), 0.0);
-    lit = lit + inst.specularColor.rgb * sheenAmt * scene.lightColor.rgb * scene.lightDirection.w;
+    if (hairBandOn) { hairBandK = smoothstep(0.55, 0.62, sheenAmt) * clamp(inst.specularColor.r * 2.0, 0.0, 1.0); }
+    else { lit = lit + inst.specularColor.rgb * sheenAmt * scene.lightColor.rgb * scene.lightDirection.w; }
   }
 
   // Rim light (silhouette back-light glow) — render-style-independent modifier; Fresnel edge tinted by the
   // scene light, stronger where the key light doesn't hit (backlit). Layers on top of any style.
   if (rimEnabled) {
-    let rimF = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
-    lit = lit + rimF * backlit * 0.42 * scene.lightColor.rgb;
+    if (scene.rimParams.x > 0.0) {
+      // Parameterised rim (setRimLight3D): width / hardness / colour — a crisp toon edge light.
+      lit = lit + rim_param(N, V, L, scene.rimParams);
+    } else {
+      let rimF = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+      let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
+      lit = lit + rimF * backlit * 0.42 * scene.lightColor.rgb;
+    }
   }
 
   // LEAF TRANSMISSION (bit 20) — added ON TOP of the lit result, right after the rim so the two COMPOSE
@@ -2743,10 +3454,17 @@ fn fs_main(
     lit = lit + spk * scene.lightColor.rgb * scene.lightDirection.w * 3.5;
   }
 
-  // POINT LIGHTS (street lamps at night): additive lambert with a smooth radius falloff � moving cars,
+  // POINT LIGHTS (street lamps at night): additive lambert with a smooth radius falloff -- moving cars,
   // walkers and walls entering a lamp's radius pick up its warm pool. PBR / cel / cel-HD paths only.
-  if (renderStyle == 0u || renderStyle == 1u || renderStyle == 5u) {
+  // (2026-09-29, city-quality L2/L9/L10) Collected into plPost and added AFTER the sun shadow (just below the
+  // SHADOW_APPLY marker) - moon/sun shadows used to multiply lamp pools down to the shadow floor. Ink (3) now gets
+  // lamps too. A small highlight weighted by (1 - roughness) squared makes wet (low-roughness) roads streak;
+  // dry roads (roughness 1) are unchanged.
+  var plPost = vec3<f32>(0.0);
+  if (renderStyle == 0u || renderStyle == 1u || renderStyle == 3u || renderStyle == 5u) {
     var plAdd = vec3<f32>(0.0);
+    var plSpec = vec3<f32>(0.0);
+    let plGloss = (1.0 - clamp(inst.roughness, 0.0, 1.0)) * (1.0 - clamp(inst.roughness, 0.0, 1.0));
     let plN = min(i32(scene.lightCounts.x), 16);
     for (var pi = 0; pi < plN; pi++) {
       let lp = scene.pointLights[pi * 2];
@@ -2756,10 +3474,13 @@ fn fs_main(
       let att = clamp(1.0 - d / max(lp.w, 1e-3), 0.0, 1.0);
       let ndl = max(dot(N, dv / max(d, 1e-4)), 0.0);
       plAdd = plAdd + lc.rgb * (lc.a * att * att * (0.3 + 0.7 * ndl));
+      let plH = normalize(dv / max(d, 1e-4) + V);
+      plSpec = plSpec + lc.rgb * (lc.a * att * pow(max(dot(N, plH), 0.0), 48.0) * plGloss * 1.6);
     }
-    lit = lit + patBase * plAdd;
+    plPost = patBase * plAdd + plSpec;
   }
   //__SHADOW_APPLY__
+  lit = lit + plPost;   // lamp light is never sun/moon-shadowed (see the point-light block)
 
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
 
@@ -2772,16 +3493,40 @@ fn fs_main(
       finalColor = vec4<f32>(finalColor.rgb * texSample.rgb, finalColor.a * texSample.a);
     }
   }
+  if (hairBandK > 0.0) { finalColor = vec4<f32>(mix(finalColor.rgb, min(finalColor.rgb * 1.55 + vec3<f32>(0.10), vec3<f32>(1.0)), hairBandK), finalColor.a); }
+  // CLOTH LINING (flags2 bit 8, Material3D.clothLining): the inside of a garment (its back face) reads as the fabric in
+  // shadow - capped at the albedo (no rim / specular white) and darkened - instead of the outer face's lighting.
+  if ((u32(inst.normalMatrix[3].x) & 256u) != 0u && !frontFacing) {
+    let lnAlb = inst.diffuseColor.rgb * select(vec3<f32>(1.0), texSample.rgb, hasTexture);
+    finalColor = vec4<f32>(min(finalColor.rgb, lnAlb) * 0.32, finalColor.a);
+  }
 
   if (finalColor.a < 0.01) { discard; }
   let fogMode = u32(scene.fogParams.w);
-  if (fogMode != 0u && renderStyle != 6u) {   // unlit (UI cards) ignore atmospheric fog
-    let fogDist = length(scene.cameraPosition.xyz - worldPos);
+  if (fogMode != 0u && renderStyle != 6u && !fhNoFogM) {   // unlit (UI cards) and no-fog meshes ignore atmospheric fog
+    let fogDist = length(scene.fogEye.xyz - worldPos);   // fog-horizon: the fog eye (perspective = the camera, bit-identical)
     var fogFactor: f32;
     if (fogMode == 1u) {
       fogFactor = clamp((fogDist - scene.fogParams.x) / max(scene.fogParams.y - scene.fogParams.x, 0.001), 0.0, 1.0);
     } else {
       fogFactor = 1.0 - exp(-scene.fogParams.z * fogDist);
+    }
+    // HEIGHT FOG (city-quality P9): a ground-hugging layer that thickens toward heightFog.y and with distance, so
+    // street canyons and low ground haze while rooftops stay crisp. density 0 = off (the original fog).
+    if (scene.heightFog.x > 0.0) {
+      let hfH = exp(-max(worldPos.y - scene.heightFog.y, 0.0) * max(scene.heightFog.z, 1e-4));
+      let hfD = 1.0 - exp(-fogDist * max(scene.heightFog.w, 1e-4));
+      fogFactor = max(fogFactor, clamp(scene.heightFog.x * hfH * hfD, 0.0, 1.0));
+    }
+    // AERIAL PERSPECTIVE (persona-polish A5): from the first metres out, contrast fades toward the haze and the colour
+    // leans to the horizon (fog) colour, so far facades sit back instead of being as punchy as near ones. It starts at
+    // zero distance (unlike the linear fog, which only begins hundreds of metres out). strength 0 = off (original).
+    if (scene.aerialParams.x > 0.0) {
+      let ah = scene.aerialParams.x * (1.0 - exp(-fogDist * scene.aerialParams.y));
+      let lw = vec3<f32>(0.2126, 0.7152, 0.0722);
+      let midL = 0.5 * (dot(finalColor.rgb, lw) + dot(scene.fogColor.rgb, lw));
+      let flatC = mix(finalColor.rgb, vec3<f32>(midL), ah * scene.aerialParams.z);
+      finalColor = vec4<f32>(mix(flatC, scene.fogColor.rgb, ah * scene.aerialParams.w), finalColor.a);
     }
     finalColor = vec4<f32>(mix(finalColor.rgb, scene.fogColor.rgb, fogFactor), finalColor.a);
   }
@@ -2790,7 +3535,7 @@ fn fs_main(
   // so it bands the actual output, including textured and non-PBR surfaces (the
   // old version quantized only the PBR lighting pre-texture, so it was invisible
   // on textured meshes).
-  let cd = scene.ps1Config.w;
+  let cd = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (flags & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (cd > 0.0 && renderStyle != 6u) {   // unlit (UI cards) keep crisp full-range colour
     if (scene.ps1Config2.x > 0.0) {
       finalColor = vec4<f32>(quantizeColorDithered(finalColor.rgb, cd, fragPos), finalColor.a);
@@ -2933,7 +3678,7 @@ fn vs_main(
   let spec = pow(max(dot(worldNormal, H), 0.0), max(shininess, 1.0));
   lit += inst.specularColor.rgb * scene.lightColor.rgb * spec;
   lit += inst.emissiveColor.rgb;
-  let colorDepth = scene.ps1Config.w;
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = vc_quantizeColor(lit, colorDepth); }
 
   let worldTangent3 = normalize((inst.normalMatrix * vec4<f32>(in.tangent.xyz, 0.0)).xyz);
@@ -2951,6 +3696,67 @@ fn vs_main(
   out.worldBitangent = B;
   out.foliageY       = clamp(in.position.y / max(inst.patternParams.x, 1e-3), 0.0, 1.0);
   return out;
+}
+`;
+
+// == LEAF CARDS (leafCard, bit 13) =================================================================
+// Shared by the untextured colour FS AND the shadow depth pass (so a card's shadow is its leaves, not a square).
+// Two silhouettes over one flag: the card's UV RANGE picks which (every material flag bit is taken, and a leaf
+// layer's instance slots all belong to wind + foliageShade):
+//   u in [0, 1]  → leafCluster: a small SPRIG of ~5 leaves (branch.ts emitSprigCrown, ground-scatter cards),
+//   u in [2, 3]  → leafClump:   a dense leaf-CLUSTER rosette (~15 leaves round a solid core) — branch.ts
+//                  emitClumpCrown writes CLUMP_CARD_U0 = 2 (polish-round-3 T4).
+/** Leaves of the CLUMP rosette: [azimuth deg, distance from the card centre, lobe scale] — outer ring then an
+ *  inner ring offset between them. Tuned on a CPU mirror to ~50% card coverage with a leafy, notched edge. */
+const CLUMP_LEAVES: [number, number, number][] = [
+  [4, 0.26, 0.21], [41, 0.25, 0.2], [75, 0.27, 0.22], [111, 0.25, 0.19], [145, 0.26, 0.21],
+  [183, 0.25, 0.2], [219, 0.27, 0.22], [254, 0.24, 0.19], [290, 0.26, 0.21], [326, 0.25, 0.2],
+  [22, 0.2, 0.16], [95, 0.19, 0.15], [165, 0.2, 0.16], [237, 0.19, 0.15], [308, 0.2, 0.16],
+];
+const f4 = (v: number): string => v.toFixed(4);
+const CLUMP_LOBES_WGSL = CLUMP_LEAVES.map(([deg, dist, sc]) => {
+  const phi = deg * Math.PI / 180;
+  // leafLobe's length axis points along (sin ang, cos ang) → ang = pi/2 - phi aims the leaf radially outward.
+  return `  m = max(m, leafLobe(uv, vec2<f32>(${f4(0.5 + dist * Math.cos(phi))}, ${f4(0.5 + dist * Math.sin(phi))}), ${f4(Math.PI / 2 - phi)}, ${f4(sc)}));`;
+}).join(String.fromCharCode(10));
+
+export const LEAF_CARD_WGSL = /* wgsl */`
+// One pointed-almond leaf at centre c, rotated ang, scaled sc, over the card UV. Coverage 0..1 (no fwidth → the
+// discard it feeds is safe in non-uniform flow).
+fn leafLobe(uv: vec2<f32>, c: vec2<f32>, ang: f32, sc: f32) -> f32 {
+  let d = (uv - c) / sc;
+  let ca = cos(ang); let sa = sin(ang);
+  let q = vec2<f32>(d.x * ca - d.y * sa, d.x * sa + d.y * ca);      // leaf-local; q.y = length axis in [-1,1]
+  let ly = clamp(q.y * 0.5 + 0.5, 0.0, 1.0);                        // 0 base .. 1 tip
+  let hw = 0.5 * pow(sin(ly * 3.14159), 0.6);
+  let body = smoothstep(-0.06, 0.06, hw - abs(q.x));
+  let ends = step(-1.0, q.y) * step(q.y, 1.0);
+  return body * ends;
+}
+// LEAF-CLUSTER silhouette: a small SPRIG of ~5 leaves over the 0..1 card UV — one card = a clump of leaves (the
+// technique real foliage layers through a volume), not a single leaf. Returns coverage 0..1.
+fn leafCluster(uv: vec2<f32>) -> f32 {
+  var m = leafLobe(uv, vec2<f32>(0.50, 0.54), 0.00, 0.44);
+  m = max(m, leafLobe(uv, vec2<f32>(0.33, 0.42), 0.85, 0.34));
+  m = max(m, leafLobe(uv, vec2<f32>(0.67, 0.44), -0.85, 0.34));
+  m = max(m, leafLobe(uv, vec2<f32>(0.42, 0.67), 0.55, 0.30));
+  m = max(m, leafLobe(uv, vec2<f32>(0.60, 0.65), -0.55, 0.30));
+  return m;
+}
+// LEAF-CLUMP silhouette: a dense ROSETTE — a solid core with ~15 leaves round it, so a clump of a dozen of these
+// cards reads as one soft leafy mass. Early-outs keep the common (core / outside) pixels cheap.
+fn leafClump(uv: vec2<f32>) -> f32 {
+  let r = length(uv - vec2<f32>(0.5, 0.5));
+  if (r > 0.48) { return 0.0; }
+  if (r < 0.24) { return 1.0; }
+  var m = 1.0 - smoothstep(0.25, 0.28, r);
+${CLUMP_LOBES_WGSL}
+  return m;
+}
+// Coverage for a leafCard: u >= 1.5 is a CLUMP card (u in [2, 3]), otherwise the sprig.
+fn leafCardCoverage(uv: vec2<f32>) -> f32 {
+  if (uv.x > 1.5) { return leafClump(vec2<f32>(uv.x - 2.0, uv.y)); }
+  return leafCluster(uv);
 }
 `;
 
@@ -2996,6 +3802,16 @@ struct SceneUniforms {
   ps1Config2:       vec4<f32>,  // .x=ditherStrength .y=uvQuantizeSteps
   lightCounts:      vec4<f32>,  // .x = point-light count
   pointLights:      array<vec4<f32>, 32>,
+  skinRampParams:   vec4<f32>,  // (declared so styleParams lands at its buffer offset, floats 208-211)
+  styleParams:      vec4<f32>,  // .x = Sketch paper amount, .y = toon shadow tint (rgb8), .z = toon saturation
+  toonParams:       vec4<f32>,  // toon shadows: .x bands .y softness .z shadow value
+  rimParams:        vec4<f32>,  // rim light: .x strength (0 = original rim) .y width .z hardness .w colour (rgb8)
+  heightFog:        vec4<f32>,  // height fog (city-quality P9): .x density (0 = off) .y base height .z falloff per unit .w distance reach
+  cascadeMatrices:  array<mat4x4<f32>, 2>,  // persona-polish A2: the near shadow cascades (nearest first)
+  cascadeParams:    vec4<f32>,  // .x cascade count (0 = off) .y cascade map size .z blend band (fraction of the box)
+  cascadeBias:      vec4<f32>,  // .x / .y depth bias of cascade 0 / 1
+  aerialParams:     vec4<f32>,  // persona-polish A5 aerial haze: .x strength (0 = off) .y 1/reach .z contrast share .w tint share
+  fogEye:           vec4<f32>,  // fog-horizon: .xyz the point fog is measured from (perspective = cameraPosition) .w fade band width
 };
 
 @group(0) @binding(1)
@@ -3008,6 +3824,8 @@ var<uniform> scene: SceneUniforms;
 // (bindings 5/6 sceneColorTexture/sceneColorSampler — for GLASS REFRACTION + SSR — are declared in PBR_IBL_WGSL above)
 
 //__SHADOW_BINDINGS__
+${FOG_FADE_WGSL}
+${CROWD_PALETTE_WGSL}
 
 const bayer4Untex = array<f32, 16>(
    0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
@@ -3028,28 +3846,7 @@ fn quantizeColorUntexDithered(c: vec3<f32>, depth: f32, fragPos: vec4<f32>) -> v
   return floor(c * depth + threshold) / depth;
 }
 
-// One pointed-almond leaf at centre c, rotated ang, scaled sc, over the card UV. Coverage 0..1 (no fwidth → the
-// discard it feeds is safe in non-uniform flow).
-fn leafLobe(uv: vec2<f32>, c: vec2<f32>, ang: f32, sc: f32) -> f32 {
-  let d = (uv - c) / sc;
-  let ca = cos(ang); let sa = sin(ang);
-  let q = vec2<f32>(d.x * ca - d.y * sa, d.x * sa + d.y * ca);      // leaf-local; q.y = length axis in [-1,1]
-  let ly = clamp(q.y * 0.5 + 0.5, 0.0, 1.0);                        // 0 base .. 1 tip
-  let hw = 0.5 * pow(sin(ly * 3.14159), 0.6);
-  let body = smoothstep(-0.06, 0.06, hw - abs(q.x));
-  let ends = step(-1.0, q.y) * step(q.y, 1.0);
-  return body * ends;
-}
-// LEAF-CLUSTER silhouette: a small SPRIG of ~5 leaves over the 0..1 card UV — one card = a clump of leaves (the
-// technique real foliage layers through a volume), not a single leaf. Returns coverage 0..1.
-fn leafCluster(uv: vec2<f32>) -> f32 {
-  var m = leafLobe(uv, vec2<f32>(0.50, 0.54), 0.00, 0.44);
-  m = max(m, leafLobe(uv, vec2<f32>(0.33, 0.42), 0.85, 0.34));
-  m = max(m, leafLobe(uv, vec2<f32>(0.67, 0.44), -0.85, 0.34));
-  m = max(m, leafLobe(uv, vec2<f32>(0.42, 0.67), 0.55, 0.30));
-  m = max(m, leafLobe(uv, vec2<f32>(0.60, 0.65), -0.55, 0.30));
-  return m;
-}
+${LEAF_CARD_WGSL}
 
 @fragment
 fn fs_main(
@@ -3066,6 +3863,8 @@ fn fs_main(
   let flags       = bitcast<u32>(inst.emissiveColor.a);
   let renderStyle = (flags >> 2u) & 7u;
   let rimEnabled  = (flags & 128u) != 0u;
+  let toonOn      = (flags & 1073741824u) != 0u;   // bit 30 — toon shadows (Cel styles)
+  let skinToonOn  = (flags & 536870912u) != 0u;    // bit 29 — skin ramp → per-pixel in Cel styles
   let sparkleOn   = (flags & 256u) != 0u;
   let starSparkle = (flags & 4096u) != 0u;
   let leafCard    = (flags & 8192u) != 0u;
@@ -3073,6 +3872,11 @@ fn fs_main(
   let patMode     = (flags >> 9u) & 7u;
   let boardShade  = (flags & 65536u) != 0u;
   let radialFade  = (flags & 131072u) != 0u;
+  // FOG HORIZON fast path (see the textured FS): this FS fogs every render style, so no style test here.
+  let fhFlags = u32(scene.toonParams.w);
+  let fhNoFogM = fhNoFog(u32(inst.normalMatrix[3].x), fhFlags);   // Material3D.noFog (flags2 bits 2 / 3)
+  let fhSkip = (fhFlags & 1u) != 0u && u32(scene.fogParams.w) == 1u && !fhNoFogM
+    && length(scene.fogEye.xyz - worldPos) >= scene.fogParams.x + max(scene.fogParams.y - scene.fogParams.x, 0.001);
 
   //__PATTERN_BLOCK__
 
@@ -3090,11 +3894,42 @@ fn fs_main(
   // LEAF CARD: cut the quad to a leaf silhouette (alpha-test, order-independent) + a midrib/edge shade. Placed AFTER
   // the fwidth pattern helpers above (they ran uniformly) so the discard doesn't make a later derivative non-uniform.
   if (leafCard) {
-    let leaf = leafCluster(uv);
+    let leaf = leafCardCoverage(uv);
     if (leaf < 0.5) { discard; }
-    // per-card shade: darker toward the base (uv.y low) + a touch darker at leaf edges → leafy depth (Ghibli-ish
-    // when combined with the cel style + rim). Random card orientation makes the uv.y gradient read as variation.
-    patBase = patBase * (0.72 + 0.4 * uv.y) * (0.86 + 0.14 * smoothstep(0.5, 0.95, leaf));
+    if (uv.x > 1.5) {
+      // CLUMP card: the spherised normals carry the light/dark, so the per-card shade stays QUIET (a per-card
+      // gradient here is exactly the noise the clump crown exists to remove) — just a hint of leaf edges.
+      patBase = patBase * (0.93 + 0.07 * smoothstep(0.5, 0.95, leaf));
+    } else {
+      // SPRIG card: darker toward the base (uv.y low) + a touch darker at leaf edges → leafy depth (Ghibli-ish
+      // when combined with the cel style + rim). Random card orientation makes the uv.y gradient read as variation.
+      patBase = patBase * (0.72 + 0.4 * uv.y) * (0.86 + 0.14 * smoothstep(0.5, 0.95, leaf));
+    }
+  }
+  // RADIAL FADE early out (visual-polish #5 perf): past the unit circle the fade below is exactly 0 and the tail
+  // discards the fragment anyway, so skip the lighting for the corners of the spill / pool / blob quads.
+  if (radialFade && length(uv - vec2<f32>(0.5, 0.5)) >= 0.5) { discard; }
+
+  // FOG HORIZON FADE BAND (P2; see the textured FS).
+  if ((fhFlags & 2u) != 0u && fhFades(u32(inst.normalMatrix[3].x), fhFlags)) {
+    let fhEdge = scene.fogParams.x + max(scene.fogParams.y - scene.fogParams.x, 0.001);
+    if (!fhDitherKeep(fhCoverage(length(scene.fogEye.xyz - worldPos), fhEdge, scene.fogEye.w), fragPos.xy + fhTaaShift(scene.cascadeParams.w, (fhFlags & 4u) != 0u), (fhFlags & 4u) != 0u)) { discard; }
+  }
+  // HLOD CROSS-FADE (performance-plan P17; flags2 bit 5): a streamed HLOD tile dissolving in / out over its tier
+  // swap; the coverage rides in normalMatrix column 3 .y (multiplied by 0 in every normal transform).
+  if ((u32(inst.normalMatrix[3].x) & 32u) != 0u && !fhDitherKeep(inst.normalMatrix[3].y, fragPos.xy + fhTaaShift(scene.cascadeParams.w, false), false)) { discard; }
+
+  // FOG HORIZON fast path (see fhSkip): after the leaf-card cut so leaves keep their holes. Same alpha (radial fade),
+  // the same alpha discard as the tail below; colour = the fog colour the tail's mix(colour, fog, 1.0) ends at.
+  if (fhSkip) {
+    var fhA = inst.diffuseColor.a;
+    if (radialFade) {
+      let fhRd = length(uv - vec2<f32>(0.5, 0.5)) * 2.0;
+      let fhFade = 1.0 - smoothstep(0.2, 1.0, fhRd);
+      fhA = fhA * fhFade * fhFade;
+    }
+    if (fhA < 0.01) { discard; }
+    return vec4<f32>(scene.fogColor.rgb, fhA);
   }
 
   let L = normalize(-scene.lightDirection.xyz);
@@ -3112,7 +3947,10 @@ fn fs_main(
     let reliefK = select(1.3, 0.85, patMode == 6u);
     N = normalize(N + (Tb * (patMask - patMaskR) + Bb * (patMask - patMaskU)) * reliefK);
     if (patMode <= 5u) {
-      patBase = patBase * (0.95 + 0.10 * fract(sin(dot(floor(uv * 260.0), vec2<f32>(12.9898, 78.233))) * 43758.5453));
+      // (B4: the 260-per-uv grain cells go sub-pixel fast - winWL.w is the pixel footprint in THIS pattern's cells, so
+      // w * 260 / freq = grain cells per pixel; fade it out past ~1 so roofs / trim stop shimmering at mid distance.)
+      let grainK = 1.0 - smoothstep(0.6, 2.0, winWL.w * 260.0 / max(inst.patternParams.x, 0.001));
+      patBase = patBase * (1.0 + grainK * 0.10 * (fract(sin(dot(floor(uv * 260.0), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5));
     }
   }
   if (patMode == 6u) {
@@ -3126,7 +3964,8 @@ fn fs_main(
       let gc = floor(uv * 140.0);
       let g1 = fract(sin(dot(gc, vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5;
       let g2 = fract(sin(dot(gc, vec2<f32>(39.3468, 11.135))) * 24634.6345) - 0.5;
-      N = normalize(N + (Tw2 * g1 + Bw2 * g2) * 0.22 * (1.0 - winWL.x));
+      // (B4: the 7 mm facets are sub-pixel past a few metres, where they only sparkle - faded by the cell footprint.)
+      N = normalize(N + (Tw2 * g1 + Bw2 * g2) * 0.16 * (1.0 - winWL.x) * (1.0 - smoothstep(0.0015, 0.005, winWL.w)));
       // STRUCTURED MASONRY RELIEF: brick courses / concrete panel seams GROOVE so the wall reads as 3-D material,
       // not painted brick. Sampled at a fine FIXED eps (brick-scale; no fwidth → uniform-safe) — the window-cell
       // relief eps above is far too coarse to resolve courses. On the masonry only (1 - winWL.x = not the glass).
@@ -3138,7 +3977,8 @@ fn fs_main(
       let mhR = wallMasonryH(uv + vec2<f32>(mEps, 0.0), inst.patternParams);
       let mhD = wallMasonryH(uv - vec2<f32>(0.0, mEps), inst.patternParams);
       let mhU = wallMasonryH(uv + vec2<f32>(0.0, mEps), inst.patternParams);
-      N = normalize(N + (Tw2 * (mhL - mhR) + Bw2 * (mhD - mhU)) * (0.42 * (1.0 - winWL.x)));
+      // (B4: joint relief fades once a joint is sub-pixel - past that it only aliases into a moire grid.)
+      N = normalize(N + (Tw2 * (mhL - mhR) + Bw2 * (mhD - mhU)) * (0.42 * (1.0 - winWL.x) * (1.0 - smoothstep(0.01, 0.04, winWL.w))));
     }
   }
 
@@ -3166,7 +4006,11 @@ fn fs_main(
     let gUnitM = select(1.0, gScale10 * 0.1, gIsWorld);   // metres per world unit
     let gMaskC = select(uv, uv * 0.02, gIsWorld);         // world mode: ~1 mask cycle per 45 m
     let gEdgeAmt = select(1.0, 0.0, gIsWorld);            // a continuous ground has no region border
-    let gUvMs = gUvM * gUnitM;                            // METRES per uv unit (uvM alone is world units)
+    // ★ The per-mesh scale computed on the CPU (renderer _writeGroundUvScale; uvTransform.z = the marker) replaces
+    //   the per-pixel derivative estimate, whose f32 rounding noise speckled + shimmered the grout (2026-09-29).
+    //   Untextured ground only (nothing else reads its uvTransform); anything else keeps the estimate.
+    let gUvMw = select(gUvM, inst.uvTransform.xy, inst.uvTransform.z < -12000.0);
+    let gUvMs = gUvMw * gUnitM;                           // METRES per uv unit (uvM alone is world units)
     let gPc = vec2<f32>(inst.specularColor.g, inst.specularColor.b);
     let gPr = inst.specularColor.a;
     let g0 = groundSurface(uv, gUvMs, gMaskC, gMode, inst.diffuseColor.rgb, gSeam, gGroutW, gP0, gP1, gJit, gPc, gPr);
@@ -3178,20 +4022,36 @@ fn fs_main(
     // per-fragment MATERIAL occlusion from the pattern, not geometry).
     patBase = gW.rgb * (1.0 - gW.grout * 0.22);
     roughOverride = clamp(gW.rough + gW.grout * 0.12, 0.04, 1.0);
+    // WET SHEEN (visual-polish #5): a material roughness under 0.3 (only the city's wet-sheen look sets one on its
+    // rain-slick roads; ground materials default to 0.5) glosses the procedural surface down to it, with ~4 m
+    // PUDDLES near mirror-smooth and the asphalt a little darker, so SSR + lamp light streak. Others keep their own.
+    if (inst.roughness < 0.3) {
+      let wetK = clamp((0.3 - inst.roughness) / 0.26, 0.0, 1.0);
+      let pud = smoothstep(0.52, 0.72, pg_vnoise(worldPos.xz * gUnitM * 0.25));
+      roughOverride = min(roughOverride, mix(max(inst.roughness, 0.04) * 1.5, 0.04, pud) + gW.grout * 0.12);
+      patBase = patBase * (1.0 - 0.18 * wetK);
+    }
     // Relief: CENTRAL differences at ~one grout width — see the textured shader for why a tile-sized
     // one-sided epsilon drew a ghost seam beside every real one.
     let gP = uv * gUvMs;
     let gE = max(gGroutW * 0.9, 0.002);
-    let hL = groundHeightM(gP - vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
-    let hR = groundHeightM(gP + vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
-    let hD = groundHeightM(gP - vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
-    let hU = groundHeightM(gP + vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
-    var Tg = cross(vec3<f32>(0.0, 1.0, 0.0), N);
-    let tgl = length(Tg);
-    let gflat = tgl <= 1e-3;
-    Tg = select(Tg / max(tgl, 1e-4), vec3<f32>(1.0, 0.0, 0.0), gflat);
-    let Bg = select(cross(N, Tg), vec3<f32>(0.0, 0.0, 1.0), gflat);
-    N = normalize(N + (Tg * (hL - hR) + Bg * (hD - hU)) * 0.45);   // deepened relief (was 0.3 — stronger surface normal)
+    // P8 GROUND RELIEF LOD (scene.cascadeBias.w = Renderer3D.groundReliefLod; off by default): the relief normal comes
+    // from heights a grout width apart, so once a pixel spans many grout widths it is per-pixel noise. It fades out
+    // between a 4 and an 8 cm pixel footprint, and the four height samples are skipped where it is gone.
+    let gFootM = max(gUvFw.x * gUvMs.x, gUvFw.y * gUvMs.y);
+    let gReliefK = select(1.0, 1.0 - smoothstep(0.04, 0.08, gFootM), scene.cascadeBias.w > 0.5);
+    if (gReliefK > 0.0) {
+      let hL = groundHeightM(gP - vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
+      let hR = groundHeightM(gP + vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
+      let hD = groundHeightM(gP - vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
+      let hU = groundHeightM(gP + vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
+      var Tg = cross(vec3<f32>(0.0, 1.0, 0.0), N);
+      let tgl = length(Tg);
+      let gflat = tgl <= 1e-3;
+      Tg = select(Tg / max(tgl, 1e-4), vec3<f32>(1.0, 0.0, 0.0), gflat);
+      let Bg = select(cross(N, Tg), vec3<f32>(0.0, 0.0, 1.0), gflat);
+      N = normalize(N + (Tg * (hL - hR) + Bg * (hD - hU)) * (0.45 * gReliefK));   // deepened relief (was 0.3 — stronger surface normal)
+    }
   }
 
   // PAINTED METAL (metalShade, bit 23) — albedo + roughness; lighting does the rest.
@@ -3240,9 +4100,29 @@ fn fs_main(
   }
 
   var lit: vec3<f32>;
-  if (renderStyle == 1u) {
+  // Procedural GROUND meshes (bit 18) repurpose specularColor for their weathering data (r = profile, g/b/a =
+  // wear path), so it is NOT a colour: the default worn profile packs (1, 0, 0) and Cel / Cel-HD / toon lit the
+  // whole ground with a RED highlight. Ground is matte dielectric here, so the stylised paths get no specular.
+  let styleSpec = select(inst.specularColor, vec4<f32>(0.0, 0.0, 0.0, 1.0), groundShade);
+  // Toon shadows (film-look-and-toon-shadows.md §B): a Cel / Cel-HD material with bit 30 (or the skin ramp, bit 29)
+  // gets the banded COLOURED shadow. Skin uses the skin ramp's bands / softness / floor / tint; everything else the
+  // scene toon look. Neither flag → the original cel paths below, unchanged.
+  let toonSkin  = skinToonOn;
+  let toonP     = select(scene.toonParams.xyz, scene.skinRampParams.xyz, toonSkin);
+  let toonTint  = select(scene.styleParams.y, scene.skinRampParams.w, toonSkin);
+  let toonSat   = select(scene.styleParams.z, 0.0, toonSkin);
+  if ((renderStyle == 1u || renderStyle == 5u) && (toonOn || skinToonOn)) {
+    lit = toon_lighting(
+      patBase, styleSpec.rgb, styleSpec.a,
+      N, L, V,
+      scene.ambientColor.rgb, scene.ambientColor.a,
+      scene.lightColor.rgb,   scene.lightDirection.w,
+      emissiveRGB,
+      toonP, toonTint, toonSat, renderStyle == 5u,
+    );
+  } else if (renderStyle == 1u) {
     lit = cel_lighting(
-      patBase, inst.specularColor.rgb, inst.specularColor.a,
+      patBase, styleSpec.rgb, styleSpec.a,
       N, L, V,
       scene.ambientColor.rgb, scene.ambientColor.a,
       scene.lightColor.rgb,   scene.lightDirection.w,
@@ -3252,6 +4132,7 @@ fn fs_main(
     lit = sketch_lighting(
       patBase, N, L, worldPos,
       scene.ambientColor.a, scene.lightDirection.w,
+      scene.styleParams.x,
     );
   } else if (renderStyle == 3u) {
     lit = ink_lighting(
@@ -3264,7 +4145,7 @@ fn fs_main(
   } else if (renderStyle == 5u) {
     // ── Cel-HD — cel's flat stepped diffuse + a smooth glossy specular ──
     lit = cel_hd_lighting(
-      patBase, inst.specularColor.rgb, inst.specularColor.a,
+      patBase, styleSpec.rgb, styleSpec.a,
       N, L, V,
       scene.ambientColor.rgb, scene.ambientColor.a,
       scene.lightColor.rgb,   scene.lightDirection.w,
@@ -3326,7 +4207,7 @@ fn fs_main(
     // SSAO: multiply AMBIENT only (see textured FS). 1×1 white when SSAO off → ×1 no-op.
     let ssaoAO = textureSampleLevel(ssaoTexture, ssaoSampler, fragPos.xy / max(scene.resolution.xy, vec2<f32>(1.0)), 0.0).r;
     var total = directLight + ambient * ssaoAO + emissiveRGB;
-    let cd = scene.ps1Config.w;
+    let cd = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (flags & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
     if (cd > 0.0) {
       if (scene.ps1Config2.x > 0.0) {
         total = quantizeColorUntexDithered(total, cd, fragPos);
@@ -3340,9 +4221,14 @@ fn fs_main(
   // Rim light (silhouette back-light glow) — render-style-independent modifier; Fresnel edge tinted by the
   // scene light, stronger where the key light doesn't hit (backlit). Layers on top of any style.
   if (rimEnabled) {
-    let rimF = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
-    lit = lit + rimF * backlit * 0.42 * scene.lightColor.rgb;
+    if (scene.rimParams.x > 0.0) {
+      // Parameterised rim (setRimLight3D): width / hardness / colour — a crisp toon edge light.
+      lit = lit + rim_param(N, V, L, scene.rimParams);
+    } else {
+      let rimF = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+      let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
+      lit = lit + rimF * backlit * 0.42 * scene.lightColor.rgb;
+    }
   }
 
   // LEAF TRANSMISSION (bit 20) — added right after the rim so the two COMPOSE (backlit grass glow).
@@ -3364,8 +4250,15 @@ fn fs_main(
 
   // POINT LIGHTS (street lamps at night): additive lambert with a smooth radius falloff — moving cars,
   // walkers and walls entering a lamp's radius pick up its warm pool. PBR / cel / cel-HD paths only.
-  if (renderStyle == 0u || renderStyle == 1u || renderStyle == 5u) {
+  // (2026-09-29, city-quality L2/L9/L10) Collected into plPost and added AFTER the sun shadow (just below the
+  // SHADOW_APPLY marker) - moon/sun shadows used to multiply lamp pools down to the shadow floor. Ink (3) now gets
+  // lamps too. A small highlight weighted by (1 - roughness) squared makes wet (low-roughness) roads streak;
+  // dry roads (roughness 1) are unchanged.
+  var plPost = vec3<f32>(0.0);
+  if (renderStyle == 0u || renderStyle == 1u || renderStyle == 3u || renderStyle == 5u) {
     var plAdd = vec3<f32>(0.0);
+    var plSpec = vec3<f32>(0.0);
+    let plGloss = (1.0 - clamp(inst.roughness, 0.0, 1.0)) * (1.0 - clamp(inst.roughness, 0.0, 1.0));
     let plN = min(i32(scene.lightCounts.x), 16);
     for (var pi = 0; pi < plN; pi++) {
       let lp = scene.pointLights[pi * 2];
@@ -3375,8 +4268,10 @@ fn fs_main(
       let att = clamp(1.0 - d / max(lp.w, 1e-3), 0.0, 1.0);
       let ndl = max(dot(N, dv / max(d, 1e-4)), 0.0);
       plAdd = plAdd + lc.rgb * (lc.a * att * att * (0.3 + 0.7 * ndl));
+      let plH = normalize(dv / max(d, 1e-4) + V);
+      plSpec = plSpec + lc.rgb * (lc.a * att * pow(max(dot(N, plH), 0.0), 48.0) * plGloss * 1.6);
     }
-    lit = lit + patBase * plAdd;
+    plPost = patBase * plAdd + plSpec;
   }
 
   // SCREEN-SPACE REFRACTION (glassEnhance + resolution.w gate): sample the PREVIOUS frame's final image at this pixel,
@@ -3424,6 +4319,7 @@ fn fs_main(
     lit = lit + scene.lightColor.rgb * glint * fres;
   }
   //__SHADOW_APPLY__
+  lit = lit + plPost;   // lamp light is never sun/moon-shadowed (see the point-light block)
 
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
   // RADIAL FADE (bit 17): soft circular alpha falloff from the UV centre — the packaging stage
@@ -3433,10 +4329,14 @@ fn fs_main(
     let fade = 1.0 - smoothstep(0.2, 1.0, rd);
     finalColor = vec4<f32>(finalColor.rgb, finalColor.a * fade * fade);
   }
+  // CLOTH LINING (flags2 bit 8; see the textured FS): the inside of a garment reads as the fabric in shadow.
+  if ((u32(inst.normalMatrix[3].x) & 256u) != 0u && !frontFacing) {
+    finalColor = vec4<f32>(min(finalColor.rgb, inst.diffuseColor.rgb) * 0.32, finalColor.a);
+  }
   if (finalColor.a < 0.01) { discard; }
   let fogMode = u32(scene.fogParams.w);
-  if (fogMode != 0u) {
-    let fogDist = length(scene.cameraPosition.xyz - worldPos);
+  if (fogMode != 0u && !fhNoFogM) {   // no-fog meshes (Material3D.noFog) ignore atmospheric fog
+    let fogDist = length(scene.fogEye.xyz - worldPos);   // fog-horizon: the fog eye (perspective = the camera, bit-identical)
     var fogFactor: f32;
     if (fogMode == 1u) {
       fogFactor = clamp((fogDist - scene.fogParams.x) / max(scene.fogParams.y - scene.fogParams.x, 0.001), 0.0, 1.0);
@@ -3449,6 +4349,23 @@ fn fs_main(
     if (aerial > 0.0) {
       let lum = dot(finalColor.rgb, vec3<f32>(0.299, 0.587, 0.114));
       finalColor = vec4<f32>(mix(finalColor.rgb, vec3<f32>(lum), fogFactor * aerial * 0.75), finalColor.a);
+    }
+    // HEIGHT FOG (city-quality P9): a ground-hugging layer that thickens toward heightFog.y and with distance, so
+    // street canyons and low ground haze while rooftops stay crisp. density 0 = off (the original fog).
+    if (scene.heightFog.x > 0.0) {
+      let hfH = exp(-max(worldPos.y - scene.heightFog.y, 0.0) * max(scene.heightFog.z, 1e-4));
+      let hfD = 1.0 - exp(-fogDist * max(scene.heightFog.w, 1e-4));
+      fogFactor = max(fogFactor, clamp(scene.heightFog.x * hfH * hfD, 0.0, 1.0));
+    }
+    // AERIAL PERSPECTIVE (persona-polish A5): from the first metres out, contrast fades toward the haze and the colour
+    // leans to the horizon (fog) colour, so far facades sit back instead of being as punchy as near ones. It starts at
+    // zero distance (unlike the linear fog, which only begins hundreds of metres out). strength 0 = off (original).
+    if (scene.aerialParams.x > 0.0) {
+      let ah = scene.aerialParams.x * (1.0 - exp(-fogDist * scene.aerialParams.y));
+      let lw = vec3<f32>(0.2126, 0.7152, 0.0722);
+      let midL = 0.5 * (dot(finalColor.rgb, lw) + dot(scene.fogColor.rgb, lw));
+      let flatC = mix(finalColor.rgb, vec3<f32>(midL), ah * scene.aerialParams.z);
+      finalColor = vec4<f32>(mix(flatC, scene.fogColor.rgb, ah * scene.aerialParams.w), finalColor.a);
     }
     finalColor = vec4<f32>(mix(finalColor.rgb, scene.fogColor.rgb, fogFactor), finalColor.a);
   }
@@ -3468,6 +4385,28 @@ fn fs_main(
 const SHADOW_SAMPLE_WGSL = (group: number): string => /* wgsl */ `
 @group(${group}) @binding(0) var shadowMap:     texture_depth_2d;
 @group(${group}) @binding(1) var shadowSampler: sampler_comparison;
+@group(${group}) @binding(2) var shadowCascades: texture_depth_2d_array;
+@group(${group}) @binding(3) var shadowMinMax: texture_2d<f32>;
+@group(${group}) @binding(4) var cascadeMinMax: texture_2d_array<f32>;
+@group(${group}) @binding(5) var<uniform> shadowMM: vec4<f32>;
+
+// P6 (performance-plan.md) EXACT PCF shortcut. A min/max texel holds the lowest and highest stored depth over an
+// 8x8 tile of the map and its 8 neighbours, so it covers every texel any tap of a kernel centred in that tile reads
+// (radius * soft + 2.5 texels, checked below). The sampler compares with less: a reference below the min passes
+// every tap (the PCF average is exactly 1), at or above the max fails every tap (exactly 0). Returns -1 when the
+// full PCF must run (an edge, a reference outside 0..1, or the shortcut is off for that map).
+fn shadowShortcut(mm: vec2<f32>, depth: f32) -> f32 {
+  if (depth < 0.0 || depth > 1.0) { return -1.0; }
+  if (depth < mm.x) { return 1.0; }
+  if (depth >= mm.y) { return 0.0; }
+  return -1.0;
+}
+
+fn shadowTileOf(uv: vec2<f32>, mapSize: f32, mmDim: vec2<u32>) -> vec2<i32> {
+  let ms = i32(mapSize);
+  let c = clamp(vec2<i32>(floor(uv * mapSize)), vec2<i32>(0, 0), vec2<i32>(ms - 1, ms - 1));
+  return min(c / i32(shadowMM.z), vec2<i32>(mmDim) - vec2<i32>(1, 1));
+}
 
 fn sampleShadow(lightSpacePos: vec4<f32>) -> f32 {
   let ndc = lightSpacePos.xyz / lightSpacePos.w;
@@ -3481,23 +4420,83 @@ fn sampleShadow(lightSpacePos: vec4<f32>) -> f32 {
   // PCF QUALITY TIER (shadowParams.x): 0 = default radius 2 (5x5 = 25 taps, unchanged look), 1 = fast 3x3
   // (9 taps, ~2.7x fewer compares per lit fragment - a big win on city-scale fill). Set via setShadowQuality.
   let r = select(2, i32(scene.shadowParams.x), scene.shadowParams.x > 0.5);
+  if (shadowMM.x > 0.5 && f32(r) * soft + 2.5 <= shadowMM.z) {
+    let q = shadowShortcut(textureLoad(shadowMinMax, shadowTileOf(clampedUV, mapSize, textureDimensions(shadowMinMax)), 0).xy, depth);
+    if (q >= 0.0) { return select(1.0, q, inRange); }
+  }
   var shadow = 0.0;
   for (var dy = -r; dy <= r; dy++) {
     for (var dx = -r; dx <= r; dx++) {
-      shadow += textureSampleCompare(shadowMap, shadowSampler, clampedUV + vec2<f32>(f32(dx), f32(dy)) * texel, depth);
+      shadow += textureSampleCompareLevel(shadowMap, shadowSampler, clampedUV + vec2<f32>(f32(dx), f32(dy)) * texel, depth);
     }
   }
   let taps = f32((2 * r + 1) * (2 * r + 1));
   return select(1.0, shadow / taps, inRange);
+}
+
+// CASCADED SHADOWS (persona-polish A2). Up to two NEAR cascades (texel-snapped boxes around the camera, in a depth
+// array) refine the original map, which stays the far cascade. Per pixel the nearest cascade that contains it wins;
+// inside the outer blend band of its box it fades into the next one, so there is no visible seam. cascadeParams.x = 0
+// means no cascades: exactly the original single-map result. All taps are CompareLevel (valid in non-uniform flow).
+// Returns (shadow, 1) when the point is inside cascade i, (1, 0) when it is not.
+fn sampleCascade(i: i32, worldPos: vec3<f32>) -> vec2<f32> {
+  let lp = scene.cascadeMatrices[i] * vec4<f32>(worldPos, 1.0);
+  let ndc = lp.xyz / lp.w;
+  let edge = max(abs(ndc.x), abs(ndc.y));
+  if (edge >= 1.0 || ndc.z < 0.0 || ndc.z > 1.0) { return vec2<f32>(1.0, 0.0); }
+  let suv = vec2<f32>(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
+  let depth = ndc.z - select(scene.cascadeBias.x, scene.cascadeBias.y, i == 1);
+  let soft = select(1.0, scene.shadowParams.w, scene.shadowParams.w > 0.01);
+  let texel = soft / max(scene.cascadeParams.y, 1.0);
+  let r = select(2, i32(scene.shadowParams.x), scene.shadowParams.x > 0.5);
+  if (shadowMM.y > 0.5 && f32(r) * soft + 2.5 <= shadowMM.z) {
+    let cms = max(scene.cascadeParams.y, 1.0);
+    let q = shadowShortcut(textureLoad(cascadeMinMax, shadowTileOf(clamp(suv, vec2<f32>(0.0), vec2<f32>(1.0)), cms, textureDimensions(cascadeMinMax)), i, 0).xy, depth);
+    if (q >= 0.0) { return vec2<f32>(q, 1.0); }
+  }
+  var sh = 0.0;
+  for (var dy = -r; dy <= r; dy++) {
+    for (var dx = -r; dx <= r; dx++) {
+      sh += textureSampleCompareLevel(shadowCascades, shadowSampler, suv + vec2<f32>(f32(dx), f32(dy)) * texel, i, depth);
+    }
+  }
+  return vec2<f32>(sh / f32((2 * r + 1) * (2 * r + 1)), 1.0);
+}
+
+fn cascadeEdge(i: i32, worldPos: vec3<f32>) -> f32 {
+  let lp = scene.cascadeMatrices[i] * vec4<f32>(worldPos, 1.0);
+  return max(abs(lp.x / lp.w), abs(lp.y / lp.w));
+}
+
+fn sampleShadowCascaded(worldPos: vec3<f32>) -> f32 {
+  let n = i32(scene.cascadeParams.x + 0.5);
+  if (n <= 0) { return sampleShadow(scene.lightSpaceMatrix * vec4<f32>(worldPos, 1.0)); }
+  let band = clamp(scene.cascadeParams.z, 0.0, 0.5);
+  for (var i = 0; i < n; i++) {
+    let c = sampleCascade(i, worldPos);
+    if (c.y > 0.5) {
+      let t = smoothstep(1.0 - band, 1.0, cascadeEdge(i, worldPos));
+      if (t <= 0.0) { return c.x; }
+      var nxt = vec2<f32>(1.0, 0.0);
+      if (i + 1 < n) { nxt = sampleCascade(i + 1, worldPos); }
+      let nv = select(sampleShadow(scene.lightSpaceMatrix * vec4<f32>(worldPos, 1.0)), nxt.x, nxt.y > 0.5);
+      return mix(c.x, nv, t);
+    }
+  }
+  return sampleShadow(scene.lightSpaceMatrix * vec4<f32>(worldPos, 1.0));
 }
 `;
 
 const SHADOW_APPLY_WGSL = /* wgsl */ `
   // RECEIVE the sun shadow (PCF above). Emissive light is restored un-shadowed.
   // The in-shadow light floor is scene.resolution.z (shadow darkness): 0.42 default, lower = darker (host-tunable).
-  let shadowFactor = sampleShadow(scene.lightSpaceMatrix * vec4<f32>(worldPos, 1.0));
-  let shadowMul = mix(scene.resolution.z, 1.0, shadowFactor);
-  lit = lit * shadowMul + emissiveRGB * (1.0 - shadowMul);
+  let shadowFactor = sampleShadowCascaded(worldPos);   // near cascades (persona-polish A2) + the original map
+  // COLOURED SHADOW (city-quality L3): styleParams.w packs an rgb8 tint; normalised to unit luminance so it shifts the
+  // HUE of the shadow (blue day, violet dusk, indigo night) without changing its darkness. 0 = neutral (original).
+  let shTintRaw = toon_unpack_rgb8(scene.styleParams.w);
+  let shTint = select(vec3<f32>(1.0), shTintRaw / max(dot(shTintRaw, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-3), scene.styleParams.w > 0.5);
+  let shadowMul = mix(vec3<f32>(scene.resolution.z) * shTint, vec3<f32>(1.0), shadowFactor);
+  lit = lit * shadowMul + emissiveRGB * (vec3<f32>(1.0) - shadowMul);
 `;
 
 // Marker substitution that ASSERTS the marker was present. String.replace silently no-ops if the marker text
@@ -3525,21 +4524,43 @@ const PATTERN_BLOCK_FULL = /* wgsl */ `
   // ALL fwidth-using helpers (patternMask x3 for the relief gradient, windowsPattern, gr_uvMetres) run
   // UNCONDITIONALLY so fwidth stays in uniform control flow; their results are gated afterwards.
   let patMask = patternMask(uv, patMode, inst.patternParams, scene.ps1Config2.z);
-  let pEps = 0.35 / max(inst.patternParams.x, 0.001);
+  // Relief step in pattern CELLS. DOTS (mode 2) use a fine step: at 0.35 cell the shifted mask of a small stud
+  // never overlaps the stud itself, so every dot grew an offset ghost twin (tactile paving, city-quality S3).
+  let pEpsK = select(f32(0.35), f32(0.06), patMode == 2u);
+  let pEps = pEpsK / max(inst.patternParams.x, 0.001);
   let patMaskR = patternMask(uv + vec2<f32>(pEps, 0.0), patMode, inst.patternParams, scene.ps1Config2.z);
   let patMaskU = patternMask(uv + vec2<f32>(0.0, pEps), patMode, inst.patternParams, scene.ps1Config2.z);
-  let winWL = windowsPattern(uv, inst.patternParams, scene.ps1Config2.z);
+  // P8 shader fast paths (Renderer3D.shaderFastPaths -> scene.cascadeBias.z): bit-identical shortcuts in the facade
+  // pattern (windowsPattern / windowShade) and the procedural ground; 0 = the original code paths (A/B).
+  let p8Fast = scene.cascadeBias.z > 0.5;
+  let gUvFw = fwidth(uv);                                        // P8 ground relief LOD footprint (uniform flow)
+  let winWL = windowsPattern(uv, inst.patternParams, scene.ps1Config2.z, patMode == 6u, p8Fast);
   let gUvM = gr_uvMetres(uv, worldPos);
+  let winAx = uvWorldAxes(uv, worldPos);                         // interior-mapping cell frame (uniform flow)
   var patBase = mix(inst.diffuseColor.rgb, inst.patternColor.rgb, patMask);
   var emissiveRGB = inst.emissiveColor.rgb;
+  // CROWD PALETTE (flags2 bit 4, performance-plan P12): the per-vertex palette code tints the base + emissive.
+  let crowdK = crowdTint(u32(inst.normalMatrix[3].x), uv, inst.patternColor.xyz);
+  patBase = patBase * crowdK;
+  emissiveRGB = emissiveRGB * crowdK;
   var roughOverride = inst.roughness;
-  if (patMode == 6u) {
-    let ws = windowShade(uv, inst.patternParams, winWL, worldPos, worldNormal, scene.cameraPosition.xyz,
-                         inst.diffuseColor.rgb, inst.patternColor.rgb, inst.emissiveColor.rgb, scene.ps1Config2.z);
+  if (patMode == 6u && !fhSkip) {   // fog horizon: a fogged pixel needs no window interior
+    let ws = windowShade(uv, inst.patternParams, winWL, worldPos, worldNormal, winAx, scene.cameraPosition.xyz,
+                         inst.diffuseColor.rgb, inst.patternColor.rgb, inst.emissiveColor.rgb, scene.ps1Config2.z, p8Fast, inst.patternColor.a);
     patBase = ws.base;
     emissiveRGB = ws.emk;
   } else if (patMode == 7u) {
-    emissiveRGB = emissiveRGB * (0.3 + 1.5 * patMask);
+    if (inst.patternParams.z > 1.5) {
+      // visual-polish #6: an AD SCREEN (designed loop, see adScreen) - the colour IS the light; the layer's glow factor
+      // (emissive / diffuse, set by the day-night glow walk) scales it.
+      let adAsp = select(1.6, clamp(length(winAx.u) / max(length(winAx.v), 1e-12), 0.3, 6.0), dot(winAx.v, winAx.v) > 1e-24);
+      let adC = adScreen(uv, gUvFw, adAsp, scene.ps1Config2.z);
+      patBase = adC;
+      let adE = inst.emissiveColor.rgb / max(inst.diffuseColor.rgb, vec3<f32>(0.05));
+      emissiveRGB = adC * max(adE.x, max(adE.y, adE.z)) * 0.9;
+    } else {
+      emissiveRGB = emissiveRGB * (0.3 + 1.5 * patMask);
+    }
   }`;
 
 const PATTERN_BLOCK_PLAIN = /* wgsl */ `
@@ -3550,8 +4571,14 @@ const PATTERN_BLOCK_PLAIN = /* wgsl */ `
   let patMaskU = 0.0;
   let winWL = vec4<f32>(0.0, 0.0, 0.0, 0.0);
   let gUvM = vec2<f32>(0.0, 0.0);
+  let p8Fast = scene.cascadeBias.z > 0.5;
+  let gUvFw = vec2<f32>(0.0, 0.0);
   var patBase = inst.diffuseColor.rgb;
   var emissiveRGB = inst.emissiveColor.rgb;
+  // CROWD PALETTE (flags2 bit 4, performance-plan P12): the per-vertex palette code tints the base + emissive.
+  let crowdK = crowdTint(u32(inst.normalMatrix[3].x), uv, inst.patternColor.xyz);
+  patBase = patBase * crowdK;
+  emissiveRGB = emissiveRGB * crowdK;
   var roughOverride = inst.roughness;`;
 
 // Base (no-shadow) fragment shaders: FULL keeps the pattern block; PLAIN strips it.

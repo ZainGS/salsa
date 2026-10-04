@@ -20,6 +20,7 @@
  */
 
 import type { ManagerContext } from './manager-context';
+import { unwrapDevice } from '../../renderer/core/gpu-device-handle';
 import { EventEmitter } from '../../renderer/util/event-emitter';
 import {
   ShellStorage,
@@ -746,7 +747,7 @@ export class ShellUIManager {
     // Match the editor's context usage (incl. COPY_DST) so handing the canvas
     // back doesn't leave the editor's compositor unable to copy → black canvas.
     context.configure({
-      device, format,
+      device: unwrapDevice(device), format,   // the editor's device is a HANDLE (proxy); configure brand-checks it
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
       alphaMode: 'premultiplied',
     });
@@ -775,7 +776,7 @@ export class ShellUIManager {
       this.renderer.start(); // idle cartridge animation
 
       // Load the Bungee web font, then re-rasterize the labels with it.
-      ensureShellFont().then(() => {
+      void ensureShellFont().then(() => {
         this.renderer?.invalidateText();
         this.rebuildAndRender();
       });
@@ -1567,6 +1568,7 @@ export class ShellUIManager {
         return;
       }
       if (e.ctrlKey || e.metaKey) {
+        if (Math.abs(e.deltaY) < 0.5) return;   // deltaY 0 (horizontal tilt / trackpad jitter) is not a zoom step
         this.adjustZoom(e.deltaY < 0 ? 1.1 : 1 / 1.1);
       } else {
         const d = (e.deltaY || e.deltaX);

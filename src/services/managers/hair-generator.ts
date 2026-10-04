@@ -16,6 +16,7 @@ import { VertGrid } from './vert-grid';
 // (src/world/curve-frame.ts) so the foliage `blade` primitive reuses the exact same math — one
 // implementation, not a copy. See foliage-quality.md §3.1.
 import { perpFrame, rotAxis } from '../../world/curve-frame';
+import { buildLockHair, HAIR_STYLE_PRESETS, HAIR_STYLE_LABELS, LOCK_STYLE_DEFAULTS } from './hair-locks';
 
 type V3 = [number, number, number];
 
@@ -81,7 +82,7 @@ export interface HairParams {
     chunkiness: number;      // 0..1 poly density (low = chunkier)
 
     // ── Card mode (alpha-card hair — the Elden-Ring/FF realism lean; see hair-generation.md §14) ──
-    hairMode: 'chunky' | 'cards';   // 'cards' = alpha-textured ribbon TAILS (cap/bangs stay solid at the root)
+    hairMode: 'chunky' | 'cards' | 'locks';   // 'cards' = alpha-textured ribbon TAILS (cap/bangs stay solid at the root) · 'locks' = the anime STYLE system (hair-locks.ts: big shaped solid locks; the fields below "Style system")
     cardWidth: number;       // ribbon width × the tube radius (card mode)
     cardsPerClump: number;   // crossed ribbons per tail → volume from any angle (card mode)
     cardSegments: number;    // length subdivisions per card (card mode)
@@ -89,6 +90,7 @@ export interface HairParams {
     alphaCutoff: number;     // strand solidity 0..1 — lower = wispier tips (strand texture)
     cardifyCap: boolean;     // card mode: build the cap ENTIRELY from layered hair cards (no solid dome — ER look); off = solid cap + card tails
     sheen: number;           // 0..1 anisotropic hair highlight (Kajiya-Kay sheen) intensity; 0 = off
+    sheenBand?: boolean;     // Cel / Cel-HD: draw the sheen as ONE crisp highlight band (the anime angel ring). Material only (no geometry change); absent = the soft sheen (saved hair)
     cardDetail: number;      // 0..1 card mode: MORE cards + per-card jitter (the "thousands of strands" breakup)
     volume: number;          // 0..1 float the cap off the skull for thickness
     capLayers: number;       // card mode: # of stacked, phase-shifted cap-card layers (more = fuller/denser cap, fills the translucent strand gaps)
@@ -123,6 +125,37 @@ export interface HairParams {
     facialHair?: 'none' | 'stubble' | 'mustache' | 'goatee' | 'full' | 'sideburns';
     beardLength?: number;                             // × ry — how far the beard tufts droop
     beardDensity?: number;                            // 0..1 — tuft coverage / density
+
+    // ── Style system (hairMode 'locks' only — docs/specs/hair-styles.md B–E; hair-locks.ts). All optional: absent →
+    //    LOCK_STYLE_DEFAULTS. Reused from above in locks mode: sideLock*, tail* (style / height / length / thickness /
+    //    spread / curl / taper), bunStyle / bunSize, hairlineFront, crownRound, colours, sheen, sheenBand. ──
+    hairStyle?: string;                               // the preset the style came from (informational; hairStyleNames())
+    fringeStyle?: 'straight' | 'swept' | 'parted' | 'choppy' | 'none';
+    fringeCount?: number;                             // bang locks across the forehead
+    fringeHeight?: number;                            // fringe tip line, × ry above the head centre (≈0.3 = above the eyes; lower covers them)
+    fringeSide?: number;                              // −1..1 sweep direction / part position
+    hairLength?: number;                              // back hem depth below the head centre (× ry): 0.3 nape · 0.75 bob · 3 mid-back
+    sideLength?: number;                              // side hem depth (× ry), same scale
+    lockCount?: number;                               // crown locks around the head (fewer = bigger, chunkier)
+    lockWidth?: number;                               // lock width multiplier (overlap)
+    lockThickness?: number;                           // lock depth (× its width)
+    lockVolume?: number;                              // how far the hair stands off the skull (× head radius)
+    lockTaper?: number;                               // 0 blunt cut (hime) · 1 sharp anime points
+    lockLayers?: number;                              // 1 | 2 overlapping layers (2 = layered tips)
+    lockFlick?: number;                               // −1 curl under (bob) · +1 flick out
+    lockJitter?: number;                              // 0..1 messiness: per-lock length / angle variation
+    lockSeed?: number;                                // per-character variation seed
+    tailLocks?: number;                               // locks per tail bundle
+    ahoge?: number;                                   // 0..2 antenna locks on the crown
+    gather?: boolean;                                 // pull the crown hair back into the tail / bun tie
+    // ── Style system, part 2 (2026-10-04): curls, spikes, volume, braids, drills (locks mode only; absent → off) ──
+    lockCurl?: number;                                // 0..1 wave / curl amplitude on the hanging crown, side and tail locks
+    lockCurlType?: 'wave' | 'spiral';                 // S-waves · spiral ringlets
+    lockCurlFreq?: number;                            // waves per head height (0.5..6, default 2)
+    lockSpike?: number;                               // 0..1 shonen spikes: the crown locks jut out from the skull instead of hanging
+    hairPoof?: number;                                // 0..1 curly volume: a big round mass (the locks stand off + bulge out)
+    tailForm?: 'bundle' | 'braid' | 'drill';          // how each tail is built: a bundle of locks · a 3-strand braid · a drill (ojou) curl
+    drillTurns?: number;                              // spiral turns of a drill tail (2..7, default 4)
 }
 
 /** Default = the reference-girl Twintails (cream → blue tips). */
@@ -147,8 +180,26 @@ export const DEFAULT_HAIR_PARAMS: HairParams = {
     facialHair: 'none', beardLength: 0.35, beardDensity: 0.6,
 };
 
+/** The anime hair style presets (hairMode 'locks'): bob, long-straight, side-swept, ponytail, twintails, short-messy,
+ *  bun, hime. docs/specs/hair-styles.md. */
+export function hairStyleNames(): string[] { return Object.keys(HAIR_STYLE_PRESETS); }
+/** [{ name, label }] for a style picker. */
+export function hairStyleList(): { name: string; label: string }[] { return hairStyleNames().map((name) => ({ name, label: HAIR_STYLE_LABELS[name] ?? name })); }
+/** Full HairParams for a style preset (DEFAULT_HAIR_PARAMS + the lock defaults + the preset), hairMode 'locks', the
+ *  highlight band on. `lockSeed` varies the per-lock jitter. Unknown name → null. */
+export function hairStylePreset(name: string, lockSeed = 0): HairParams | null {
+    const key = String(name ?? '').toLowerCase().trim().replace(/[\s_]+/g, '-');
+    const pre = HAIR_STYLE_PRESETS[key] ?? HAIR_STYLE_PRESETS[key === 'hime-cut' ? 'hime' : key === 'long' ? 'long-straight' : ''];
+    if (!pre) return null;
+    return {
+        ...DEFAULT_HAIR_PARAMS, ...LOCK_STYLE_DEFAULTS, frontDrape: 0, scalpLength: 0, bangCount: 0,
+        sheen: 0.45, sheenBand: true, gradient: false,
+        ...pre, hairMode: 'locks', hairStyle: key === 'hime-cut' ? 'hime' : key === 'long' ? 'long-straight' : key, preset: undefined, lockSeed,
+    };
+}
+
 // ── vec3 helpers ──
-const sub = (a: V3, b: V3): V3 => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const sub =(a: V3, b: V3): V3 => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
 const add = (a: V3, b: V3): V3 => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
 const scl = (a: V3, s: number): V3 => [a[0]*s, a[1]*s, a[2]*s];
 const cross = (a: V3, b: V3): V3 => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
@@ -802,8 +853,11 @@ function buildFrontDrape(ac: Accum, h: HeadFrame, p: HairParams, segs: number, r
             : [h.cx + sx * h.rx * 0.55, s[1] + h.ry * 0.15, h.cz + h.rz * 0.1];    // straight DOWN the front of the neck to the collarbone
         const C2: V3 = [s[0] * 0.4 + h.cx * 0.6, cY,                 anc.frontZAt(cY) + r0 * 0.8];  // curve IN + forward onto the chest
         const E:  V3 = [s[0] * 0.3 + h.cx * 0.7, eY,                 anc.frontZAt(eY) + r0 * 0.6];  // tip, hugging the lower-chest/waist
+        // Chunky: a WAVY drape needs more rings — at the default chunkiness the tube has 5 segments and a 2.5-wave S-curve
+        // sampled at t = k/5 lands on its zeros, so the Wave sliders did nothing (2026-10-04 panel audit). Unwaved = as before.
+        const dsegs = waveX > 0 || waveZ > 0 ? Math.max(segs, 14) : segs;
         if (p.hairMode === 'cards') buildTailCards(ac, A, C, E, r0, dp, Math.max(segs, Math.round(p.cardSegments)), C2, waveX, waveZ, waveFreq, 0);
-        else buildTail(ac, A, C, E, r0, dp, segs, ring, C2, waveX, waveZ, waveFreq, 0);
+        else buildTail(ac, A, C, E, r0, dp, dsegs, ring, C2, waveX, waveZ, waveFreq, 0);
         // Stray flyaway wisps: thin, jittered copies fanning out toward the TIP (share the root A with the main lock),
         // each its OWN spring chain (sways loose) + a touch more wave + a random phase so they don't sync.
         for (let k = 0; k < nStray; k++) {
@@ -817,7 +871,7 @@ function buildFrontDrape(ac: Accum, h: HeadFrame, p: HairParams, segs: number, r
             const swX = waveX * 1.4 + h.rx * 0.06, swZ = waveZ * 1.4;              // strays a touch wavier (+ a width baseline)
             const sph = jit(10) * Math.PI;                                         // random wave phase per stray
             if (p.hairMode === 'cards') buildTailCards(ac, A, jC, jE, sr, dp, Math.max(segs, Math.round(p.cardSegments)), jC2, swX, swZ, waveFreq, sph);
-            else buildTail(ac, A, jC, jE, sr, dp, segs, ring, jC2, swX, swZ, waveFreq, sph);
+            else buildTail(ac, A, jC, jE, sr, dp, Math.max(segs, 14), ring, jC2, swX, swZ, waveFreq, sph);   // strays always wave (see dsegs)
         }
     }
     ac.curTailId = -1;
@@ -1056,6 +1110,15 @@ export function generateHair(headIn: HeadFrame, partial?: Partial<HairParams>, b
     // phase-shifted so the translucent strand gaps fill in → full, not sparse). VOLUME = card puff, CAP LAYERS =
     // density; Cap Thickness is inert in this mode. Plain Cards / Chunky keep the full Cap-Thickness-driven solid cap.
     const cardedCap = p.hairMode === 'cards' && p.cardifyCap;
+    // STYLE SYSTEM (hairMode 'locks', hair-locks.ts): big shaped locks over a scalp shell — replaces every legacy
+    // component below (facial hair still applies). Same shrink-wrap / normals / spring-tail output as the other modes.
+    if (p.hairMode === 'locks') {
+        const nTails = buildLockHair(ac, head, p, bodyVerts);
+        buildFacialHair(ac, head, p);
+        if (bodyVerts && bodyVerts.length >= 12) fitHairToBody(ac, bodyVerts, 0.004, 0.1);
+        recomputeNormals(ac);
+        return finishHair(ac, nTails);
+    }
     // BUZZ cut = a thin uniform cap hugging the scalp; it suppresses every other length component below.
     if (p.buzzCut) {
         buildCap(ac, head, { ...p, capThickness: Math.min(p.capThickness, 0.03), backLength: 0, crownRound: Math.min(p.crownRound, 0.03) }, capLat, ring);
@@ -1098,7 +1161,11 @@ export function generateHair(headIn: HeadFrame, partial?: Partial<HairParams>, b
     if (bodyVerts && bodyVerts.length >= 12) fitHairToBody(ac, bodyVerts, 0.004, 0.1);
 
     recomputeNormals(ac);
+    return finishHair(ac, drapeFromTailId);
+}
 
+/** Pack the accumulator into the 12-float mesh + the spring-tail rig hints. */
+function finishHair(ac: Accum, drapeFromTailId: number): HairResult {
     const vcount = ac.count;
     const verts = new Float32Array(vcount * 12);
     for (let i = 0; i < vcount; i++) {

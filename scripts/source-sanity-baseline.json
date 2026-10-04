@@ -1,0 +1,3 @@
+{
+  "// note": "Known problems that check-source-sanity.mjs reports but does not fail on. Fix the file, then delete its entry. All 2026-10-04 entries were fixed the same day. See docs/dev/checks-and-ci.md."
+}

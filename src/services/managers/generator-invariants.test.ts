@@ -16,6 +16,8 @@ const CASES: { name: string; params: Partial<BodyParams> }[] = [
   { name: 'curvy',    params: { bust: 1.8, waist: 0.6, hipWidth: 1.6, hipFront: 1.5, buttSize: 1.8 } },
   { name: 'flat',     params: { bust: 1, waist: 1, hipWidth: 1, hipFront: 1, buttSize: 0, shoulderWidth: 1.6 } },
   { name: 'leggy',    params: { legLength: 2.2, torsoLength: 0.7 } },
+  { name: 'joint smoothness 0.5', params: { seamBlend: 0.5 } },                       // audit C1 — up to 4 influences
+  { name: 'joint smoothness 1 + curvy', params: { seamBlend: 1, bust: 1.8, hipWidth: 1.6, buttSize: 1.8 } },
 ];
 
 describe('§5.3 body generator invariants', () => {

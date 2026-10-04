@@ -86,6 +86,15 @@ export interface InstanceOverride {
    *  keeps the source mesh's textureIndex (the previous behaviour). Only meaningful for atlas-resident meshes
    *  (a textureLibraryId in the atlas); a standalone-textured source ignores it. */
   textureIndex?: number;
+  /** CROWD PALETTE (performance-plan P12): this copy's packed palette slots (renderer/3d/crowd-palette.ts) — written to
+   *  its patternColor.xyz after the source's material floats are copied. Only meaningful on a Material3D.crowdPalette source. */
+  crowdSlots?: [number, number, number];
+  /** P20 INSTANCED PROPS (world/prop-instancing.ts): a full column-major 3×3 post-multiplied onto the source's upper
+   *  3×3 (wins over rotationEulerDeg / scale), so a copy can carry the drape's local stretch / shear. */
+  affine?: number[];
+  /** P20: with `affine`, this copy's column-major 3×3 NORMAL matrix (post-multiplied onto the source's) instead of the
+   *  inverse-transpose of its model part — the baked drape tilts normals by the height gradient only. */
+  normal3?: number[];
 }
 
 /** Three orthonormal columns representing a mesh's local orientation in world space. */
@@ -107,6 +116,32 @@ export class ArrayGroup3D extends MeshGroup3D {
   arrayParams: ArrayParams;
   /** Per-instance transform overrides. Key = 0-based instance index (source not counted). */
   instanceOverrides?: Map<number, InstanceOverride>;
+  /** P20 INSTANCED PROPS: every copy's 3×3s in ONE typed array, 21 floats a copy — translation (3, = the offset),
+   *  column-major model 3×3 (9) and normal 3×3 (9), post-multiplied onto the source's. Used instead of per-copy
+   *  InstanceOverride.affine / normal3 objects (an override's `visible: false` still hides a copy). Never serialized. */
+  instanceXf?: Float32Array;
+  /** P15 (renderer/3d/gpu-scene.ts): RENDERER-PRIVATE — this group's GPU-driven record (owner, index), the frame
+   *  stamps of the last draw-list visit / CPU-visible verdict, and the slot / source / count seen there. */
+  public _gdOwner: unknown = null;
+  public _gdRec = -1;
+  public _gdSeen = -1;
+  public _gdVis = -1;
+  public _gdCand = -1;
+  public _gdFirst = -1;
+  public _gdSrc: unknown = null;
+  public _gdN = 0;
+  public _gdTaken = -1;
+  public _gdKA: unknown = undefined;
+  public _gdKS = -2;
+  public _gdKN = -1;
+  public _gdKSrc: unknown = null;
+  public _gdKD = NaN;
+  public _gdKB = NaN;
+  public _gdKBox: unknown = undefined;
+  /** P15 Phase B: unused for groups (no hierarchical cull); keeps the record bookkeeping uniform. */
+  public _gdVisit = -1;
+  /** P15 Phase B / C: the source's castsInstancedShadow the record was written with. */
+  public _gdKC = false;
 
   constructor(interactionService: InteractionService, sourceId: string, params: ArrayParams) {
     super(interactionService);

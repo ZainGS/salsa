@@ -80,6 +80,10 @@ export class RasterInteractionController {
       // author-bound keys like Escape→pause). No-op unless interactive, so editing shortcuts are untouched.
       if (this.r._uiKeyHandler && this.r._uiKeyHandler(event.key, event.shiftKey)) { event.preventDefault(); return; }
 
+      // Play mode (Round 8): no editor shortcut fires while playing — undo / duplicate / group / delete would mutate
+      // the scene under the running game (Play's own keys are read by its KeyboardInput).
+      if (this.r.interactionService.playActive) return;
+
       // Don't fire editor shortcuts (g/u below) while the user is typing in a HOST form field — this is a global
       // window listener, so without this a 'g'/'u' typed into a Frogmarks text input would group/ungroup the
       // selected shapes. (The host owns G/R/S transform + Play-movement keys; those it must gate itself.)
@@ -140,6 +144,7 @@ export class RasterInteractionController {
   }
 
   public handleWheel(event: WheelEvent) {
+    if (this.r.interactionService.playActive) return;   // Play: no 2D zoom
     if (event.ctrlKey) {
       // Prevent the default zoom behavior in the browser
       event.preventDefault(); 
@@ -191,9 +196,12 @@ export class RasterInteractionController {
     const isDoubleClick = (now - this.lastClickTime) < DOUBLE_CLICK_THRESHOLD;
     this.lastClickTime = now;
 
+    // Play mode (Round 8): no 2D pan / select; only a left click reaches the UI system's hook below.
+    if (this.r.interactionService.playActive && event.button !== 0) return;
+
     const rect = this.cacheRect();
 
-    // Middle mouse or Pan tool â†’ start panning
+    // Middle mouse or Pan tool → start panning
     if (event.button === 1 || this.r.interactionService.isPanToolSelected) {
       this.r.mode = { kind: 'panning', lastClient: [event.clientX, event.clientY], rect };
       event.preventDefault();
@@ -211,6 +219,8 @@ export class RasterInteractionController {
       const [uwx, uwy] = this.transformMouseCoordinatesToWorldSpace(event.offsetX, event.offsetY);
       if (this.r._uiPointerHandler.onDown(uwx, uwy, event.offsetX, event.offsetY)) { this.r.scheduleRender(); return; }
     }
+    // Play mode (Round 8): the click grabs pointer-lock for mouse-look — never a 2D select / drag / box.
+    if (this.r.interactionService.playActive) return;
 
     // During armature / weight paint mode, suppress 2D box-select entirely. Also suppress whenever a 3D camera
     // owns the view (free3D + the ortho creator modes): you select 3D meshes by click, not a 2D marquee, so a
@@ -246,7 +256,7 @@ export class RasterInteractionController {
     const [mouseX, mouseY] = [event.offsetX, event.offsetY];
     const [worldX, worldY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
 
-    // LINE ENDPOINT HANDLE â†’ set endpointDragging mode
+    // LINE ENDPOINT HANDLE → set endpointDragging mode
     if (this.r.interactionService.selectedNodes.size === 1) {
       const sel = Array.from(this.r.interactionService.selectedNodes)[0];
       if (sel instanceof Line) {
@@ -273,7 +283,7 @@ export class RasterInteractionController {
       }
     }
 
-    // ROTATION â†’ set rotating mode
+    // ROTATION → set rotating mode
     if (this.r.interactionService.selectedNodes.size === 1) {
       const shape = Array.from(this.r.interactionService.selectedNodes)[0] as Shape;
       if (isNearRotationHandle(shape, [worldX, worldY])) {
@@ -288,20 +298,20 @@ export class RasterInteractionController {
       }
     }
 
-    // SCALING â†’ set scaling mode
+    // SCALING → set scaling mode
     if (this.r.interactionService.selectedNodes.size === 1) {
       const shape = Array.from(this.r.interactionService.selectedNodes)[0] as Shape;
       const side = getScalingSide(shape, [worldX, worldY]);
       if (side) {
         const sx0 = shape.scaleX ?? 1;
         const sy0 = shape.scaleY ?? 1;
-        const baseW = shape.width;   // the groupâ€™s local width (before scale)
-        const baseH = shape.height;  // the groupâ€™s local height (before scale)
+        const baseW = shape.width;   // the group’s local width (before scale)
+        const baseH = shape.height;  // the group’s local height (before scale)
 
         const initial: ShapeDimensions & { baseW:number; baseH:number; scaleX:number; scaleY:number } = {
           x: shape.x,
           y: shape.y,
-          // effective starting world size along the groupâ€™s axes:
+          // effective starting world size along the group’s axes:
           width:  baseW * sx0,
           height: baseH * sy0,
           baseW, baseH,
@@ -545,7 +555,7 @@ export class RasterInteractionController {
       const y0 = new Float32Array(nodes.length);
       nodes.forEach((n,i) => { x0[i] = n.x; y0[i] = n.y; });
 
-      // Primaryâ€™s initial world position (used to compute delta)
+      // Primary’s initial world position (used to compute delta)
       const primaryX0 = (primary as Node).x;
       const primaryY0 = (primary as Node).y;
 
@@ -563,7 +573,7 @@ export class RasterInteractionController {
         data: {
           primary, rect, dragOffset, nodes, x0, y0, primaryX0, primaryY0,
           initialGroupChildPositions,
-          invParentAtDrag,  // <â€” pass it along
+          invParentAtDrag,  // <— pass it along
         }
       };
 
@@ -709,7 +719,7 @@ export class RasterInteractionController {
       const undoToken = this.r.interactionService.vectorUndo.begin(this.r.sceneGraph.root, nodes);
 
       for (const node of nodes) {
-          if (node instanceof Group && node.getType() != 'Sticky Note' && node.getType() != 'Speech Balloon') {
+          if (node instanceof Group && node.getType() !== 'Sticky Note' && node.getType() !== 'Speech Balloon') {
               // Children go to the GROUP'S PARENT (root for a top-level group — the classic behavior;
               // the enclosing group when ungrouping a NESTED one, so they stay inside it). Positions are
               // rebased through TRUE world coords, exact at any nesting depth (audit 2026-09-14 — the old
@@ -806,6 +816,9 @@ export class RasterInteractionController {
       const cur = this.r._uiPointerHandler.onMove(cwx, cwy, mouseX, mouseY);
       if (cur) this.r.canvas.style.cursor = cur;
     }
+    // Play mode (Round 8): nothing below applies (2D hover hit-tests, cursor updates, drags) — and it skips a
+    // getBoundingClientRect layout read per mouse move under pointer-lock.
+    if (this.r.interactionService.playActive && this.r.mode.kind === 'idle') return;
 
     // Track pointer UV for shader uniforms (cursor-reactive text effects)
     const rect = this.r.canvas.getBoundingClientRect();
@@ -1045,7 +1058,7 @@ export class RasterInteractionController {
               const tgtW = Math.max(minW, newW);
               const tgtH = Math.max(minH, newH);
 
-              if (this.r.mode.kind == 'scaling') {
+              if (this.r.mode.kind === 'scaling') {
                 const sx = (this.r.mode.data.initial.baseW > 0) ? (tgtW / this.r.mode.data.initial.baseW) : 1;
                 const sy = (this.r.mode.data.initial.baseH > 0) ? (tgtH / this.r.mode.data.initial.baseH) : 1;
 
@@ -1068,7 +1081,7 @@ export class RasterInteractionController {
               shape.scaleY = Math.max(minH, newH) / bH;
             }
 
-            if (this.r.mode.kind == 'scaling') {
+            if (this.r.mode.kind === 'scaling') {
               shape.x = this.r.mode.data.initial.x + dxCenter;
               shape.y = this.r.mode.data.initial.y + dyCenter;
             }
@@ -1289,9 +1302,9 @@ export class RasterInteractionController {
     });
   }
 
-  /** When scaling a Section or ungrouping â€” if the Section/Group moves, 
+  /** When scaling a Section or ungrouping — if the Section/Group moves, 
    * you sometimes need to move its children back into world space correctly. 
-   * Again: not just immediate children â€” all nested children recursively. */
+   * Again: not just immediate children — all nested children recursively. */
   moveChildrenByDeltaDeep(node: Node, dx: number, dy: number) {
     node.forEachDeep(n => {
         if (n instanceof Shape) {
@@ -1305,11 +1318,12 @@ export class RasterInteractionController {
   public handlePointerUp(event: PointerEvent) {
   // Track pointer state for shader uniforms
   this.r.interactionService.pointerDown = false;
+  if (this.r.interactionService.playActive && this.r.mode.kind === 'idle') return;   // Play (Round 8): nothing to finish
 
   this.r.renderListDirty = true;
   this.r.scheduleRender();
 
-  // â”€â”€ Endpoint drag finalization â”€â”€
+  // ── Endpoint drag finalization ──
   // Ephemera placement interaction finalization
   if (this.r.mode.kind === 'draggingPlacement' ||
       this.r.mode.kind === 'resizingPlacement' ||
@@ -1336,7 +1350,7 @@ export class RasterInteractionController {
         line.endBinding = { shapeId: snap.shapeId, portId: snap.portId };
       }
     } else {
-      // Not snapped â€” clear binding for that endpoint
+      // Not snapped — clear binding for that endpoint
       if (which === 'start') line.startBinding = null;
       else line.endBinding = null;
     }
@@ -1588,7 +1602,7 @@ maybeSection.addChild(shape);
           n instanceof Shape && n.getType?.() === "Section" && n !== shape
       ) as Section[];
   
-      // Find all sections that contain the shapeâ€™s center
+      // Find all sections that contain the shape’s center
       const shapeCenter = [shape.x, shape.y] as [number, number];
       const containingSections = candidates.filter(section =>
           pointInPolygon(shapeCenter, section.getWorldSpaceBoundingBoxPolygon())

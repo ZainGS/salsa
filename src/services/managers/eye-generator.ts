@@ -89,6 +89,13 @@ export interface EyeParams {
     underDeco: boolean;
     underDecoColor: string;
     underDecoCount: number;
+
+    // ── Upper-lid shadow (face kit, 2026-10-03) ──
+    /** 0..1 strength of the cel shadow the upper lid casts across the top of the sclera + iris — the anime cue that
+     *  makes the eye sit IN the face instead of on it. Optional: eyes saved before it existed have none (0). */
+    lidShadow?: number;
+    /** Colour of that shadow (default a cool slate, '#4b4f7a'). */
+    lidShadowColor?: string;
 }
 
 /** The default "anime girl" preset — round, cat-eyed lavender eyes, low-res (dollcore) by default. */
@@ -112,7 +119,21 @@ export function defaultEyeParams(): EyeParams {
         pixelResolution: 200,
         closed: false,
         underDeco: true, underDecoColor: '#9ad0e8', underDecoCount: 3,
+        lidShadow: 0.45, lidShadowColor: '#4b4f7a',
     };
+}
+
+/**
+ * The closed-eye (blink) frame for a set of OPEN eyes: the same eyes — placement, shape, lashes, under-eye deco,
+ * resolution — drawn closed. A procedural blink frame is re-derived from the active expression with this, so edits to
+ * the open eyes (e.g. the deco dots turned off) carry into the blink instead of a stale copy flashing old settings.
+ * Returns null when `blink` is already exactly that (nothing to re-render). Pure.
+ */
+export function blinkParamsFor(open: EyeParams, blink?: EyeParams | null): EyeParams | null {
+    const next: EyeParams = { ...structuredClone(open), closed: true };
+    // Gaze isn't drawn on a closed eye — keep the blink's own, so a look-around doesn't force a re-render.
+    if (blink) { next.gazeX = blink.gazeX; next.gazeY = blink.gazeY; }
+    return blink && JSON.stringify(next) === JSON.stringify(blink) ? null : next;
 }
 
 type Ctx2D = CanvasRenderingContext2D;
@@ -217,6 +238,23 @@ function drawEye(
         ctx.ellipse(irisCx, irisCy, irisR * p.pupilRadius, irisR * p.pupilRadius, 0, 0, Math.PI * 2);
         ctx.fillStyle = p.pupilColor;
         ctx.fill();
+
+        // Upper-lid shadow: a hard-edged band under the lid line, over the sclera AND the iris top (still inside the lid
+        // clip), drawn before the highlights so the catchlights stay bright. Deeper at the outer corner.
+        const ls = Math.max(0, Math.min(1, p.lidShadow ?? 0));
+        if (ls > 0) {
+            const d = hh * 0.55;
+            ctx.beginPath();
+            ctx.moveTo(innerX, innerY + d * 0.35);
+            ctx.bezierCurveTo(upCp1x, upCp1y + d, upCp2x, upCp2y + d * 1.05, outerX, outerY + d * 0.7);
+            ctx.lineTo(outerX + outerSign * hw, cy - hh * 3);
+            ctx.lineTo(innerX - outerSign * hw, cy - hh * 3);
+            ctx.closePath();
+            ctx.fillStyle = p.lidShadowColor || '#4b4f7a';
+            ctx.globalAlpha = 0.6 * ls;
+            ctx.fill();
+            ctx.globalAlpha = 1;
+        }
 
         for (const hgl of p.highlights) {
             const r = Math.max(1, hgl.radius * irisR);

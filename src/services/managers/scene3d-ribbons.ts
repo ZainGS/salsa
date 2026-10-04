@@ -476,7 +476,7 @@ export class Scene3DRibbons {
             }
             return hasActive;
         };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._updateCb);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._updateCb, 'ribbons');
     }
 
     /** Tear down the tick and drop all references (used on manager teardown). Safe to call more than once. */

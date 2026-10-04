@@ -18,6 +18,7 @@ import { cellLevelAt, makeElevation } from './elevation';
 import { inShotengai } from './shotengai';
 import { hash2, pointInPolygon } from './util';
 import { METAL_GALVANISED } from './palette';
+import { signPost } from './signals';
 
 type V3 = [number, number, number];
 type RGB = [number, number, number];
@@ -83,6 +84,9 @@ export function buildRoadSigns(graph: WorldGraph, keep?: ((region: number) => bo
         if (overWater(it.pos[0], it.pos[1]) || inShotengai(graph, it.pos[0], it.pos[1])) return;
         const roll = hash2(ii * 7.1, 3.3, (p.seed ^ 0x2b71) >>> 0);
         if (roll > 0.4) return;   // ~40% of junctions get a road sign
+        // A signalled 4-way cross has a signal pole on EVERY corner (one head per approach), so the "free" corner
+        // below is taken — the sign pole used to stand ~0.3 m from the signal pole. Signs go on the other junctions.
+        if (p.trafficLights && it.type === 'cross') return;
 
         const d0 = nrm2(it.arms[0]), pd: V2 = [-d0[1], d0[0]];
         // The FREE corner — signals take (+pW,−dW), vending (+d0,+pd), corner-props (+d0,−pd); this is (−d0,−pd).
@@ -90,26 +94,41 @@ export function buildRoadSigns(graph: WorldGraph, keep?: ((region: number) => bo
         const fx = it.pos[0] + (-d0[0] - pd[0]) * cOff, fz = it.pos[1] + (-d0[1] - pd[1]) * cOff;
         if (overWater(fx, fz)) return;
         const cy = gy + lift(fx, fz);                          // bake the slope into BOTH pole + face
-        const poleH = 0.16 * s, r = 0.006 * s;                 // ~2.4 m pole
-        pole.prism([fx, cy, fz], r, r, poleH, 6);
+        const poleH = 0.16 * s, r = 0.006 * s;                 // ~2.4 m to the plate's lower edge
         const face: V2 = [d0[0], d0[1]];                       // sign faces up the road toward oncoming traffic
+        // T3.3: the bevelled post runs up BEHIND the plate (was a stub ending at its lower edge); the plate sits proud
+        // of the post on a rimmed backing plate, strapped to it by two clamps.
+        signPost(pole, [fx, cy, fz], poleH + 0.03 * s, r);
+        const fW: V3 = [face[0], 0, face[1]], pW: V3 = [pd[0], 0, pd[1]], up: V3 = [0, 1, 0];
+        const pc = cy + poleH + 0.02 * s;                      // plate centre height
+        const at = (k: number): V3 => [fx + fW[0] * k * s, pc, fz + fW[2] * k * s];
+        for (const dy of [-0.011, 0.011]) {
+            pole.obox([fx + fW[0] * 0.0028 * s, pc + dy * s, fz + fW[2] * 0.0028 * s], pW, up, fW, r * 1.05, 0.0016 * s, 0.0036 * s);
+        }
 
         if (roll < 0.22) {
-            warnInst.push(warningInstanceTransform([fx, cy + poleH + 0.02 * s, fz], face, wpm));   // warning diamond (GARP)
+            // Warning diamond (GARP) on a rimmed diamond backing plate (a bevelled square turned 45°).
+            const dA: V3 = [(pW[0]) * Math.SQRT1_2, Math.SQRT1_2, (pW[2]) * Math.SQRT1_2];
+            const dB: V3 = [-pW[0] * Math.SQRT1_2, Math.SQRT1_2, -pW[2] * Math.SQRT1_2];
+            const half = WARNING_CANON_M * 0.5 * wpm * Math.SQRT1_2 + 0.0016 * s;
+            pole.bevelBox(at(0.0066), dA, dB, fW, half, half, 0.0006 * s, 0.0005 * s);
+            warnInst.push(warningInstanceTransform(at(0.0075), face, wpm));
         } else {
             const reg = REGULATORY[(hash2(ii * 3.9, 9.2, (p.seed ^ 0x77c3) >>> 0) * REGULATORY.length) | 0];
-            const c: V3 = [fx, cy + poleH + 0.02 * s, fz];
+            const hw = 0.028 * s, hh = 0.020 * s, t = Math.max(4e-4, hh * 0.22);   // signQuad's slab half-thickness
+            // Rimmed backing plate just behind the text slab (the rim shows as a galvanised border round the face).
+            pole.bevelBox(at(0.0066), pW, up, fW, hw + 0.0025 * s, hh + 0.0025 * s, 0.0006 * s, 0.0008 * s);
+            const c = at(0.0074 + t / s);
             textSigns.push({
                 label: reg.label,
                 layer: {
                     name: 'world:roadsign-reg' + idx, color: reg.color, y: gy, emissive: 0.4, singleSided: true,
-                    geometry: signQuad(c, pd, face, 0.028 * s, 0.020 * s),
+                    geometry: signQuad(c, pd, face, hw, hh),
                 },
             });
         }
         idx++;
     });
-
     const layers: LayoutPreviewLayer[] = [];
     if (!pole.empty) layers.push({
         name: 'world:roadsign-pole', color: POLE, y: gy, geometry: pole.geometry(), drape: 'baked',

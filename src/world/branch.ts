@@ -136,6 +136,21 @@ export interface BranchResult {
     radius: number;
     /** Deepest level reached. */
     depth: number;
+    /** Every swept limb's spine (bezier control points), in emission order — what {@link emitSprigCrown}
+     *  grows its twig sprays along. Cheap (one small record per limb, capped by `maxLimbs`). */
+    spines: BranchSpine[];
+}
+
+/** One swept limb, kept so a crown can hang leaves ALONG the wood rather than beside it. */
+export interface BranchSpine {
+    /** Quadratic bezier: base, control, end (the limb's own spine, gnarl + upBias included). */
+    a: V3; c: V3; e: V3;
+    depth: number;
+    length: number;
+    /** Base / tip radius of the tube. */
+    r0: number; r1: number;
+    /** True when this limb ended the recursion (it is one of `tips`). */
+    terminal: boolean;
 }
 
 export interface BranchPlacement { base: V3; axis?: V3; ref?: V3 }
@@ -171,7 +186,7 @@ function radialDir(tan: V3, ref: V3, bino: V3, a: number): V3 {
  */
 export function emitBranch(acc: Accum3D, spec: BranchSpec, at: BranchPlacement, rnd: () => number): BranchResult {
     const R = spec.seed !== undefined ? rngFor(Math.imul(spec.seed | 0, 0x9e3779b1)) : rnd;
-    const out: BranchResult = { limbs: 0, tips: [], height: at.base[1], radius: 0, depth: 0 };
+    const out: BranchResult = { limbs: 0, tips: [], height: at.base[1], radius: 0, depth: 0, spines: [] };
     const budget: LimbBudget = { left: Math.max(1, Math.round(spec.maxLimbs ?? MAX_LIMBS_PER_PLANT)), warned: false };
     const nStem = Math.max(1, Math.round(spec.stems));
     const axis0 = cfNorm(at.axis ?? [0, 1, 0]);
@@ -250,7 +265,9 @@ function emitLimb(
     }
 
     const tan = spine.tangent(1);
-    if (depth >= Math.max(0, Math.round(spec.levels))) {
+    const terminal = depth >= Math.max(0, Math.round(spec.levels));
+    out.spines.push({ a: A, c: C, e: E, depth, length: L, r0, r1, terminal });
+    if (terminal) {
         out.tips.push({ p: [E[0], E[1], E[2]], dir: tan, depth, radius: r1, length: L });
         return;
     }
@@ -444,6 +461,407 @@ export function emitCanopy(
         res.leaves += r.leaves;
         res.height = Math.max(res.height, r.top);
         res.radius = Math.max(res.radius, Math.hypot(c[0] - origin[0], c[2] - origin[2]) + r.reach);
+    }
+    return res;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §3.6b — the SPRIG CROWN: many small alpha-cut leaf cards grown ON fine twigs
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ★ WHY. `emitCanopy` hangs a leaf CLUSTER VOLUME beyond each twig tip — right for a bush seen from a
+// metre away, wrong for a street tree: at tree scale the volume is ~1.3 m across and its ~20 leaves (each
+// ~0.5 m) scatter through it, so what you see is a bare skeleton with a few huge leaves floating in the
+// air near it. A real crown is the opposite: thousands of SMALL leaves, every one on a twig, the twigs on
+// the branches. So this grows the last branch level on into fine TWIGLETS (2-tri tapered ribbons — you read
+// them as structure, not as tubes) and lines each twiglet with small leaf CARDS whose base sits ON it.
+// A card is 2 triangles cut in the shader (`leafCard`, the 5-leaf `leafCluster` silhouette), so the
+// same triangle budget that bought ~450 swept half-metre blades buys ~2 000 sprigs ≈ 10 000 leaves.
+//
+// The card normals are BENT toward the crown's outward direction (the standard foliage trick): lit as
+// one volume, the crown reads as a mass with a lit top and a shaded underside instead of as noise.
+
+/** Hard cap on sprig cards in ONE plant (2 tris each) — logged like every other budget (§7). */
+export const MAX_SPRIG_CARDS_PER_PLANT = 4200;
+
+export interface SprigCrownSpec {
+    /** Leaf-card edge (m). The shader cuts it to a sprig of ~5 leaves, the longest ≈ 0.85× this. */
+    cardSize: number;
+    /** ± fraction on `cardSize`. */
+    cardSizeVar: number;
+    /** Fine twiglets along each TERMINAL limb's leafy span (its last one continues the tip). */
+    twigsPerTip: number;
+    /** Twiglets along each limb ONE level up — fills the crown between the tips. */
+    twigsPerLimb: number;
+    /** Twiglet length (m). */
+    twigLength: number;
+    /** Twiglet base radius (m) — clamped to the carrying limb's own radius there. */
+    twigRadius: number;
+    /** Leaf cards along each twiglet (+1 at its end). */
+    cardsPerTwig: number;
+    /** Cards directly on a carrying limb, per metre of its leafy span — the wood is leafed, not bare. */
+    cardsPerMetre: number;
+    /** 0..1 how hard twiglets lean AWAY from the plant axis — fills the crown out past the skeleton. */
+    spread: number;
+    /** −1..1: twiglets climb toward the light (+) or weep (−, sakura). */
+    twigLift: number;
+    /** 0..1 how much cards face the SKY (layered, flat-topped sprays) vs outward from the crown. */
+    skyFacing: number;
+    /** Probability a terminal limb is left BARE (see-through gaps into the crown). */
+    gapChance: number;
+    /** Extra bare probability for interior limbs (grows with nearness to the plant's axis). */
+    innerGap: number;
+    /** Fraction of cards routed to the lighter new-growth `tip` accumulator (biased to the twig ends). */
+    tipFrac: number;
+    /** 0 near · 1 mid · 2 far — fewer, proportionally LARGER cards (coverage is kept, detail drops). */
+    lodLevel?: number;
+}
+
+export const DEFAULT_SPRIG_CROWN: SprigCrownSpec = {
+    cardSize: 0.16, cardSizeVar: 0.3, twigsPerTip: 6, twigsPerLimb: 4, twigLength: 0.6, twigRadius: 0.009, spread: 0.55,
+    cardsPerTwig: 8, cardsPerMetre: 10, twigLift: 0.25, skyFacing: 0.35, gapChance: 0.06, innerGap: 0.3, tipFrac: 0.32,
+};
+
+export interface SprigCrownResult { twigs: number; cards: number; height: number; radius: number }
+
+/**
+ * Grow a SPRIG CROWN on an emitted branch skeleton: twiglets into `wood`, leaf cards into `leaf` / `tip`.
+ * Carriers are the terminal limbs plus the level above them (never the trunk). Deterministic in `rnd`.
+ */
+export function emitSprigCrown(
+    wood: Accum3D, leaf: Accum3D, tip: Accum3D | null, branch: BranchResult, spec: SprigCrownSpec,
+    rnd: () => number, origin: V3 = [0, 0, 0], budget?: LeafBudget,
+): SprigCrownResult {
+    const res: SprigCrownResult = { twigs: 0, cards: 0, height: origin[1], radius: 0 };
+    const deepest = branch.depth;
+    const carriers = branch.spines.filter((sp) => sp.terminal || (sp.depth > 0 && sp.depth >= deepest - 1));
+    if (!carriers.length) return res;
+    const lod = clamp(Math.round(spec.lodLevel ?? 0), 0, LEAF_LOD_SCALE.length - 1);
+    const kN = LEAF_LOD_SCALE[lod], kS = 1 / Math.sqrt(kN);     // fewer cards per twig → larger, same coverage
+    // ★ The branch LOD already thinned the skeleton (splitCount × BRANCH_LOD_SCALE, so ~1/3 the tips at mid). A
+    // LOD variant still stands beside full ones on the same avenue, so it must keep a FULL crown: each surviving
+    // carrier grows proportionally more twiglets (≈ the lost tips back), and only the cards per twig thin out.
+    const kT = lod > 0 ? 0.8 / (BRANCH_LOD_SCALE[lod] * BRANCH_LOD_SCALE[lod]) : 1;
+
+    // Crown frame from the carriers' ends: centre + half-extents → the outward direction at any point.
+    let cx = 0, cy = 0, cz = 0;
+    for (const sp of carriers) { cx += sp.e[0]; cy += sp.e[1]; cz += sp.e[2]; }
+    cx /= carriers.length; cy /= carriers.length; cz /= carriers.length;
+    let rH = 1e-3, rV = 1e-3, maxR = 1e-4;
+    for (const sp of carriers) {
+        rH = Math.max(rH, Math.hypot(sp.e[0] - cx, sp.e[2] - cz));
+        rV = Math.max(rV, Math.abs(sp.e[1] - cy));
+        maxR = Math.max(maxR, Math.hypot(sp.e[0] - origin[0], sp.e[2] - origin[2]));
+    }
+    // A slight +Y lean: sky light is what a crown's normals should mostly catch.
+    const outward = (p: V3): V3 => cfNorm([(p[0] - cx) / rH, (p[1] - cy) / rV + 0.3, (p[2] - cz) / rH]);
+    const sky = clamp01(spec.skyFacing);
+    const S0 = Math.max(1e-3, spec.cardSize) * kS;
+
+    const bound = (p: V3): void => {
+        if (p[1] > res.height) res.height = p[1];
+        res.radius = Math.max(res.radius, Math.hypot(p[0] - origin[0], p[2] - origin[2]));
+    };
+    /** One sprig card whose STEM (uv ≈ 0.5, 0.12 — where the shader's five leaves meet) sits at `q`. */
+    const card = (q: V3, u0: V3, toTip: boolean): boolean => {
+        if (budget) {
+            if (budget.left <= 0) {
+                if (!budget.warned) { budget.warned = true; console.warn(`[branch] sprig card budget hit — extra leaves dropped (foliage-quality.md §7)`); }
+                return false;
+            }
+            budget.left--;
+        }
+        const S = S0 * (1 + (rnd() * 2 - 1) * spec.cardSizeVar);
+        const u = cfNorm(u0), o = outward(q);
+        const j = 0.9;
+        const f: V3 = [o[0] * (1 - sky) + (rnd() - 0.5) * j, o[1] * (1 - sky) + sky + (rnd() - 0.5) * j, o[2] * (1 - sky) + (rnd() - 0.5) * j];
+        let w = cfCross(u, f);
+        w = Math.hypot(w[0], w[1], w[2]) > 1e-4 ? cfNorm(w) : perpFrame(u).u;
+        let n = cfCross(w, u);
+        if (cfDot(n, o) < 0) n = [-n[0], -n[1], -n[2]];
+        const hw = S * 0.5;
+        const b: V3 = [q[0] - u[0] * S * 0.12, q[1] - u[1] * S * 0.12, q[2] - u[2] * S * 0.12];
+        const P = (sw: number, su: number): V3 => [b[0] + w[0] * hw * sw + u[0] * S * su, b[1] + w[1] * hw * sw + u[1] * S * su, b[2] + w[2] * hw * sw + u[2] * S * su];
+        const target = toTip && tip ? tip : leaf;
+        const vx = (p: V3, uu: number, vv: number): number => {
+            const ob = outward(p);
+            bound(p);
+            return target.vertex(p, cfNorm([n[0] * 0.45 + ob[0] * 0.55, n[1] * 0.45 + ob[1] * 0.55, n[2] * 0.45 + ob[2] * 0.55]), uu, vv);
+        };
+        const v0 = vx(P(-1, 0), 0, 0), v1 = vx(P(1, 0), 1, 0), v2 = vx(P(1, 1), 1, 1), v3 = vx(P(-1, 1), 0, 1);
+        target.triangle(v0, v1, v2); target.triangle(v0, v2, v3);
+        res.cards++;
+        return true;
+    };
+    /** A leaf direction leaving an axis `tan` sideways at azimuth `a` (leaves splay off their twig). */
+    const splay = (tan: V3, a: number, along: number): V3 => {
+        const { u, v } = perpFrame(tan);
+        const ca = Math.cos(a), sa = Math.sin(a);
+        return cfNorm([
+            tan[0] * along + (u[0] * ca + v[0] * sa) * 0.85 + (rnd() - 0.5) * 0.3,
+            tan[1] * along + (u[1] * ca + v[1] * sa) * 0.85 + 0.2 + (rnd() - 0.5) * 0.3,
+            tan[2] * along + (u[2] * ca + v[2] * sa) * 0.85 + (rnd() - 0.5) * 0.3,
+        ]);
+    };
+
+    let leafIdx = 0;
+    for (const sp of carriers) {
+        if (sp.terminal) {
+            const rel = clamp01(Math.hypot(sp.e[0] - origin[0], sp.e[2] - origin[2]) / maxR);
+            const inner = 1 - rel;
+            if (rnd() < spec.gapChance + spec.innerGap * inner * inner) continue;   // a bare twig: see-through gap
+        }
+        const spine = bezierSpine(sp.a, sp.c, sp.e);
+        const tStart = sp.terminal ? 0.3 : 0.5;
+        // ── Cards directly on the carrying limb's leafy span.
+        const nL = Math.round(spec.cardsPerMetre * sp.length * (1 - tStart) * kN * Math.sqrt(kT));
+        for (let i = 0; i < nL; i++) {
+            const t = tStart + (1 - tStart) * (i + rnd()) / nL;
+            if (!card(spine.at(t), splay(spine.tangent(t), (leafIdx++) * GOLDEN_ANGLE, 0.45), false)) return res;
+        }
+        // ── TWIGLETS along the span; on a terminal limb the last one continues the tip.
+        const nT = Math.max(1, Math.round((sp.terminal ? spec.twigsPerTip : spec.twigsPerLimb) * kT));
+        for (let j = 0; j < nT; j++) {
+            const last = sp.terminal && j === nT - 1;
+            const t = last ? 1 : tStart + (1 - tStart) * (j + 0.15 + rnd() * 0.7) / nT;
+            const p = spine.at(t), tan = spine.tangent(t);
+            const { u: pu, v: pv } = perpFrame(tan);
+            const az = (res.twigs + j) * GOLDEN_ANGLE + rnd() * 1.2;
+            const ca = Math.cos(az), sa = Math.sin(az), along = last ? 1.1 : 0.55;
+            // ★ SPREAD: twiglets lean away from the plant's axis — that is what fills the crown OUT to a
+            // silhouette instead of hugging the (narrow) branch skeleton.
+            const hx = p[0] - origin[0], hz = p[2] - origin[2], hl = Math.hypot(hx, hz) || 1;
+            const spr = spec.spread;
+            const dir = cfNorm([
+                tan[0] * along + (pu[0] * ca + pv[0] * sa) * 0.8 + (hx / hl) * spr,
+                tan[1] * along + (pu[1] * ca + pv[1] * sa) * 0.8 + spec.twigLift * 0.45,
+                tan[2] * along + (pu[2] * ca + pv[2] * sa) * 0.8 + (hz / hl) * spr,
+            ]);
+            const len = Math.max(0.02, spec.twigLength * (0.65 + rnd() * 0.7));
+            const end: V3 = [p[0] + dir[0] * len, p[1] + dir[1] * len, p[2] + dir[2] * len];
+            const tw = bezierSpine(p, [(p[0] + end[0]) / 2, (p[1] + end[1]) / 2, (p[2] + end[2]) / 2], end);
+            // ★ A twiglet is a tapered RIBBON (2 tris), not a tube (6): it is millimetres thick — sub-pixel at any
+            // city camera — so its whole job is to be the visible line the leaves hang from. Faced toward the
+            // crown's outside (where it is seen from); the material is double-sided.
+            const rootR = Math.max(1e-4, Math.min(spec.twigRadius, (sp.r0 + (sp.r1 - sp.r0) * t) * 0.8));
+            const o = outward(p);
+            let bw = cfCross(dir, o);
+            bw = Math.hypot(bw[0], bw[1], bw[2]) > 1e-4 ? cfNorm(bw) : perpFrame(dir).u;
+            const rn = cfNorm(cfCross(bw, dir));
+            const r1 = rootR * 0.35;
+            const w0 = wood.vertex([p[0] - bw[0] * rootR, p[1] - bw[1] * rootR, p[2] - bw[2] * rootR], rn, 0, 0);
+            const w1 = wood.vertex([p[0] + bw[0] * rootR, p[1] + bw[1] * rootR, p[2] + bw[2] * rootR], rn, 1, 0);
+            const w2 = wood.vertex([end[0] + bw[0] * r1, end[1] + bw[1] * r1, end[2] + bw[2] * r1], rn, 1, 1);
+            const w3 = wood.vertex([end[0] - bw[0] * r1, end[1] - bw[1] * r1, end[2] - bw[2] * r1], rn, 0, 1);
+            wood.triangle(w0, w1, w2); wood.triangle(w0, w2, w3);
+            res.twigs++;
+            bound(end);
+            const nC = Math.max(1, Math.round(spec.cardsPerTwig * kN));
+            for (let i = 0; i < nC; i++) {
+                const s = 0.2 + 0.8 * (i + 0.5) / nC;
+                if (!card(tw.at(s), splay(tw.tangent(s), (leafIdx++) * GOLDEN_ANGLE, 0.55), rnd() < spec.tipFrac * (0.4 + s))) return res;
+            }
+            // The terminal sprig continues the twig itself — every twig ENDS in leaves.
+            if (!card(end, splay(tw.tangent(1), rnd() * TAU, 2.2), rnd() < spec.tipFrac * 2)) return res;
+        }
+    }
+    return res;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §3.6c — the CLUMP CROWN: a few big leaf-CLUSTER cards per clump, SPHERISED normals
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ★ WHY (polish-round-3 T4). The sprig crown is right close up — every leaf on a twig — but at the city's
+// normal viewing distance its ~2 000 small cards read as busy noise with sky showing through. The look the
+// user is after (P5X Shibuya) is the painterly one: a crown is a handful of soft, dense CLUMPS at the branch
+// ends, each a volume that shades with a clean light/dark split. So:
+//   · clump CENTRES sit at the terminal twig ends (pushed a little past them), plus a few along the leafy
+//     span of the terminal limbs and — per species — along the level above (the fill that makes a dense
+//     camphor dome or a ginkgo's spur-shoot column);
+//   · each clump is ~10–14 LARGE cards cut by the shader's dense CLUMP silhouette (`leafClump`, a rosette
+//     of ~12 leaves around a solid core), marked by writing the card's u in [2, 3] instead of [0, 1]
+//     (every material flag bit is taken; a UV range costs nothing and needs no instance slot);
+//   · every vertex normal is BENT toward the clump's outward direction AND the crown's outward direction
+//     (the standard foliage "spherised normals" trick), so the whole crown lights as one soft ball-of-balls
+//     instead of as hundreds of randomly-facing planes.
+// Clump radius auto-fits to the spacing of the centres (median nearest-neighbour), so a branch-LOD variant
+// with a third of the tips grows proportionally bigger clumps and keeps the SAME coverage beside a full one.
+
+/** Hard cap on clump cards in ONE plant (2 tris each) — logged like every other budget (§7). */
+export const MAX_CLUMP_CARDS_PER_PLANT = 1800;
+
+export interface ClumpCrownSpec {
+    /** Target clump radius (m). The fitted radius (the crown's shell area shared between the clumps, so neighbours
+     *  OVERLAP and merge into one crown rather than reading as separate balls) stays within ×0.8 … ×1.8 of this. */
+    clumpRadius: number;
+    /** ± fraction of per-clump size variation. */
+    radiusVar: number;
+    /** Cluster cards per clump (the LOD thins this a little; bigger clumps keep coverage). */
+    cardsPerClump: number;
+    /** Card edge as a multiple of the clump radius. */
+    cardScale: number;
+    /** Vertical squash of each clump (0.6 = flat layered pads — sakura; 1.15 = a taller column — ginkgo). */
+    flatten: number;
+    /** Extra clumps along each terminal limb's leafy span (fills between the tips). */
+    alongLimb: number;
+    /** Clumps along each limb one level up — the density knob (camphor / ginkgo spurs). */
+    parentClumps: number;
+    /** Push each tip clump past its twig end, as a fraction of its radius. */
+    tipPush: number;
+    /** Normal weight toward the CLUMP's outward direction. */
+    clumpBend: number;
+    /** Normal weight toward the CROWN's outward direction (the rest is the card's own facing). */
+    crownBend: number;
+    /** +Y lean of the bent normal (a crown mostly catches sky light). */
+    skyLift: number;
+    /** 0..1 cards lie flatter (sky-facing layered pads) instead of tangent to the clump. */
+    skyFacing: number;
+    /** Probability a terminal limb carries no clump (holes into the crown). */
+    gapChance: number;
+    /** Extra skip probability for interior clumps (grows with nearness to the plant's axis). */
+    innerGap: number;
+    /** Fraction of cards routed to the lighter `tip` accumulator (biased to each clump's TOP). */
+    tipFrac: number;
+    /** 0 near · 1 mid · 2 far. */
+    lodLevel?: number;
+}
+
+export const DEFAULT_CLUMP_CROWN: ClumpCrownSpec = {
+    clumpRadius: 0.75, radiusVar: 0.22, cardsPerClump: 12, cardScale: 1.05, flatten: 0.85, alongLimb: 2, parentClumps: 1,
+    tipPush: 0.35, clumpBend: 0.4, crownBend: 0.5, skyLift: 0.25, skyFacing: 0.2, gapChance: 0.04, innerGap: 0.35, tipFrac: 0.3,
+};
+
+/** The CLUMP card marker: cluster cards carry u in [2, 3] (see the shader's `leafCardCoverage`). */
+export const CLUMP_CARD_U0 = 2;
+
+export interface ClumpCrownResult { clumps: number; cards: number; height: number; radius: number; clumpRadius: number }
+
+/**
+ * Grow a CLUMP CROWN on an emitted branch skeleton: cluster cards into `leaf` / `tip`. Clumps sit at the
+ * terminal twig ends (+ along the leafy spans); normals are spherised toward clump + crown. Deterministic in `rnd`.
+ */
+export function emitClumpCrown(
+    leaf: Accum3D, tip: Accum3D | null, branch: BranchResult, spec: ClumpCrownSpec,
+    rnd: () => number, origin: V3 = [0, 0, 0], budget?: LeafBudget,
+): ClumpCrownResult {
+    const res: ClumpCrownResult = { clumps: 0, cards: 0, height: origin[1], radius: 0, clumpRadius: 0 };
+    const deepest = branch.depth;
+    const terminals = branch.spines.filter((sp) => sp.terminal && sp.depth > 0);
+    const parents = spec.parentClumps > 0 ? branch.spines.filter((sp) => !sp.terminal && sp.depth > 0 && sp.depth >= deepest - 1) : [];
+    if (!terminals.length) return res;
+    const lod = clamp(Math.round(spec.lodLevel ?? 0), 0, LEAF_LOD_SCALE.length - 1);
+
+    // ── 1. Clump centres. `inner` (0 shell … 1 core) thins the unseen interior. ★ Measured in 3D against the
+    // twig-end ellipsoid, NOT as distance from the plant's axis: the top-centre of a crown is on the axis but in
+    // full view, and skipping it there left bare limb ends poking out of the crown's crest.
+    let ex = 0, ey = 0, ez = 0;
+    for (const sp of terminals) { ex += sp.e[0]; ey += sp.e[1]; ez += sp.e[2]; }
+    ex /= terminals.length; ey /= terminals.length; ez /= terminals.length;
+    let eH = 1e-3, eV = 1e-3;
+    for (const sp of terminals) { eH = Math.max(eH, Math.hypot(sp.e[0] - ex, sp.e[2] - ez)); eV = Math.max(eV, Math.abs(sp.e[1] - ey)); }
+    const centres: { c: V3; k: number }[] = [];
+    const push = (c: V3, k: number, skipBias: number): void => {
+        const rel = clamp01(Math.hypot((c[0] - ex) / eH, (c[1] - ey) / eV, (c[2] - ez) / eH));
+        const inner = 1 - rel;
+        if (rnd() < spec.gapChance * skipBias + spec.innerGap * inner * inner * skipBias) return;
+        centres.push({ c, k: k * (0.8 + 0.2 * rel) });
+    };
+    const tipShift = spec.clumpRadius * spec.tipPush;
+    // ★ A branch-LOD variant has ~BRANCH_LOD_SCALE² the tips but stands beside full ones on the same avenue, so
+    // each surviving limb carries proportionally more fill clumps (the sprig crown's `kT` rule).
+    const kFill = lod > 0 ? 0.6 / (BRANCH_LOD_SCALE[lod] * BRANCH_LOD_SCALE[lod]) : 1;
+    for (const sp of terminals) {
+        const spine = bezierSpine(sp.a, sp.c, sp.e);
+        const d = spine.tangent(1);
+        push([sp.e[0] + d[0] * tipShift, sp.e[1] + d[1] * tipShift, sp.e[2] + d[2] * tipShift], 1, 1);
+        const nA = Math.round(spec.alongLimb * kFill);
+        for (let j = 0; j < nA; j++) push(spine.at(0.45 + 0.4 * (j + 0.5) / nA + (rnd() - 0.5) * 0.1), 0.85, 1.3);
+    }
+    for (const sp of parents) {
+        const spine = bezierSpine(sp.a, sp.c, sp.e);
+        const nP = Math.round(spec.parentClumps * kFill);
+        for (let j = 0; j < nP; j++) push(spine.at(0.55 + 0.4 * (j + 0.5) / nP), 0.8, 1.6);
+    }
+    if (!centres.length) return res;
+
+    // ── 2. Crown frame (centre + half-extents) → the crown's outward direction at any point.
+    let cx = 0, cy = 0, cz = 0;
+    for (const { c } of centres) { cx += c[0]; cy += c[1]; cz += c[2]; }
+    cx /= centres.length; cy /= centres.length; cz /= centres.length;
+    let rH = 1e-3, rV = 1e-3;
+    for (const { c } of centres) { rH = Math.max(rH, Math.hypot(c[0] - cx, c[2] - cz)); rV = Math.max(rV, Math.abs(c[1] - cy)); }
+
+    // ── 3. Fit the clump radius to COVERAGE: the crown's shell area (an ellipsoid through the centres,
+    // Knud Thomsen's approximation) shared between the clumps. A branch-LOD variant with fewer clumps on the
+    // same-sized crown gets proportionally bigger ones, so it keeps the same coverage beside a full one.
+    // (Nearest-neighbour spacing was tried first: the fill clumps along one limb sit close together, so it pinned
+    // every crown to the lower clamp and the LOD variants went patchy.)
+    const pp = 1.6, ah = Math.max(rH, 0.2), av = Math.max(rV, 0.2);
+    const shell = 4 * Math.PI * Math.pow((Math.pow(ah * ah, pp) + 2 * Math.pow(ah * av, pp)) / 3, 1 / pp);
+    const R0 = clamp(1.1 * Math.sqrt(shell / centres.length), spec.clumpRadius * 0.8, spec.clumpRadius * 1.8);
+    res.clumpRadius = R0;
+    rH += R0; rV += R0 * spec.flatten;
+    const crownOut = (p: V3): V3 => cfNorm([(p[0] - cx) / rH, (p[1] - cy) / rV, (p[2] - cz) / rH]);
+
+    const kC = Math.max(0, Math.min(1, spec.clumpBend)), kW = Math.max(0, Math.min(1 - kC, spec.crownBend)), kN = 1 - kC - kW;
+    const sky = clamp01(spec.skyFacing);
+    const flat = clamp(spec.flatten, 0.3, 1.6);
+    // Bigger clumps at LOD already keep coverage; the per-clump card count only thins a touch.
+    const nCards = Math.max(4, Math.round(spec.cardsPerClump * (lod === 0 ? 1 : lod === 1 ? 0.85 : 0.7)));
+
+    const bound = (p: V3): void => {
+        if (p[1] > res.height) res.height = p[1];
+        res.radius = Math.max(res.radius, Math.hypot(p[0] - origin[0], p[2] - origin[2]));
+    };
+
+    // ── 4. Cards. Directions on a jittered golden spiral per clump — an EVEN shell (clean) rather than random
+    // clusters of overlapping cards with holes between them (noisy).
+    for (let ci = 0; ci < centres.length; ci++) {
+        const { c, k } = centres[ci];
+        const r = R0 * k * (1 + (rnd() * 2 - 1) * spec.radiusVar);
+        const spin = rnd() * TAU;
+        res.clumps++;
+        for (let i = 0; i < nCards; i++) {
+            if (budget) {
+                if (budget.left <= 0) {
+                    if (!budget.warned) { budget.warned = true; console.warn(`[branch] clump card budget hit — extra clumps dropped (foliage-quality.md §7)`); }
+                    return res;
+                }
+                budget.left--;
+            }
+            const yy = 1 - 2 * (i + 0.5) / nCards;
+            const rr = Math.sqrt(Math.max(0, 1 - yy * yy));
+            const th = spin + i * GOLDEN_ANGLE + (rnd() - 0.5) * 0.5;
+            const d: V3 = cfNorm([rr * Math.cos(th), yy + (rnd() - 0.5) * 0.25, rr * Math.sin(th)]);
+            const depth = r * (0.3 + 0.38 * rnd());
+            const q: V3 = [c[0] + d[0] * depth, c[1] + d[1] * depth * flat, c[2] + d[2] * depth];
+            // Card facing: tangent to the clump (faces along d), leaning to the sky by `skyFacing`, a little jitter.
+            const f = cfNorm([d[0] * (1 - sky) + (rnd() - 0.5) * 0.35, d[1] * (1 - sky) + sky + (rnd() - 0.5) * 0.35, d[2] * (1 - sky) + (rnd() - 0.5) * 0.35]);
+            const { u: fu, v: fv } = perpFrame(f);
+            const roll = rnd() * TAU, cr = Math.cos(roll), sr = Math.sin(roll);
+            const ax: V3 = [fu[0] * cr + fv[0] * sr, fu[1] * cr + fv[1] * sr, fu[2] * cr + fv[2] * sr];
+            const ay: V3 = cfCross(f, ax);
+            const hs = 0.5 * r * spec.cardScale * (0.85 + rnd() * 0.3);
+            const top = (tip && rnd() < spec.tipFrac * (0.55 + 0.9 * Math.max(0, d[1]))) ? tip : leaf;
+            const vx = (sx: number, sy: number, uu: number, vv: number): number => {
+                const p: V3 = [q[0] + (ax[0] * sx + ay[0] * sy) * hs, q[1] + (ax[1] * sx + ay[1] * sy) * hs, q[2] + (ax[2] * sx + ay[2] * sy) * hs];
+                bound(p);
+                // ★ SPHERISED normal: clump-outward + crown-outward + a sliver of the card's own facing + sky.
+                const oc = cfNorm([p[0] - c[0], (p[1] - c[1]) / flat, p[2] - c[2]]);
+                const ow = crownOut(p);
+                const fn = cfDot(f, oc) < 0 ? [-f[0], -f[1], -f[2]] : f;
+                return top.vertex(p, cfNorm([
+                    oc[0] * kC + ow[0] * kW + fn[0] * kN,
+                    oc[1] * kC + ow[1] * kW + fn[1] * kN + spec.skyLift,
+                    oc[2] * kC + ow[2] * kW + fn[2] * kN,
+                ]), uu, vv);
+            };
+            const v0 = vx(-1, -1, CLUMP_CARD_U0, 0), v1 = vx(1, -1, CLUMP_CARD_U0 + 1, 0);
+            const v2 = vx(1, 1, CLUMP_CARD_U0 + 1, 1), v3 = vx(-1, 1, CLUMP_CARD_U0, 1);
+            top.triangle(v0, v1, v2); top.triangle(v0, v2, v3);
+            res.cards++;
+        }
     }
     return res;
 }

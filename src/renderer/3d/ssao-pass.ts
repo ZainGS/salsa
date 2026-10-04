@@ -15,6 +15,7 @@
  * Spec: docs/specs/ssao.md.
  */
 
+import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { SSAO_AO_SHADER, SSAO_BLUR_SHADER, SSAO_DEBUG_SHADER } from './shaders/ssao-shaders';
 
 export interface SSAOConfig {
@@ -69,9 +70,10 @@ export class SSAOPass {
   private readonly _aoBGL: GPUBindGroupLayout;
   private readonly _blurBGL: GPUBindGroupLayout;
   private readonly _debugBGL: GPUBindGroupLayout;
-  private readonly _aoPipeline: GPURenderPipeline;
-  private readonly _blurPipeline: GPURenderPipeline;
-  private readonly _debugPipeline: GPURenderPipeline;
+  // P2: non-blocking cache handles. While compiling, the AO passes only CLEAR to white (= no occlusion).
+  private readonly _aoPipeline: PipelineHandle<GPURenderPipeline>;
+  private readonly _blurPipeline: PipelineHandle<GPURenderPipeline>;
+  private readonly _debugPipeline: PipelineHandle<GPURenderPipeline>;
 
   // Bind groups (rebuilt on resize, since the texture views change)
   private _aoBG: GPUBindGroup | null = null;
@@ -97,9 +99,10 @@ export class SSAOPass {
     this._blurBGL  = device.createBindGroupLayout({ label: 'SSAOBlurBGL',  entries: [uni(0), texF(1), texUF(2), samp(3)] });
     this._debugBGL = device.createBindGroupLayout({ label: 'SSAODebugBGL', entries: [texF(0), samp(1)] });
 
-    const mk = (code: string, label: string, bgl: GPUBindGroupLayout, format: GPUTextureFormat): GPURenderPipeline => {
+    const cache = GPUPipelineCache.for(device);
+    const mk = (code: string, label: string, bgl: GPUBindGroupLayout, format: GPUTextureFormat): PipelineHandle<GPURenderPipeline> => {
       const mod = device.createShaderModule({ code, label });
-      return device.createRenderPipeline({
+      return cache.render({
         label,
         layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
         vertex:   { module: mod, entryPoint: 'vs_main' },
@@ -114,7 +117,8 @@ export class SSAOPass {
     // must match that pass's colour (swap) + depth (depth24plus-stencil8) attachments. depthCompare 'always'
     // + no write → it overwrites the scene regardless of depth, purely for verification.
     const dbgMod = device.createShaderModule({ code: SSAO_DEBUG_SHADER, label: 'SSAODebug' });
-    this._debugPipeline = device.createRenderPipeline({
+    void this._aoPipeline.warm(PIPELINE_PRIORITY.DOCUMENT); void this._blurPipeline.warm(PIPELINE_PRIORITY.DOCUMENT);
+    this._debugPipeline = cache.render({
       label: 'SSAODebugPipeline',
       layout: device.createPipelineLayout({ bindGroupLayouts: [this._debugBGL] }),
       vertex:   { module: dbgMod, entryPoint: 'vs_main' },
@@ -228,16 +232,21 @@ export class SSAOPass {
         { binding: 1, resource: this._sampler },
       ]});
     }
-    pass.setPipeline(this._debugPipeline);
+    const dbg = this._debugPipeline.get();
+    if (!dbg) return;
+    pass.setPipeline(dbg);
     pass.setBindGroup(0, this._debugBG);
     pass.draw(3);
   }
 
-  private _runFull(encoder: GPUCommandEncoder, pipeline: GPURenderPipeline, bg: GPUBindGroup, dst: GPUTextureView, label: string): void {
+  private _runFull(encoder: GPUCommandEncoder, handle: PipelineHandle<GPURenderPipeline>, bg: GPUBindGroup, dst: GPUTextureView, label: string): void {
     const pass = encoder.beginRenderPass({ label, colorAttachments: [{ view: dst, loadOp: 'clear', clearValue: { r: 1, g: 1, b: 1, a: 1 }, storeOp: 'store' }] });
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bg);
-    pass.draw(3);
+    const pipeline = handle.get();
+    if (pipeline) {   // P2: pending → the clear (white = unoccluded) is the result
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.draw(3);
+    }
     pass.end();
   }
 

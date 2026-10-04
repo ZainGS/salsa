@@ -31,7 +31,7 @@ export interface BuildingScaleInfo { scale: number; metersPerUnit: number; realH
 
 const cap = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
 
-const COLOR_KEYS = ['baseColor', 'trimColor', 'roofColor', 'glassColor', 'accentColor', 'signColor', 'storefrontColor', 'awningColor', 'doorColor', 'doorFrameColor', 'doorHandleColor', 'julietColor', 'windowTrimColor'] as const;
+const COLOR_KEYS = ['baseColor', 'trimColor', 'roofColor', 'glassColor', 'accentColor', 'signColor', 'signColor2', 'signColor3', 'storefrontColor', 'awningColor', 'doorColor', 'doorFrameColor', 'doorHandleColor', 'julietColor', 'windowTrimColor'] as const;
 
 /** Coerce any host colour format → a [0..1] RGB triple: [0..1] array, [0..255] array, {r,g,b}, or "#rrggbb"/"#rgb".
  *  The generator/shader expect 0..1 linear-ish RGB; this makes the API robust to whatever a host picker emits. */

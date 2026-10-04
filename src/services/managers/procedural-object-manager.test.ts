@@ -182,10 +182,10 @@ describe('generic dispatch surface (createFromParams + base setParams)', () => {
     // base, so a host can drive any creator by id without knowing its concrete manager type.
     it('createFromParams places an object from an untyped params bag and returns its id', () => {
         const c = scene(); const mgr = new VendingManager(c.s);
-        const id = mgr.createFromParams({ brand: 2, productCols: 3 } as unknown);
+        const id = mgr.createFromParams({ brand: 2, cansPerShelf: 3 } as unknown);
         expect(mgr.isVending(id)).toBe(true);
         expect(mgr.getParams(id)!.brand).toBe(2);
-        expect(mgr.getParams(id)!.productCols).toBe(3);
+        expect(mgr.getParams(id)!.cansPerShelf).toBe(3);
         expect(c.fake.roots[0].id).toBe(id);
     });
 
@@ -193,8 +193,8 @@ describe('generic dispatch surface (createFromParams + base setParams)', () => {
         const c = scene(); const mgr = new VendingManager(c.s);
         const id = mgr.createFromParams({ brand: 0 } as unknown);
         const removedBefore = c.fake.removed.length;
-        expect(mgr.setParams(id, { productRows: 4 })).toBe(true);
-        expect(mgr.getParams(id)!.productRows).toBe(4);
+        expect(mgr.setParams(id, { shelves: 4 })).toBe(true);
+        expect(mgr.getParams(id)!.shelves).toBe(4);
         expect(mgr.getParams(id)!.brand).toBe(0);                      // untouched keys survive the merge
         expect(c.fake.removed.length).toBeGreaterThan(removedBefore);  // regenerated in place
         expect(mgr.setParams('missing', { brand: 1 })).toBe(false);
@@ -229,13 +229,13 @@ describe('VendingManager — the 2nd procedural-creation member rides the same b
         expect(mgr.isVending(id)).toBe(true);
         expect((fake.roots[0].worldParams as { kind: string }).kind).toBe('vending');
         const removedBefore = fake.removed.length;
-        expect(mgr.setParams(id, { productCols: 3 })).toBe(true);
-        expect(mgr.getParams(id)!.productCols).toBe(3);
+        expect(mgr.setParams(id, { cansPerShelf: 3 })).toBe(true);
+        expect(mgr.getParams(id)!.cansPerShelf).toBe(3);
         expect(fake.removed.length).toBeGreaterThan(removedBefore);   // old child group swapped
     });
 
     it('params round-trip through a save marker into a fresh manager', () => {
-        const { id } = mgr.create({ brand: 2, productRows: 3 }, { z: 6 });
+        const { id } = mgr.create({ brand: 2, shelves: 3 }, { z: 6 });
         mgr.setScale(id, 0.2);
         const marker = fake.roots[0].worldParams;
         const c2 = scene(); const mgr2 = new VendingManager(c2.s);
@@ -243,7 +243,7 @@ describe('VendingManager — the 2nd procedural-creation member rides the same b
         expect(mgr2.restoreFromSave()).toBe(1);
         const rid = c2.fake.roots[0].id;
         expect(mgr2.getParams(rid)!.brand).toBe(2);
-        expect(mgr2.getParams(rid)!.productRows).toBe(3);
+        expect(mgr2.getParams(rid)!.shelves).toBe(3);
         expect(mgr2.getTransform(rid)!.z).toBe(6);
     });
 

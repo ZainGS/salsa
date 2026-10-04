@@ -9,7 +9,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { cellLevelAt, terraceStep, streetBandHalf } from './elevation';
-import { buildTerraces } from './terraces';
+import { buildTerraces, STAIR } from './terraces';
+import { cityMetresPerUnit } from './types';
 import { generateCityLayout } from './layout';
 import type { WorldGraph } from './types';
 
@@ -86,20 +87,22 @@ describe('terrace steps never cut a carriageway', () => {
 });
 
 describe('the staircase lands on the pavement, not the road and not under the terrace', () => {
-  it('a flight is no longer than the pavement ring it stands on', () => {
-    // The flight projects OUTWARD from the wall at the lot line. Inset into the terrace instead and the
-    // raised block's ground polygon covers it; centred on the boundary and half of it hangs over the
-    // carriageway. Outward only works while the run fits in the pavement — and the margin is thin (~8%),
-    // so a change to streetWidth, the tread run, or the terrace step can silently push it into the road.
+  it('a flight fits ACROSS the pavement ring it stands on', () => {
+    // A real ~13-riser flight is ~3.7 m long — far longer than the ~2.6 m pavement is wide — so it runs
+    // ALONG the wall (a Japanese hillside stair) and only its WIDTH (+ side wall) has to fit across the
+    // pavement, leaving room to walk past. Inset into the terrace, the raised block's ground would cover it;
+    // wider than the pavement, it would stand in the carriageway.
     for (const seed of [1, 3, 7]) {
       const g = grid(seed);
-      const s = g.radius / 10;
-      const carriagewayHalf = Math.max(g.params.streetWidth, g.params.arterialWidth ?? 0) * 0.5;
+      const mpu = cityMetresPerUnit(g.radius);
+      const carriagewayHalf = g.params.streetWidth * 0.5;
       const pavement = streetBandHalf(g.params) - carriagewayHalf;
-      const nSteps = Math.max(2, Math.round(terraceStep(g.params) / (0.05 * s)));
-      const flight = nSteps * 0.038 * s;
-      expect(flight, `seed ${seed}: flight ${flight.toFixed(4)} overhangs a ${pavement.toFixed(4)} pavement`)
-        .toBeLessThanOrEqual(pavement);
+      const width = (STAIR.widthM + 0.12) / mpu;              // flight + stringer wall
+      expect(width, `seed ${seed}: stair ${width.toFixed(4)} is wider than a ${pavement.toFixed(4)} pavement`)
+        .toBeLessThanOrEqual(pavement * 0.6);
+      // And a real riser: ~18 cm, so a one-level step takes a dozen-plus treads (not three giant ones).
+      const n = Math.round(terraceStep(g.params) / (STAIR.riseM / mpu));
+      expect(n).toBeGreaterThanOrEqual(10);
     }
   });
 

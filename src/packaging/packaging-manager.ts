@@ -238,7 +238,9 @@ export interface PackagingHost extends BoxNodeHost {
  *  engine imports. The host's theme picker offers: 'gradient' (the studio default), 'wavy' (the
  *  signature animated bg), 'solid', 'checkers', 'dim', 'none'. */
 export interface StageBackgroundOpts {
-  mode: 'wavy' | 'solid' | 'gradient' | 'checkers' | 'dim' | 'none';
+  /** ('sky' = the engine's view-direction sky dome, visual-polish #9 — a city backdrop; without its `sky` block it
+   *  draws as the color1 → color2 gradient, so a stage never needs it.) */
+  mode: 'wavy' | 'solid' | 'gradient' | 'checkers' | 'dim' | 'none' | 'sky';
   /** Primary colour [r,g,b,a] — background / top of gradient / wave colour 1. */
   color1?: [number, number, number, number];
   /** Secondary colour [r,g,b,a] — stripe / bottom of gradient / wave colour 2. */

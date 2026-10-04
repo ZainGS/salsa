@@ -1,6 +1,11 @@
 # Procedural Ground — Material + Scatter System
 
-**Status:** 📋 Spec (2026-07-24). NOT built. Reference: Pokémon Legends Z-A plaza/park/street ground.
+**Status (2026-10-04): P1–P6 BUILT** (P1–P5 2026-07-24, §11 P6 material library 2026-07-25; see the phase sections
+below and [../ui/ground.md](../ui/ground.md)). (A) material: `src/world/ground-surfaces.ts` + WGSL ground modes 0..21, used
+by the city by default (`ground: { surface }` layers); masks: `src/world/ground-masks.ts`; (B) scatter:
+`src/world/ground-scatter.ts`, `sm.scatterOnGround3D` (standalone, opt-in; not used by the city). P8 ground relief LOD
+`Renderer3D.groundReliefLod` is built, default OFF. **Not built:** transitions / blend masks / border strips, P7 biome /
+seasonal params in the world composer, scatter in the city LOD. *(Original header:)* 📋 Spec (2026-07-24). NOT built. Reference: Pokémon Legends Z-A plaza/park/street ground.
 **Sibling specs:** [world-generation.md](world-generation.md) (the composer pipeline this plugs into),
 [foliage-generator.md](foliage-generator.md) (the card/clump vegetation this scatters),
 [instancing-blocks.md](instancing-blocks.md) (how scatter draws cheaply), [city-detail.md](city-detail.md)
@@ -71,6 +76,28 @@ regenerates every map from that. Persist it in the world graph like building/fol
 per plaza, not megabytes of texture.
 
 ---
+
+### 2a. The metric scale is computed per MESH, not per pixel (fix 2026-09-29)
+
+Every tiler works in metric coordinates, `p = uv × (world units per uv) × (metres per world unit)`. The middle term
+used to come from `gr_uvMetres`, a **per-pixel** solve from screen-space derivatives (`dpdx`/`dpdy` of world
+position and uv). Up close, neighbouring pixels differ by ~1e-4 units while the values are ~1–100 (the city's
+ground uv is worldXZ × 0.5), so f32 rounding left the derivatives with 1–10 % noise. Multiplied by the absolute uv,
+that moved `p` by centimetres per pixel, and the millimetre grout rendered as **speckled noise that shimmered, worse
+when zoomed in**.
+
+Now:
+- `src/renderer/3d/ground-uv-scale.ts` `groundUvWorldScale(geometry, model)` computes the scale **once per mesh**:
+  a uv-area-weighted mean of |M·∂P/∂u|, |M·∂P/∂v| over up to 64 triangles. It's exact for planes and city ground.
+- `Renderer3D._writeGroundUvScale` writes it into the untextured ground mesh's `uvTransform.xy`, with the marker
+  `uvTransform.z = -12345`, at every slot write: full, array-group source, and the transform/material fast path. So
+  it stays right when the mesh moves or scales. It's cached by geometry identity + the 3×3 matrix.
+- Both ground branches of the shader use it when the marker is present (`gUvMw`). Otherwise they keep the old
+  estimate.
+
+Scope: **untextured** ground meshes only (no diffuse texture, normal map or GARP texture), because nothing else
+reads their `uvTransform`. A textured ground still uses the per-pixel estimate (not fixed). Tests:
+`ground-uv-scale.test.ts`.
 
 ## 3. Tilers (stone layout) — the cell/id generator
 

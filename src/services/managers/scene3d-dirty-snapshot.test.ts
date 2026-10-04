@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { webcrypto } from 'node:crypto';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
-import { Scene3DManager } from './scene3d-manager';
+import { Scene3DManager, playCharacterOutlinesOnRestore } from './scene3d-manager';
 import type { InteractionService } from '../interaction-service';
 
 // Node test env: Shape.id uses self.crypto.randomUUID (browser globals).
@@ -70,7 +70,22 @@ describe('resetGlobalScene3DSettingsForLoad (audit 2026-09-28 P6)', () => {
     reset();                                              // first load: defaults = the app-start state
     live = { fog: { enabled: true }, ssao: { enabled: true } };   // doc A turns fog + SSAO on
     reset();                                              // opening doc B must start from the DEFAULTS, not A's
-    expect(applied[1]).toEqual({ fog: { enabled: false }, ssao: { enabled: false } });
+    // fogHardEdge is an only-when-on key, so the reset pins its default explicitly (2026-10-01); fogHorizon saves only
+    // its non-default fields, so its pinned default is {} (= every field at its default). (playCharacterOutlines is
+    // NOT pinned: it is always saved, so the snapshot's app-start value — on — is what a new / empty document gets; an
+    // old full save without the key is detected in restoreGlobalScene3DSettings instead — see the test below.)
+    expect(applied[1]).toEqual({ fog: { enabled: false }, ssao: { enabled: false }, fogHardEdge: false, fogHorizon: {} });
     expect(applied[1]).not.toBe(applied[0]);              // a fresh copy each time (restore can't mutate the snapshot)
+  });
+});
+
+describe('play character outlines on restore (visual-polish item 10)', () => {
+  it('saved value wins; an old full save without the key plays without; a partial patch / empty doc keeps the default', () => {
+    expect(playCharacterOutlinesOnRestore({ playCharacterOutlines: true }, false)).toBe(true);
+    expect(playCharacterOutlinesOnRestore({ playCharacterOutlines: false }, true)).toBe(false);
+    expect(playCharacterOutlinesOnRestore({ characterOutlines: null }, true)).toBe(false);      // pre-item-10 full save
+    expect(playCharacterOutlinesOnRestore({ viewState: {} as never }, true)).toBe(false);
+    expect(playCharacterOutlinesOnRestore({ fog: { enabled: true } } as never, true)).toBe(true);   // lighting-only patch
+    expect(playCharacterOutlinesOnRestore({}, true)).toBe(true);                                // new / empty document
   });
 });

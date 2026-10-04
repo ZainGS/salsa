@@ -754,7 +754,7 @@ export class Scene3DCloth {
             frame++;
             return this.tickLiveCloths(frame);
         };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._liveClothTickCb);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._liveClothTickCb, 'cloth');
     }
 
     private _removeLiveClothTick(): void {
@@ -816,6 +816,18 @@ export class Scene3DCloth {
             preview.render(mesh);
             mesh.gpuDirty = true;
         }
+    }
+
+    /** Device-lost recovery: stop the live sims + previews (their GPU state died with the device). The cloth CONFIG
+     *  (_clothData) stays. Returns how many live sims were stopped. */
+    resetForDeviceLoss(): number {
+        const n = this._liveClothHandles.size;
+        for (const h of this._liveClothHandles.values()) { try { h.destroy(); } catch { /* lost device */ } }
+        this._liveClothHandles.clear();
+        for (const p of this._previewRenderers.values()) { try { p.destroy(); } catch { /* lost device */ } }
+        this._previewRenderers.clear();
+        this._removeLiveClothTick();
+        return n;
     }
 
     /** Tear down all live sims, previews, and the tick (used on manager teardown). Safe to call more than once. */

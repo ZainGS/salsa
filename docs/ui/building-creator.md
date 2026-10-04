@@ -44,7 +44,7 @@ one-click style, or any subset of fields to fine-tune.
 - **Massing:** `floors`, `width`, `depth`, `floorHeight`, `groundFloorHeight`, `cornerStyle`
   (`sharp`·`chamfer`·`round`), `cornerAmount`, `setbacks`, `setbackInset`, `podium`, `podiumFloors`.
 - **Facade:** `windowStyle` (`grid`·`punched`·`ribbon`·`curtain`), `bayWidth`, `material`
-  (`concrete`·`brick`·`plaster`·`tile`·`glass`·`timber`·`metal`), `pilasters`, `quoins`, `quoinStyle`
+  (`concrete`·`brick`·`plaster` (painted render)·`tile`·`glass`·`timber`·`metal` (windowless corrugated sheet)·`siding`·`panel` (windowed metal-panel cladding — persona polish B4)), `pilasters`, `quoins`, `quoinStyle`
   (`alternating` — interlocking corner stones, the default · `block` — the old chunky corner cubes; only applies when
   `quoins` is on), `cornice`, `mullions`.
 - **Ground/storefront:** `storefront`, `shopBays`, `stallriser`, `transom`, `shutter`, `awning`, `awningStyle`
@@ -58,7 +58,9 @@ one-click style, or any subset of fields to fine-tune.
   hugging each upper-floor window — no slab; auto-aligned to the window grid, and only shown on `punched`/`grid`
   window styles, not `ribbon`/`curtain`) with `julietColor` (railing tint, default dark iron) + `julietScroll`
   (0 = plain bars → 1 = diamond + side scrolls), `windowTrim` (raised stone surround — sill + lintel + jambs, +
-  keystone on `punched`; same window-grid alignment + `punched`/`grid`-only gating as juliet), `ledges`,
+  keystone on `punched`; same window-grid alignment + `punched`/`grid`-only gating as juliet), `windowSills` (default on — a slim
+  instanced sill under every upper-floor street window where no `windowTrim` surround carries one; persona polish D2), `ledges` (floor-band
+  string courses, 11 cm tall / 9 cm proud),
   `fireEscape`, `downpipes`, `wallUnits`.
 - **Roof:** `roofStyle` (`flat`·`parapet`·`hip`·`gable`·`mansard`·`sawtooth`·`tiled-hip`), `roofPitch`, `deepEaves`,
   `roofClutter`, `roofPenthouse`, `roofRailing`, `roofGarden`, `roofDishes`, `roofVents`, `helipad`, `crown`

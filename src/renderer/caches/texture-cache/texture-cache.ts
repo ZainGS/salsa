@@ -10,6 +10,13 @@ export class TextureCache {
     private static bitmaps = new Map<string, ImageBitmap>();
     private static pendingBitmaps = new Map<string, Promise<ImageBitmap>>();
 
+    /** Device-lost recovery (docs/ui/device-recovery.md): drop the GPU textures (made on the lost device). The decoded
+     *  ImageBitmaps are CPU-side and stay, so the next getTexture re-uploads without a re-fetch. */
+    static clearGpuTextures(): void {
+        this.textures.clear();
+        this.pendingTextures.clear();
+    }
+
     static async getImageBitmap(url: string): Promise<ImageBitmap> {
         if (this.bitmaps.has(url)) return this.bitmaps.get(url)!;
         if (this.pendingBitmaps.has(url)) return this.pendingBitmaps.get(url)!;

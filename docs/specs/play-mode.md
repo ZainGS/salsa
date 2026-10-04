@@ -1,6 +1,12 @@
 # Play Mode — walk the scene (character controller) — spec + to-do
 
-**Date:** 2026-09-01 · **Status:** engine v1 building · **Parent:** `free-camera-and-scene-targets.md` (L3 = Play mode) · **Home:** `src/game/`
+**Date:** 2026-09-01 · **Status:** engine v1 building — **status 2026-10-04: engine BUILT** (`src/game/`: controller,
+third-person camera, mouse / keyboard / gamepad input, locomotion state machine + animator, collision cells / snapshot /
+hood, trigger volumes, interaction, landing dust, player light, character scale; script behaviors run in the loop;
+`sm.enterPlayMode3D` / `exitPlayMode3D` / `setPlayerObject3D` …). The host contract and everything since (auto player,
+walk / run / jog, jump variety, landing dust, idle variety, Play suspends the editor) is in
+[../ui/play-mode.md](../ui/play-mode.md). Still open below: capsule collision, a dynamic broadphase for traffic, real
+physics, browser verification · **Parent:** `free-camera-and-scene-targets.md` (L3 = Play mode) · **Home:** `src/game/`
 
 ## One line
 

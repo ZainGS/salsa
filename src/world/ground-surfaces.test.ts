@@ -69,7 +69,7 @@ describe('mesh3d shader — shingle + half-timber branches are wired', () => {
     it('applies the shared PBR deepening (micro-AO + groove roughness + stronger relief) on the ground path', () => {
         expect(MESH3D_FRAGMENT_SHADER, 'micro-AO').toContain('gW.grout * 0.22');           // crevice occlusion
         expect(MESH3D_FRAGMENT_SHADER, 'groove roughness').toContain('gW.grout * 0.12');
-        expect(MESH3D_FRAGMENT_SHADER, 'deepened relief').toContain('(hD - hU)) * 0.45');
+        expect(MESH3D_FRAGMENT_SHADER, 'deepened relief').toContain('(hD - hU)) * (0.45 * gReliefK)');   // (P8: × the relief LOD, 1 when off)
     });
 
     it('defines + dispatches the A5–A7 materials (thatch/clay/bark/metal/leaves/fabric, modes 12–17)', () => {

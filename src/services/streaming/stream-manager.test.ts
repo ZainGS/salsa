@@ -227,6 +227,53 @@ describe('StreamManager async (worker-style) build', () => {
     });
 });
 
+// bug-hunt 2026-10-01 D-W4: a clear() + rebuild of the same key while the OLD generation's build is still in flight —
+// the old result used to delete the NEW in-flight entry (duplicate dispatch) and go live as the new chunk.
+class ManualSource implements StreamSource<{ key: StreamKey; gen: number }> {
+    target: StreamKey[] = [];
+    gen = 0;
+    readonly pending: Array<{ key: StreamKey; gen: number; resolve: (h: { key: StreamKey; gen: number }) => void; reject: (e: Error) => void }> = [];
+    readonly disposed: Array<{ key: StreamKey; gen: number }> = [];
+    targetChunks(): StreamKey[] { return this.target; }
+    buildPreview(): null { return null; }
+    build(key: StreamKey): Promise<{ key: StreamKey; gen: number }> {
+        const gen = this.gen;
+        return new Promise((resolve, reject) => this.pending.push({ key, gen, resolve, reject }));
+    }
+    dispose(_key: StreamKey, handle: { key: StreamKey; gen: number }): void { this.disposed.push(handle); }
+}
+describe('StreamManager in-flight generations', () => {
+    it('an old generation resolving after clear + rebuild neither goes live nor frees the new in-flight slot', async () => {
+        const src = new ManualSource(); src.target = ['a'];
+        const mgr = new StreamManager(src);
+        mgr.sync(FOCUS, BUDGET);                       // gen 0 dispatch
+        mgr.clear();
+        src.gen = 1; mgr.sync(FOCUS, BUDGET);          // gen 1 dispatch of the same key
+        expect(src.pending.map(p => p.gen)).toEqual([0, 1]);
+        src.pending[0].resolve({ key: 'a', gen: 0 });  // the stale result lands first
+        await flush();
+        expect(mgr.has('a')).toBe(false);              // not shown as the new chunk
+        expect(src.disposed).toEqual([{ key: 'a', gen: 0 }]);
+        mgr.sync(FOCUS, BUDGET);                       // must NOT re-dispatch: gen 1 is still in flight
+        expect(src.pending.length).toBe(2);
+        src.pending[1].resolve({ key: 'a', gen: 1 });
+        await flush();
+        expect(mgr.has('a')).toBe(true);
+    });
+
+    it('an old generation REJECTING after clear + rebuild keeps the new in-flight slot', async () => {
+        const src = new ManualSource(); src.target = ['a'];
+        const mgr = new StreamManager(src);
+        mgr.sync(FOCUS, BUDGET);
+        mgr.clear();
+        src.gen = 1; mgr.sync(FOCUS, BUDGET);
+        src.pending[0].reject(new Error('cancelled'));
+        await flush();
+        mgr.sync(FOCUS, BUDGET);
+        expect(src.pending.length).toBe(2);           // no duplicate dispatch
+    });
+});
+
 describe('StreamManager tier-flip hold (chunkId)', () => {
     // A source whose chunk identity strips a "|p" tier suffix — models the city's proxy↔full key flip.
     class TierSource implements StreamSource<{ key: StreamKey }> {
@@ -257,6 +304,51 @@ describe('StreamManager tier-flip hold (chunkId)', () => {
         // Flip to proxy and away again in back-to-back reconciles: the hold must not leak the old handle.
         mgr.reconcile(['b']);     // 'a' has no replacement in this target → plain dispose
         expect(src.events).toEqual(['D:a', 'B:b']);
+    });
+});
+
+describe('StreamManager P17: a tier swap the source dissolves (crossFade)', () => {
+    class FadeSource implements StreamSource<{ key: StreamKey }> {
+        target: StreamKey[] = [];
+        readonly events: string[] = [];
+        readonly handed: Array<{ prev: StreamKey; next: StreamKey; nextHandle: StreamKey }> = [];
+        take = true;   // the source takes over the old handle's disposal
+        targetChunks(): StreamKey[] { return this.target; }
+        chunkId(key: StreamKey): string { const b = key.indexOf('|'); return b >= 0 ? key.slice(0, b) : key; }
+        build(key: StreamKey): { key: StreamKey } { this.events.push(`B:${key}`); return { key }; }
+        dispose(key: StreamKey): void { this.events.push(`D:${key}`); }
+        crossFade(prevKey: StreamKey, _prev: { key: StreamKey }, _pp: boolean, nextKey: StreamKey, next: { key: StreamKey }): boolean {
+            this.handed.push({ prev: prevKey, next: nextKey, nextHandle: next.key });
+            return this.take;
+        }
+    }
+
+    it('hands the held old tier + the landed new one to the source, which then owns the old handle', () => {
+        const src = new FadeSource();
+        const mgr = new StreamManager(src);
+        mgr.reconcile(['a|h']);
+        src.events.length = 0;
+        mgr.reconcile(['a|f']);   // mid → far HLOD swap
+        expect(src.events).toEqual(['B:a|f']);   // the old tier is NOT disposed by the manager
+        expect(src.handed).toEqual([{ prev: 'a|h', next: 'a|f', nextHandle: 'a|f' }]);
+        expect(mgr.has('a|f')).toBe(true);
+        expect(mgr.has('a|h')).toBe(false);
+        mgr.clear();
+        expect(src.events).toEqual(['B:a|f', 'D:a|f']);   // clear never disposes a handle it gave away
+    });
+
+    it('a source that declines (false) gets the old handle disposed at once; the A/B switch skips the hook', () => {
+        const src = new FadeSource(); src.take = false;
+        const mgr = new StreamManager(src);
+        mgr.reconcile(['a']);
+        src.events.length = 0;
+        mgr.reconcile(['a|h']);
+        expect(src.events).toEqual(['B:a|h', 'D:a']);
+        src.take = true; src.handed.length = 0; src.events.length = 0;
+        StreamManager.crossFade = false;
+        try { mgr.reconcile(['a|f']); } finally { StreamManager.crossFade = true; }
+        expect(src.handed).toEqual([]);
+        expect(src.events).toEqual(['B:a|f', 'D:a|h']);
     });
 });
 
@@ -313,6 +405,67 @@ describe('StreamManager async in-flight cap (maxConcurrentBuilds)', () => {
     });
 });
 
+describe('StreamManager P10: stale-build cancellation + preview-aware dispose', () => {
+    class CancelSource implements StreamSource<{ key: StreamKey; preview?: boolean }> {
+        target: StreamKey[] = [];
+        readonly maxConcurrentBuilds = 2;
+        cancelOk = true;
+        readonly dispatched: StreamKey[] = [];
+        readonly cancelled: StreamKey[] = [];
+        readonly disposed: Array<[StreamKey, boolean]> = [];
+        readonly resolvers = new Map<StreamKey, (h: { key: StreamKey }) => void>();
+        targetChunks(): StreamKey[] { return this.target; }
+        buildPreview(key: StreamKey): { key: StreamKey; preview: boolean } { return { key, preview: true }; }
+        build(key: StreamKey): Promise<{ key: StreamKey }> {
+            this.dispatched.push(key);
+            return new Promise(res => this.resolvers.set(key, res));
+        }
+        cancel(key: StreamKey): boolean { this.cancelled.push(key); return this.cancelOk; }
+        dispose(key: StreamKey, h: { key: StreamKey; preview?: boolean }, preview?: boolean): void {
+            expect(!!preview).toBe(!!h.preview);   // the manager says exactly which handles are preview stand-ins
+            this.disposed.push([key, !!preview]);
+        }
+    }
+
+    it('a chunk that leaves the target mid-build is cancelled and its slot freed at once', async () => {
+        const src = new CancelSource(); src.target = ['a', 'b', 'c', 'd'];
+        const mgr = new StreamManager(src);
+        mgr.sync(FOCUS, BUDGET);
+        expect(src.dispatched).toEqual(['a', 'b']);              // capped
+        src.target = ['c', 'd'];                                 // a + b scrolled out while building
+        mgr.sync(FOCUS, BUDGET);
+        expect(src.cancelled.sort()).toEqual(['a', 'b']);
+        expect(src.dispatched).toEqual(['a', 'b', 'c', 'd']);    // the freed slots went to the wanted chunks NOW
+        // the stale results still resolve later: discarded (disposed as full builds), never live
+        src.resolvers.get('a')!({ key: 'a' });
+        await flush();
+        expect(mgr.has('a')).toBe(false);
+        expect(src.disposed).toContainEqual(['a', false]);
+    });
+
+    it('without a successful cancel the slot stays held (the legacy behaviour)', () => {
+        const src = new CancelSource(); src.cancelOk = false; src.target = ['a', 'b', 'c'];
+        const mgr = new StreamManager(src);
+        mgr.sync(FOCUS, BUDGET);
+        src.target = ['c'];
+        mgr.sync(FOCUS, BUDGET);
+        expect(src.dispatched).toEqual(['a', 'b']);              // c waits until a / b settle
+    });
+
+    it('preview handles are disposed with preview = true (upgrade swap and scroll-out)', async () => {
+        const src = new CancelSource(); src.target = ['a', 'b'];
+        const mgr = new StreamManager(src);
+        mgr.sync(FOCUS, BUDGET);                                  // previews of a + b live, fulls in flight
+        src.resolvers.get('a')!({ key: 'a' });
+        await flush();
+        expect(src.disposed).toContainEqual(['a', true]);         // a's preview swapped out for its full build
+        src.target = [];
+        mgr.sync(FOCUS, BUDGET);
+        expect(src.disposed).toContainEqual(['b', true]);         // b left while still a preview
+        expect(src.disposed).toContainEqual(['a', false]);        // a left as a full build
+    });
+});
+
 describe('hysteresisTile (Phase 2 focus deadband)', () => {
     it('stays on the current tile within the deadband, snaps once past 0.5 + margin', () => {
         // On tile 0, margin 0.15 → deadband is |pos| ≤ 0.65.
@@ -331,5 +484,142 @@ describe('hysteresisTile (Phase 2 focus deadband)', () => {
 
     it('snaps directly across multiple tiles on a big jump', () => {
         expect(hysteresisTile(3.2, 0)).toBe(3);
+    });
+});
+
+describe('StreamManager P10.D6: a cheap concurrency class is never starved by capped full builds', () => {
+    class ClassSource implements StreamSource<{ key: StreamKey }> {
+        target: StreamKey[] = [];
+        readonly maxConcurrentBuilds = 2;
+        readonly maxConcurrentCheap = 1;
+        readonly dispatched: StreamKey[] = [];
+        readonly resolvers = new Map<StreamKey, (h: { key: StreamKey }) => void>();
+        isCheapKey(key: StreamKey): boolean { return key.endsWith('|p'); }
+        targetChunks(): StreamKey[] { return this.target; }
+        build(key: StreamKey): Promise<{ key: StreamKey }> { this.dispatched.push(key); return new Promise(res => this.resolvers.set(key, res)); }
+        dispose(): void { /* not exercised */ }
+    }
+    it('dispatches cheap keys past a full queue that is at its cap, each class within its own cap', async () => {
+        const src = new ClassSource(); src.target = ['a', 'b', 'c', 'x|p', 'y|p'];
+        const mgr = new StreamManager(src);
+        mgr.sync(FOCUS, BUDGET);
+        expect(src.dispatched).toEqual(['a', 'b', 'x|p']);   // 2 full (cap) + 1 cheap (its cap); 'c' and 'y|p' wait
+        src.resolvers.get('x|p')!({ key: 'x|p' });
+        await flush();
+        expect(src.dispatched).toEqual(['a', 'b', 'x|p', 'y|p']);   // the cheap slot freed → the next cheap key, fulls still capped
+        src.resolvers.get('a')!({ key: 'a' });
+        await flush();
+        expect(src.dispatched).toEqual(['a', 'b', 'x|p', 'y|p', 'c']);
+    });
+});
+
+describe('StreamManager P17: a cheap backlog borrows full-build slots (fullCapFor)', () => {
+    class BorrowSource implements StreamSource<{ key: StreamKey }> {
+        target: StreamKey[] = [];
+        readonly maxConcurrentBuilds = 3;
+        readonly maxConcurrentCheap = 2;
+        readonly dispatched: StreamKey[] = [];
+        readonly seenQueued: number[] = [];
+        readonly resolvers = new Map<StreamKey, (h: { key: StreamKey }) => void>();
+        isCheapKey(key: StreamKey): boolean { return key.endsWith('|h'); }
+        fullCapFor(cheapQueued: number): number { this.seenQueued.push(cheapQueued); return cheapQueued > 2 ? 1 : this.maxConcurrentBuilds; }
+        targetChunks(): StreamKey[] { return this.target; }
+        build(key: StreamKey): Promise<{ key: StreamKey }> { this.dispatched.push(key); return new Promise(res => this.resolvers.set(key, res)); }
+        dispose(): void { /* not exercised */ }
+    }
+    it('with many cheap keys waiting the full class keeps one slot; once they drain it gets its cap back', async () => {
+        const src = new BorrowSource(); src.target = ['a', 'b', 'c', '1|h', '2|h', '3|h', '4|h', '5|h'];
+        const mgr = new StreamManager(src);
+        mgr.sync(FOCUS, BUDGET);
+        expect(src.dispatched.filter(k => !k.endsWith('|h'))).toEqual(['a']);          // backlog of 5 cheap keys → full cap 1
+        expect(src.dispatched.filter(k => k.endsWith('|h')).length).toBe(2);           // the cheap class at its own cap
+        expect(Math.max(...src.seenQueued)).toBe(5);
+        for (const k of ['1|h', '2|h']) src.resolvers.get(k)!({ key: k });
+        await flush();
+        for (const k of ['3|h', '4|h']) src.resolvers.get(k)!({ key: k });
+        await flush();
+        src.resolvers.get('5|h')!({ key: '5|h' });
+        await flush();
+        // the backlog is gone (≤ 2 queued) → the other full keys dispatch
+        expect(src.dispatched.filter(k => !k.endsWith('|h'))).toEqual(['a', 'b', 'c']);
+    });
+});
+
+describe('StreamManager P20: a build past its worker phase frees its slot (holdsWorker)', () => {
+    class PhaseSource implements StreamSource<{ key: StreamKey }> {
+        target: StreamKey[] = [];
+        readonly maxConcurrentBuilds = 2;
+        readonly dispatched: StreamKey[] = [];
+        readonly reassembling = new Set<StreamKey>();
+        readonly resolvers = new Map<StreamKey, (h: { key: StreamKey }) => void>();
+        useHolds = true;
+        targetChunks(): StreamKey[] { return this.target; }
+        holdsWorker(key: StreamKey): boolean { return !this.useHolds || !this.reassembling.has(key); }
+        build(key: StreamKey): Promise<{ key: StreamKey }> { this.dispatched.push(key); return new Promise(res => this.resolvers.set(key, res)); }
+        dispose(): void { /* not exercised */ }
+    }
+    it('the next key dispatches once a build reassembles; never more worker-phase builds than the cap', async () => {
+        for (const useHolds of [true, false]) {
+            const src = new PhaseSource(); src.useHolds = useHolds; src.target = ['a', 'b', 'c', 'd'];
+            const mgr = new StreamManager(src);
+            mgr.sync(FOCUS, BUDGET);
+            expect(src.dispatched).toEqual(['a', 'b']);
+            src.reassembling.add('a');                // a's worker is done; its result reassembles on the main thread
+            mgr.sync(FOCUS, BUDGET);
+            expect(src.dispatched).toEqual(useHolds ? ['a', 'b', 'c'] : ['a', 'b']);   // the A/B: off = the slot is held
+            const inWorker = src.dispatched.filter(k => !src.reassembling.has(k) && src.resolvers.has(k)).length;
+            expect(inWorker).toBeLessThanOrEqual(2);
+            src.resolvers.get('a')!({ key: 'a' });
+            await flush();
+            // with the hook b + c are in their worker phase (the cap) so d waits; without it c took a's freed slot
+            expect(src.dispatched).toEqual(['a', 'b', 'c']);
+            src.reassembling.add('b');
+            mgr.sync(FOCUS, BUDGET);
+            expect(src.dispatched).toEqual(useHolds ? ['a', 'b', 'c', 'd'] : ['a', 'b', 'c']);
+        }
+    });
+});
+
+describe('StreamManager P10.D7: a held old-tier handle is the stand-in (no preview rebuild)', () => {
+    class HeldSource implements StreamSource<{ key: StreamKey }> {
+        target: StreamKey[] = [];
+        readonly events: string[] = [];
+        readonly resolvers = new Map<StreamKey, (h: { key: StreamKey }) => void>();
+        targetChunks(): StreamKey[] { return this.target; }
+        chunkId(key: StreamKey): string { const b = key.indexOf('|'); return b >= 0 ? key.slice(0, b) : key; }
+        canPreviewKey(key: StreamKey): boolean { return !key.includes('|'); }
+        buildPreview(key: StreamKey): { key: StreamKey } { this.events.push(`P:${key}`); return { key }; }
+        build(key: StreamKey): { key: StreamKey } | Promise<{ key: StreamKey }> {
+            this.events.push(`B:${key}`);
+            if (key.includes('|')) return { key };
+            return new Promise(res => this.resolvers.set(key, res));
+        }
+        dispose(key: StreamKey): void { this.events.push(`D:${key}`); }
+    }
+    it('a flat tile promoted to full stays on screen until the full build lands; no preview is built', async () => {
+        const src = new HeldSource();
+        const mgr = new StreamManager(src);
+        mgr.reconcile(['a|p']);
+        src.events.length = 0;
+        mgr.reconcile(['a']);                      // the moving window promotes the flat tile
+        expect(src.events).toEqual(['B:a']);       // straight to the full build — the held 'a|p' is the stand-in
+        src.resolvers.get('a')!({ key: 'a' });
+        await flush();
+        expect(src.events).toEqual(['B:a', 'D:a|p']);   // swap-disposed when the full build landed
+        // a chunk that was NOT live still gets its preview
+        src.events.length = 0;
+        mgr.reconcile(['a', 'b']);
+        expect(src.events.slice(0, 2)).toEqual(['P:b', 'B:b']);
+    });
+    it('the A/B switch restores the old preview-on-flip behaviour', () => {
+        StreamManager.heldAsPreview = false;
+        try {
+            const src = new HeldSource();
+            const mgr = new StreamManager(src);
+            mgr.reconcile(['a|p']);
+            src.events.length = 0;
+            mgr.reconcile(['a']);
+            expect(src.events).toEqual(['P:a', 'D:a|p', 'B:a']);
+        } finally { StreamManager.heldAsPreview = true; }
     });
 });

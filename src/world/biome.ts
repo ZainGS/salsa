@@ -8,10 +8,12 @@ import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { makeRng, Rng, scatterInPolygon, centroid, pointInPolygon, hash2, bounds, graphLookups } from './util';
 import { Accum3D } from './meshbuild';
 import { buildCityFoliage, type TreePlacement, type TreeKind } from './city-foliage';
+import { buildFoliage } from './foliage';
 import { cityMetresPerUnit } from './types';
+import type { InstanceXform } from './types';
 import { cellLevelAt } from './elevation';
 import { regionAt } from './layout';
-import { inShotengai } from './shotengai';
+import { streetPlan, pavementLift, type Slot } from './street-slots';
 
 type V3 = [number, number, number];
 
@@ -19,7 +21,7 @@ const TRUNK_COLOR: [number, number, number] = [0.36, 0.26, 0.17];   // bark brow
 const FOLIAGE_COLOR: [number, number, number] = [0.30, 0.55, 0.28]; // leaf green
 const ROCK_COLOR: [number, number, number] = [0.55, 0.55, 0.58];    // grey stone
 const SAKURA_COLOR: [number, number, number] = [0.95, 0.76, 0.84];  // cherry-blossom pink
-const PLANTER_COLOR: [number, number, number] = [0.58, 0.40, 0.32]; // terracotta planter
+const GRATE_COLOR: [number, number, number] = [0.13, 0.13, 0.14];   // cast-iron tree grate + guard
 
 /** A PLAYGROUND: swing frame (two A-legs + top bar + hanging seats) and a slide (ladder + sloped chute). */
 function addPlayground(a: Accum3D, c: V2, gy: number, s: number): void {
@@ -69,7 +71,7 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     const seed = graph.params.seed;
     const gy = graph.params.groundY;
     const scale = graph.radius / 10;                 // props sized relative to a radius-10 reference city
-    const foliage = new Accum3D(), trunk = new Accum3D(), rock = new Accum3D(), sakura = new Accum3D(), planter = new Accum3D();
+    const foliage = new Accum3D(), trunk = new Accum3D(), rock = new Accum3D(), sakura = new Accum3D();
     const parkProp = new Accum3D(), fountainWater = new Accum3D();   // playground/gazebo frames + the fountain pool
     // ★ Trees are no longer accumulated as blobs — they are COLLECTED and handed to the real foliage
     // generator (city-foliage.ts), which builds a small pool of proper carded trees and GPU-instances them.
@@ -77,8 +79,12 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     const trees: TreePlacement[] = [];
     const metersPerUnit = cityMetresPerUnit(graph.radius);
     const plant = (pos: V2, kind: TreeKind, sc = 1): void => { trees.push({ pos, y: gy, kind, scale: sc }); };
-    // Pick a tree kind from a 0..1 roll, keeping roughly the old species mix (conifer-leaning parks).
-    const kindFromRoll = (r: number): TreeKind => (r < 0.42 ? 'conifer' : r < 0.74 ? 'broadleaf' : r < 0.88 ? 'conifer' : 'bush');
+    // Park / garden species mix (E7): a JAPANESE park is camphor + zelkova canopy with SAKURA groves, a few conifers
+    // and shrubs — not the old 56% spruce. Near a SHRINE the black pines take over.
+    const kindFromRoll = (r: number): TreeKind => (r < 0.24 ? 'camphor' : r < 0.46 ? 'zelkova' : r < 0.72 ? 'sakura' : r < 0.82 ? 'broadleaf' : r < 0.9 ? 'conifer' : 'bush');
+    const shrines = graph.landmarks.filter(l => l.type === 'shrine').map(l => ({ c: l.center, r: 1.4 * scale }));
+    const nearShrine = (pt: V2): boolean => shrines.some(sh => Math.hypot(pt[0] - sh.c[0], pt[1] - sh.c[1]) < sh.r);
+    const parkKind = (pt: V2, r: number): TreeKind => (nearShrine(pt) && r < 0.7 ? 'pine' : kindFromRoll(r));
     // ★ NEVER plant inside a building. Street trees are placed off the kerb by a fixed offset with no
     // regard for what is actually there, so on a shallow lot the offset lands inside the frontage — which
     // the old cone-and-sphere trees hid but a 6 m carded tree does not. Lots are convex quads, so a point
@@ -114,7 +120,7 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
         const lotRng = makeRng((seed ^ Math.floor(hash2(lot.center[0] * 97.31, lot.center[1] * 57.17, seed) * 0xfffffffe)) >>> 0);
         if (lot.zone === 'park') {
             const nTrees = Math.min(16, Math.max(1, Math.round(lot.area / (0.03 * scale * scale))));
-            for (const p of scatterInPolygon(lot.poly, nTrees, lotRng)) if (!inWater(p)) plant(p, kindFromRoll(lotRng.next()));
+            for (const p of scatterInPolygon(lot.poly, nTrees, lotRng)) { const r = lotRng.next(); if (!inWater(p)) plant(p, parkKind(p, r)); }
             const nRocks = Math.min(4, Math.round(nTrees * 0.25));
             for (const p of scatterInPolygon(lot.poly, nRocks, lotRng)) if (!inWater(p)) addRock(rock, [p[0], gy, p[1]], lotRng, scale);
             // PARK PROP: bigger parks get one centrepiece — a playground, a fountain or a gazebo (parks stop
@@ -133,36 +139,37 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
             if (lotRng.chance(0.3)) {
                 const c = centroid(lot.poly), v = lot.poly[0];
                 const g: V2 = [v[0] + (c[0] - v[0]) * 0.2, v[1] + (c[1] - v[1]) * 0.2];
-                const k = kindFromRoll(lotRng.next());
-                if (!inBuilding(g)) plant(g, k, 0.7);
+                const k = parkKind(g, lotRng.next());
+                if (!inBuilding(g)) plant(g, k === 'zelkova' || k === 'camphor' ? 'broadleaf' : k, 0.7);
             }
         }
         // civic / commercial / water: left clear (buildings + water dressing come later)
     }
 
-    // STREET TREES + planters lining the roads (whole-city infra, like lamp posts — position-hash deterministic).
+    // STREET TREES (E6) — the shared pavement plan (street-slots.ts) lays REGULAR PAIRED rows per road class, with
+    // gaps only where something else claimed the kerb (lamp, pole, bus stop, door, driveway). ONE species per road —
+    // Japanese avenues are planted in a single species: arterials zelkova / ginkgo / camphor, side streets add
+    // sakura. Each tree stands in a cast-iron GRATE, arterial trees inside a guard frame. Streets without a row get
+    // the odd kerb PLANTER, homes a POTTED plant by the door — the real planter foliage, instanced.
+    const planterSlots: Slot[] = [], pottedSlots: Slot[] = [], grateInst: InstanceXform[] = [], guardInst: InstanceXform[] = [];
     if (graph.params.streetTrees ?? true) {
-        const p = graph.params, half = p.streetWidth * 0.5, curb = half + 0.05 * scale;
-        const overW = (x: number, z: number): boolean => cellLevelAt(graph, x, z) < 0 || !pointInPolygon([x, z], graph.border);
-        graph.roads.forEach((road, ri) => {
-            if (road.klass === 'alley' || road.klass === 'ring') return;
-            const ax = road.a, dx = road.b[0] - ax[0], dz = road.b[1] - ax[1], len = Math.hypot(dx, dz);
-            if (len < 0.8 * scale) return;
-            const px = -dz / len, pz = dx / len, sp = 0.62 * scale, n = Math.floor(len / sp);
-            for (let i = 0; i < n; i++) {
-                const t = (i + 0.5) / n; if (t * len < half + 0.2 * scale || (1 - t) * len < half + 0.2 * scale) continue;
-                if (hash2(ri, i, (p.seed ^ 0x77ee) >>> 0) > 0.5) continue;                       // ~half the slots → a tree-lined but not solid avenue
-                const side = hash2(ri, i, (p.seed ^ 0x0051) >>> 0) < 0.5 ? 1 : -1;
-                const x = ax[0] + dx * t + px * curb * side, z = ax[1] + dz * t + pz * curb * side;
-                if (overW(x, z) || inBuilding([x, z])) continue;                       // never plant into a frontage
-                if (keep && !keep(regionAt(graph, x, z) ?? -1)) continue;             // skip disabled regions (matches furniture)
-                if (inShotengai(graph, x, z)) continue;                              // not in the pedestrian shotengai mall
-                const tr = makeRng((p.seed ^ (ri * 131 + i * 17) ^ 0xa1) >>> 0);
-                if (hash2(ri, i, (p.seed ^ 0x009c) >>> 0) < 0.14) addPlanter(planter, foliage, [x, gy, z], tr, scale);
-                // street planting leans formal: broadleaf avenues with ~22% sakura
-                else plant([x, z], hash2(ri, i, (p.seed ^ 0x003d) >>> 0) < 0.22 ? 'sakura' : 'broadleaf', 0.9);
-            }
-        });
+        const p = graph.params, plan = streetPlan(graph), py = gy + pavementLift(p);
+        const on = (sl: Slot): boolean => !keep || keep(regionAt(graph, sl.x, sl.z) ?? -1);
+        const species = (ri: number, arterial: boolean): TreeKind => {
+            const r = hash2(ri, 17, (p.seed ^ 0x5bec) >>> 0);
+            return arterial ? (r < 0.45 ? 'zelkova' : r < 0.85 ? 'ginkgo' : 'camphor')
+                : (r < 0.35 ? 'zelkova' : r < 0.65 ? 'sakura' : r < 0.85 ? 'camphor' : 'ginkgo');
+        };
+        for (const sl of plan.of('tree')) {
+            if (!on(sl)) continue;
+            const R = plan.roads[sl.ri]!, arterial = R.klass === 'arterial';
+            plant([sl.x, sl.z], species(sl.ri, arterial), 0.9);
+            const ry = Math.atan2(-R.d[1], R.d[0]);
+            grateInst.push({ x: sl.x, y: py, z: sl.z, ry });
+            if (arterial && sl.h < 0.7) guardInst.push({ x: sl.x, y: py, z: sl.z, ry });
+        }
+        for (const sl of plan.of('planter')) if (on(sl)) planterSlots.push(sl);
+        for (const sl of plan.of('potted')) if (on(sl)) pottedSlots.push(sl);
     }
 
     const layers: LayoutPreviewLayer[] = [];
@@ -174,7 +181,14 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     // `foliage` / `sakura` now only carry PLANTER greenery (addPlanter), not trees.
     if (!foliage.empty) layers.push({ name: 'world:tree-foliage', color: FOLIAGE_COLOR, y: gy, geometry: foliage.geometry(), pattern: { color: [0.22, 0.44, 0.21], freq: 7, scale: 0.55, mode: 'dots' } });
     if (!sakura.empty) layers.push({ name: 'world:tree-sakura', color: SAKURA_COLOR, y: gy, geometry: sakura.geometry(), pattern: { color: [0.99, 0.88, 0.92], freq: 7, scale: 0.55, mode: 'dots' } });
-    if (!planter.empty) layers.push({ name: 'world:planter', color: PLANTER_COLOR, y: gy, geometry: planter.geometry() });
+    // Tree GRATES + GUARDS (instanced canonical cast iron; the drape lifts each instance onto the pavement).
+    const unit = 1 / metersPerUnit;
+    const iron = { tint: GRATE_COLOR, roughness: 0.55, streakAmount: 0.2, grime: 0.45, scale: 3 * metersPerUnit };   // cast iron
+    if (grateInst.length) layers.push({ name: 'world:tree-grate', color: GRATE_COLOR, y: gy, geometry: treeGrateGeometry(unit, false), instances: grateInst, arrayGroup: true, instanceKey: 'tree-grate', metal: iron });
+    if (guardInst.length) layers.push({ name: 'world:tree-guard', color: GRATE_COLOR, y: gy, geometry: treeGrateGeometry(unit, true), instances: guardInst, arrayGroup: true, instanceKey: 'tree-guard', metal: iron });
+    // PLANTERS + POTTED plants: the real foliage vessel archetypes at their far LOD (~450 tris), instanced.
+    layers.push(...vesselLayers('planter', planterSlots, unit, seed, gy + pavementLift(graph.params)));
+    layers.push(...vesselLayers('potted', pottedSlots, unit, seed, gy + pavementLift(graph.params)));
     // Granite, not flat grey: a boulder reads as a boulder because of the mineral speckle and the
     // roughness break-up. `jitter` is dropped to near-nothing — a rock has no courses to jitter.
     if (!rock.empty) layers.push({ name: 'world:rocks', color: ROCK_COLOR, y: gy, geometry: rock.geometry(),
@@ -187,11 +201,41 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     return layers;
 }
 
-/** A street planter: a low terracotta tub + a small green shrub. */
-function addPlanter(planter: Accum3D, foliage: Accum3D, base: V3, rng: Rng, scale: number): void {
-    const w = 0.03 * scale;
-    planter.prism(base, w, w, 0.032 * scale, 6);
-    foliage.blob([base[0], base[1] + 0.055 * scale, base[2]], w * 1.15, 0.035 * scale, w * 1.15, 0.35, rng.next() * 1000);
+/** A square cast-iron TREE GRATE (≈1.1 m, flush bars) — or, with `guard`, the waist-high guard frame around it
+ *  (four posts + a top ring). Canonical, built at the origin in world units (`u` = units per metre). */
+function treeGrateGeometry(u: number, guard: boolean): ReturnType<Accum3D['geometry']> {
+    const a = new Accum3D(), X: V3 = [1, 0, 0], Y: V3 = [0, 1, 0], Z: V3 = [0, 0, 1], h = 0.55 * u;
+    if (!guard) {
+        for (const sx of [-1, 1]) { a.obox([sx * h, 0.012 * u, 0], X, Y, Z, 0.04 * u, 0.012 * u, h); a.obox([0, 0.012 * u, sx * h], X, Y, Z, h, 0.012 * u, 0.04 * u); }
+        for (const k of [-0.5, 0, 0.5]) { a.obox([k * h, 0.008 * u, 0], X, Y, Z, 0.012 * u, 0.008 * u, h); a.obox([0, 0.008 * u, k * h], X, Y, Z, h, 0.008 * u, 0.012 * u); }
+        return a.geometry();
+    }
+    const g = h * 0.92, top = 0.95 * u;
+    for (const [x, z] of [[-g, -g], [g, -g], [g, g], [-g, g]] as [number, number][]) a.prism([x, 0, z], 0.02 * u, 0.02 * u, top, 5);
+    for (const y of [top, 0.35 * u]) {
+        a.beam([-g, y, -g], [g, y, -g], 0.016 * u, 4); a.beam([g, y, -g], [g, y, g], 0.016 * u, 4);
+        a.beam([g, y, g], [-g, y, g], 0.016 * u, 4); a.beam([-g, y, g], [-g, y, -g], 0.016 * u, 4);
+    }
+    return a.geometry();
+}
+
+/** Instanced PLANTER / POTTED foliage at the plan's slots — one generated vessel arrangement per archetype (far LOD),
+ *  GPU-instanced per layer like the trees (the foliage look — wind / translucency / leaf cards — rides along). */
+function vesselLayers(type: 'planter' | 'potted', slots: Slot[], unit: number, seed: number, y: number): LayoutPreviewLayer[] {
+    if (!slots.length) return [];
+    let built;
+    try {
+        built = buildFoliage({ type, seed: (seed ^ (type === 'planter' ? 0x9a17 : 0x9a18)) >>> 0, render: 'card', celShade: true,
+            density: 0.5, plantLod: 2, size: type === 'planter' ? 0.45 : 0.5, width: 1.0,
+            potMaterial: type === 'planter' ? 'stone' : 'terracotta' } as never);
+    } catch { return []; }
+    const xf = slots.map(sl => ({ x: sl.x, y, z: sl.z, ry: hash2(Math.round(sl.x * 1000), Math.round(sl.z * 1000), seed ^ 0x9a19) * Math.PI * 2, s: unit }));
+    return built.layers.filter(L => L.geometry?.indices?.length).map(L => ({
+        ...L, name: `world:planter-${type}:${L.name}`, y: 0, instances: xf.map(t => ({ ...t })), arrayGroup: true,
+        // P10: the arrangement is built from `seed` (each streamed tile has its own) — keying it by type alone made
+        // every tile's planters share ONE pooled geometry (whichever uploaded first; 14 users / 3 different meshes).
+        instanceKey: `vessel:${type}:${seed >>> 0}:${L.name}`,
+    }));
 }
 
 /** A tree with per-planting VARIETY: conifer (stacked cones) · broadleaf (round canopy) · columnar cypress

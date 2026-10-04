@@ -7,6 +7,15 @@
 > view**). Default OFF = the origin diorama. A second source (`DepthStreamSource`, the depth/scale axis) proves the
 > engine generalises beyond cities with no engine change. **Phase 4 (street-level per-tile life) is the only one
 > left** — deferred until the street-level view exists. Built one phase at a time; each testable in isolation.
+> **Update 2026-10-01 (performance-plan §P10.D):** with follow ON in a Full tiled world the resident set is now an
+> **eye-centred ACTIVE window** — the Tile radius setting = (2r+1)² FULL tiles around the tile under the camera eye (the
+> player in Play), ~12 % border hysteresis (`tile-window.ts`) — plus an **outside tier** for the rest of the view
+> (`setStreamOutsideTiles('none' | 'flat' | 'massing')`). The **centre city is no longer special**: it parks
+> (leaves the scene, GPU geometry freed) when the window leaves it and re-attaches on return — this is most of Phase 4
+> ("even the centre unloads"). Infinite exploration is bounded: count + byte LRUs (`byte-lru.ts`), cheap tiles built in
+> workers with their own concurrency class, cancelled full builds recycle their worker, and the geometry pool shrinks.
+> Per-tile movers (traffic / trains) are still not streamed (tiled worlds run none; the live crowd follows any
+> resident tile).
 > **Thesis:** *Load only what the focus needs, at the detail the view warrants; unload the rest.* A **content-agnostic,
 > toggleable** engine — the city is the flagship, but the same primitive serves products, sims, and material structure.
 
@@ -135,7 +144,7 @@ The streaming **budget** is now zoom-derived (`_streamBudget`), so the window re
 - Reserved for later: `unloadRadius` (currently = `loadRadius`; a separate load<unload hysteresis band) and
   `maxLiveChunks` enforcement (the window radius already bounds live count to ≤ 49).
 
-### Phase 4 — Street-level hook
+### Phase 4 — Street-level hook — PARTLY BUILT 2026-10-01 (eye-centred window, the centre unloads; per-tile movers not)
 Street view sets a small `unloadRadius` + a tight `detailRadius`, so only the blocks around the player are high-detail
 and the rest is disposed. Per-tile **life** (clouds/pedestrians/traffic) becomes first-class here — each live tile can
 own its movers instead of the whole world sharing the centre's (fixes "clouds only over the original city"). Ties to
@@ -185,7 +194,10 @@ a reusable template; a future product/material/sim app registers a `DepthStreamS
 
 **0 → 1 → 2 → 3 → 5 are done.** Only **4** (street-level per-tile life) remains, and it's deferred until the
 street-level view exists — its tight-window part already works via Phase 3, and its remaining parts (per-tile
-clouds/pedestrians/traffic, unloading the origin city, focus rotation) belong with that view. Phase 3 is the one
+clouds/pedestrians/traffic, unloading the origin city, focus rotation) belong with that view. **(Status 2026-10-04:
+unloading the origin city is BUILT — the centre parks / re-attaches with the P10.D eye-centred window; HLOD (P17), the
+speed-aware window + Play corridor (P19) and the P16 hitch fixes are also built — performance-plan §P10.D–P19. Still not
+built: per-tile traffic / clouds / movers; traffic stays off in tiled worlds.)** Phase 3 is the one
 that changed what's *possible* (world > memory); Phase 5 proved the engine is content-agnostic.
 
 ## Verification (per phase)

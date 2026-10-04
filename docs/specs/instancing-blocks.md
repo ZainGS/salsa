@@ -1,6 +1,13 @@
 # Procedural Instancing + Neighborhood Blocks — Spec
 
-> **Status:** NOT built (planning, 2026-07-15). Foundational perf + authoring architecture for the Building
+> **Status (2026-10-04): mostly BUILT** — see §10 below and [../STATUS-2026-10-04.md](../STATUS-2026-10-04.md).
+> P0 width buckets + canonical local geometry (`src/world/building.ts` `IBUCKET`, `buildJulietCanonical`), P1 shared keys
+> (`EMIT_INSTANCED = true`) and P2 Blocks (`BlockManager`, `sm.createBlock3D`, standalone; the city does not use Blocks)
+> were built 2026-07-15. Since then: instanced city trees (`city-foliage.ts`), P9 prop far twins, the P12 instanced crowd
+> (`crowd-instanced.ts`) and P20 instanced props shared across tiles (`src/world/prop-instancing.ts`,
+> `sm.world.setLighterTiles`, default on; performance-plan §P20) cover P3 / P5 and most of P4. **Not built:** whole-building
+> instancing (§7 item 4), the city consuming Blocks, per-key low-detail juliet / trim variants.
+> *(Original header:)* NOT built (planning, 2026-07-15). Foundational perf + authoring architecture for the Building
 > generator (extends to Foliage / any repeated procedural detail). Prereq for dense neighborhoods + city scale.
 > Related: [building-generator.md](building-generator.md), [world-generation.md](world-generation.md),
 > [foliage-generator.md](foliage-generator.md), [street-level-mode.md](street-level-mode.md) (LOD).

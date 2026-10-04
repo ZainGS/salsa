@@ -10,6 +10,7 @@
  */
 
 import { Camera3D } from './camera-3d';
+import { unwrapDevice } from '../core/gpu-device-handle';
 import { Renderer3D } from './renderer-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { addZonelessListener, removeZonelessListener } from '../util/zoneless-listeners';
@@ -58,7 +59,7 @@ export class ClothPreviewRenderer {
 
         const ctx = canvas.getContext('webgpu') as GPUCanvasContext | null;
         if (!ctx) throw new Error('ClothPreviewRenderer: canvas does not support WebGPU');
-        ctx.configure({ device, format: this._format, alphaMode: 'opaque' });
+        ctx.configure({ device: unwrapDevice(device), format: this._format, alphaMode: 'opaque' });   // a device HANDLE is a proxy: configure brand-checks
         this._ctx = ctx;
 
         this._camera   = new Camera3D({ position: [0, 2, 0], target: [0, 0, 0], mode: 'orthographic', orthoSize: 1, near: 0.01, far: 1000 });

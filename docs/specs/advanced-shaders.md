@@ -1,6 +1,11 @@
 # Advanced Shaders & Materials — gemstones, rocks, glass, glow, and the effects layer (spec)
 
-**Date:** 2026-08-25 · **Status:** planned (spec only) · **Companions:** `procedural-material-library.md` (stylized surfaces — stone/wood/grass), `render-styles.md` (cel/ink/sketch/PBR lighting), `post-processing.md` (bloom/grade/vignette), `wall-materials.md`, `ssao.md`, `procedural-ground.md`, `hover-outline.md`, `car-creator.md` (matcap note).
+**Date:** 2026-08-25 · **Status:** planned (spec only) — **status 2026-10-04: the jewel layer itself is NOT built** (no
+gemShade, marble / ore modes, plasma / lava / portal, energy rims, matcap sampler, anisotropic metal, DOF, god rays).
+Parts of the foundation exist: §8 prefiltered cube + BRDF LUT, SSR (`sm.setSSR3D`, off by default), planar mirrors
+(`sm.setMeshPlanarReflector3D`), screen-space glass refraction (`Renderer3D.setGlassRefraction`, CD kit only), CD
+thin-film iridescence, clearcoat car paint (`vehicle.ts`), hair Kajiya-Kay, chromatic aberration (film pass), sprite
+alpha outlines, patterned hover / per-mesh outlines · **Companions:** `procedural-material-library.md` (stylized surfaces — stone/wood/grass), `render-styles.md` (cel/ink/sketch/PBR lighting), `post-processing.md` (bloom/grade/vignette), `wall-materials.md`, `ssao.md`, `procedural-ground.md`, `hover-outline.md`, `car-creator.md` (matcap note).
 
 ## Why
 

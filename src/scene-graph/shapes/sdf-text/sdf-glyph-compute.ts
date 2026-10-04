@@ -29,7 +29,7 @@ export class SDFGlyphCompute {
   private retireTemp(t?: GPUTexture | null) { if (t) this.tempBuckets[this.tempBucketCursor].push(t); }
   public async sweepComputeTemps(queue: GPUQueue) {
     this.tempBucketCursor ^= 1;
-    queue.onSubmittedWorkDone();
+    void queue.onSubmittedWorkDone();
     for (const t of this.tempBuckets[this.tempBucketCursor]) { try { t.destroy(); } catch {} }
     this.tempBuckets[this.tempBucketCursor].length = 0;
   }

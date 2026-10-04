@@ -1,4 +1,11 @@
-﻿import { SceneGraph } from "../../scene-graph/core/scene-graph";
+import { SceneGraph } from "../../scene-graph/core/scene-graph";
+import { GPUPipelineCache } from './gpu-pipeline-cache';
+import { GpuFrameTimer } from './gpu-frame-timer';
+import { createGpuDeviceHandle, unwrapDevice, type GpuDeviceHandle } from './gpu-device-handle';
+import { GpuDeviceStatusTracker, requestSalsaDevice, requestSalsaDeviceWithRetry, WebGPUUnavailableError, describeWebGPUUnavailable,
+  showWebGPUOverlay, hideWebGPUOverlay, sweepGpuFields, type SalsaDevice, type GpuDeviceStatusInfo, type GpuDeviceStatusListener } from './gpu-device-recovery';
+import { ResolutionScaler, sanitizeResolutionScale, type ResolutionScaleSettings, type ResolutionScaleState } from './resolution-scaler';
+import { DEFAULT_TEMPORAL_AA, sanitizeTemporalAA, type TemporalAASettings, type TemporalAAState } from '../3d/temporal-aa';
 import { WebGPURenderStrategy } from "../render-strategies/webgpu-render-strategy";
 import { addZonelessListener, removeZonelessListener } from "../util/zoneless-listeners";
 import { Node } from "../../scene-graph/shapes/base/node";
@@ -81,6 +88,8 @@ import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d'
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import { GpRenderer3D } from '../3d/gp-renderer-3d';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
+import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
+import { RenderListIndex, RL_2D, RL_3D, RL_SKELETON, type RenderListNode } from './render-list-index';
 
 type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -226,6 +235,59 @@ export class WebGPURenderer {
   private _flatShapes: Shape[] = [];
   private _flatShapesDirty = true;
 
+  // ── Step 2 (engine-roadmap; performance-plan §P13 "Step 2"): per-kind render lists ──
+  // With `split` on, _flatShapes / renderList hold only the nodes the 2D strategy can act on, and the 3D kinds live in
+  // their own lists (built by the same structure walk, same zIndex order), so the per-frame 2D steps (beginFrame, the
+  // caret / text-selection collectors, the below / above-raster split) and the 3D draw filters never loop over the
+  // whole city. `incremental` = the structure walk merges new nodes into the previous order instead of re-sorting.
+  // Both off = the old single list (A/B reference): setFrameScanOptions({ splitRenderList, incrementalRenderList }).
+  private _rlSplit = true;
+  /** The 3D getTypes the 2D strategy's beginFrame skips (keep in sync with WebGPURenderStrategy.beginFrame). */
+  private static readonly _TYPES_3D = new Set(['3DMesh', '3DMeshGroup', '3DArrayGroup', '3DClothMesh', 'GpObject3D', 'ParticleEmitter3D']);
+  private readonly _rlIndex = new RenderListIndex<Node & RenderListNode>((n) => this._rlClassify(n));
+  /** Every 3D-list node (zIndex order, all visibility) — the 3D counterpart of _flatShapes. */
+  private _flat3D: Shape[] = [];
+  /** The 3D lists as of the last render-list rebuild (visible at that rebuild, like the old render list). */
+  private readonly _rl3DMeshes: Mesh3D[] = [];
+  private _rl3DSkinned = new Uint8Array(64);      // parallel to _rl3DMeshes: 1 = SkinnedMesh3D
+  private readonly _rl3DEmitters: ParticleEmitter3D[] = [];
+  private readonly _rl3DGp: GpObject3D[] = [];
+  private _frameMeshEditHides = false;            // this frame's meshEditHidesContent (the 3D filters read it)
+  private _rlSkeletonMap: Map<string, Skeleton3D> | null = null;
+  private _rlSkeletonMapVer = -1;
+  private _rlClassify(n: Node): number {
+    if (n instanceof Skeleton3D) return RL_SKELETON;
+    if (!(n instanceof Shape)) return 0;
+    if (!this._rlSplit) return RL_2D;
+    if (n instanceof Mesh3D || n instanceof ParticleEmitter3D || n instanceof GpObject3D) {
+      // A 3D node whose type the strategy doesn't treat as 3D would draw a 2D selection box when selected: keep it in both.
+      return WebGPURenderer._TYPES_3D.has(n.getType()) ? RL_3D : (RL_3D | RL_2D);
+    }
+    // Mesh / array groups: no consumer reads them from the render list (the 3D passes take their meshes, the strategy
+    // skips the 3D types), so they are in no list — this also drops their 2D viewport-cull box from every rebuild.
+    if (n instanceof MeshGroup3D && WebGPURenderer._TYPES_3D.has(n.getType())) return 0;
+    return RL_2D;
+  }
+  /** Step 2 A/B switches (all on by default). Changing one re-walks the scene on the next frame. */
+  public setFrameScanOptions(o: { splitRenderList?: boolean; incrementalRenderList?: boolean }): { splitRenderList: boolean; incrementalRenderList: boolean } {
+    if (o.splitRenderList !== undefined && !!o.splitRenderList !== this._rlSplit) {
+      this._rlSplit = !!o.splitRenderList;
+      this._rlIndex.reset();
+      this._flat3D = []; this._rl3DMeshes.length = 0; this._rl3DEmitters.length = 0; this._rl3DGp.length = 0;
+    }
+    if (o.incrementalRenderList !== undefined) this._rlIndex.incremental = !!o.incrementalRenderList;
+    this._flatShapesDirty = true; this.renderListDirty = true; this.scheduleRender();
+    return this.getFrameScanOptions();
+  }
+  public getFrameScanOptions(): { splitRenderList: boolean; incrementalRenderList: boolean } {
+    return { splitRenderList: this._rlSplit, incrementalRenderList: this._rlIndex.incremental };
+  }
+  /** Diagnostics: list sizes + the structure-walk counters. */
+  public getRenderListStats(): { list2D: number; flat2D: number; flat3D: number; meshes3D: number; emitters3D: number; gp3D: number; walks: number; merged: number; fullSorts: number; lastAdded: number; lastRemoved: number; lastNodes: number } {
+    return { list2D: this.renderList.length, flat2D: this._flatShapes.length, flat3D: this._flat3D.length, meshes3D: this._rl3DMeshes.length,
+      emitters3D: this._rl3DEmitters.length, gp3D: this._rl3DGp.length, ...this._rlIndex.stats };
+  }
+
   /** Pre-render callbacks (called at the start of each render frame). */
   private preRenderCallbacks: Array<() => boolean> = [];
 
@@ -236,8 +298,27 @@ export class WebGPURenderer {
    * Register a callback to run before each render frame.
    * Return `true` to request another frame (e.g. for damping).
    */
-  public addPreRenderCallback(cb: () => boolean): void {
+  public addPreRenderCallback(cb: () => boolean, label?: string): void {
     if (!this.preRenderCallbacks.includes(cb)) this.preRenderCallbacks.push(cb);
+    if (label) this._cbLabels.set(cb, label);
+  }
+
+  // ── Per-frame CPU profile (opt-in; salsaWorld.callbackStats()) ──
+  // Why: "armature Play drops 60 → 40 fps" — the pre-render callbacks (springs / IK / idle / gizmos / orbit) are
+  // plain JS run every frame, invisible to frameStats() (which times the 3D draw). With profiling on, each callback's
+  // time is averaged (EMA) by label, plus the whole render() CPU time and the real frame interval.
+  private _cbLabels = new WeakMap<() => boolean, string>();
+  private _cbProfile: Map<string, { ms: number; calls: number }> | null = null;
+  private _frameProfile = { renderMs: 0, intervalMs: 0, last: 0 };
+  /** Turn per-frame callback profiling on/off (off = zero overhead). */
+  public setCallbackProfiling(on: boolean): void { this._cbProfile = on ? new Map() : null; this._frameProfile = { renderMs: 0, intervalMs: 0, last: 0 }; }
+  /** The profile: per labelled callback avg ms (EMA), render() CPU ms, frame interval ms (1000/fps). */
+  public getCallbackProfile(): { callbacks: Record<string, number>; renderMs: number; frameIntervalMs: number; fps: number } | null {
+    if (!this._cbProfile) return null;
+    const callbacks: Record<string, number> = {};
+    for (const [k, v] of [...this._cbProfile].sort((a, b) => b[1].ms - a[1].ms)) callbacks[k] = Math.round(v.ms * 100) / 100;
+    const iv = this._frameProfile.intervalMs;
+    return { callbacks, renderMs: Math.round(this._frameProfile.renderMs * 100) / 100, frameIntervalMs: Math.round(iv * 10) / 10, fps: iv > 0 ? Math.round(1000 / iv) : 0 };
   }
 
   /** Remove a pre-render callback. */
@@ -294,6 +375,11 @@ export class WebGPURenderer {
   private readonly _skinnedMeshesScratch: SkinnedMesh3D[] = [];
   private readonly _emittersScratch: ParticleEmitter3D[] = [];
   private readonly _gpObjsScratch: GpObject3D[] = [];
+  // P9: the frame's render-list copies (below-raster / visible / above-raster) — a tiled city's ~13 k-node list was
+  // filtered / sliced into three fresh arrays EVERY frame (~0.35 MB/frame). Same synchronous-consumer rule as above.
+  private readonly _belowRasterScratch: Node[] = [];
+  private readonly _visibleNodesScratch: Node[] = [];
+  private readonly _aboveRasterScratch: Node[] = [];
   private _gpDrawOverlay: {
     hoveredTri: [number,number,number, number,number,number, number,number,number] | null;
     planeQuad: {
@@ -371,6 +457,11 @@ export class WebGPURenderer {
   /** This frame's cached scrim state (computed once at frame start; used by the blur prep + the scrim draw). */
   private _uiScrimFrame: import('../../ui/ui-types').UIOverlayState | null = null;
   public setUIScrimProvider(p: (() => import('../../ui/ui-types').UIOverlayState | null) | null): void { this._uiScrimProvider = p; }
+  /** UI-kit overlay (docs/ui/persona-ui-kit.md): draws HUD / menu widgets + kit transitions onto the FINAL swapchain
+   *  image after post-processing — full canvas resolution, untouched by TAAU / resolution scaling / bloom / grade.
+   *  Returns true while it animates (the renderer schedules another frame). */
+  private _uiKitDrawer: ((device: GPUDevice, encoder: GPUCommandEncoder, view: GPUTextureView, w: number, h: number, format: GPUTextureFormat, cssToDevice: number, generation: number) => boolean) | null = null;
+  public setUIKitOverlayDrawer(fn: ((device: GPUDevice, encoder: GPUCommandEncoder, view: GPUTextureView, w: number, h: number, format: GPUTextureFormat, cssToDevice: number, generation: number) => boolean) | null): void { this._uiKitDrawer = fn; this.scheduleRender(); }
 
   // Groups with modified child objects that need a bbox recalc on mouseup
   public pendingGroupBounds = new Set<Group>();
@@ -417,11 +508,15 @@ export class WebGPURenderer {
   private _lastFrameMs = 0;
   private _frameStamps: number[] = [];
   private _gpuName: string | null = null;
+  private _framesRendered = 0;
+  /** Frames rendered this session (the device-lost read-back shadow only refreshes after something drew). */
+  public get framesRendered(): number { return this._framesRendered; }
   /** Record a frame's CPU duration + timestamp (called around each render). */
   private _noteFrame(ms: number): void {
     this._lastFrameMs = ms;
     const now = performance.now();
     this._frameStamps.push(now);
+    this._framesRendered++;
     // keep the last ~1s window
     while (this._frameStamps.length && now - this._frameStamps[0] > 1000) this._frameStamps.shift();
   }
@@ -431,6 +526,115 @@ export class WebGPURenderer {
     const now = performance.now();
     const recent = this._frameStamps.filter(t => now - t <= 1000).length;
     return { frameMs: this._lastFrameMs, fps: recent, gpuName: this._gpuName };
+  }
+
+  // ── RESOLUTION SCALING (docs/ui/performance.md §Resolution scaling) ──
+  // The ResolutionScaler decides the 3D scene's render scale (off / fixed / auto); the GpuFrameTimer measures the GPU
+  // frame time it steers by. The setting is a per-machine VIEWPORT preference (localStorage), never document data:
+  // the right scale depends on this GPU and this monitor, not on the scene.
+  private readonly _resScaler = new ResolutionScaler();
+  private _gpuTimer: GpuFrameTimer | null = null;
+  private _gpuMs: number | null = null;       // smoothed GPU frame time while timing runs
+  private _gpuTimingLease = 0;                // performance.now() until which a stats readout keeps timing on
+  /** Frames forced to full resolution (snapshots / thumbnails / video export wait on a settled frame). */
+  private _fullResHold = 0;
+  private _frameScaled = false;      // this frame renders below native (set per frame before the 3D pass)
+  private _submittedScaled = false;  // ... as of the last submitted frame (waitForFrameSettled skips such frames)
+  static readonly RES_SCALE_PREF_KEY = 'salsa.viewport.resolutionScale';
+  private _resPrefLoaded = false;
+  private _loadResolutionPref(): void {
+    if (this._resPrefLoaded) return;
+    this._resPrefLoaded = true;
+    try {
+      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(WebGPURenderer.RES_SCALE_PREF_KEY) : null;
+      if (raw) this._resScaler.set(sanitizeResolutionScale(JSON.parse(raw)));
+    } catch { /* storage blocked / bad JSON: keep the defaults */ }
+  }
+  /** Set the resolution scaling (merged onto the current setting). `persist` false = this session only. */
+  public setResolutionScale(patch: Partial<ResolutionScaleSettings>, persist = true): ResolutionScaleState {
+    this._loadResolutionPref();
+    const s = this._resScaler.set(patch ?? {});
+    if (persist) { try { localStorage.setItem(WebGPURenderer.RES_SCALE_PREF_KEY, JSON.stringify(s)); } catch { /* storage blocked */ } }
+    this.scheduleRender();
+    return this.getResolutionScale();
+  }
+  /** The setting plus what it is doing now: `current` = the scale the 3D scene renders at, `gpuMs` = smoothed GPU ms. */
+  public getResolutionScale(): ResolutionScaleState {
+    this._loadResolutionPref();
+    const r3 = this._renderer3D;
+    return { ...this._resScaler.settings, current: r3 ? r3.dynamicResolutionScale : this._resScaler.scale(), gpuMs: this._gpuMs,
+      timing: this._gpuTimer?.supported ? 'timestamp' : 'estimate' };
+  }
+  /** Keep GPU timing on for `ms` (a perf readout polls this; timing otherwise runs only in auto mode). */
+  public leaseGpuTiming(ms = 3000): void {
+    const until = performance.now() + Math.max(0, ms);
+    if (until > this._gpuTimingLease) this._gpuTimingLease = until;
+  }
+  /** Smoothed GPU frame time (ms) while timing runs, else null. */
+  public getGpuFrameMs(): number | null { return this._gpuMs; }
+  private _onGpuSample = (ms: number, source: 'timestamp' | 'estimate'): void => {
+    this._gpuMs = this._gpuMs == null ? ms : this._gpuMs + (ms - this._gpuMs) * 0.1;
+    if (source === 'timestamp') this._renderer3D?.noteCullGpuMs(ms);   // GPU culling auto mode (performance-plan §P15)
+    if (this._resScaler.sample(ms, performance.now())) this.scheduleRender();
+  };
+  /** Per frame, before the 3D pass: decide the scale and whether the timer runs. */
+  // ── TEMPORAL AA / UPSCALING (engine-roadmap step 6; temporal-aa.ts, docs/ui/performance.md) ──
+  // Like resolution scaling, a per-machine VIEWPORT preference (localStorage), never document data.
+  static readonly TAA_PREF_KEY = 'salsa.viewport.temporalAA';
+  private _taaSettings: TemporalAASettings = { ...DEFAULT_TEMPORAL_AA };
+  private _taaPrefLoaded = false;
+  private _taaSettleLeft = 0;          // settle frames still to render after the last requested frame
+  private _taaExternal = true;         // the next frame was requested by something other than the settle loop
+  /** Frames rendered after the view stops so the jittered history converges (edges, dither fades). */
+  static TAA_SETTLE_FRAMES = 32;
+  private _loadTemporalPref(): void {
+    if (this._taaPrefLoaded) return;
+    this._taaPrefLoaded = true;
+    try {
+      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(WebGPURenderer.TAA_PREF_KEY) : null;
+      if (raw) this._taaSettings = sanitizeTemporalAA(JSON.parse(raw));
+    } catch { /* storage blocked / bad JSON: keep the defaults */ }
+  }
+  /** Set temporal AA / upscaling (merged onto the current setting). `persist` false = this session only. */
+  public setTemporalAA(patch: Partial<TemporalAASettings>, persist = true): TemporalAAState {
+    this._loadTemporalPref();
+    const prevMode = this._taaSettings.mode;
+    this._taaSettings = sanitizeTemporalAA(patch ?? {}, this._taaSettings);
+    if (persist) { try { localStorage.setItem(WebGPURenderer.TAA_PREF_KEY, JSON.stringify(this._taaSettings)); } catch { /* storage blocked */ } }
+    if (prevMode !== this._taaSettings.mode) this._renderer3D?.resetTemporalHistory();
+    this.scheduleRender();
+    return this.getTemporalAA();
+  }
+  /** The setting plus what it did on the last 3D frame (active, why not, the internal scale). */
+  public getTemporalAA(): TemporalAAState {
+    this._loadTemporalPref();
+    const st = this._renderer3D?.getTemporalStatus() ?? { active: false, reason: this._taaSettings.mode === 'off' ? 'off' as const : 'ok' as const, renderScale: 1, samples: 16, velocityDraws: 0 };
+    return { ...this._taaSettings, ...st };
+  }
+  /** After a TAA frame: keep rendering a few frames once the view stops, so the history converges. */
+  private _temporalSettle(): void {
+    const ext = this._taaExternal;   // set by every scheduleRender since the last settle request
+    this._taaExternal = false;
+    if (!this._renderer3D?.temporalActive) { this._taaSettleLeft = 0; return; }
+    this._taaSettleLeft = ext ? WebGPURenderer.TAA_SETTLE_FRAMES : this._taaSettleLeft - 1;
+    if (this._taaSettleLeft > 0) { this.scheduleRender(); this._taaExternal = false; }
+  }
+
+  private _applyResolutionScale(r3d: { setUserResolutionScale(s: number): void } | null): void {
+    this._loadResolutionPref();
+    const auto = this._resScaler.settings.mode === 'auto';
+    if (!this._gpuTimer && this.device) { this._gpuTimer = new GpuFrameTimer(this.device); this._gpuTimer.onResult = this._onGpuSample; }
+    // (the GPU culling auto mode needs GPU timestamps too while the GPU scene runs a city: Renderer3D.wantsGpuTiming)
+    const timing = auto || performance.now() < this._gpuTimingLease || !!this._renderer3D?.wantsGpuTiming();
+    this._gpuTimer?.setEnabled(timing && !this._captureMode);
+    this._renderer3D?.setGpuTimerSource(!this._gpuTimer || !this._gpuTimer.enabled ? 'none' : this._gpuTimer.supported ? 'timestamp' : 'estimate');
+    if (!timing) this._gpuMs = null;
+    const full = this._fullResHold > 0 || !!this._captureMode;   // exports / snapshots always render at native size
+    r3d?.setUserResolutionScale(full ? 1 : this._resScaler.scale());
+    // Temporal AA: exports / snapshots render natively (no jitter, no history) with FXAA standing in.
+    this._loadTemporalPref();
+    this._renderer3D?.setTemporalFrame(this._taaSettings, full, this._resScaler.settings.mode !== 'off');
+    this._frameScaled = !full && (this._resScaler.scale() < 1 || !!this._renderer3D?.temporalActive);
   }
   private live = false;             // on/off switch for the loop
   private _suspended = false;       // hard stop: a foreign owner (the Shell UI)
@@ -458,17 +662,19 @@ export class WebGPURenderer {
 
     if (this.needsFrame && !this._suspended) {
       this.needsFrame = false;
-      const _t0 = performance.now(); this.render(); this._noteFrame(performance.now() - _t0);
+      const _t0 = performance.now(); this._renderLive(); this._noteFrame(performance.now() - _t0);
     }
 
     // stay alive: if something else marks needsFrame before next vsync,
-    // weâ€™ll draw it; otherwise weâ€™ll spin very cheaply.
+    // we’ll draw it; otherwise we’ll spin very cheaply.
     this.requestTick();
   };
 
   // rAF scheduler
   public scheduleRender() {
+    this._taaExternal = true;      // temporal AA settle: a real request restarts the settle count
     if (this._suspended) return;   // Shell UI owns the canvas — block all draws
+    if (this._deviceLost) { this.needsFrame = true; return; }   // device lost: the recovery schedules the next frame
     // Mark that a frame is wanted. CRITICAL: when the rAF loop is live (play()),
     // requestTick() keeps `rafId` permanently pending, so the early-return below
     // would otherwise drop every on-demand render — and onRAF only draws when
@@ -479,9 +685,24 @@ export class WebGPURenderer {
       this.rafId = null;
       if (this._suspended) return;
       this.needsFrame = false;
-      const _t0 = performance.now(); this.render(); this._noteFrame(performance.now() - _t0);
+      const _t0 = performance.now(); this._renderLive(); this._noteFrame(performance.now() - _t0);
       if (this.interactiveCount > 0) this.scheduleRender();
     });
+  }
+  /** A LIVE (on-screen) frame: pipelines still compiling are skipped rather than compiled synchronously
+   *  (GPUPipelineCache live-frame scope — docs/specs/performance-plan.md P2). One-shot captures call render()
+   *  directly, outside the scope, so they compile what they need and never read back a half-drawn image. */
+  private _renderLive(): void {
+    // A frame requested before the GPU device / canvas context exist (an early scheduleRender during async init —
+    // e.g. a pipeline-ready or deferred-work callback) must be a no-op, not a crash (ensureLastFrameTex → device
+    // undefined). The init path schedules the first real frame once the device is ready.
+    if (!this.device || !this.context || this._deviceLost) { this.needsFrame = true; return; }
+    const cache = GPUPipelineCache.peek(this.device);
+    if (!cache) { void this.render(); return; }
+    cache.beginFrame();
+    let p: Promise<void>;
+    try { p = this.render(); } catch (e) { cache.endFrame(); throw e; }
+    p.then(() => cache.endFrame(), () => cache.endFrame());
   }
   public beginInteractive() { this.interactiveCount++; this.scheduleRender(); }
   public endInteractive()   { this.interactiveCount = Math.max(0, this.interactiveCount-1); this.scheduleRender(); }
@@ -520,7 +741,7 @@ export class WebGPURenderer {
     // the compositor needs); re-assert our configuration before resuming.
     try {
       this.context.configure({
-        device: this.device,
+        device: unwrapDevice(this.device),
         format: this.swapChainFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
         alphaMode: 'premultiplied',
@@ -738,8 +959,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     }
     
     // Pass world dimensions - shader will compute aspect = world/texture
-    // This makes aspectX = 2.0/1669 â‰ˆ 0.0012, aspectY = 2.0/991 â‰ˆ 0.0020
-    // The ratio aspectY/aspectX â‰ˆ 1.684 compensates for the texture stretch
+    // This makes aspectX = 2.0/1669 ≈ 0.0012, aspectY = 2.0/991 ≈ 0.0020
+    // The ratio aspectY/aspectX ≈ 1.684 compensates for the texture stretch
     this.rasterTextureManager.dispatchBrushToTexture(
         targetTex, view, cx, cy, radius, color, mode, eraseHard, 
         worldQuadW,   // World quad width (2.0)
@@ -835,6 +1056,190 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   public whenReady(): Promise<void> {
       return this.device ? Promise.resolve() : this._readyPromise;
   }
+
+  // ── GPU DEVICE LOSS + RECOVERY (docs/ui/device-recovery.md) ─────────────────────────────────────────────────────────
+  // On loss the render loop stops (no per-frame throws against a dead device) and, with autoRecoverDevice on, the
+  // renderer asks for a new adapter + device, re-points the device HANDLE every owner holds, rebuilds its own GPU
+  // resources (fresh Renderer3D / GpRenderer3D, raster engines, swept lazy buffers), runs the registered owner hooks (the
+  // 2D stack, ShapeManager's managers) and, through the recovery handler ShapeManager installs, restores the document
+  // content from its CPU snapshot. Status changes go to onDeviceStatusChange (sm.onDeviceStatusChange for the host).
+
+  /** Show the built-in overlay when WebGPU is unavailable at start-up / a recovery fails. Set false before
+   *  startWebGPURendering to render your own (getDeviceStatus / onDeviceStatusChange carry the same information). */
+  public static showDeviceOverlays = true;
+  /** Recover automatically when the device is lost (false = wait for recoverDevice()). */
+  public autoRecoverDevice = true;
+  private _deviceHandle: GpuDeviceHandle | null = null;
+  private readonly _deviceStatus = new GpuDeviceStatusTracker();
+  private _deviceLost = false;
+  private _wasLiveBeforeLoss = false;
+  private _intentionalDeviceDestroy = false;
+  private _recoveryPromise: Promise<boolean> | null = null;
+  private _recoveryHandler: ((install: () => Promise<void>) => Promise<string[] | void>) | null = null;
+  private readonly _gpuOwners: Array<{ name: string; order: number; rebuild: (device: GPUDevice) => void | Promise<void> }> = [];
+
+  /** The device status (ok / lost / recovering / failed / unavailable) plus loss + recovery counters. */
+  public getDeviceStatus(): GpuDeviceStatusInfo { return this._deviceStatus.info; }
+  /** Subscribe to device status changes; returns the unsubscribe function. */
+  public onDeviceStatusChange(fn: GpuDeviceStatusListener): () => void { return this._deviceStatus.subscribe(fn); }
+  /** True from the loss until the recovery finished (rendering is stopped meanwhile). */
+  public get isDeviceLost(): boolean { return this._deviceLost; }
+  /** How many times the device was replaced (0 = the first device). Owners can compare it to drop cached objects. */
+  public get deviceGeneration(): number { return this._deviceHandle?.generation ?? 0; }
+
+  /**
+   * Register an owner of long-lived GPU objects to rebuild after a device loss. `rebuild` runs once the new device is
+   * in place (the handle already points at it) and must replace every GPU object the owner kept. Lower `order` runs
+   * first (the renderer's own resources run before all of them; the 2D stack = 10, ShapeManager managers = 50).
+   * Returns an unregister function.
+   */
+  public registerGpuResourceOwner(name: string, rebuild: (device: GPUDevice) => void | Promise<void>, order = 100): () => void {
+    const rec = { name, order, rebuild };
+    this._gpuOwners.push(rec);
+    this._gpuOwners.sort((a, b) => a.order - b.order);
+    return () => { const i = this._gpuOwners.indexOf(rec); if (i >= 0) this._gpuOwners.splice(i, 1); };
+  }
+
+  /** ShapeManager installs this: it snapshots the document, calls `install()` (new device + every GPU resource) and
+   *  restores the document content. Returns what could not be recovered. Null = infrastructure-only recovery. */
+  public setDeviceRecoveryHandler(fn: ((install: () => Promise<void>) => Promise<string[] | void>) | null): void { this._recoveryHandler = fn; }
+
+  /** TEST HOOK: destroy the current device as if the GPU process had reset (a real loss takes the same path). */
+  public simulateDeviceLoss(): void { try { this._deviceHandle?.current.destroy(); } catch { /* already lost */ } }
+
+  private _rasterOwnerRegistered = false;
+  /** The raster engines (paint / composite / selection) re-initialise after the layer textures are re-created (the
+   *  RasterLayerManager owner runs at order 40), so they bind the new active layer texture, never the dead one. */
+  private _registerRasterEngineOwner(): void {
+    if (this._rasterOwnerRegistered) return;
+    this._rasterOwnerRegistered = true;
+    this.registerGpuResourceOwner('raster-engines', () => { if (this.rasterDrawingService) this.initializeRasterTexture(); }, 60);
+    // Temporal AA: the history / velocity targets live on the (rebuilt) Renderer3D; a recovered device starts the
+    // accumulation over (the setting itself lives here and is re-applied every frame).
+    this.registerGpuResourceOwner('temporal-aa', () => { this._renderer3D?.resetTemporalHistory(); this._taaSettleLeft = 0; }, 70);
+  }
+
+  private _watchDevice(real: GPUDevice): void {
+    real.lost.then((info) => {
+      if (this._deviceHandle && this._deviceHandle.current !== real) return;   // a device we already replaced
+      if (this._intentionalDeviceDestroy) return;                               // our own teardown, not a loss
+      this._onDeviceLost(info.reason ?? 'unknown', info.message ?? '');
+    }, () => { /* never rejects */ });
+  }
+
+  private _onDeviceLost(reason: string, message: string): void {
+    if (this._deviceLost) return;
+    this._deviceLost = true;
+    console.warn(`[Salsa][gpu] device lost (${reason}): ${message}`);
+    // Stop the loop cleanly: no frame is recorded against the dead device (each would throw or log every vsync).
+    this._wasLiveBeforeLoss = this.live || this._wasLiveBeforeLoss;
+    this.live = false;
+    if (this.rafId != null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+    this._deviceStatus.set({ status: 'lost', reason, message, unrecovered: [] });
+    if (this.autoRecoverDevice) void this.recoverDevice();
+  }
+
+  /**
+   * Recover from a device loss: new adapter + device, every GPU resource rebuilt, content restored (via the recovery
+   * handler). Resolves true when the canvas renders again; false (status 'failed', overlay shown) when no device
+   * could be had or a rebuild step threw. Concurrent calls share one attempt.
+   */
+  public recoverDevice(): Promise<boolean> {
+    if (this._recoveryPromise) return this._recoveryPromise;
+    if (!this._deviceLost) return Promise.resolve(true);
+    this._recoveryPromise = (async () => {
+      this._deviceStatus.set({ status: 'recovering' });
+      const t0 = performance.now();
+      try {
+        const unrecovered = (this._recoveryHandler ? await this._recoveryHandler(() => this._installNewDevice()) : await this._installNewDevice()) || [];
+        this._deviceLost = false;
+        if (this._wasLiveBeforeLoss) this.play();
+        this._wasLiveBeforeLoss = false;
+        this.renderListDirty = true; this._flatShapesDirty = true;
+        this.scheduleRender();
+        hideWebGPUOverlay(this.canvas);
+        console.log(`[Salsa][gpu] device recovered in ${Math.round(performance.now() - t0)} ms`);
+        this._deviceStatus.set({ status: 'ok', reason: null, message: null, unrecovered: unrecovered as string[] });
+        return true;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        console.error('[Salsa][gpu] device recovery failed:', e);
+        this._deviceStatus.set({ status: 'failed', reason: 'recovery-failed', message });
+        if (WebGPURenderer.showDeviceOverlays) showWebGPUOverlay(this.canvas, describeWebGPUUnavailable('recovery-failed', message));
+        return false;
+      } finally {
+        this._recoveryPromise = null;
+      }
+    })();
+    return this._recoveryPromise;
+  }
+
+  /** New device, handle re-pointed, context reconfigured, own resources, then the registered owners (in order). */
+  private async _installNewDevice(): Promise<void> {
+    const got = await requestSalsaDeviceWithRetry();
+    if (!this._deviceHandle) throw new Error('no device handle');
+    this._deviceHandle.retarget(got.device);
+    this._gpuName = got.gpuName ?? this._gpuName;
+    this._watchDevice(got.device);
+    // The pipeline cache is keyed by the device object; the handle keeps its identity, so drop the dead cache.
+    GPUPipelineCache.forget(this.device);
+    this._pipelineWarmScheduled = false; this._pipelineWarmStarted = false;
+    this.context.configure({
+      device: unwrapDevice(this.device),
+      format: this.swapChainFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+      alphaMode: 'premultiplied',
+    });
+    this._rebuildOwnGpuResources();
+    for (const o of [...this._gpuOwners]) {
+      try { await o.rebuild(this.device); }
+      catch (e) { throw new Error(`rebuilding '${o.name}' failed: ${e instanceof Error ? e.message : String(e)}`); }
+    }
+    this._schedulePipelineWarmup();
+  }
+
+  /** The renderer's OWN GPU objects. Renderers / engines are re-created (their constructors make their resources);
+   *  lazily created buffers + textures are swept (null) and come back on first use; the few eager ones are rebuilt. */
+  private _rebuildOwnGpuResources(): void {
+    const old3D = this._renderer3D;
+    const cam = old3D?.getCamera();
+    // Fresh 3D renderers: every pipeline, pass, geometry pool, instance buffer, shadow map, IBL bake and GPU-scene
+    // buffer comes back through the constructor (or lazily). The CAMERA object carries over: the orbit / fly / Play
+    // controllers hold it. Scene settings are re-applied by the document restore; the per-SESSION switches (never
+    // saved) are carried here. GPU-driven / culling-mode / P14 / P16 switches are statics and survive on their own.
+    this._renderer3D = undefined;
+    this._gpRenderer3D = undefined;
+    if (cam) {
+      const r3 = this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
+      r3.onDeferredWork = () => this.scheduleRender();
+      if (old3D) {
+        r3.shadowStaticCache = old3D.shadowStaticCache;   // P14 farStaticCache
+        r3.setShadowQuality(old3D.shadowPcfRadius);        // the scene PCF kernel (per session outside a city)
+        r3.frustumCulling = old3D.frustumCulling;
+        r3.distanceLod = old3D.distanceLod;
+        r3.distanceLodScale = old3D.distanceLodScale;
+        r3.distanceLodBias = old3D.distanceLodBias;
+        r3.orthoScreenLod = old3D.orthoScreenLod;
+      }
+    }
+    // Raster engines (paint / composite / selection / overlay): re-created below by initializeRasterTexture.
+    this.rasterTextureManager = undefined; this._rasterPaintEngine = undefined; this._rasterCompositor = undefined;
+    this._rasterSelectionEngine = undefined; this._selectionOverlayRenderer = undefined; this.rasterTexture = undefined;
+    this.rasterCompositionList = undefined; this.rasterForegroundList = undefined;
+    this._gpuTimer = null;
+    this.bgBindGroup = undefined as unknown as GPUBindGroup;   // ensureBackgroundResources re-creates the bg set
+    // Every remaining own field that holds an old-device object (all lazily created: `if (!this.x) this.x = ...`).
+    const swept = sweepGpuFields(this, ['device', 'context']);
+    if (swept.length) console.log('[Salsa][gpu] renderer fields swept:', swept.join(', '));
+    // The eager ones.
+    this.stagingBuffer = new StrokesStagingBuffer(this.device);
+    this.patternSampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat' });
+    this.interactionService.setDepthTextureView(this.device);
+    this.ensureLastFrameTex();
+    // (the raster engines re-initialise in the 'raster-engines' owner hook, AFTER the layer textures are re-created)
+    this.bgDirty.res = true; this.bgDirty.matrix = true; this.bgDirty.colors = true;
+    this.renderListDirty = true; this._flatShapesDirty = true;
+  }
   
   public setWebGPURenderStrategy(strategy: WebGPURenderStrategy) {
       this.webGPURenderStrategy = strategy;
@@ -851,6 +1256,15 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           this.interactionService.isVectorLayerInteractive(n.layerId);
       this._flatShapesDirty = true;
       this.renderListDirty = true;
+  }
+
+  /** QUIET structural change: re-walk the tree into the flat shape list on the next render-list rebuild (what the
+   *  onSceneGraphChanged subscription does) WITHOUT a host-facing scene-graph event — engine-internal node churn
+   *  (the live crowd's per-person meshes, Scene3DManager.notifySceneStructureChanged3D). */
+  public markStructureDirty(): void {
+      this._flatShapesDirty = true;
+      this.renderListDirty = true;
+      this.scheduleRender();
   }
 
   public setPipelineManager(
@@ -955,7 +1369,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   private handlePointerMove(event: PointerEvent) { this._interaction.handlePointerMove(event); }
   private handlePointerUp(event: PointerEvent) { this._interaction.handlePointerUp(event); }
 
-  // â”€â”€ Onion Skin Overlay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Onion Skin Overlay ──────────────────────────────────────────
 
   /**
    * Apply onion skin ghost frames on top of the composited raster output.
@@ -1138,7 +1552,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   const oldCanvas = this.canvas;
   this.interactionService.canvas = newCanvas;
 
-  // 3) Rebind rendererâ€™s own event handlers to the new canvas
+  // 3) Rebind renderer’s own event handlers to the new canvas
   //    (avoid duplicate bindings if called multiple times)
   if (oldCanvas && oldCanvas !== newCanvas) {
     removeZonelessListener(oldCanvas, 'pointerdown', this._boundPointerDown);
@@ -1175,7 +1589,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   // 5) Reconfigure the WebGPU context for the new canvas
   this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
   this.context.configure({
-    device: this.device,
+    device: unwrapDevice(this.device),
     format: this.swapChainFormat,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
     alphaMode: 'premultiplied',
@@ -1221,36 +1635,25 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         When you call functions on the GPU object, the browser translates these into lower-level graphics API calls 
         (like Vulkan, Direct3D, or Metal) that are executed by the GPU.
         --------------------------------------------------------------------------------------------------------------------------*/
-        if (!navigator.gpu) { throw new Error("WebGPU is not supported on this browser."); }
-
-        /* About the GPUAdapter:
-           The GPUAdapter is an interface that provides information about the GPU hardware and 
-           allows us to request a GPUDevice to perform rendering or compute operations.
-           Not all devices or browsers support WebGPU. By checking for the availability of a GPUAdapter, 
-           the application can handle cases where WebGPU isn't supported and potentially provide fallbacks 
-           (a different rendering strategy) or inform the user.
-        ---------------------------------------------------------------------------------------------------------------------------*/
-        const adapter = await navigator.gpu.requestAdapter();
-        if (!adapter) { throw new Error("Failed to request WebGPU adapter."); }
-        // Capture the GPU name for the stats HUD (best-effort; browsers may return limited info for privacy).
-        try {
-            const info = (adapter as any).info ?? (typeof (adapter as any).requestAdapterInfo === 'function' ? await (adapter as any).requestAdapterInfo() : null);
-            if (info) this._gpuName = [info.description, info.vendor, info.architecture].filter(Boolean).join(' ') || null;
-        } catch { /* adapter info optional */ }
-        // this.device = await adapter.requestDevice();
-
-        // Raise the buffer-size ceilings to whatever THIS adapter supports (default is a low 256 MB). Big scenes —
-        // notably a TILED world (several cities merged into one geometry pool) — blow past 256 MB; requesting the
-        // adapter's own max (commonly 2 GB) lets them allocate. (The real scalability fix beyond that is tile LOD,
-        // where far tiles collapse to the flat map — but this removes the hard wall so big scenes render at all.)
-        const lim = adapter.limits;
-        this.device = await adapter.requestDevice({
-            requiredFeatures: ["indirect-first-instance"],
-            requiredLimits: {
-                maxBufferSize: lim.maxBufferSize,
-                maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
-            },
-        });
+        // Adapter + device through the shared request (docs/ui/device-recovery.md): every recovery requests the same
+        // features + limits again. No WebGPU / no adapter (e.g. Chrome Canary's "No available adapters") shows a friendly
+        // overlay with the fixes instead of leaving a black canvas; the error still propagates to the caller.
+        let got: SalsaDevice;
+        try { got = await requestSalsaDevice(); }
+        catch (e) {
+            const reason = e instanceof WebGPUUnavailableError ? e.reason : 'device-failed';
+            const message = e instanceof Error ? e.message : String(e);
+            this._deviceStatus.set({ status: 'unavailable', reason, message });
+            if (WebGPURenderer.showDeviceOverlays) showWebGPUOverlay(this.canvas, describeWebGPUUnavailable(reason, message));
+            throw e;
+        }
+        this._gpuName = got.gpuName;
+        // Every owner gets the STABLE handle, so a recovery re-points one object instead of ~100 captured references.
+        this._deviceHandle = createGpuDeviceHandle(got.device);
+        this.device = this._deviceHandle.device;
+        this._watchDevice(got.device);
+        this._deviceStatus.set({ status: 'ok', reason: null, message: null, gpuName: got.gpuName });
+        this._registerRasterEngineOwner();
 
         this.interactionService.setDepthTextureView(this.device);
 
@@ -1261,7 +1664,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         which is a special type of context for managing the WebGPU rendering pipeline.
 
         The canvas context is the bridge between the WebGPU rendering pipeline and the HTML canvas. 
-        Itâ€™s where the WebGPU commands will output the rendered content.
+        It’s where the WebGPU commands will output the rendered content.
 
         Note: The swap chain format we use is bgra8unorm ("blue-green-red-alpha with 8 bits per channel and normalized values"). 
         The swap chain format determines how the image data is represented in memory before being displayed on the screen.
@@ -1271,7 +1674,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         --------------------------------------------------------------------------------------------------------------------------*/
         this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
         this.context.configure({
-            device: this.device,
+            device: unwrapDevice(this.device),
             format: this.swapChainFormat,
             usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
             alphaMode: 'premultiplied',
@@ -1332,6 +1735,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     private _schedulePipelineWarmup(): void {
         if (this._pipelineWarmScheduled || !this.device) return;
         this._pipelineWarmScheduled = true;
+        // P2: a draw skipped because its pipeline was still compiling asks for another frame when it lands (the
+        // on-demand render loop would otherwise sit on the incomplete frame until the next input event).
+        GPUPipelineCache.for(this.device).onPipelineReady(() => this.scheduleRender());
+        if (this.needsFrame) queueMicrotask(() => this.scheduleRender());   // a frame requested before the device existed
         const g = globalThis as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void };
         if (typeof g.requestIdleCallback === 'function') g.requestIdleCallback(() => this.warmPipelinesNow(), { timeout: 200 });
         else setTimeout(() => this.warmPipelinesNow(), 0);
@@ -1344,13 +1751,18 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       // During drag, pan, scale or zoom the shape list is identical — only the viewport
       // filter and sort need to re-run on the already-flat list.
       if (this._flatShapesDirty) {
-        this._flatShapes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
         // PRE-SORT once per STRUCTURE change: the flat list keeps zIndex order, so the per-frame viewport filter
         // below (stable) yields an already-sorted renderList — the old per-PAN-FRAME O(n log n) sort over every
         // shape+mesh (meshes don't even use zIndex; depth-buffer orders them) is skipped on the hot path.
-        this._flatShapes.sort((a, b) => a.zIndex - b.zIndex);
+        // Step 2: one walk builds the 2D list and the 3D list (render-list-index.ts), each = the stable zIndex sort
+        // of the preorder walk exactly as findAllShapesDeep + sort produced; a small structure change merges the new
+        // nodes into the previous order instead of re-sorting the whole tree.
+        this._rlIndex.walk(this.sceneGraph.root as Node & RenderListNode);
+        this._flatShapes = this._rlIndex.flat2D as unknown as Shape[];
+        this._flat3D = this._rlIndex.flat3D as unknown as Shape[];
         this._flatShapesDirty = false;
       }
+      if (this._rlSplit) this._rebuild3DLists();
 
       const viewBox = viewportAABB(this.canvas, this.interactionService.getWorldMatrix());
       const list: typeof this.renderList = [];
@@ -1375,6 +1787,36 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       this.renderList = list;
 
       this.renderListDirty = false;
+    }
+
+    /** Step 2: the 3D half of the render-list rebuild — every 3D node, in zIndex order, split by kind. 3D nodes have
+     *  no 2D viewport box (getWorldSpaceBoundingBoxPolygon returns [] → never viewport-culled), plus the same zIndex
+     *  sortedness repair. HIDDEN nodes stay in the lists (§P15 draw-bug 2026-10-04): the per-frame users
+     *  (draw3DMeshes / draw3DParticles / draw3DGp) filter `visible` every frame, so a node shown again with only a
+     *  scheduleRender (the eye decal / face kit / Play / script show paths) is drawn at once. Filtering it here kept a
+     *  node hidden at the last rebuild out of every frame until an unrelated structure change. */
+    private _rebuild3DLists(): void {
+      const flat = this._flat3D;
+      let sorted = true;
+      for (let i = 1; i < flat.length; i++) if (flat[i].zIndex < flat[i - 1].zIndex) { sorted = false; break; }
+      if (!sorted) flat.sort((a, b) => a.zIndex - b.zIndex);   // a zIndex edit since the walk (stable, like the old repair)
+      const meshes = this._rl3DMeshes, emitters = this._rl3DEmitters, gp = this._rl3DGp;
+      if (this._rl3DSkinned.length < flat.length) this._rl3DSkinned = new Uint8Array(Math.max(64, flat.length * 2));
+      const sk = this._rl3DSkinned;
+      let nm = 0, ne = 0, ng = 0;
+      for (let i = 0; i < flat.length; i++) {
+        const n = flat[i];
+        if (n instanceof Mesh3D) { sk[nm] = n instanceof SkinnedMesh3D ? 1 : 0; meshes[nm++] = n; }
+        else if (n instanceof ParticleEmitter3D) emitters[ne++] = n;
+        else gp[ng++] = n as unknown as GpObject3D;
+      }
+      meshes.length = nm; emitters.length = ne; gp.length = ng;
+    }
+
+    /** Step 2: does this frame's layer / below-raster filter (the old aboveRaster filter) keep 3D node `n`? */
+    private _keep3D(n: Node, hidden: Set<string>, meshEditHides: boolean, checkBelow: boolean): boolean {
+      if (n.layerId && (hidden.has(n.layerId) || meshEditHides)) return false;
+      return !(checkBelow && n.isRenderBelowRaster());
     }
 
     private cachedAtlasVersion = -1;
@@ -1470,10 +1912,29 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     private _captureMode: { transparent: boolean; skip3D: boolean } | null = null;
 
     public async render() {
+        if (!this.device || !this.context) return;   // not initialised yet (see _renderLive)
+        if (this._deviceLost) { this.needsFrame = true; return; }   // device lost: nothing records until recovery (docs/ui/device-recovery.md)
         // Run pre-render callbacks (orbit controller update, etc.)
         let needsAnotherFrame = false;
-        for (const cb of this.preRenderCallbacks) {
-          if (cb()) needsAnotherFrame = true;
+        const prof = this._cbProfile;
+        const _r0 = prof ? performance.now() : 0;
+        this._gpuTimer?.beginFrame();
+        const _cull0 = performance.now();   // GPU culling auto mode: this frame's main-thread ms
+        this._frameScaled = false;
+        if (prof) {
+          const fp = this._frameProfile;
+          if (fp.last) fp.intervalMs = fp.intervalMs ? fp.intervalMs * 0.9 + (_r0 - fp.last) * 0.1 : _r0 - fp.last;
+          fp.last = _r0;
+          this.preRenderCallbacks.forEach((cb, i) => {
+            const t0 = performance.now();
+            if (cb()) needsAnotherFrame = true;
+            const dt = performance.now() - t0, key = this._cbLabels.get(cb) ?? `cb#${i}`;
+            const e = prof.get(key); if (e) { e.ms = e.ms * 0.9 + dt * 0.1; e.calls++; } else prof.set(key, { ms: dt, calls: 1 });
+          });
+        } else {
+          for (const cb of this.preRenderCallbacks) {
+            if (cb()) needsAnotherFrame = true;
+          }
         }
         if (needsAnotherFrame) this.scheduleRender();
 
@@ -1487,7 +1948,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
         The beginFrame() method processes finalized (non-staged) shapes and prepares their corresponding
         IndirectDrawCommandBuffers. These buffers hold indirect draw commands, which allow all finalized shapes
-        to be rendered in a single batched call using drawIndexedIndirect() in this render() method â€” improving performance
+        to be rendered in a single batched call using drawIndexedIndirect() in this render() method — improving performance
         since it is a batched and efficient WebGPU draw call..
 
         In contrast, staged shapes are not included in these command buffers. Instead, they are drawn manually 
@@ -1560,8 +2021,16 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // Render background
         //this.renderBackground(passEncoder);
 
+        // P4.4 (docs/specs/performance-plan.md): when the 3D workspace backdrop paints an opaque full-canvas background
+        // over everything drawn before it (free3D, or a 2D mode on the scene target), the 2D raster layers underneath
+        // cannot be seen — skip compositing them (a full-document copy + per-layer blend/dither/grain passes EVERY
+        // frame while the 3D scene animates) and the artboard/raster draws. Checked live each frame, so the moment the
+        // backdrop goes away (back to the illustration, or a capture that turns it off) the layers composite fresh.
+        const hidden2DUnder3D = this.scene3DVisible && !this._captureMode && !!this._renderer3D?.focusBgCoversCanvas();
         // If in raster mode, composite raster layers (if provided) into rasterTexture, then draw
-        if (this.renderMode === 'raster' && this.pipelineManager) {
+        if (hidden2DUnder3D) {
+          // nothing: the 3D backdrop (drawArmatureBg, below) covers the canvas
+        } else if (this.renderMode === 'raster' && this.pipelineManager) {
           // Compose layers into the rasterTexture if we have a list
           if (this.rasterCompositionList && this.rasterCompositionList.length > 0) {
             // Ensure raster texture exists
@@ -1595,7 +2064,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
                 this._rasterCompositor.composite(compositorLayers, this.rasterTexture);
               }
 
-              // â”€â”€ Onion skin overlay â”€â”€
+              // ── Onion skin overlay ──
               // After compositing the current frame, overlay ghost frames for
               // adjacent frames so animators can see surrounding drawings.
               this.applyOnionSkinOverlay();
@@ -1636,13 +2105,18 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             this.renderArtboardPattern(passEncoder);
           }
 
-          // â”€â”€ Pre-raster vector pass: draw below-raster nodes (panels) â”€â”€
+          // ── Pre-raster vector pass: draw below-raster nodes (panels) ──
           // Panel layouts render underneath raster layers so illustrations
           // are drawn on top of the panel structure.
           {
             this.handleAtlasChangeIfNeeded();
             this.rebuildRenderListIfNeeded();
-            const belowRasterNodes = this.renderList.filter(n => n.isRenderBelowRaster());
+            // (indexed writes + one final length: `length = 0` then push() dropped and regrew the backing store
+            // every frame, and for-of allocated an iterator result per node below TurboFan)
+            const belowRasterNodes = this._belowRasterScratch, rl = this.renderList;
+            let nb = 0;
+            for (let i = 0; i < rl.length; i++) if (rl[i].isRenderBelowRaster()) belowRasterNodes[nb++] = rl[i];
+            belowRasterNodes.length = nb;
             if (belowRasterNodes.length > 0) {
               this.webGPURenderStrategy.beginFrame(belowRasterNodes, this.stagingBuffer, stagingContainer);
               this.webGPURenderStrategy.uploadDrawCommands();
@@ -1653,7 +2127,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
           // Apply global canvas grain to the raster texture (paper texture effect).
           // In multi-layer mode the compositor already applies it during composite().
-          // In single-layer mode we copy paint â†’ display texture and apply grain there
+          // In single-layer mode we copy paint → display texture and apply grain there
           // so the live paint data is never modified.
           let rasterTexToRender: GPUTexture | undefined = this.rasterTexture;
           if (this.rasterTexture && this._rasterCompositor && this._rasterPaintEngine &&
@@ -1673,7 +2147,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
               this.rasterDisplayTexW = tw;
               this.rasterDisplayTexH = th;
             }
-            // Copy paint â†’ display
+            // Copy paint → display
             const grainCopyEnc = this.device.createCommandEncoder();
             grainCopyEnc.copyTextureToTexture(
               { texture: this.rasterTexture }, { texture: this.rasterDisplayTex! },
@@ -1734,7 +2208,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             passEncoder.drawIndexed(6, 1, 0, 0, 0);
           }
 
-          // â”€â”€ Raster text preview overlay â”€â”€
+          // ── Raster text preview overlay ──
           this.drawRasterTextPreview(passEncoder);
 
           // Draw floating layer (lifted / pasted pixels) during a transform
@@ -1771,10 +2245,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
               // Build a quad for the floating texture
               const fVerts = new Float32Array([
-                x0, y1, 0, 1,  // bottom-left  â†’ UV(0,1)
-                x1, y1, 1, 1,  // bottom-right â†’ UV(1,1)
-                x0, y0, 0, 0,  // top-left     â†’ UV(0,0)
-                x1, y0, 1, 0,  // top-right    â†’ UV(1,0)
+                x0, y1, 0, 1,  // bottom-left  → UV(0,1)
+                x1, y1, 1, 1,  // bottom-right → UV(1,1)
+                x0, y0, 0, 0,  // top-left     → UV(0,0)
+                x1, y0, 1, 0,  // top-right    → UV(1,0)
               ]);
               if (!this._floatingQuadVB || this._floatingQuadVB.size < fVerts.byteLength) {
                 this._floatingQuadVB?.destroy();
@@ -1847,10 +2321,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             }
           }
 
-          // (Raster-specific overlays done â€” fall through to vector drawing
+          // (Raster-specific overlays done — fall through to vector drawing
           //  so SDF text, shapes, panels, speech balloons render on top.)
         } else {
-          // â”€â”€ Vector-only mode: draw artboard background â”€â”€
+          // ── Vector-only mode: draw artboard background ──
           if (artboard) passEncoder.setScissorRect(artboard.x, artboard.y, artboard.w, artboard.h);
           this.renderArtboardPattern(passEncoder);
         }
@@ -1862,7 +2336,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         this.handleAtlasChangeIfNeeded();
 
         this.rebuildRenderListIfNeeded();
-        const visibleNodes = this.renderList.slice();
+        const visibleNodes = this._visibleNodesScratch;
+        { const rl = this.renderList; for (let i = 0; i < rl.length; i++) visibleNodes[i] = rl[i]; visibleNodes.length = rl.length; }
 
         if (this.interactionService.boxSelectPreview) {
             visibleNodes.push(this.interactionService.boxSelectPreview);
@@ -1919,11 +2394,15 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // content (vector layers) so only the mesh + background show — 3D meshes carry no
         // layerId, so they're kept.
         const meshEditHidesContent = this.getRenderer3D()?.meshEditHidesContent() ?? false;
-        const aboveRasterNodes = visibleNodes.filter(n =>
+        this._frameMeshEditHides = meshEditHidesContent;
+        const aboveRasterNodes = this._aboveRasterScratch;
+        let na = 0;
+        for (let i = 0; i < visibleNodes.length; i++) { const n = visibleNodes[i]; if (
             !n.isRenderBelowRaster() &&
             (!n.layerId || !this._hiddenVectorLayerIds.has(n.layerId)) &&
             !(meshEditHidesContent && n.layerId)
-        );
+        ) aboveRasterNodes[na++] = n; }
+        aboveRasterNodes.length = na;
         // Below-raster nodes were already rendered in the pre-raster pass above
 
         this.webGPURenderStrategy.beginFrame(aboveRasterNodes, this.stagingBuffer, stagingContainer);
@@ -1937,6 +2416,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // blit — so nothing 3D touches the canvas. Scene state is untouched → toggling back on restores
         // it exactly (no per-object visibility bookkeeping needed).
         if (this.scene3DVisible && !this._captureMode?.skip3D) {
+        this._applyResolutionScale(r3d);
+        r3d.lodViewHeight = this.canvas.height;   // P9: resolution-aware draw distances follow the CANVAS, not the lo-res target
         const loResSize = r3d.getLoResSize(this.canvas.width, this.canvas.height);
 
         if (loResSize) {
@@ -1948,13 +2429,21 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           // guarantees the lo-res submission runs before the main one.
           const loResEncoder = this.device.createCommandEncoder();
           const loResPass = r3d.beginLowResRenderPass(loResEncoder, lrW, lrH);
+          // RESOLUTION SCALING: the lo-res depth is upsampled into the main pass below, so the overlays (grid, gizmos,
+          // mesh-edit handles) can draw in the full-size overlay pass, crisp. The PS1 look keeps them inline.
+          const deferLo = r3d.loResIsDynamic() && r3d.lowResDepthBlitReady();
           r3d.drawArmatureBg(loResPass, lrW, lrH);
-          this.draw3DMeshes(loResPass, aboveRasterNodes, lrW, lrH);
+          this.draw3DMeshes(loResPass, aboveRasterNodes, lrW, lrH, deferLo);
           this.draw3DParticles(loResPass, aboveRasterNodes, lrW, lrH);
           this.draw3DGp(loResPass, aboveRasterNodes, lrW, lrH);
           loResPass.end();
+          r3d.endLowResScene(loResEncoder, this.canvas.width, this.canvas.height);   // temporal AA: un-jitter + velocity + resolve
           this.device.queue.submit([loResEncoder.finish()]);
           r3d.blitLowResToPass(passEncoder);
+          if (deferLo) {
+            r3d.blitLowResDepthToPass(passEncoder);
+            r3d.applySceneDepthRange(passEncoder, this.canvas.width, this.canvas.height);   // as the native path leaves it
+          }
         } else {
           // Normal full-resolution path.
           r3d.drawArmatureBg(passEncoder, this.canvas.width, this.canvas.height);
@@ -2100,12 +2589,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             this.draw3DOverlays(overlayPass);
           }
           if (!this._captureMode) {
-          // â”€â”€ Selection highlight overlay (behind carets) â”€â”€
+          // ── Selection highlight overlay (behind carets) ──
           const selHighlights = this.webGPURenderStrategy.collectSelectionHighlights(visibleNodes);
           this.selectionHighlightManager.update(selHighlights);
           this.drawSelectionHighlightInstances(overlayPass);
 
-          // â”€â”€ Connection-port indicator dots â”€â”€
+          // ── Connection-port indicator dots ──
           this.updateConnectionPortDots();
           this.drawOverlayDotInstances(overlayPass);
 
@@ -2139,6 +2628,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             { texture: backTex },
             { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
           );
+          // A focus background (armature / mesh edit) is editor UI: put its unprocessed pixels back so the scene's
+          // post effects don't grade it (a light pattern used to wash out to white). Before drawPostOverlays, which
+          // clears the depth this reads.
+          // (Skipped in the lo-res PS1 mode: its 3D depth lives in the lo-res target, so the main depth is empty and
+          // the whole frame would lose its post look.)
+          if (ppOutput && this._renderer3D && (!this._renderer3D.getLoResSize(this.canvas.width, this.canvas.height) || this._renderer3D.loResIsDynamic())) this._renderer3D.restoreFocusBgAfterPost(commandEncoder, this.lastFrameTex!, backTex.createView(), this.interactionService.depthTextureView);
         }
 
         // POST-PROCESS-IMMUNE overlays (the landmark info card): drawn directly onto the FINAL swapchain image,
@@ -2148,12 +2643,27 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           this._renderer3D.drawPostOverlays(commandEncoder, backTex.createView(), this.interactionService.depthTextureView);
         }
 
+        // UI KIT overlay: last, on the swapchain at native size (post-process immune; skipped in captures).
+        let uiKitMore = false;
+        if (this._uiKitDrawer && !this._captureMode) {
+          try {
+            uiKitMore = this._uiKitDrawer(this.device, commandEncoder, backTex.createView(), this.canvas.width, this.canvas.height,
+              this.swapChainFormat, this.canvas.width / Math.max(1, this.canvas.clientWidth || this.canvas.width), this.deviceGeneration);
+          } catch (e) { console.warn('[ui-kit] overlay draw failed', e); }
+        }
+
         this.device.queue.submit([commandEncoder.finish()]);
+        if (uiKitMore) this.scheduleRender();
+        this._gpuTimer?.endFrame();   // resolution scaling: resolve this frame's GPU timestamps
+        this._renderer3D?.noteCullCpuMs(performance.now() - _cull0);   // GPU culling auto mode (performance-plan §P15)
+        this._submittedScaled = this._frameScaled;
+        if (prof) { const fp = this._frameProfile, d = performance.now() - _r0; fp.renderMs = fp.renderMs ? fp.renderMs * 0.9 + d * 0.1 : d; }   // whole frame CPU (callbacks + encode)
 
         // Tell anyone waiting that a frame was submitted (for thumbnails)
         this.notifyFrameSubmitted();
+        if (!this._captureMode && this.scene3DVisible) this._temporalSettle();   // temporal AA: converge after the view stops
 
-        if(this.cacheService!.getSdfAtlas().version != this.cachedAtlasVersion) {
+        if(this.cacheService!.getSdfAtlas().version !== this.cachedAtlasVersion) {
           this.cacheService!.getSdfAtlas().sweepRetired();
           this.cacheService!.getSdfAtlas().glyphCompute.sweepComputeTemps(this.device.queue);
         }
@@ -2173,18 +2683,44 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
      */
     private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height, deferOverlays = false): void {
       // Reused scratch (no per-frame array allocation) — see field docs.
-      const allMeshes = this._allMeshesScratch; allMeshes.length = 0;
-      for (const n of nodes) if (n instanceof Mesh3D && n.visible) allMeshes.push(n);
+      // P9: indexed writes + one final length (no iterator results; the backing stores are kept across frames)
+      const allMeshes = this._allMeshesScratch;
+      const regularMeshes = this._regularMeshesScratch;
+      const skinnedMeshes = this._skinnedMeshesScratch;
+      let nm = 0, nr = 0, ns = 0;
+      if (this._rlSplit) {
+        // Step 2: the cached 3D mesh list (render-list order) + this frame's visible / layer / below-raster filter —
+        // the same set and order the old instanceof scan of the whole frame list produced, without touching 2D nodes.
+        const src = this._rl3DMeshes, sk = this._rl3DSkinned, hidden = this._hiddenVectorLayerIds;
+        const hides = this._frameMeshEditHides, below = this._rlIndex.any3DBelowRaster, plain = hidden.size === 0 && !hides && !below;
+        for (let i = 0; i < src.length; i++) {
+          const m = src[i];
+          if (!m.visible || (!plain && !this._keep3D(m, hidden, hides, below))) continue;
+          allMeshes[nm++] = m;
+          if (sk[i]) skinnedMeshes[ns++] = m as SkinnedMesh3D; else regularMeshes[nr++] = m;
+        }
+      } else {
+        for (let i = 0; i < nodes.length; i++) { const n = nodes[i]; if (n instanceof Mesh3D && n.visible) allMeshes[nm++] = n; }
+      }
+      allMeshes.length = nm;
 
       // Lazy-init the 3D renderer — needed even for a ghost-only preview (no committed meshes).
       if (!this._renderer3D) {
         const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0], autoNear: true });   // near tracks orbit distance (docs/specs/depth-precision.md)
         this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
+        this._renderer3D.onDeferredWork = () => this.scheduleRender();   // P4.3: budgeted re-dress continues next frame
       }
+      // P1.1: under ortho, every depth-tested 3D draw in this pass (meshes, skinned, particles, GP, artboard, inline
+      // overlays) stores depth in [1/3, 1] instead of [0, 1] — see Renderer3D.orthoDepthRemap. No-op in perspective.
+      this._renderer3D.applySceneDepthRange(passEncoder, w, h);
 
       if (allMeshes.length === 0) {
         // No committed meshes → no info card either; drop any stale overlay so it can't reference dead slots.
         this._renderer3D.clearPostOverlays();
+        // Stats fix (performance-plan §P15): zero the frame counters + drop the GPU-driven records (else the last
+        // static frame's numbers and records stayed forever), and let the skinned path see its roster go empty.
+        this._renderer3D.noStaticMeshesThisFrame();
+        if (this._renderer3D.skinnedLastCount > 0) this._renderer3D.drawSkinnedMeshes(passEncoder, [], w, h);
         this._renderer3D.drawArtboardTextureIfActive(passEncoder); // the 2D illustration on the artboard plane (CONTENT — stays in the grab)
         if (deferOverlays) { this._overlays3DPending = true; }
         else { this.draw3DOverlays(passEncoder, w, h); }
@@ -2192,12 +2728,15 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       }
 
       // Split into single-material vs skinned in ONE pass (was two more .filter allocations per frame).
-      const regularMeshes = this._regularMeshesScratch; regularMeshes.length = 0;
-      const skinnedMeshes = this._skinnedMeshesScratch; skinnedMeshes.length = 0;
-      for (const m of allMeshes) {
-        if (m instanceof SkinnedMesh3D) skinnedMeshes.push(m);
-        else regularMeshes.push(m);
+      // (Step 2: the split list already did this while filtering.)
+      if (!this._rlSplit) {
+        for (let i = 0; i < allMeshes.length; i++) {
+          const m = allMeshes[i];
+          if (m instanceof SkinnedMesh3D) skinnedMeshes[ns++] = m;
+          else regularMeshes[nr++] = m;
+        }
       }
+      regularMeshes.length = nr; skinnedMeshes.length = ns;
 
       // The selection box + transform gizmo filter from this (so skinned meshes get one too).
       this._renderer3D.setSelectableMeshes(allMeshes);
@@ -2207,8 +2746,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         this._renderer3D.drawMeshes(passEncoder, regularMeshes, w, h);   // (re)captures always-on-top overlays
       } else {
         this._renderer3D.clearPostOverlays();   // no regular meshes → drawMeshes didn't run → no valid card this frame
+        this._renderer3D.noStaticMeshesThisFrame();   // ...so zero its frame counters + drop the GPU-driven records (§P15 stats fix)
       }
-      if (skinnedMeshes.length > 0) {
+      // (an empty roster after a frame with characters still runs once: their stats / shadow / replay list clear)
+      if (skinnedMeshes.length > 0 || this._renderer3D.skinnedLastCount > 0) {
         // P1: if drawMeshes just ran, it already uploaded identical scene uniforms this frame → don't repeat the work.
         this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, w, h, !regularDrew);
       }
@@ -2225,11 +2766,17 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
      *  with the main pass's depth buffer loaded so depth-tested overlays (grid) still occlude correctly. */
     private draw3DOverlays(passEncoder: GPURenderPassEncoder, w = this.canvas.width, h = this.canvas.height): void {
       if (!this._renderer3D) return;
+      // P1.1: the overlay pass depth-tests against the scene depth the main pass stored — same depth range (no-op in
+      // perspective; harmless when this runs inline in the main pass, which already set it).
+      this._renderer3D.applySceneDepthRange(passEncoder, w, h);
       // Ghost preview over the committed meshes (works even when all meshes are skinned).
       this._renderer3D.drawGhostPreviewIfActive(passEncoder, w, h);
       // Ground reference grid — depth-occluded by meshes (the depth buffer is loaded in the overlay pass).
       this._renderer3D.drawGridIfActive(passEncoder);
       this._renderer3D.drawArtboardFrameIfActive(passEncoder);   // illustration × free3D render frame
+      // Play mode (Round 8): none of the editor affordances below are drawn (selection box / gizmo / bone overlay /
+      // mesh-edit handles / snap viz / camera frustum / emitter icons) — it's a game view.
+      if (this.interactionService.playActive) return;
       this._renderer3D.drawCameraFrustumIfActive(passEncoder);   // selected camera-node frustum
       // Particle-emitter icons (editor affordance — hidden while a creator/Player mode owns input).
       if (!this.interactionService.suppressBoxSelect) this._renderer3D.drawEmitterIconsIfActive(passEncoder, h);
@@ -2247,17 +2794,28 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
       if (!this._renderer3D) return;
       const emitters = this._emittersScratch; emitters.length = 0;
-      for (const n of nodes) if (n instanceof ParticleEmitter3D && n.visible) emitters.push(n);
+      if (this._rlSplit) {
+        const src = this._rl3DEmitters, hidden = this._hiddenVectorLayerIds, hides = this._frameMeshEditHides, below = this._rlIndex.any3DBelowRaster;
+        for (let i = 0; i < src.length; i++) { const n = src[i]; if (n.visible && this._keep3D(n, hidden, hides, below)) emitters.push(n); }
+      } else {
+        for (let i = 0; i < nodes.length; i++) { const n = nodes[i]; if (n instanceof ParticleEmitter3D && n.visible) emitters.push(n); }
+      }
       // Stash for the overlay pass BEFORE the empty early-return: the emitter ICONS + the selection
       // gizmo need the node list even when an emitter currently has zero live particles.
       this._renderer3D.setFrameEmitters(emitters);
-      if (emitters.length === 0) return;
-      this._renderer3D.drawParticles(passEncoder, emitters, w, h);
+      if (emitters.length > 0) this._renderer3D.drawParticles(passEncoder, emitters, w, h);
+      // Runtime-only sources (the Play landing dust): registered only while alive, so idle = one length check.
+      if (this._renderer3D.hasTransientParticles) this._renderer3D.drawTransientParticles(passEncoder);
     }
 
     private draw3DGp(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
       const gpObjs = this._gpObjsScratch; gpObjs.length = 0;
-      for (const n of nodes) if (n instanceof GpObject3D && n.visible) gpObjs.push(n as unknown as GpObject3D);
+      if (this._rlSplit) {
+        const src = this._rl3DGp, hidden = this._hiddenVectorLayerIds, hides = this._frameMeshEditHides, below = this._rlIndex.any3DBelowRaster;
+        for (let i = 0; i < src.length; i++) { const n = src[i]; if (n.visible && this._keep3D(n as unknown as Node, hidden, hides, below)) gpObjs.push(n); }
+      } else {
+        for (let i = 0; i < nodes.length; i++) { const n = nodes[i]; if (n instanceof GpObject3D && n.visible) gpObjs.push(n as unknown as GpObject3D); }
+      }
       gpObjs.sort((a, b) => a.renderOrder - b.renderOrder);   // in-place sort on the reused array
       const hasOverlay = this._gpDrawOverlay !== null;
       if (gpObjs.length === 0 && !hasOverlay) return;
@@ -2271,10 +2829,24 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       if (gpObjs.length > 0) {
         // Build skeleton map from scene graph (Skeleton3D nodes are not in the render list
         // since they extend Node, not Shape — traverse scene root directly).
-        const skeletons = new Map<string, Skeleton3D>();
-        this.sceneGraph.root.forEachDeep(n => {
-          if (n instanceof Skeleton3D) skeletons.set(n.id, n);
-        });
+        // Step 2: the structure walk already collected every Skeleton3D (same nodes, same preorder) — keyed once per
+        // walk instead of a forEachDeep of the whole graph every frame. A stroke bound to a skeleton the map doesn't
+        // hold (an id changed, or a skeleton attached without a structure notification) falls back to the full walk.
+        let skeletons = this._rlSkeletonMap;
+        if (!skeletons || this._rlSkeletonMapVer !== this._rlIndex.version) {
+          skeletons = this._rlSkeletonMap = new Map<string, Skeleton3D>();
+          for (const s of this._rlIndex.skeletons as unknown as Skeleton3D[]) skeletons.set(s.id, s);
+          this._rlSkeletonMapVer = this._rlIndex.version;
+        }
+        let miss = false;
+        for (let i = 0; i < gpObjs.length && !miss; i++) { const id = gpObjs[i].skeletonId; if (id && !skeletons.has(id)) miss = true; }
+        if (miss) {
+          skeletons = new Map<string, Skeleton3D>();
+          const all = skeletons;
+          this.sceneGraph.root.forEachDeep(n => {
+            if (n instanceof Skeleton3D) all.set(n.id, n);
+          });
+        }
         const frame = (this.interactionService as any).currentFrame ?? 0;
         this._gpRenderer3D.draw(gpObjs, skeletons, camera, passEncoder, w, h, frame);
       }
@@ -2298,6 +2870,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       if (!this._renderer3D) {
         const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0], autoNear: true });   // near tracks orbit distance (docs/specs/depth-precision.md)
         this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
+        this._renderer3D.onDeferredWork = () => this.scheduleRender();   // P4.3: budgeted re-dress continues next frame
       }
       return this._renderer3D;
     }
@@ -3016,7 +3589,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         return this.rgbaToHex(this.dotColor);
     }
 
-    // Helper to convert RGBA [0â€“1] to hex string
+    // Helper to convert RGBA [0–1] to hex string
     private rgbaToHex(color: Float32Array): string {
         const toHex = (value: number) => {
             const hex = Math.round(value * 255).toString(16).padStart(2, '0');
@@ -3307,7 +3880,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     let h  = Math.ceil(y2 - eps) - yi;
 
     // --- bleed in pixels ---
-    const padPx = 2;                 // try 1â€“2 px
+    const padPx = 2;                 // try 1–2 px
     xi = Math.max(0, xi - padPx);
     yi = Math.max(0, yi - padPx);
     w  = Math.min(cw - xi, w + 2*padPx);
@@ -3319,14 +3892,32 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   }
 
     public async waitForFrameSettled(): Promise<void> {
-      // ensure a frame will be produced
-      this.scheduleRender();
+      // The frame below is a LIVE frame (scheduleRender → _renderLive): draws whose pipeline is still compiling are
+      // SKIPPED. Snapshot / thumbnail / video-export callers read this frame back, so re-render (bounded) until no
+      // skipped draw is left — else a fresh page's capture came out missing meshes / FXAA / outlines / bloom
+      // (bug-hunt 2026-10-01). Normally one pass (nothing waiting).
+      // RESOLUTION SCALING: the frame read back renders at native size (exports / thumbnails are never scaled).
+      this._fullResHold++;
+      try {
+      for (let pass = 0, scaledSkips = 0; pass < 4; pass++) {
+        // ensure a frame will be produced
+        this.scheduleRender();
 
-      // wait until this renderer actually submitted a frame (notifyFrameSubmitted() right after queue.submit())
-      await this.waitForFrameSubmitted();
+        // wait until this renderer actually submitted a frame (notifyFrameSubmitted() right after queue.submit())
+        await this.waitForFrameSubmitted();
+        // A frame that STARTED before the hold (still scaled) does not count: wait for the next one (bounded).
+        if (this._submittedScaled && scaledSkips++ < 3) { pass--; continue; }
 
-      // wait until GPU work is done
-      await this.device.queue.onSubmittedWorkDone();
+        // wait until GPU work is done
+        await this.device.queue.onSubmittedWorkDone();
+
+        const cache = GPUPipelineCache.peek(this.device);
+        if (!cache || cache.status().waitingDraws === 0) break;
+        await Promise.race([cache.whenWaitedSettled(), new Promise<void>(r => setTimeout(r, 4000))]);
+      }
+      } finally {
+        this._releaseFullRes();
+      }
 
       // wait one browser frame so the swapchain image is presented (waits one requestAnimationFrame tick)
       await this.nextRAF();
@@ -3412,7 +4003,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       return new Promise<void>(res => this.frameSubmittedResolvers.push(res));
     }
 
-    // Use the canvasâ€™ window if available; fall back to setTimeout in non-DOM envs
+    // Use the canvas’ window if available; fall back to setTimeout in non-DOM envs
     private nextRAF(): Promise<void> {
       const win: any =
         this.canvas?.ownerDocument?.defaultView ??
@@ -3456,7 +4047,18 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       }
     }
 
+    /** End one full-resolution hold; the last one re-renders the (scaled) on-screen view. */
+    private _releaseFullRes(): void {
+        this._fullResHold = Math.max(0, this._fullResHold - 1);
+        if (this._fullResHold === 0 && (this._resScaler.scale() < 1 || this._taaSettings.mode !== 'off')) this.scheduleRender();
+    }
+    /** RESOLUTION SCALING: snapshots hold full resolution from the settled frame until their read-back is encoded
+     *  (else the next live frame, scaled again, could land in lastFrameTex before the copy). */
     public async snapshotToBlob(maxWidth = 300): Promise<Blob> {
+        this._fullResHold++;
+        try { return await this._snapshotToBlobImpl(maxWidth); } finally { this._releaseFullRes(); }
+    }
+    private async _snapshotToBlobImpl(maxWidth: number): Promise<Blob> {
         // make sure a fresh frame exists
         await this.waitForFrameSettled();
 
@@ -3568,7 +4170,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     g.scaleX = 1;
     g.scaleY = 1;
 
-    // update groupâ€™s logical size to match the visual size we just baked
+    // update group’s logical size to match the visual size we just baked
     g.width  = oldW * sx;
     g.height = oldH * sy;
 
@@ -3647,7 +4249,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     return depth;
   }
 
-  // Returns the chain from root â†’ leaf for a node
+  // Returns the chain from root → leaf for a node
   public buildHitChain(n: Node): Node[] {
     const chain: Node[] = [];
     let cur: Node | null = n;
@@ -3657,7 +4259,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
   // Highest Group in a chain (closest to root)
   public highestGroupInChain(chain: Node[]): Group | null {
-    for (const n of chain) if (n instanceof Group) return n; // first group in rootâ†’leaf order
+    for (const n of chain) if (n instanceof Group) return n; // first group in root→leaf order
     return null;
   }
 
@@ -3865,6 +4467,15 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
    *  rAF loop producing a fresh frame (which lets the loop be suspended during a capture). Default false = thumbnail
    *  path: schedule + wait for a live frame. srcX/Y/W/H are physical canvas px. */
   async snapshotRegionToCanvas(
+    srcX: number, srcY: number, srcW: number, srcH: number,
+    outW: number, outH: number,
+    skipWait = false,
+  ): Promise<OffscreenCanvas | HTMLCanvasElement> {
+    if (skipWait) return this._snapshotRegionToCanvasImpl(srcX, srcY, srcW, srcH, outW, outH, true);
+    this._fullResHold++;   // resolution scaling: see snapshotToBlob
+    try { return await this._snapshotRegionToCanvasImpl(srcX, srcY, srcW, srcH, outW, outH, false); } finally { this._releaseFullRes(); }
+  }
+  private async _snapshotRegionToCanvasImpl(
     srcX: number, srcY: number, srcW: number, srcH: number,
     outW: number, outH: number,
     skipWait = false,

@@ -16,7 +16,7 @@
 export interface GroundSurfaceSpec {
     /** WGSL `groundSurface` branch: 0 ashlar · 1 radial · 2 border · 3 grass · 4 asphalt · 5 concrete · 6 dirt ·
      *  7 cobble · 8 plank · 9 shingle · 10 half-timber · 11 radial-shingle · 12 thatch · 13 clay-tile · 14 bark ·
-     *  15 metal · 16 leaves · 17 fabric · 18 wicker · 19 rope. ⚠ Saves store this NUMBER — never renumber, append. */
+     *  15 metal · 16 leaves · 17 fabric · 18 wicker · 19 rope · 20 road paint · 21 paver tiles. ⚠ Saves store this NUMBER — never renumber, append. */
     mode: number;
     /** Tile LONG dimension in mm (0 for the organic surfaces, which have no cells). */
     tileMm: number;
@@ -74,6 +74,13 @@ export const GROUND_SURFACES = {
     wicker:          { mode: 18, tileMm: 250,  aspect: 1.0,     groutMm: 30, tint: [0.62, 0.46, 0.28] as [number, number, number], jitter: 1.00, rough: 0.85, grout: [0.28, 0.20, 0.10] as [number, number, number] },
     // ROPE / CORD (mode 19): twisted strands. tileMm = strand pitch; grout = groove colour.
     rope:            { mode: 19, tileMm: 120,  aspect: 1.0,     groutMm: 15, tint: [0.68, 0.58, 0.38] as [number, number, number], jitter: 1.00, rough: 0.88, grout: [0.30, 0.24, 0.14] as [number, number, number] },
+    // ROAD PAINT (mode 20, persona-polish B2): matte off-white marking with ragged worn edges + scuffs where the
+    // asphalt (grout) shows through. jitter = WEAR amount (0 = flat paint). Needs the stripe-frame uv roadpaint.ts
+    // lays (v = metres from the nearest long edge); on a plain uv it still reads as scuffed paint.
+    roadPaint:       { mode: 20, tileMm: 0,    aspect: 1.0,     groutMm: 0,  tint: [0.84, 0.82, 0.76] as [number, number, number], jitter: 1.00, rough: 1.00, grout: [0.30, 0.29, 0.28] as [number, number, number] },
+    // PAVER TILES (mode 21, persona-polish B3): square stack-bond pavement tiles, per-tile value steps, thin soft
+    // joints. tileMm = tile size, groutMm = joint width.
+    paverTiles:      { mode: 21, tileMm: 500,  aspect: 1.0,     groutMm: 3,  tint: [0.72, 0.67, 0.59] as [number, number, number], jitter: 1.00, rough: 0.82, grout: [0.58, 0.54, 0.48] as [number, number, number] },
 } satisfies Record<string, GroundSurfaceSpec>;
 
 /** Every surface name the ground material accepts — feed a picker straight from `Object.keys`. */
@@ -94,7 +101,7 @@ export interface GroundRecipe {
     mode: number;
     /** Mode-multiplexed: tilers = [tileW, tileH] m · radial = [ringSpacing m, wedgeCount] ·
      *  border = [stoneLength m, rowCount] · cobble = [cellSize m, —] · plank = [boardLen m, boardW m] ·
-     *  organic (grass/asphalt/dirt) = [0, 0], no cells. */
+     *  organic (grass/asphalt/dirt) = [0, 0], no cells · road paint = [wear, —]. */
     tile: [number, number];
     groutM: number;
     tint: [number, number, number];
@@ -116,6 +123,8 @@ export function resolveGroundRecipe(surface: GroundSurfaceName | undefined, o?: 
         tile = [tileM, 1.0];
     } else if (preset.mode === 3 || preset.mode === 4 || preset.mode === 6) {
         tile = [0, 0];                                            // organic — no cell layout
+    } else if (preset.mode === 20) {
+        tile = [o?.jitter ?? preset.jitter, 0];                   // road paint: p0 = wear (the relief fn reads it there)
     } else {
         // LANDSCAPE pavers via the preset's aspect (ashlar 900 × 600, brick 215 × 65, …). Ashlar was
         // PORTRAIT once, which put the courses 1.5× further apart than the column seams and made the

@@ -1,6 +1,6 @@
 # Shared Asset Library — the account-global asset spine
 
-**Date:** 2026-09-17 · **Status: SPEC ONLY — nothing built.**
+**Date:** 2026-09-17 · **Status (audited 2026-10-01): L1–L3 BUILT, L4 partial, L5–L6 not built** — see §8. Code: `src/services/assets/`, `sm.assets` (shape-manager).
 **Origin:** the product vision is a *suite of creators in one app* (Illustrator · Character Creator · Animator · Effects
 Creator …) surfaced from the Shell, where **an asset authored once in any creator is reusable in every Illustration**.
 That only works if assets live **above** the document — at the account/app level — and documents *reference* them.
@@ -209,7 +209,7 @@ domain is: register the provider, and let promote/instantiate optionally target 
    document, so no embed needed). **TODO:** embed copies for by-reference (non-instantiated) kinds; an "accept update"
    action re-instantiating from the newer global record; promote provenance to document-level when 2D asset kinds land
    (today it rides the 3D scene settings).
-4. **L4 — fold in the rest:** material, kitbash part, brush, texture providers (payloads already exist).
+4. **L4 — fold in the rest:** material, kitbash part, brush, texture providers (payloads already exist). **[~] 2026-10-01:** anim-clip, pose, creator-preset, character and material providers exist (`shape-manager.ts` `sm.assets`); kitbash part, brush and texture providers remain.
 5. **L5 — sharing:** `.frogpack` export/import (re-mint), untrusted gating (§7), storage management UI.
 6. **L6 — host docs + the unified Library panel** across creators (the "apps in one app" surfacing).
 7. Later: cloud sync (OPFS → account backend), team/shared libraries, `effect` kind once the script sandbox lands.

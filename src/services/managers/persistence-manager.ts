@@ -26,6 +26,12 @@ export interface PersistenceCallbacks {
     getDitherConfig(): any;
     setDitherConfig(config: any): void;
     getRasterLayers(): any[];
+    /** Play / UI preview / Player mode active — automatic saves skip and explicit ones defer (bug-hunt 2026-10-01 D-P2). */
+    isBusy?(): boolean;
+    /** Moves when a busy period starts (the GPU device-loss count): a save whose gather spanned one is re-run. */
+    busyEpoch?(): number;
+    /** An explicit save had to wait for the editor to go idle (host notice). */
+    onSaveDeferred?(): void;
 }
 
 export class PersistenceManager {
@@ -41,10 +47,18 @@ export class PersistenceManager {
 
     setCallbacks(cb: PersistenceCallbacks): void { this._callbacks = cb; }
 
+    /** The busy gate (Play / UI preview / Player mode / device lost), its epoch and the deferral notice. */
+    private _wireGates(p: DocumentPersistence): void {
+        p.setBusyPredicate(() => this._callbacks.isBusy?.() ?? false);
+        p.setBusyEpochProvider(() => this._callbacks.busyEpoch?.() ?? 0);
+        p.setDeferredCallback(() => this._callbacks.onSaveDeferred?.());
+    }
+
     private ensurePersistence(): DocumentPersistence {
         if (!this._persistence) {
             this._persistence = new DocumentPersistence();
             this._persistence.setStateProvider(() => this._callbacks.gatherDocumentState());
+            this._wireGates(this._persistence);
         }
         return this._persistence;
     }
@@ -61,6 +75,7 @@ export class PersistenceManager {
         this._persistence?.destroy();
         this._persistence = new DocumentPersistence(config);
         this._persistence.setStateProvider(() => this._callbacks.gatherDocumentState());
+        this._wireGates(this._persistence);
         this._persistence.startAutoSave();
     }
 

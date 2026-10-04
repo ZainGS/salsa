@@ -75,6 +75,10 @@ describe('neon signs emit rather than being painted', () => {
 });
 
 describe('awnings are fabric, not folded card', () => {
+  // City-level awnings only dress the BASIC (non-detailed) buildings now — detailed buildings dress their own
+  // shopfronts (city-quality B3) — so these fabric checks run on a basic-building city.
+  const city = (seed = 3): WorldGraph =>
+    generateCityLayout({ seed, radius: 10, pattern: 'grid', border: 'square', detailedBuildings: false });
   it('the canvas is subdivided into bays, not one flat quad', () => {
     const awnings = buildAwnings(city()).filter((L) => L.name.startsWith('world:awning-'));
     expect(awnings.length).toBeGreaterThan(0);

@@ -1,6 +1,12 @@
 # Character Variety — Wardrobe, Materials, Collections & Randomizer
 
-**Status:** 📋 Spec / not started — consolidates scattered "more clothes / more hair" notes into one prioritized buildout.
+**Status (2026-10-04): PARTLY BUILT.** Seeded randomizer: `src/services/managers/character-randomizer.ts`,
+`sm.randomCharacterParams3D(seed?, body?)` / `sm.createRandomCharacter3D({ seed, position, body })` (Play's auto character
+uses it; hair rolls one of the 15 lock styles via `randomLockStyle`). Bottom silhouettes (skirt / shorts / pants + Mini
+Skirt / Baggy Jeans / Wide Leg / Skinny, §6a jean stack), shoes, socks, under-layers built. **Not built:** the §4 API
+(`randomizeCharacter3D`, seeds / locks / collections), outerwear tops (hoodie, blazer, kimono … and the 'outer' layer),
+fabric material presets / `setGarmentMaterial3D`, fashion collections, the crowd hook (the world crowd is its own
+generator). *(Original:)* 📋 Spec / not started — consolidates scattered "more clothes / more hair" notes into one prioritized buildout.
 **Created:** 2026-06-26
 **Related:** [fashion-creator.md](./fashion-creator.md) (the slot/paint UX umbrella) · [clothing-generation.md](./clothing-generation.md) (the top/bottom generator) · [hair-generation.md](./hair-generation.md) · [dollz-creator.md](./dollz-creator.md) (collection #1 = dollcore) · [character-creation-pipeline.md](./character-creation-pipeline.md) (the shrinkwrap/drape path) · [kitbash-armature-grease-pencil.md](./kitbash-armature-grease-pencil.md) (attach slots) · [character-system-backlog.md](./character-system-backlog.md) (correctness / live-edit / fit work).
 **Effort tags:** **S** ≈ <½ day · **M** ≈ 1–2 days · **L** ≈ multi-day. Engine-only unless **[Frogmarks]**. Rule still holds: no `npm run build` — only `npx tsc --noEmit`; the user rebuilds.

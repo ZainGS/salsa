@@ -28,6 +28,11 @@ export class Node {
      */
     public renderBelowRaster: boolean = false;
     public children: Node[] = [];
+    /** @internal Host render-list index bookkeeping (renderer/core/render-list-index.ts): the generation of the last
+     *  structure walk that visited this node, and its preorder position in that walk. Not scene state. */
+    public _rlGen = 0;
+    /** @internal See _rlGen. */
+    public _rlPos = 0;
     public transformMode: "inherit" | "translate-only" = "inherit";
     
     // Cache the parent chain matrix to avoid recomputation
@@ -184,6 +189,22 @@ export class Node {
         this._x = x;
         this._y = y;
         this._z = z;
+        this.updateLocalMatrix();
+    }
+
+    /**
+     * Assign position + yaw (Y) + roll (Z, the 2D `rotation`) together with ONE matrix rebuild. The per-frame city
+     * movers used to set `rotationY`, `rotation` and `setXYZ` separately — up to 3 rebuilds (+ subtree walks + bounds
+     * refreshes) per mesh per frame. No-op when nothing changed. `rz` omitted keeps the current roll.
+     */
+    public setPoseXYZYaw(x: number, y: number, z: number, ry: number, rz: number = this._rotation, rx: number = this._rotationX): void {
+        if (this._x === x && this._y === y && this._z === z && this._rotationY === ry && this._rotation === rz && this._rotationX === rx) return;
+        this._x = x;
+        this._y = y;
+        this._z = z;
+        this._rotationY = ry;
+        this._rotation = rz;
+        this._rotationX = rx;
         this.updateLocalMatrix();
     }
 
@@ -383,8 +404,8 @@ export class Node {
 
     // Check if a point is within this node (override in subclasses)
     public containsPoint(x: number, y: number): boolean {
-        x = x;
-        y = y;
+        void x;
+        void y;
         return false;
     }
 

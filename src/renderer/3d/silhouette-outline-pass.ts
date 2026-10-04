@@ -6,8 +6,10 @@
  * scene (depthCompare 'always' → on top). Spec: docs/specs/hover-outline.md. Only runs while something is hovered.
  */
 
+import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { OUTLINE_MASK_SHADER, OUTLINE_COMPOSITE_SHADER } from './shaders/silhouette-outline-shaders';
 import { MESH3D_VERTEX_STRIDE } from './pipeline-3d';
+import { PACKED_STRIDE } from './vertex-pack';
 import type { HighlightMeshEntry, HighlightStyle } from './mesh-highlight-pass';
 
 export class SilhouetteOutlinePass {
@@ -17,8 +19,9 @@ export class SilhouetteOutlinePass {
   private _w = 0;
   private _h = 0;
 
-  private readonly _maskPipeline: GPURenderPipeline;
-  private readonly _compositePipeline: GPURenderPipeline;
+  private readonly _maskPipeline: PipelineHandle<GPURenderPipeline>;        // P2: non-blocking cache handles
+  private readonly _maskPipelinePk: PipelineHandle<GPURenderPipeline>;
+  private readonly _compositePipeline: PipelineHandle<GPURenderPipeline>;
   private readonly _compBGL: GPUBindGroupLayout;
   private readonly _paramsBuf: GPUBuffer;      // 64 bytes
   private readonly _scratch = new Float32Array(16);
@@ -32,13 +35,16 @@ export class SilhouetteOutlinePass {
 
     // MASK pipeline — position-only, no depth, both faces, writes 1.0 to r8.
     const maskMod = device.createShaderModule({ code: OUTLINE_MASK_SHADER, label: 'OutlineMask' });
-    this._maskPipeline = device.createRenderPipeline({
-      label: 'OutlineMaskPipeline',
-      layout: device.createPipelineLayout({ bindGroupLayouts: [meshBGL] }),
-      vertex: { module: maskMod, entryPoint: 'vs', buffers: [{ arrayStride: MESH3D_VERTEX_STRIDE, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }] },
+    const maskLayout = device.createPipelineLayout({ bindGroupLayouts: [meshBGL] });
+    const maskDesc = (stride: number, label: string): GPURenderPipelineDescriptor => ({
+      label, layout: maskLayout,
+      vertex: { module: maskMod, entryPoint: 'vs', buffers: [{ arrayStride: stride, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }] },
       fragment: { module: maskMod, entryPoint: 'fs', targets: [{ format: 'r8unorm' }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
     });
+    this._maskPipeline = GPUPipelineCache.for(device).render(maskDesc(MESH3D_VERTEX_STRIDE, 'OutlineMaskPipeline'));
+    // P22: the stride-32 twin for packed pool allocations (vertex-pack.ts; position only)
+    this._maskPipelinePk = GPUPipelineCache.for(device).render(maskDesc(PACKED_STRIDE, 'OutlineMaskPipeline #packed'));
 
     // COMPOSITE pipeline — fullscreen, blends the band over the main pass (depthCompare 'always' → on top).
     this._compBGL = device.createBindGroupLayout({ entries: [
@@ -47,7 +53,7 @@ export class SilhouetteOutlinePass {
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     ]});
     const compMod = device.createShaderModule({ code: OUTLINE_COMPOSITE_SHADER, label: 'OutlineComposite' });
-    this._compositePipeline = device.createRenderPipeline({
+    this._compositePipeline = GPUPipelineCache.for(device).render({
       label: 'OutlineCompositePipeline',
       layout: device.createPipelineLayout({ bindGroupLayouts: [this._compBGL] }),
       vertex: { module: compMod, entryPoint: 'vs' },
@@ -76,11 +82,15 @@ export class SilhouetteOutlinePass {
   renderMask(encoder: GPUCommandEncoder, meshBindGroup: GPUBindGroup, entries: HighlightMeshEntry[], w: number, h: number): void {
     this._ensure(w, h);
     const pass = encoder.beginRenderPass({ label: 'OutlineMaskPass', colorAttachments: [{ view: this._maskView!, loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
-    pass.setPipeline(this._maskPipeline);
+    const mask = this._maskPipeline.get();
     pass.setBindGroup(0, meshBindGroup);
-    for (const e of entries) {
+    let cur: GPURenderPipeline | null = null;
+    if (mask) for (const e of entries) {   // P2: pending → empty (cleared) mask
+      const p = e.pk ? this._maskPipelinePk.get() : mask;   // P22: a packed allocation (stride 32, 16-bit indices)
+      if (!p) continue;
+      if (p !== cur) { pass.setPipeline(p); cur = p; }
       pass.setVertexBuffer(0, e.vertex);
-      pass.setIndexBuffer(e.index, 'uint32');
+      pass.setIndexBuffer(e.index, e.pk ? 'uint16' : 'uint32');
       pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
     }
     pass.end();
@@ -98,7 +108,8 @@ export class SilhouetteOutlinePass {
 
   /** Draw the band into an OPEN scene render pass (blends on top). Call after renderMask + writeParams. */
   composite(pass: GPURenderPassEncoder): void {
-    if (!this._maskView) return;
+    const comp = this._compositePipeline.get();
+    if (!this._maskView || !comp) return;
     if (!this._compBG) {
       this._compBG = this.device.createBindGroup({ layout: this._compBGL, entries: [
         { binding: 0, resource: { buffer: this._paramsBuf } },
@@ -106,7 +117,7 @@ export class SilhouetteOutlinePass {
         { binding: 2, resource: this._sampler },
       ]});
     }
-    pass.setPipeline(this._compositePipeline);
+    pass.setPipeline(comp);
     pass.setBindGroup(0, this._compBG);
     pass.draw(3);
   }

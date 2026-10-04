@@ -35,7 +35,7 @@ export class MouseLook {
   private readonly _onClick = (): void => {
     const el = this._el as (Element & { requestPointerLock?: () => void }) | null;
     if (el?.requestPointerLock && typeof document !== 'undefined' && document.pointerLockElement !== el) {
-      try { el.requestPointerLock(); } catch { /* no-op if unsupported / not allowed */ }
+      try { void el.requestPointerLock(); } catch { /* no-op if unsupported / not allowed */ }
     }
   };
 

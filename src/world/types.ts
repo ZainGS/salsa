@@ -9,6 +9,9 @@
 
 import type { MeshGeometry } from '../renderer/3d/mesh-generators';
 import type { GroundSurfaceName } from './ground-surfaces';
+import type { AdvertCatalog } from './adverts';
+import type { LocalLinePlan } from './local-line';
+import type { PackedInstances } from './packed-instances';
 
 /** Metres per building FLOOR in the city bridge. With `streets.ts` sizing a floor at 0.2 * scale world
  *  units, this is what fixes the city's real-world scale: at the default radius one world unit = 15 m.
@@ -36,6 +39,12 @@ export type V2 = [number, number];
 /** Overall silhouette the city is clipped to (all convex → Sutherland–Hodgman clip works). */
 export type BorderShape = 'circle' | 'square' | 'hexagon' | 'octagon';
 
+/** The crowd's shading (LayoutParams.pedestrianStyle). */
+export type PedestrianStyle = 'flat' | 'default' | 'cel' | 'cel-hd' | 'ink';
+/** visual-polish #11 tail: how the detailed flat roofs carry their plant (LayoutParams.roofEquipment). */
+export type RoofEquipmentStyle = 'classic' | 'clustered';
+export const PEDESTRIAN_STYLES: readonly PedestrianStyle[] = ['flat', 'default', 'cel', 'cel-hd', 'ink'];
+
 /** How the street network is generated. Hybrid per §6.3: cities lean 'grid', towns lean 'radial'. */
 export type RoadPattern = 'radial' | 'grid';
 
@@ -43,7 +52,10 @@ export type RoadPattern = 'radial' | 'grid';
 export type Zone = 'civic' | 'commercial' | 'residential' | 'park' | 'water' | 'plaza';
 
 /** What ultimately fills a slot (consumed by later composers). */
-export type SlotKind = 'building' | 'park' | 'water' | 'plaza' | 'landmark' | 'shotengai' | 'empty';
+export type SlotKind = 'building' | 'park' | 'water' | 'plaza' | 'landmark' | 'shotengai' | 'viaduct' | 'empty';
+
+/** What fills one bay of the railway ARCADE (railway-upgrade R3.1, `railViaduct: 'arcade'`). */
+export type ArcadeBayKind = 'izakaya' | 'eatery' | 'shop' | 'bike' | 'storage' | 'service' | 'station';
 
 /** A pedestrian shopping street (shotengai): a run of grid cells with paving, market stalls + entry arches. */
 export interface Shotengai { cells: [number, number][]; spine: [V2, V2]; width: number; region: number; }
@@ -79,6 +91,15 @@ export interface LayoutParams {
     // widths (world units)
     streetWidth: number;     // gap between lots (the visible streets)
     arterialWidth: number;   // main road width (graph data for later phases)
+    /** The radius `streetWidth`/`arterialWidth` were authored for. Props and kerbs scale with `s = radius/10`,
+     *  so the street widths must too: when this is set and differs from `radius`, generateCityLayout rescales
+     *  both widths by radius/streetWidthRadius. When a caller omits the widths entirely, the defaults are
+     *  derived from the radius (0.40·s / 0.5·s — identical at the default radius 10) and this is stamped. Left
+     *  unset (old saves / explicit absolute widths), the widths are taken as-is. */
+    streetWidthRadius?: number;
+    /** Seed of the terrain HEIGHT field (default: `seed`). A tiled world sets every tile's to the BASE seed so
+     *  all tiles sample one continuous world-space field (no cliffs at tile borders). */
+    terrainSeed?: number;
     plazaRadius: number;     // central plaza half-size (× radius)
     // dressing
     parkChance: number;      // 0..1 chance a block becomes a park
@@ -87,6 +108,17 @@ export interface LayoutParams {
     elevation: number;       // 0..1 — terrain relief (0 = flat; gentle rolling hills otherwise)
     warp: number;            // 0..1 — DOMAIN WARP: 0 = clean grid, 1 = organic old-town (roads curve, blocks vary)
     terraces: boolean;       // grid — discrete raised terraces (retaining walls + stairs where the level steps up)
+    /** E2 EDGE WEAR (Look control): chipped + worn edges on stairs, kerbs and wall copings, drawn for NEAR chunks only
+     *  (a clean far twin elsewhere). 'off' / absent = the clean build (saved cities unchanged). */
+    edgeWear?: 'off' | 'subtle' | 'heavy';
+    /** P9 FAR TWINS (performance-plan P9): cheap distant versions of the heavy street props (utility poles, signal
+     *  housings, lamp posts, roof plant, parked-car trim) and a third, cheapest tier of the static crowd. Absent =
+     *  on; false = the pre-P9 build (A/B). Runtime build option only — the near look is unchanged either way. */
+    propTwins?: boolean;
+    /** P12 INSTANCED CROWD (performance-plan P12): the static crowd as per-person records + shared xfar variants, its
+     *  near / mid tiers built lazily around the camera (crowd-instanced.ts, world-crowd.ts). Absent = on; false = the
+     *  baked per-colour crowd layers (A/B, `salsaWorld.instancedCrowd(false)`). Runtime build option only. */
+    instancedCrowd?: boolean;
     groundY: number;         // world Y the flat map sits at
     // streetscape detail
     sidewalks: boolean;      // draw a sidewalk band around each block
@@ -101,7 +133,17 @@ export interface LayoutParams {
     // detail pass (docs/specs/city-detail.md)
     awnings: boolean;        // ground-floor striped awnings + shopfront glass + noren on shop frontages
     streetFurniture: boolean;// vending machines / benches / bus stops / manholes / post boxes / cones / guardrails
-    powerLines: boolean;     // utility poles + overhead catenary wires beside the roads (the JP street look)
+    /** Persona-polish D1: eye-level FRONTAGE DRESSING (nobori flags, noren over shop doors, doorway pots, bikes against
+     *  the wall, shotengai flag rows). Rides the street-furniture toggle too. Absent = on. */
+    frontageDressing?: boolean;
+    /** Persona-polish E1: the drifting clear-weather clouds as a few BIG soft painted cloud cards (true) or the legacy
+     *  small puffs (false / absent). Kept in step with the look's `paintedClouds` by WorldManager. */
+    paintedClouds?: boolean;
+    /** visual-polish #9: the sky dome paints the clear-weather clouds (the look's skyDome with cloud style 'anime'), so
+     *  the painted cloud cards are not spawned (movers only; no other geometry). Kept in step by WorldManager. Absent =
+     *  false (the cards, as before). */
+    domeClouds?: boolean;
+    powerLines: boolean;    // utility poles + overhead catenary wires beside the roads (the JP street look)
     parkedCars: boolean;     // low-poly parked cars (+ bus/truck/taxi variants) along the curbs
     nightMode: boolean;      // crank emissives (lit windows / neon signs / lamps) for a night render
     // detail pass 2
@@ -111,6 +153,26 @@ export interface LayoutParams {
     bicycles: boolean;       // parked bicycles + bike racks near shops / stations
     lanterns: boolean;       // strung paper lanterns (chōchin) over the shotengai + downtown alleys (glow)
     railway: boolean;        // an elevated railway viaduct with a train running across the city
+    /** railway-upgrade R2.1: elevated stations on the viaduct (side platforms + canopy + stair / ticket-gate hall).
+     *  Default on. A FULL-regen param (the street plan reserves the stair / hall footprints). */
+    stations?: boolean;
+    /** railway-upgrade R2.3: metro entrance kiosks on busy junction pavements. Default on. Full regen (street plan). */
+    metroEntrances?: boolean;
+    /** railway-upgrade R3.1: how the viaduct is carried. 'portal' (default) = over a grid road on portal frames (columns
+     *  on the pavements, cap beam across the road). 'arcade' = BESIDE its road over the adjacent lot strip on a
+     *  continuous brick / concrete ARCADE whose bays hold izakaya, shops, bike parking, storage and fenced service
+     *  space (the Yurakucho / Koenji look) — the strip's lots are claimed by the viaduct. Grid cities only (radial
+     *  falls back to portal). A FULL-regen param (it changes the lots). */
+    railViaduct?: 'portal' | 'arcade';
+    railCars?: number;       // EMU consist length, cars (2..10, default 8; fewer on a short line) — railway-upgrade R1.5
+    railLivery?: 'auto' | 'green' | 'silver' | 'cream';   // train livery (generic, no logos): green-stripe commuter · silver + coloured band · cream/orange local; 'auto'/unset = seeded
+    railDwellScale?: number; // station / terminus dwell multiplier (1 = ~24 s at a station, ~30 s at a terminus; 0 = no dwell, the train only halts) — R2.2
+    /** railway-upgrade R3.2/R3.3: an optional AT-GRADE local line (single track, level crossings, a small station at
+     *  each end, one gentle reverse curve when there is room) through the blocks — grid cities only. Default false.
+     *  A FULL-regen param (it merges roads and carves lots). See local-line.ts. */
+    localLine?: boolean;
+    /** Local-line consist length, cars (2..4, default 2) — sizes the platforms (full regen). */
+    localLineCars?: number;
     rooftops: boolean;       // rooftop water tanks / AC units / antennas on flat roofs
     facadeDetail: boolean;   // fire escapes + pipes + AC boxes on some building facades
     detailedBuildings: boolean;  // ON (default) = full procedural buildings; OFF = the basic extruded-box fallback
@@ -118,14 +180,38 @@ export interface LayoutParams {
                                  // (buildBuilding per lot: real facades / windows / balconies / trim), fit to each lot
     detailGrid: number;          // 0 = detail merged CITY-WIDE (few draws, no cull); N = N×N spatial grid so off-screen cells frustum-cull (more draws, scales larger). PERF TOGGLE while we profile.
     pedestrians: boolean;    // tiny static people on sidewalks / the shotengai / the plaza (crowd v1; sim moves them later)
-    pedestrianDensity: number;   // ×multiplier on the crowd count (static peds + walking movers). 1 = default; crank for a busy city.
-    traffic: boolean;        // MOVING cars/train/walkers while in City mode (the live sim ticker)
+    pedestrianDensity: number;   // ×multiplier on the crowd count (static peds + walking movers). 1.4 = default for new cities (visual-polish #16; was 1); crank for a busy city.
+    /** visual-polish #16: ×multiplier on the moving TRAFFIC (routed cars + buses; the cap rises with it up to 2×). Absent = 1
+     *  (the original count — a city saved before the field keeps its traffic); new cities default to 1.3. */
+    trafficDensity?: number;
+    /** visual-polish #11: the DISTRICT PALETTE — facades span a real value range (near-white tile to dark brick and
+     *  charcoal cladding) in a hue family per neighbourhood, weighted per district (downtown: cool, contrasty; market: warm
+     *  renders; residential: pale + brick). Absent / false = the muted B4 swatches (cities saved before it keep them);
+     *  new cities and every scene preset turn it on (CityLook.districtPalette). Rebuilds 'World Streets'. */
+    districtPalette?: boolean;
+    /** visual-polish #11: ROOF VARIETY — per-lot roof colours and finishes (green / blue waterproofing, red-oxide metal,
+     *  pale concrete, white membrane, dark tar; kawara, glazed blue and copper on pitched roofs) and turf roof gardens.
+     *  Absent / false = the region-tinted grey roofs. Same opt-in rules as districtPalette. Rebuilds 'World Streets'. */
+    roofVariety?: boolean;
+    /** visual-polish #11 (tail): ROOF EQUIPMENT on the detailed flat / parapet roofs. 'classic' (absent = classic: cities
+     *  saved before it keep it) = the scattered plant (a tank, 1-3 AC boxes, vents, a mast and pipe runs spread over the
+     *  roof grid). 'clustered' = one plant cluster along the back edge (a stair box in the wall colour, ONE coloured water
+     *  tank, ONE AC bank) plus at most a couple of district-weighted extras (solar panels, a laundry line, a garden edge,
+     *  a rooftop billboard / neon frame on commercial roofs, a lit mast, a helipad on rare towers), leaving most of the
+     *  deck clear. New cities and every scene preset use 'clustered'. Rebuilds 'World Streets'. */
+    roofEquipment?: RoofEquipmentStyle;
+    /** How the crowd (static people, walkers, the live near-field crowd) is SHADED — applied live, no regen:
+     *  'flat' (absent = the default; saved cities unchanged) = the soft Persona-NPC colour blocks (PED_SHADE: dimmed
+     *  diffuse + an emissive lift; follows the city's render style) · 'default' = normal lit PBR (full colour, no lift)
+     *  · 'cel' / 'cel-hd' / 'ink' = that render style on the crowd only (the ground + buildings keep theirs). */
+    pedestrianStyle?: PedestrianStyle;
+    traffic: boolean;       // MOVING cars/train/walkers while in City mode (the live sim ticker)
     clouds: boolean;         // drifting procedural clouds above the city (part of the live ticker)
     cloudDensity: number;    // 0..1 — how many clouds (≈3 at 0 … ≈18 at 1)
     holograms: boolean;      // the CYBER suite: holo fish + billboards, flying vehicles, robot walkers, megatower + sky-train
-    weather: 'clear' | 'rain' | 'snow';   // rain = streaks/grey deck/wet roads/lightning · snow = drifting flakes + frosted ground
+    weather: 'clear' | 'rain' | 'snow' | 'overcast';   // rain = streaks/grey deck/wet roads/lightning · snow = drifting flakes + frosted ground · overcast = a pale grey deck, soft flat light, no precipitation
     fog: boolean;            // day/night-cycle distance fog (haze for depth); false = fog off
-    palette: 'auto' | 'terracotta' | 'slate' | 'pastel' | 'brick' | 'mint';   // city colour grade ('auto' = seeded pick)
+    palette: 'auto' | 'terracotta' | 'slate' | 'pastel' | 'brick' | 'mint' | 'phantom' | 'inaba';   // city colour grade ('auto' = seeded pick; phantom = P5, inaba = P4)
     // world borders (docs/specs/world-borders.md — Phase A)
     voidGrid: boolean;       // emissive grid / rings extending PAST the border into the void (the "cyberspace" floor); shape follows border
     borderGlow: boolean;     // emissive outline ribbon along the city border (reads especially in City Edit Mode)
@@ -141,6 +227,21 @@ export interface LayoutParams {
     worldMode?: 'diorama' | 'tiled';  // 'diorama' = one city (default); 'tiled' = an N×N block of connected tiles
     tileRadius?: number;     // tiled: rings of tiles around the centre (0=1×1, 1=3×3, 2=5×5; default 1). Grid/square tiles only.
     tileDetail?: 'flat' | 'focus' | 'full';   // tiled LOD: 'flat' = all tiles flat maps (cheap overview) · 'focus' = centre 3D + neighbours flat (default) · 'full' = EVERY tile full 3D (heavy — memory grows with tile count)
+    /** ADVERTS (docs/ui/garp.md §Adverts): the user's signage images as world-gen metadata (buckets, lit flags,
+     *  aspects, page cells — never pixels). INJECTED by WorldManager from the GARP signage library at build time
+     *  and stripped from the save marker (the library persists in garp.json). Absent → procedural signs. */
+    adverts?: AdvertCatalog | null;
+    /** visual-polish #6: building LED screens show the designed AD loop (true, the default for new cities) or the
+     *  legacy 'waves' static (false). A city saved before the field existed has no value in its marker, and
+     *  WorldManager.restoreFromSave pins it to false, so old documents keep the old screens. */
+    adScreens?: boolean;
+    /** TILED WORLDS only (P10.A1, set by tile-build on a neighbour tile's graph, never persisted): the tile's world
+     *  offset. Layout-space features defined relative to the city centre (the railway line and its stations, the
+     *  skyway) are placed at the tile instead of on top of the centre city. Absent = (0, 0). */
+    tileOrigin?: [number, number];
+    /** TILED WORLDS only (P10.A1): the seed of the WORLD's domain warp. A neighbour tile is generated with its own
+     *  seed but drapes with the world's warp, so paths a builder warps itself (railway, local line) use this one. */
+    warpSeed?: number;
 }
 
 export type CornerStyle = 'sharp' | 'chamfer' | 'round' | 'mixed';
@@ -203,7 +304,11 @@ export const DEFAULT_LAYOUT_PARAMS: LayoutParams = {
     detailedBuildings: true, quoinStyle: 'alternating',
     detailGrid: 0,              // default 0 = city-wide merge (current baseline); set N>0 for N×N spatial chunking
     pedestrians: true,
-    pedestrianDensity: 1,      // crowd multiplier — salsaWorld.update({ pedestrianDensity: 20 }) for a packed city
+    pedestrianDensity: 1.4,    // crowd multiplier — salsaWorld.update({ pedestrianDensity: 20 }) for a packed city. visual-polish #16: 1 → 1.4 (saved cities keep theirs: the marker stores the full params)
+    trafficDensity: 1.3,       // visual-polish #16: a little more traffic on new cities (old saves are pinned to 1 on restore)
+    districtPalette: true,     // visual-polish #11 (old saves are pinned to false on restore)
+    roofVariety: true,         // visual-polish #11 (old saves are pinned to false on restore)
+    roofEquipment: 'clustered',   // visual-polish #11 tail (old saves are pinned to 'classic' on restore)
     traffic: true,
     clouds: true,
     cloudDensity: 0.55,
@@ -211,9 +316,13 @@ export const DEFAULT_LAYOUT_PARAMS: LayoutParams = {
     weather: 'clear',
     fog: true,
     palette: 'auto',
-    voidGrid: true,
-    borderGlow: true,
+    // visual-polish #1a (2026-10-03): OFF by default. The cyan "cyberspace" grid + luminous border wall made every Tokyo
+    // look read as a board-game diorama. Saved cities keep their own value (the City marker saves the full params);
+    // the Neon Cyber pack and the panel toggles still turn them on.
+    voidGrid: false,
+    borderGlow: false,
     terrainApron: false,
+    adScreens: true,   // visual-polish #6: the designed ad loop on new cities (old saves are pinned to false on restore)
 };
 
 /** A road centerline (graph data; the Street composer walks these later). The preview shows roads as the gaps. */
@@ -240,10 +349,22 @@ export interface Lot {
     door?: V2;
     /** The door's outward (street-facing) direction. */
     doorOut?: V2;
+    /** Grid layouts: this lot is a MERGED parcel (a whole block frontage or the whole block) — big enough for a
+     *  tower / mall / civic building. Ordinary lots are narrow street frontages (~4–12 m). */
+    merged?: boolean;
+    /** Grid layouts: indices `i` of the `poly` edges (poly[i] → poly[i+1]) that face a STREET (a road runs along
+     *  them, behind the pavement). Edges not listed are party walls / back walls shared with a neighbour lot. */
+    streetEdges?: number[];
+    /** railway-upgrade R3.1: a bay of the viaduct ARCADE (slot 'viaduct') and what fills it. */
+    bay?: ArcadeBayKind;
 }
 
 /** A block = one cell of the generating structure (a ring×sector wedge, or a grid cell), pre-subdivision. */
-export interface Block { id: number; poly: V2[]; ring: number; sector: number; zone: Zone; district?: DistrictType; region?: number; level?: number; lots: string[]; }
+export interface Block { id: number; poly: V2[]; ring: number; sector: number; zone: Zone; district?: DistrictType; region?: number; level?: number; lots: string[];
+    /** railway-upgrade R3.1: the railway ARCADE runs over part of this block (landmarks / the shotengai skip it). */
+    viaduct?: boolean;
+    /** railway-upgrade R3.2: the at-grade LOCAL LINE runs through this block (landmarks / the shotengai / ponds skip it). */
+    localLine?: boolean; }
 
 /** The whole layout graph — consumed by Biome / Street / Landmark / NPC composers. */
 export interface WorldGraph {
@@ -264,6 +385,8 @@ export interface WorldGraph {
     bridges: V2[][];   // road-deck quads where a cross-street spans a canal
     plaza: V2[] | null;
     bounds: { min: V2; max: V2 };
+    /** railway-upgrade R3.2: the at-grade local line (local-line.ts), or null/absent when off. Plain data. */
+    localLine?: LocalLinePlan | null;
 }
 
 /** A road RAMP: a stretch of carriageway that slopes smoothly between two terrace levels so a car climbs it
@@ -291,6 +414,31 @@ export interface InstanceXform {
      *  layer's `garp` marker + the services resolver → written as this copy's per-instance textureIndex. A NAME,
      *  never a layer index (layers are session-local). Only meaningful when the layer carries `garp`. */
     skin?: string;
+    /** P12 instanced crowd: per-copy NON-uniform scale (person width, height, width) — overrides `s`. */
+    sv?: [number, number, number];
+    /** P12 instanced crowd: the copy's packed palette slots (renderer/3d/crowd-palette.ts packCrowdSlots). */
+    cs?: [number, number, number];
+    /** P12 instanced crowd: the person's index in the build's crowd records. */
+    pi?: number;
+}
+
+/** P12 INSTANCED CROWD records (world/crowd-instanced.ts): one build's static people as flat numbers — everything the
+ *  main thread needs to emit any person's near / mid geometry exactly as the baked crowd would (CREC_* fields), plus
+ *  the drape's build → render offset per person (filled by the drape pass). Carried by the build's crowd AUX layer. */
+export interface CrowdRecords {
+    /** Unique per build (ties the records to the build's xfar copies across reassembly sibling groups). */
+    id: string;
+    /** CREC_STRIDE numbers per person. */
+    recs: Float64Array;
+    n: number;
+    /** World units per metre. */
+    u: number;
+    /** The small (near / mid) cell size in world units (tile-aligned; the xfar cells are CROWD_XFAR.bigK x this). */
+    cell: number;
+    /** Twin distances (world units): near below d1, mid below d2, xfar past it. */
+    d1: number; d2: number;
+    /** The build's drape is done (the offsets are final). */
+    draped?: boolean;
 }
 
 export interface LayoutPreviewLayer {
@@ -367,6 +515,9 @@ export interface LayoutPreviewLayer {
      *  the geometry is world-baked as usual. Per-instance `tint` overrides the layer `color` for that copy (free —
      *  material is per-instance in the renderer). Used for repeated building detail (juliet balconies / window trim). */
     instances?: InstanceXform[];
+    /** Step 3b: `instances` packed by the world worker (packed-instances.ts) — a streamed tile's lists travel as typed
+     *  arrays; WorldManager unpacks each layer's list when its reassembly slice reaches it. Never both. */
+    instPacked?: PackedInstances;
     /** When true (with `instances`), render as ONE GPU-instanced ArrayGroup (1 node + 1 draw for ALL instances)
      *  instead of one shared-key mesh per instance. For CITY-scale repetition (thousands of instances) where the
      *  per-instance node count of the shared-key path would bite. All instances share the layer material. */
@@ -379,6 +530,10 @@ export interface LayoutPreviewLayer {
      *  their rim — a lamp light-pool that reads as a soft glow on the pavement instead of a hard-edged sticker
      *  disc. Pair with a disc/quad whose UVs are centred (see `MeshBuild.disc`) + opacity<1 (transparent pass). */
     radialFade?: boolean;
+    /** Material3D.noFog for the layer's meshes (fog-horizon follow-up 2026-10-01): 'hardEdge' = the sky / clouds skip
+     *  the fog only while Hard fog edge is on (so they stay clouds instead of fog-coloured blobs past Far), true =
+     *  never fogged. */
+    noFog?: boolean | 'hardEdge';
     /** Per-OBJECT index sub-ranges within this merged layer's geometry — `{ id, start, count }` where `start`/`count`
      *  are indices relative to this mesh. Lets the hover-outline pass trace ONE object's exact silhouette out of a
      *  merged mesh (landmarks merge all buildings into ~9 material meshes). See buildLandmarks + setHoverOutlineRanges. */
@@ -395,7 +550,7 @@ export interface LayoutPreviewLayer {
      *  (so USER-ADDED variants are eligible — a static world-gen pick could only ever choose the built-in skins).
      *  An instance may still force a specific {@link InstanceXform.skin} by name (explicit consumers); otherwise the
      *  copy's (x,z)+seed hash chooses. The atlas itself is built services-side (the pool's skin textures are content). */
-    garp?: { pool: string; slot: string; seed: number };
+    garp?: { pool: string; slot: string; seed: number; skin?: string };
     /** Override the render STYLE for this layer's meshes (e.g. 'cel' for toon/Ghibli foliage). Default = scene/PBR. */
     renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud';
     /** Add a Fresnel rim / back-light glow (Ghibli-ish backlit leaves). */
@@ -407,4 +562,45 @@ export interface LayoutPreviewLayer {
     /** TRANSLUCENCY + GROUND BLEND + BASE AO (foliage-quality.md S2) — the fragment half of the shared
      *  foliage look. Leave off for trunks/vessels (opaque wood/ceramic never transmits). */
     foliageShade?: { translucency?: number; translucencyColor?: [number, number, number]; groundBlend?: number; groundTint?: [number, number, number]; baseAO?: number };
+    /** SPATIAL CHUNK id ("ix_iz/nx×nz") when chunkCityLayers split this layer out of a city-wide one (polish-round-3
+     *  Round 5 — culling). Diagnostics only: the layer keeps the ORIGINAL name, so no rule ever keys on this. */
+    chunk?: string;
+    /** P12 instanced crowd: this layer's copies belong to the crowd build `id` (an xfar variant group per cell). */
+    crowdInst?: { id: string };
+    /** P12 instanced crowd: the build's person records (on its AUX layer, see crowdAux). */
+    crowdRecords?: CrowdRecords;
+    /** P12 instanced crowd AUX layer: never a mesh. Its geometry is the people's ground footprints (for the contact
+     *  blob pass, which sees it like any world-baked crowd layer) and it may carry `crowdRecords`. */
+    crowdAux?: boolean;
+    /** Skip this layer in the contact-blob pass (the instanced crowd's copies — the AUX layer stands in for them). */
+    noContact?: boolean;
+    /** P20 INSTANCED PROPS (world/prop-instancing.ts): an arrayGroup layer whose copies are in `propXf` and which keeps
+     *  the source layer's WHOLE look (metal / ground / neon / pattern …). The scene builds it with a never-drawn phantom
+     *  source (every copy is an instance) that casts shadows like the baked layer. */
+    propInst?: boolean;
+    /** P20: the copies of a `propInst` layer, PROP_XF_STRIDE (21) floats each — translation (3), the column-major 3×3
+     *  model part (9: yaw + the drape's local stretch) and 3×3 normal matrix (9). One typed array (it transfers from the
+     *  worker as is: no per-copy objects anywhere, and the reassembly never slices it — one layer = one group). */
+    propXf?: Float32Array;
+    /** Procedural ground split into chunks: the UNSPLIT layer's uv-scale sample triangles, so every chunk derives
+     *  the identical world-units-per-uv (no paver-phase seam at cell borders). See world/chunking.ts. */
+    groundUvSample?: MeshGeometry;
+    /** E2 NEAR/FAR TWIN (persona-polish-plan.md E2 edge chips). Layers sharing a `key` are two versions of the SAME
+     *  surfaces: role 'far' = the clean piece (always built), role 'near' = its chipped replacement. The renderer shows
+     *  the near twins of a chunk only while the camera is within `dist` world units of it and the far twins otherwise
+     *  (one shared hysteresis state, see Mesh3D.lodTwinRole), and chunkCityLayers splits every layer of a key on ONE
+     *  grid so the pairs cover identical cells. Distance LOD off / ortho → far twins only. `cell` (optional) = that
+     *  grid's cell size in world units (default ~1.5 × dist) — the static crowd's twins use bigger cells (fewer draws). */
+    nearTwin?: {
+        key: string; role: 'near' | 'far' | 'mid' | 'xfar'; dist: number; cell?: number;
+        /** P9 three-tier families (the static crowd): 'mid' draws between `dist` and `dist2`, 'xfar' past `dist2`. */
+        dist2?: number;
+        /** P9: the far twin is a DEGRADED copy (prop far twins), not the clean base piece: distance LOD off / ortho
+         *  without screen LOD then shows the NEAR twin, and a ground layer takes its uv-scale sample from the near
+         *  geometry, so the near look is exactly the pre-twin one. */
+        uvFromNear?: boolean;
+        /** P8 instanced twins (the far tree crowns): the per-instance triangle count both twins chunk their shared
+         *  transforms by (the near twin's), so the pairs land on one grid (world/chunking.ts). */
+        gridTris?: number;
+    };
 }

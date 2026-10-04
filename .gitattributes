@@ -1,0 +1,34 @@
+# Line-ending normalisation (added 2026-10-04; see docs/dev/checks-and-ci.md, "Line endings").
+#
+# Every text file is stored with LF in the repository and checked out with LF, whatever the machine's
+# core.autocrlf says. The index was already 100% LF when this was added, so it changes no committed content; it
+# stops CRLF from ever entering the repo (CI on Linux, a clone with autocrlf=false, a tool writing CRLF) and stops
+# the CRLF/LF diff churn. Existing working-tree files keep their current endings until git rewrites them
+# (checkout / reset); staging a CRLF or mixed file converts it to LF in the index, which is not a content change.
+* text=auto eol=lf
+
+# Windows scripts keep CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Binary: never convert, never diff as text.
+*.wasm  binary
+*.png   binary
+*.png~  binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.cur   binary
+*.glb   binary
+*.bin   binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
+*.zip   binary
+*.gz    binary
+*.frogmarks binary
+*.frogcart  binary

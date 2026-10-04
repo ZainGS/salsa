@@ -44,3 +44,32 @@ describe('spring-bone-solver — finite guards', () => {
         expect(allFinite(skel.skinMatrices)).toBe(true);
     });
 });
+
+describe('spring-bone-solver — scaled characters (Round 4: the Play auto player shrunk to city size)', () => {
+    // Joint 2 is a spring chain's second bone: its head comes from joint 1's SOLVED world matrix, so a scale lost there
+    // would show up as a full-size tail on a shrunk body.
+    const build = (scale: number) => {
+        const skel = new Skeleton3D({ name: 'S', joints: [joint(0), joint(1, 0), joint(2, 1)], clips: [], springChains: [{ ...chain([1, 2]), gravity: 0.02, gravityDir: [1, -1, 0] }] });
+        if (scale !== 1) {
+            skel.objectTransform.set([scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, 1]);
+            skel.computeWorldMatrices();
+        }
+        return skel;
+    };
+    const tipOf = (skel: Skeleton3D, j: number) => {
+        const m = skel.data.joints[j].worldMatrix;
+        return [m[12], m[13], m[14]];
+    };
+    it('a uniformly scaled rig swings EXACTLY like the unscaled one, scaled (bone length, gravity, joint scale)', () => {
+        const a = build(1), b = build(1 / 15);
+        for (let i = 0; i < 40; i++) { solveSpringBones(a, 1 / 60); solveSpringBones(b, 1 / 60); }
+        for (const j of [1, 2]) {
+            const pa = tipOf(a, j), pb = tipOf(b, j);
+            for (let k = 0; k < 3; k++) expect(pb[k]).toBeCloseTo(pa[k] / 15, 5);
+        }
+        // The solved spring joint keeps the character's scale (its X basis length = 1/15, not 1).
+        const m = b.data.joints[1].worldMatrix;
+        expect(Math.hypot(m[0], m[1], m[2])).toBeCloseTo(1 / 15, 5);
+        expect(allFinite(b.skinMatrices)).toBe(true);
+    });
+});

@@ -9,13 +9,18 @@
  *                with slowly-spinning clover/flower motifs in scattered cells
  *   'dim'      — semi-transparent dark overlay rendered over the scene
  *   'none'     — caller should skip draw()
+ *   'sky'      — the stylised view-direction SKY DOME (visual-polish #9; SkyDomePass, needs a camera view) —
+ *                falls back to the color1 → color2 gradient while its pipeline compiles / without a view
  *
  * Draw order:
  *   • solid / gradient / wavy  →  caller draws BEFORE meshes (acts as background)
  *   • dim                      →  caller draws AFTER meshes, BEFORE bone overlay
  */
 
+import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import type { ArmatureBgMode, ArmatureBgOptions } from '../../types/armature-3d';
+import { SkyDomePass } from './sky-dome-pass';
+import type { SkyDomeView } from './sky-dome';
 
 // --- Shaders ---
 
@@ -153,6 +158,7 @@ const MODE_U32: Record<ArmatureBgMode, number> = {
     dim:      3,
     checkers: 4,
     none:     0xff,
+    sky:      1,      // the gradient fallback (the dome itself is SkyDomePass)
 };
 
 // ── Named wavy presets (Frogmarks uses these for the background style dropdown) ──
@@ -193,15 +199,18 @@ const UNIFORM_FLOATS = 16; // 64 bytes / 4
 
 export class ArmatureBgPass {
     private _device:    GPUDevice;
-    private _pipeline:  GPURenderPipeline;
+    private _pipeline:  PipelineHandle<GPURenderPipeline>;   // P2: non-blocking cache handle
     private _ubuf:      GPUBuffer;
     private _bindGroup: GPUBindGroup;
     private _startTime  = performance.now();
     private _f32        = new Float32Array(UNIFORM_FLOATS);
     private _u32        = new Uint32Array(this._f32.buffer);
+    private _format:    GPUTextureFormat;
+    private _sky:       SkyDomePass | null = null;   // lazily built on the first 'sky' draw
 
     constructor(device: GPUDevice, format: GPUTextureFormat) {
         this._device = device;
+        this._format = format;
 
         this._ubuf = device.createBuffer({
             size:  UNIFORM_FLOATS * 4,
@@ -221,7 +230,8 @@ export class ArmatureBgPass {
             entries: [{ binding: 0, resource: { buffer: this._ubuf } }],
         });
 
-        this._pipeline = device.createRenderPipeline({
+        this._pipeline = GPUPipelineCache.for(device).render({
+            label: 'FocusBackground',
             layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
             vertex: {
                 module:     device.createShaderModule({ code: VERT }),
@@ -249,9 +259,13 @@ export class ArmatureBgPass {
         });
     }
 
-    /** Draw the background. Skip if mode is 'none'. */
-    draw(pass: GPURenderPassEncoder, opts: ArmatureBgOptions, canvasW: number, canvasH: number): void {
+    /** Draw the background. Skip if mode is 'none'. `view` (the camera basis) is only read by the 'sky' mode. */
+    draw(pass: GPURenderPassEncoder, opts: ArmatureBgOptions, canvasW: number, canvasH: number, view?: SkyDomeView | null): void {
         if (opts.mode === 'none') return;
+        if (opts.mode === 'sky' && opts.sky && view) {
+            this._sky ??= new SkyDomePass(this._device, this._format);
+            if (this._sky.draw(pass, opts.sky, view, canvasW, canvasH)) return;   // else: still compiling → the gradient below
+        }
 
         const t   = (performance.now() - this._startTime) / 1000.0;
         // Checkers falls back to green/yellow (not the wavy blue/cream) when no colors are given.
@@ -271,12 +285,16 @@ export class ArmatureBgPass {
         // f[13..15] = padding (zero from initialization)
 
         this._device.queue.writeBuffer(this._ubuf, 0, f);
-        pass.setPipeline(this._pipeline);
+        const pipe = this._pipeline.get();
+        if (!pipe) return;   // P2: still compiling → no focus background this frame
+        pass.setPipeline(pipe);
         pass.setBindGroup(0, this._bindGroup);
         pass.draw(6);
     }
 
     destroy(): void {
         this._ubuf.destroy();
+        this._sky?.destroy();
+        this._sky = null;
     }
 }

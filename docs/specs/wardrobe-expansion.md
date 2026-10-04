@@ -4,6 +4,10 @@
 **Status:** 📋 SPEC (roadmap). Nothing here is built yet except where a row says ✅. Build order is **Phase 1 (quick
 upgrades) → Phase 2 (charms/accessories engine) → Phase 3 (draw→geometry) → Phase 4 (drapes)**, per the
 2026-06-28 direction call.
+**Status (2026-10-04):** Phase 1A taper + 1B cutouts (`setGarmentEraseStyle3D`) and Phase 2 charms v1 (8+ types, spring
+dangle, belt loops; `attachment-generator.ts`) are BUILT. **Not built:** 1C outer / open-front layer, Phase 3
+draw→geometry, Phase 4 drapes. Clothing fit round 2 (layer order, body-hiding mask, lining) is in progress separately —
+see [../STATUS-2026-10-04.md](../STATUS-2026-10-04.md).
 **Engine:** `src/services/managers/clothing-generator.ts` (garments), `scene3d-manager.ts` (rigging / slots /
 persistence), `shape-manager.ts` (public `*3D` API + UV paint). Host: **Frogmarks** owns the UI.
 **Siblings:** [clothing-generation.md](./clothing-generation.md) · [shoe-generation.md](./shoe-generation.md) ·

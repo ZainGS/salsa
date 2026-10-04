@@ -80,3 +80,17 @@ describe('skyAt — keyframe lerp around the day', () => {
         expect(skyAt(-0.75, DEFAULT_SKY)).toEqual(skyAt(0.25, DEFAULT_SKY));
     });
 });
+
+describe('keyFill (persona-polish A4)', () => {
+    it('absent / 0 = the original curves exactly', () => {
+        expect(computeDayNight(0.5, { keyFill: 0 })).toEqual(computeDayNight(0.5));
+    });
+    it('by day: a warmer, stronger sun over a lower, less blue fill; night untouched', () => {
+        const a = computeDayNight(0.5), b = computeDayNight(0.5, { keyFill: 1 });
+        expect(b.sunIntensity).toBeGreaterThan(a.sunIntensity);
+        expect(b.ambientIntensity).toBeLessThan(a.ambientIntensity);
+        expect(b.sunColor[2] / b.sunColor[0]).toBeLessThan(a.sunColor[2] / a.sunColor[0]);          // warmer key
+        expect(b.ambientColor[2] - b.ambientColor[0]).toBeLessThan(a.ambientColor[2] - a.ambientColor[0]);   // less blue fill
+        expect(computeDayNight(0.0, { keyFill: 1 })).toEqual(computeDayNight(0.0));
+    });
+});

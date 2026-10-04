@@ -54,6 +54,59 @@ fn cel_hd_lighting(
     return lit;
 }
 
+// ── Toon shadows (bit 30; also skinRamp materials in Cel) ────────
+// Banded diffuse with a COLOURED shadow: the shadow tone is the diffuse colour times a tint, slightly saturated —
+// the anime "multiply layer" shadow — instead of just a darker copy. p = (bands, softness, shadowValue, _),
+// tintPacked = rgb 8:8:8, sat = shadow saturation boost. hdSpec: false = cel's hard specular dot, true = Cel-HD's
+// smooth highlight. Same band maths as the skin ramp (skinRamp in mesh3d-shaders.ts).
+fn toon_unpack_rgb8(v: f32) -> vec3<f32> {
+    let r = floor(v / 65536.0);
+    let g = floor((v - r * 65536.0) / 256.0);
+    let b = v - r * 65536.0 - g * 256.0;
+    return vec3<f32>(r, g, b) / 255.0;
+}
+fn toon_band(ndl: f32, bands: f32, soft: f32) -> f32 {
+    let nb      = max(bands, 1.0);
+    let stepped = floor(ndl * nb) / nb;
+    let edge    = fract(ndl * nb);
+    let s       = smoothstep(0.5 - max(soft, 0.001), 0.5 + max(soft, 0.001), edge);
+    return clamp(mix(stepped, stepped + 1.0 / nb, s), 0.0, 1.0);
+}
+fn toon_lighting(
+    diffuse: vec3<f32>, specular: vec3<f32>, shininess: f32,
+    N: vec3<f32>, L: vec3<f32>, V: vec3<f32>,
+    ambientRgb: vec3<f32>, ambientI: f32,
+    lightRgb: vec3<f32>, lightI: f32,
+    emissive: vec3<f32>,
+    p: vec3<f32>, tintPacked: f32, sat: f32, hdSpec: bool,
+) -> vec3<f32> {
+    let NdotL  = max(dot(N, L), 0.0);
+    let band   = toon_band(NdotL, p.x, p.y);
+    var shadow = diffuse * toon_unpack_rgb8(tintPacked) * p.z;
+    let sl     = dot(shadow, vec3<f32>(0.2126, 0.7152, 0.0722));
+    shadow     = max(mix(vec3<f32>(sl), shadow, 1.0 + sat), vec3<f32>(0.0));
+    var lit    = mix(shadow, diffuse, band) * (ambientRgb * ambientI + lightRgb * lightI);
+    let H      = normalize(L + V);
+    let sp     = pow(max(dot(N, H), 0.0), max(shininess, 1.0));
+    if (hdSpec) { lit += specular * lightRgb * sp * step(0.0001, NdotL); }
+    else        { lit += specular * lightRgb * step(0.97, sp); }
+    return lit + emissive;
+}
+
+// ── Parameterised rim light (rimEnabled materials when scene rimParams.x > 0) ──
+// rp = (strength, width, hardness, colourPacked). Width = how far in from the silhouette; hardness blends a soft
+// Fresnel falloff into a crisp toon edge. Stronger on the side the key light doesn't hit (back-lit), like the
+// original rim.
+fn rim_param(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, rp: vec4<f32>) -> vec3<f32> {
+    let edge = 1.0 - max(dot(N, V), 0.0);
+    let w    = clamp(rp.y, 0.02, 1.0);
+    let soft = pow(edge, mix(8.0, 1.5, w));
+    let hard = smoothstep(1.0 - w - 0.03, 1.0 - w + 0.03, edge);
+    let m    = mix(soft, hard, clamp(rp.z, 0.0, 1.0));
+    let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
+    return m * backlit * rp.x * toon_unpack_rgb8(rp.w);
+}
+
 // ── Sketch / crosshatch ──────────────────────────────────────────
 // Simulates hand-drawn crosshatching: paper base colour with ink lines
 // that grow denser as the surface turns away from the light.
@@ -62,6 +115,7 @@ fn sketch_lighting(
     N: vec3<f32>, L: vec3<f32>,
     worldPos: vec3<f32>,
     ambientI: f32, lightI: f32,
+    paperAmt: f32,
 ) -> vec3<f32> {
     let NdotL     = max(dot(N, L), 0.0);
     let intensity = clamp(ambientI + NdotL * lightI, 0.0, 1.0);
@@ -73,8 +127,12 @@ fn sketch_lighting(
     let h2   = step(0.55, fract(p.x - p.z));           // diagonal B (cross)
     let h3   = step(0.55, fract(p.x * 0.7 + p.y));     // tertiary
 
-    // Paper: off-white tinted by the diffuse colour
-    let paper  = mix(vec3<f32>(0.96, 0.94, 0.88), diffuse * 0.9 + 0.1, 0.25);
+    // Paper: off-white washed with the diffuse colour. paperAmt (scene styleParams.x): 1 = all paper, 0 = the full
+    // colour (pencil hatching only). At the default 0.75 this is EXACTLY the original mix(paper, lifted, 0.25);
+    // the small colour lift fades out with the paper so paperAmt 0 shows the true colour.
+    let paperK = clamp(paperAmt, 0.0, 1.0);   // (not 'p' — that's the hatch coordinate above; WGSL forbids redeclaring)
+    let lifted = mix(diffuse, diffuse * 0.9 + 0.1, min(1.0, paperK / 0.75));
+    let paper  = mix(lifted, vec3<f32>(0.96, 0.94, 0.88), paperK);
     // Ink: very dark version of diffuse
     let ink    = diffuse * 0.12;
 

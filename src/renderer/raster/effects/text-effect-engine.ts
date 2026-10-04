@@ -414,7 +414,7 @@ export class TextEffectEngine {
         { source: img },
         { destination: { texture: gpuTex } },
       );
-      this.device.popErrorScope().then((err) => {
+      void this.device.popErrorScope().then((err) => {
         if (err) console.warn('[captureElement] element copy skipped (resize transient?):', err.message);
       });
       return { texture: gpuTex, width: w, height: h };

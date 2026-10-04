@@ -92,7 +92,7 @@ export class SDFTextAtlas {
 		this.retireCursor ^= 1;
 
 		// fence all work submitted so far (this frame’s submit)
-		this.device.queue.onSubmittedWorkDone();
+		void this.device.queue.onSubmittedWorkDone();
 
 		const bucket = this.retireBuckets[this.retireCursor];
 		for (const t of bucket) { try { t.destroy(); } catch {} }

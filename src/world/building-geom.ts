@@ -41,22 +41,91 @@ export function offsetPoly(poly: V2[], amt: number): V2[] {
     return out;
 }
 
+/** Offset each EDGE of a polygon by its own distance `d[i]` (edge i = poly[i]→poly[i+1]; + = outward, − = inset),
+ *  re-intersecting neighbouring edge lines at every vertex. Used where a uniform offset is wrong: a plinth / parapet
+ *  / eave must stay FLUSH on a party wall (d = 0) but project on exposed faces, and the city insets only the STREET
+ *  edges of a lot (a fixed setback) so party edges still meet the neighbour. Miter length is clamped (sharp
+ *  corners), and near-parallel neighbours fall back to the averaged normal. */
+export function offsetPolyEdges(poly: V2[], d: number[]): V2[] {
+    const n = poly.length; const out: V2[] = [];
+    for (let i = 0; i < n; i++) {
+        const ip = (i - 1 + n) % n;
+        const a0 = poly[ip] as V2L, a1 = poly[i] as V2L, b1 = poly[(i + 1) % n] as V2L;
+        const n1 = outN(a0, a1), n2 = outN(a1, b1);
+        const d1 = d[ip] ?? 0, d2 = d[i] ?? 0;
+        const det = n1[0] * n2[1] - n1[1] * n2[0];
+        if (Math.abs(det) < 0.05) {   // (near-)collinear edges → no unique intersection
+            const m = nrm2([n1[0] + n2[0], n1[1] + n2[1]]), dd = (d1 + d2) / 2;
+            out.push([a1[0] + m[0] * dd, a1[1] + m[1] * dd]); continue;
+        }
+        let x = (d1 * n2[1] - n1[1] * d2) / det, z = (n1[0] * d2 - d1 * n2[0]) / det;
+        const L = Math.hypot(x, z), maxL = 3 * Math.max(Math.abs(d1), Math.abs(d2)) + 1e-9;
+        if (L > maxL) { x *= maxL / L; z *= maxL / L; }
+        out.push([a1[0] + x, a1[1] + z]);
+    }
+    return out;
+}
+
 /** A rectangular footprint centred at the origin, wound CCW (outward normals via walls()). */
 export function rectFoot(w: number, d: number): V2[] {
     const hw = w / 2, hd = d / 2;
     return [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]];
 }
 
-export interface Edge { i: number; a: V2L; b: V2L; mid: V2L; dir: V2L; out: V2L; len: number; street: boolean; }
+/** What an edge faces: a STREET (full facade), OPEN ground that is not a street (a back yard / courtyard / alley /
+ *  park — gets the utilities: AC, pipes, fire escape), or a PARTY wall shared with the neighbour (plain, nothing
+ *  protrudes — it would poke into the next building).
+ *  Two more the CITY finds from the ground levels (city-quality B1/B2, S13):
+ *   · 'drop'  — a street, but DOWN (or up) a retaining wall: the lot is on a raised terrace. It keeps the street
+ *               facade, but the building stands well back from the wall (a walkable strip along its top) and a
+ *               door only goes here when the lot has no level street edge.
+ *   · 'water' — a canal / pond / water lot (or a road sunk in a canal trench): never the front, never a door, and
+ *               the building keeps a walkable strip clear of the railing. */
+export type EdgeKind = 'street' | 'open' | 'party' | 'drop' | 'water';
+/** A per-edge frontage entry: an EdgeKind, or a boolean (true = street, false = party — the legacy mask). */
+export type FrontageMask = (EdgeKind | boolean)[];
 
-/** All footprint edges with outward normals + street-facing flag. `frontage` (per-edge) overrides; else all street. */
-export function edgesOf(foot: V2[], frontage?: boolean[]): Edge[] {
+export interface Edge { i: number; a: V2L; b: V2L; mid: V2L; dir: V2L; out: V2L; len: number; street: boolean; kind: EdgeKind; }
+
+const kindOf = (v: EdgeKind | boolean | undefined): EdgeKind => v === undefined || v === true ? 'street' : v === false ? 'party' : v;
+
+/** All footprint edges with outward normals + street-facing flag. `frontage` (per-edge) overrides; else all street
+ *  (the standalone Building Creator, which has no neighbours). */
+export function edgesOf(foot: V2[], frontage?: FrontageMask): Edge[] {
     const out: Edge[] = [];
     for (let i = 0; i < foot.length; i++) {
         const a = foot[i] as V2L, b = foot[(i + 1) % foot.length] as V2L;
-        out.push({ i, a, b, mid: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], dir: nrm2([b[0] - a[0], b[1] - a[1]]), out: outN(a, b), len: dist2(a, b), street: frontage ? (frontage[i] ?? true) : true });
+        const kind = kindOf(frontage?.[i]);
+        out.push({ i, a, b, mid: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], dir: nrm2([b[0] - a[0], b[1] - a[1]]), out: outN(a, b), len: dist2(a, b), street: kind === 'street' || kind === 'drop', kind });
     }
     return out;
+}
+
+/** The footprint's extent in a local frame (`dir` along, `out` across — typically the front edge's), relative to
+ *  `origin`. Lets roofs + rooftop clutter follow the building's REAL orientation and size instead of the world-axis
+ *  bbox (which is wrong on rotated / radial lots). */
+export function frameExtent(poly: V2[], origin: V2L, dir: V2L, out: V2L): { a0: number; a1: number; o0: number; o1: number } {
+    let a0 = Infinity, a1 = -Infinity, o0 = Infinity, o1 = -Infinity;
+    for (const p of poly) {
+        const dx = p[0] - origin[0], dz = p[1] - origin[1];
+        const a = dx * dir[0] + dz * dir[1], o = dx * out[0] + dz * out[1];
+        if (a < a0) a0 = a; if (a > a1) a1 = a; if (o < o0) o0 = o; if (o > o1) o1 = o;
+    }
+    return { a0, a1, o0, o1 };
+}
+
+/** Signed area (positive = the CCW winding edgesOf/walls assume). */
+export function signedArea(poly: V2[]): number {
+    let s = 0;
+    for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i + 1) % poly.length]; s += a[0] * b[1] - b[0] * a[1]; }
+    return s / 2;
+}
+
+/** A small deterministic integer hash (for per-face UV offsets etc.) — no float trig, platform-stable. */
+export function ihash(a: number, b = 0): number {
+    let h = Math.imul((a | 0) ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul((b | 0) + 0x632be5ab, 0xc2b2ae35);
+    h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d); h = Math.imul(h ^ (h >>> 13), 0x297a2d39);
+    return (h ^ (h >>> 16)) >>> 0;
 }
 
 /** Minimum front-edge length (metres). Below this the winning "front" is a ROUNDED-CORNER chord, not a real wall —
@@ -107,7 +176,9 @@ export function panel(acc: Accum3D, mid: V2L, dir: V2L, out: V2L, y0: number, y1
 
 /** A vertical post (thin oriented box) at a ground point, from y0 to y1. */
 export function post(acc: Accum3D, x: number, z: number, y0: number, y1: number, r: number): void {
+    acc.beginPart([x, y0, z]);   // P20: a prop part (no-op unless a streamed tile is building) — railing / tank legs repeat
     acc.obox([x, (y0 + y1) / 2, z], [1, 0, 0], [0, 1, 0], [0, 0, 1], r, Math.max(0.02, (y1 - y0) / 2), r);
+    acc.endPart();
 }
 
 export const darken = (c: [number, number, number], f: number): [number, number, number] => [c[0] * f, c[1] * f, c[2] * f];

@@ -28,8 +28,30 @@ import type { GarpManager } from '../managers/garp-manager';
 import type { PackagingManager } from '../../packaging/packaging-manager';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
+import { gpuPixelEpoch } from '../../renderer/raster/gpu-pixel-epoch';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D } from '../../scene-graph/shapes/array-group-3d';
+
+/**
+ * Everything a save reads BACK from the GPU (no CPU copy exists): raster layer + cel pixels, UV-paint / decal textures
+ * and hand-painted face textures. Kept as the device-lost READ-BACK SHADOW (docs/ui/device-recovery.md): once the
+ * device is lost these can't be read, so the recovery snapshot uses the newest copy instead.
+ */
+export interface GpuOnlyDocumentData {
+    layers: Array<{ id: string; pixelData: ArrayBuffer }>;
+    cels: Array<{ celId: string; pixelData: ArrayBuffer }>;
+    meshTextures: Record<string, ArrayBuffer>;
+    meshTexturesComplete: boolean;
+    /** Every raster layer / cel / painted-texture key that existed at capture time (blank layers are not exported). */
+    layerIds: string[];
+    celIds: string[];
+    meshTextureKeys: string[];
+    /** Date.now() at capture. */
+    at: number;
+    /** gpuPixelEpoch() when the capture STARTED (an edit during the read-back moves the count past it). Absent = unknown
+     *  (treated as stale). */
+    editEpoch?: number;
+}
 
 /** The facade-PRIVATE state the orchestration needs — wired by ShapeManager with closures/refs. */
 export interface DocumentStatePrivate {
@@ -55,6 +77,8 @@ export interface DocumentStatePrivate {
     restoreClothingTextures(blobs: Map<string, ArrayBuffer>): Promise<void>;
     restoreProceduralMeshTextures(map: Map<string, ArrayBuffer>): Promise<void>;
     backfillUnassignedVectorLayers(): void;
+    /** Called with each successful GPU read-back (the device-lost shadow). Optional. */
+    onGpuOnlyGathered?(data: GpuOnlyDocumentData): void;
     /** Suppresses intermediate scene-graph-changed events during restore. */
     setRestoring(v: boolean): void;
     getDocumentSizePx(): { w: number; h: number } | null;
@@ -72,7 +96,7 @@ export class DocumentStateCoordinator {
     /** Shorthand — the original methods read `this.rasterLayerManager` (optional) pervasively. */
     private get rlm(): RasterLayerManager | undefined { return this.priv.getRasterLayerManager(); }
 
-    async gather(forceAll3D = false): Promise<DocumentSavePayload> {
+    async gather(forceAll3D = false, opts: { gpuOnly?: GpuOnlyDocumentData | null } = {}): Promise<DocumentSavePayload> {
         const canvasSize = this.rlm?.getCanvasSize() ?? { w: 1920, h: 1080 };
         const layerMeta = this.rlm?.getLayerMetadata() ?? [];
 
@@ -152,9 +176,10 @@ export class DocumentStateCoordinator {
             pixelFormat: this.priv.getPixelFormat(),
         };
 
-        // Read pixel data
-        const layers = await this.rlm?.exportLayerPixels() ?? [];
-        const cels = await this.rlm?.exportCelPixels() ?? [];
+        // Everything read back from the GPU (raster layers, cels, painted textures). A device-lost recovery passes the
+        // last read-back instead (the dead device can't be read); a normal save reads it now and refreshes that shadow.
+        const gpuOnly = opts.gpuOnly ?? await this.gatherGpuOnly();
+        const { layers, cels, meshTextures, meshTexturesComplete } = gpuOnly;
 
         // Gather 3D mesh states — gated on dirty to avoid serializing geometry on every stroke save.
         // packProject() passes forceAll3D=true to always include the full snapshot.
@@ -172,7 +197,10 @@ export class DocumentStateCoordinator {
         if (this.sm.scene3d) {
             // Global scene settings are always serialized — they're tiny and changes
             // to fog/lighting/etc. don't flip the mesh dirty flag.
-            const globalScene = this.sm.scene3d.getGlobalScene3DSettings();
+            // In City mode the global uniforms hold the CITY's look — save the document's own (pre-city) base look
+            // instead; the city look persists in its worldParams marker (bug-hunt 2026-10-01 D-P1).
+            const liveGlobal = this.sm.scene3d.getGlobalScene3DSettings();
+            const globalScene = this.sm.world?.overlayPreCityState?.(liveGlobal) ?? liveGlobal;
             const faceRigs = this.sm.scene3d.serializeFaceRigs();         // anime face/eye expression metadata
             const clothingRigs = this.sm.scene3d.serializeClothingRigs(); // procedural garment params (regenerate on load)
             const hairRigs = this.sm.scene3d.serializeHairRigs();         // procedural hair params (regenerate on load)
@@ -194,7 +222,7 @@ export class DocumentStateCoordinator {
                 return false;
             };
             const nodes = this.sm.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument && !underSkipWrapper(m)).map(m => this.priv.buildMeshState(m));
-            const skeletons = this.sm.scene3d.getAllSkeletons().map(s => this.sm.scene3d!.serializeSkeletonForSave(s));
+            const skeletons = this.sm.scene3d.getAllSkeletons().filter(s => !s.excludeFromDocument).map(s => this.sm.scene3d!.serializeSkeletonForSave(s));   // runtime-only rigs (Play auto player) never save
             // Round floats to 6 decimals as we serialize — skeleton inverse-bind matrices + rotations carry ~15
             // digits of noise ("0.916000000012") that bloat the JSON and gzip poorly. 6 decimals is visually
             // lossless for matrices/quaternions/positions. Guard ≥1e9 (timestamps etc.) so *1e6 can't overflow 2^53.
@@ -216,6 +244,51 @@ export class DocumentStateCoordinator {
             }
         }
 
+        // Baked kitbash parts (generated garments/hair) → GLB bytes keyed by part id, so they survive reload.
+        const bakedParts = this.sm.scene3d ? await this.sm.scene3d.getBakedPartBuffers() : {};
+
+        return {
+            manifest,
+            sceneGraphJSON: this.sm.getSceneGraphJSONForDocument(),   // 3D-mesh geometry stripped (lives in scene3dJSON) — was duplicating ~MBs/character
+            brushPresetsJSON: this.sm.exportAllBrushPresets(),
+            layers,
+            cels,
+            scene3dJSON,
+            models3d,
+            models3dComplete: has3DChanges,   // prune keep-set is only valid when the full store was gathered
+            meshTextures,
+            meshTexturesComplete,
+            bakedParts,
+            textureLibrary,
+            ephemeraJSON: this.priv.ephemera ? this.priv.ephemera.serialize() : null,
+            // GARP pools + skin sources (user-authored variants MUST survive reload). Sources are DecalSources
+            // (ephemera params / image dataUrls) → already JSON-serializable; layers are session-local (not saved).
+            garpJSON: this.priv.garp.hasContent() ? this.priv.garp.serialize() : null,
+            // UI System layers (state machine + shape interactions). Null when the doc has none.
+            uiLayersJSON: this.sm.ui.listUILayers().length ? JSON.stringify(this.sm.ui.serialize()) : null,
+            _onWriteComplete,
+        };
+    }
+
+    /** Serializes GPU read-backs: a save and the shadow refresh share RasterLayerManager's one read-back buffer. */
+    private _gpuReadChain: Promise<unknown> = Promise.resolve();
+
+    /** Read back everything that lives only on the GPU (see GpuOnlyDocumentData). Also feeds the device-lost shadow. */
+    async gatherGpuOnly(): Promise<GpuOnlyDocumentData> {
+        const run = this._gpuReadChain.then(() => this._gatherGpuOnlyNow(), () => this._gatherGpuOnlyNow());
+        this._gpuReadChain = run.catch(() => undefined);
+        return run;
+    }
+
+    private async _gatherGpuOnlyNow(): Promise<GpuOnlyDocumentData> {
+        const at = Date.now();
+        const editEpoch = gpuPixelEpoch();
+        const layerIds = (this.rlm?.getLayerMetadata() ?? []).map((l) => l.id);
+        const celIds: string[] = [];
+        for (const l of this.rlm?.getLayerMetadata() ?? []) if (l.animationType === 'animated') for (const c of this.rlm!.getCels(l.id)) celIds.push(c.id);
+        // Read pixel data
+        const layers = await this.rlm?.exportLayerPixels() ?? [];
+        const cels = await this.rlm?.exportCelPixels() ?? [];
         // UV-painted mesh textures → PNG bytes keyed by mesh ID (from the UV paint tool).
         const meshTextures: Record<string, ArrayBuffer> = {};
         // False if ANY texture failed to export this save: the map is then incomplete, and pruning meshTextures/
@@ -248,30 +321,9 @@ export class DocumentStateCoordinator {
             } catch (e) { meshTexturesComplete = false; console.warn('[Face] export texture failed for', key, e); }
         }
 
-        // Baked kitbash parts (generated garments/hair) → GLB bytes keyed by part id, so they survive reload.
-        const bakedParts = this.sm.scene3d ? await this.sm.scene3d.getBakedPartBuffers() : {};
-
-        return {
-            manifest,
-            sceneGraphJSON: this.sm.getSceneGraphJSONForDocument(),   // 3D-mesh geometry stripped (lives in scene3dJSON) — was duplicating ~MBs/character
-            brushPresetsJSON: this.sm.exportAllBrushPresets(),
-            layers,
-            cels,
-            scene3dJSON,
-            models3d,
-            models3dComplete: has3DChanges,   // prune keep-set is only valid when the full store was gathered
-            meshTextures,
-            meshTexturesComplete,
-            bakedParts,
-            textureLibrary,
-            ephemeraJSON: this.priv.ephemera ? this.priv.ephemera.serialize() : null,
-            // GARP pools + skin sources (user-authored variants MUST survive reload). Sources are DecalSources
-            // (ephemera params / image dataUrls) → already JSON-serializable; layers are session-local (not saved).
-            garpJSON: this.priv.garp.listPools().length ? this.priv.garp.serialize() : null,
-            // UI System layers (state machine + shape interactions). Null when the doc has none.
-            uiLayersJSON: this.sm.ui.listUILayers().length ? JSON.stringify(this.sm.ui.serialize()) : null,
-            _onWriteComplete,
-        };
+        const data: GpuOnlyDocumentData = { layers, cels, meshTextures, meshTexturesComplete, layerIds, celIds, meshTextureKeys: Object.keys(meshTextures), at, editEpoch };
+        try { this.priv.onGpuOnlyGathered?.(data); } catch { /* shadow hook */ }
+        return data;
     }
 
     async restore(incoming: DocumentSavePayload): Promise<RestoreReport> {

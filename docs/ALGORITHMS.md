@@ -99,12 +99,18 @@
 
 ### Shadows
 - **Shadow mapping with tiered PCF (5×5 / 3×3 `textureSampleCompare`)** — `mesh3d-shaders.ts` (`SHADOW_SAMPLE_WGSL`) — penumbra-width multiplier for soft city shadows.
-- **Texel-snapped, zoom-adaptive shadow box** — `renderer-3d.ts` — ortho volume centre rounded to the shadow-map texel grid (kills shimmer/crawl); half-extent ∝ orbit distance, bias ∝ texel size. One adaptive box, not cascaded CSM.
+- **Texel-snapped, zoom-adaptive shadow box** — `renderer-3d.ts` — ortho volume centre rounded to the shadow-map texel grid (kills shimmer/crawl); half-extent ∝ orbit distance, bias ∝ texel size. (2026-10: the box is now the LAST level of the cascades below.)
 - **Wind-displaced depth pass** — `shadow-shaders.ts` — swaying foliage casts swaying shadows; emissive is restored un-shadowed (neon stays lit).
+- **Cascaded shadow maps (near boxes in a depth-array texture, edge-band blend)** — `src/renderer/3d/shadow-cascades.ts` — the original far map becomes the last cascade; quality presets Low–Ultra in `shadow-quality.ts`.
+- **Cached static / dynamic shadow layers + texel-snapped cascade box hold + per-caster index-run range culling against the light box ∩ shadow reach** — `src/renderer/3d/shadow-cache.ts` (+ `shadow-lod.ts`, `shadow-minmax.ts`) — static casters re-render only when the caster signature or the box changes; movers draw on top each refresh (performance-plan P14).
 
 ### Post-processing
 - **Bloom: soft-knee luminance threshold → 9-tap separable Gaussian (canonical 0.227027… weights) → additive composite** — `post-process-shaders.ts` (Rec. 709 luma). Single-scale, not a Karis mip pyramid.
 - **Fused grade + vignette (brightness → pivot contrast → luma-lerp saturation → tint)**, **linear + exponential distance fog**, **fullscreen-triangle idiom**, **UI world-blur (half-res ping-pong Gaussian)**, **transition masks (directional wipe + iris via smoothstep ramps)** — `post-process-shaders.ts`, `pipeline-manager.ts`, `webgpu-renderer.ts`.
+- **Wide bloom: dual-filter (Kawase) mip chain (5-tap down, 8-tap tent up, additive)** — `post-process-shaders.ts` §2b — the city-quality wide glow on top of the single-scale bloom.
+- **Exponential height fog (density × height falloff × distance)** — `mesh3d-shaders.ts` (`scene.heightFog`), `scene-uniforms.ts` — ground-hugging fog layer (city-quality P9).
+- **Fog horizon: hard fog edge + silhouette skyline fast path + Bayer-dithered fade band** — `src/renderer/3d/fog-horizon.ts`, `mesh3d-shaders.ts` — detail past the fog Far is culled on the CPU; the band dissolves instead of popping (docs/specs/fog-horizon.md).
+- **TAA / TAAU (Halton(2,3) sub-pixel jitter, depth reprojection + a velocity pass for movers / skinned parts, closest-depth velocity dilation, YCoCg variance clip, temporal upscale)** — `src/renderer/3d/temporal-aa.ts` — native TAA, or render at ~0.65 and reconstruct at full size (performance-plan P18; default off).
 
 ### Retro / PS1
 - **Affine texture warp (`@interpolate(linear)` UV blend), clip-space vertex snapping, color-depth posterization with 4×4 Bayer dither, UV quantization (texel crawl), low-res render target with nearest upscale** — `mesh3d-shaders.ts` + `src/renderer/3d/lofi-pass.ts` — the PS1 suite; lofi doubles as a dynamic-resolution lever.
@@ -130,9 +136,14 @@
 - **BVH (centroid-median split) + slab ray–AABB + Möller–Trumbore (cited)** — `src/renderer/3d/mesh-bvh.ts` — allocation-free traversal; dual picking strategy (BVH static, AABB-prefiltered scan for cloth-dirty meshes) in `mesh-picker.ts`.
 - **Adaptive near plane (near ∝ target distance) + scene-tracking far** — `camera-3d.ts` — depth precision without reversed-Z (see `docs/specs/depth-precision.md`).
 - **Spherical orbit camera with exponential damping, screen-constant gizmo scaling, hierarchical instanced-group culling, opaque front-to-back / transparent back-to-front sorting, geometry-keyed instancing runs, uber-shader marker-substitution specialization, vertex-bufferless billboard particles** — `orbit-controller.ts`, `gizmo-renderer.ts`, `renderer-3d.ts`, `mesh3d-shaders.ts`, `particle-shaders.ts`.
+- **GPU-driven culling + indirect draws (persistent per-draw records, compute cull → `drawIndexedIndirect` in render bundles, GPU near / far twin + cull-range choice, compacted dynamic shadow lists)** — `src/renderer/3d/gpu-driven.ts`, `gpu-scene.ts`, `shaders/gpu-cull-shaders.ts`, `gpu-cull-auto.ts` — the compute pass mirrors the CPU cull and writes instanceCount 0 for culled records (performance-plan P15; default on, Auto culling mode).
+- **CPU software occlusion culling (conservative depth raster of convex building-wall occluders, farthest depth per pixel, same frame)** — `src/renderer/3d/occlusion-culler.ts` — zero-latency rejection of boxes wholly behind buildings (performance-plan P11; built, default off).
+- **Sub-mesh cull ranges (256-triangle runs per merged chunk) + hierarchical cull clusters** — `src/renderer/3d/cull-ranges.ts`, `cull-clusters.ts` — merged chunks draw only the runs in view / in each cascade (P11, P9; default on).
+- **Incremental draw-order rank (interned numeric geometry-key codes, sort-new-and-merge)** — `src/renderer/3d/draw-order-rank.ts` — the same order as a full stable sort without the ~10 ms re-sort per structure change (P13).
+- **Specialised uber-shader variants (the flags line constant-folded by text substitution, keyed on the exact flags value, background-compiled with the uber-shader as fallback)** — `src/renderer/3d/shader-variants.ts` — extends the marker-substitution specialization above (P21; default on).
 
 ### Verified absent (so this doc never over-claims)
-No matcap sampling, no reversed-Z, no ACES/Reinhard tone mapping (LDR clamp), no cascaded shadow maps, no bloom mip pyramid / Kawase blur, no jump-flood outlines (the ring-scan above), and 2D MSAA is configured but currently set to 1.
+No matcap sampling, no reversed-Z, no Hi-Z occlusion (as of 2026-10-04), no ACES/Reinhard tone mapping (LDR clamp), no jump-flood outlines (the ring-scan above), and 2D MSAA is configured but currently set to 1.
 
 ---
 
@@ -163,6 +174,8 @@ No matcap sampling, no reversed-Z, no ACES/Reinhard tone mapping (LDR clamp), no
 - **Bone constraints (look-at, copy-rotation, volume-preserving stretch-to, Euler limits) blended by slerp influence** — `constraint-solver.ts` — documented FK → IK → constraints → springs order.
 - **Inverse-distance² auto-skinning, dab weight painting with renormalization, ring-blended garment weights via the VertGrid spatial hash (Teschner primes)** — `scene3d-manager.ts`, `scene3d-weight-paint.ts`, `clothing-generator.ts`, `vert-grid.ts`.
 - **Blend shapes / morph targets** — `scene3d-blend-shapes.ts`, `gltf-importer.ts`.
+- **Dual-quaternion skinning (DQS)** — `src/renderer/3d/dual-quat-skin.ts` — rigid blend of joint rotation + translation (no candy-wrapper volume loss); per character `sm.setSkinningMethod3D(id, 'linear' | 'dualQuat')`, new bodies = DQ.
+- **Anime hair locks (tapered lens-section ribbons over a scalp shell, layered crown / fringe / side locks / tails on spring chains)** — `src/services/managers/hair-locks.ts` — the 15-style lock system (hair-styles.md B–E).
 
 ### Animation & Interpolation
 - **Quaternion slerp keyframes (Euler→quat→slerp→Euler), NLA strip blending as delta rotations, CSS-style cubic-Bézier easing inverted by Newton–Raphson, Penner easing presets** — `skeleton-animator.ts`, `types/keyframe-3d.ts`, `ui-manager.ts`, `world-manager.ts`.
@@ -178,6 +191,8 @@ No matcap sampling, no reversed-Z, no ACES/Reinhard tone mapping (LDR clamp), no
 - **Fixed-timestep accumulator loop ("Fix Your Timestep", cited)** — `src/game/game-loop.ts` — with a spiral-of-death cap.
 - **Kinematic character controller: wall-slide (tangential projection), step-up detection, third-person occlusion pull-in, frame-rate-independent `1−e^{−rate·dt}` smoothing, pointer-lock mouse look, locomotion clip state machine** — `src/game/`.
 - **Uniform XZ-grid broadphase with an oversized-AABB escape list** — `src/game/spatial-grid.ts`.
+- **Lazy per-cell merged collision BVHs (3×3 cells around the player, gathered in time slices, built in a worker lane)** — `src/game/collision-cells.ts` (+ `collision-snapshot.ts`, `collision-hood.ts`) — same hits as the whole-tile BVH (performance-plan P13 step 3).
+- **Closed-form walker clock (sim-LOD movers as a function of world time)** — `src/world/walker-clock.ts` (+ `train.ts` `trainRunAt`, `src/world/sim-lod.ts`) — a frozen walker / train reappears exactly on its route; update rate banded by distance + visibility with an anti-stutter floor (P13 step 1).
 
 ### Packaging & Print
 - **Hinge-tree fold compilation (`T(a)·R(axis,θ)·T(−a)` about arbitrary 3D lines) + frame-conjugation identity for scene-node folding + windowed fold sequencing** — `src/packaging/fold-mesh.ts`, `box-hierarchy.ts` — cascade folding of dieline panel trees; staged phases via piecewise-linear remap.
@@ -216,9 +231,16 @@ No matcap sampling, no reversed-Z, no ACES/Reinhard tone mapping (LDR clamp), no
 - **Sutherland–Hodgman clipping (named), Cyrus–Beck-style parametric segment clipping, SAT convex intersection (named), miter offsetting with clamp, chamfer + quadratic-Bézier corner rounding, annulus sectors, grid fill for drapables** — `src/world/util.ts`, `building-geom.ts`, `src/renderer/util/geometry.ts`.
 
 ### Streaming, LOD & Caching
-- **Hysteretic deadband tile snap + LOD show/hide hysteresis** — `stream-manager.ts`, `world-manager.ts` — boundary-thrash killers.
+- **Hysteretic deadband tile snap + LOD show/hide hysteresis** — `stream-manager.ts`, `world-manager.ts`, `src/services/streaming/tile-window.ts` (eye-centred active window, ~12 % border hysteresis, P10.D) — boundary-thrash killers.
 - **Reconcile-diff chunk streaming (nearest-first, time-sliced, proxy-first preview, hold-then-swap tier flips)** — `src/services/streaming/stream-manager.ts`.
-- **Byte-capped LRU of retired tiles** — `world-manager.ts` — exploits procedural determinism: a cache hit is a re-upload, not a rebuild.
+- **Byte- and count-capped LRU of retired tiles** — `src/services/streaming/byte-lru.ts` (used by `world-manager.ts`) — exploits procedural determinism: a cache hit is a re-upload, not a rebuild.
+- **HLOD merged tiles (per-lot extrusion on the full build's RNG stream, colour-bucket merged shells; mid ≈ 12 draws, far = 3 draws a tile) + massing tier** — `src/world/tile-hlod.ts`, `tile-massing.ts`, `src/services/streaming/hlod-select.ts` — the endless skyline (performance-plan P17; default outside tier).
+- **Dithered (screen-door) tier dissolve** — flags2 bit 5 `hlodFade` (`material-3d.ts`) + `mesh3d-shaders.ts`, `world-manager.ts` (`STREAM19.dissolveOldTiers`) — a replaced tier dissolves in quantised Bayer coverage steps in the colour, shadow and AO / SSR passes (P17, P19).
+- **Speed-aware stream prediction (smoothed focus velocity → look-ahead focus, fast mode = HLOD stand-ins, capped Play corridor)** — `src/services/streaming/motion-window.ts`, `src/world/tile-speed.ts` — no wasted full builds at speed (P19).
+- **World-anchored skyline impostor ring** — `src/world/skyline-ring.ts` — hashed per-tile stand-in boxes past the HLOD skyline, a few draws (P19; default off).
+- **Instanced props with fitted affine (3×3 + translation) per-copy transforms** — `src/world/prop-instancing.ts` (+ `packed-instances.ts`) — repeated props are quantised and content-hashed to canonical geometry shared by every tile; each copy is a least-squares fit to its draped vertices, exact to 1 mm (P20).
+- **Packed 32-byte vertices + 16-bit indices with a stride-0 constant-tangent stream** — `src/renderer/3d/vertex-pack.ts` — lossless smaller pool format for streamed full tiles; pipelines get packed twins (P22).
+- **Coalesced size-bucketed instance-slot free list + per-frame write ledger + GPU geometry-pool compaction (adjacent runs moved as one copy) and capacity shrink** — `src/renderer/3d/instance-slot-allocator.ts`, `stream-hitch.ts`, `geom-compaction.ts` — landing-hitch killers (P16, P10.D4).
 - **Round-robin worker pools, WeakMap graph-lookup memoization, cached-inverse NDC unprojection keyed on matrix version, cursor-anchored zoom** — `tile-worker-pool.ts`, `util.ts`, `interaction-service.ts`.
 
 ### UI & Interaction
@@ -234,6 +256,7 @@ No matcap sampling, no reversed-Z, no ACES/Reinhard tone mapping (LDR clamp), no
 - **DEFLATE/ZIP via fflate** — `src/services/persistence/project-package.ts` (`.frogmarks`) and `frogcart.ts` (`.frogcart` ZIP envelope, audio registry) — plus zlib streams in the PDF writer.
 - **OPFS atomic directory-swap saves, PNG/WebP/AVIF pixel codecs with worker offload + zero-copy transfer, structured-clone-safe pure build pipelines, single-source build-order constants** — `document-persistence.ts`, `pixel-codec.ts`, `centre-build.ts`, `build-order.ts`.
 - **RGB↔HSB conversion, curated seeded palettes, data-only style packs** — `utils/color.ts`, `world/palette.ts`, `world/styles.ts`.
+- **GPU device-lost recovery via a retargetable device handle** — `src/renderer/core/gpu-device-handle.ts`, `gpu-device-recovery.ts`, `src/services/persistence/device-recovery-coordinator.ts`, `src/renderer/raster/gpu-pixel-epoch.ts` — one stable handle re-pointed at the new device, owner rebuild hooks, the document rebuilt from CPU data plus an exact raster read-back shadow; saves / exports wait on an idle gate (`idle-gate.ts`) (docs/ui/device-recovery.md).
 
 ---
 

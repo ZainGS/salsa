@@ -1,5 +1,7 @@
 # Procedural Car Creator — GT-style lofted car bodies + paintable atlas
 
+> **Status (audited 2026-10-01): phases 1–3 BUILT for city cars** (`src/world/vehicle.ts`: lofted bodies, six styles, clearcoat `reflect` paint). Phases 4–8 (standalone Car Creator, paint atlas + GARP pools, L2 glass, city fleet, L3 parts) not built.
+>
 > **Deliverable of this pass:** this SPEC only. Built later, phased, screenshot-tuned. Save as
 > `docs/specs/car-creator.md` (+ backlog line + memory pointer). This is a **foundational generator** at the level of
 > the building / hair / clothing generators, and the first Creator asset whose *texture* is the point (a paintable

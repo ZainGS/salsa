@@ -63,12 +63,186 @@ existing name overwrites — warn first).
 
 ---
 
+## Vending machine skins — the three slots (redesign 2026-09-29)
+
+The machine was redesigned (spec: [../specs/vending-machine-redesign.md](../specs/vending-machine-redesign.md)). It
+now has a framed window of **3D cans on lit shelves**, price strips with LED buttons, a control panel, a pickup bay
+and a plinth. A skin has three slots:
+
+| Slot | What it is | How the user makes it |
+|---|---|---|
+| `body` | The cabinet: logos and art on the front, sides and top (six-face unwrap, `garpSlotRegions3D(…,'body')`). The window and controls cover part of the front; the **lower panel, the area above the window, the sides and the top** show your art. | UV Paint (Bridge 1), or upload a 512² image laid out on the regions. |
+| `products` | The **lit back wall** behind the cans, or the whole display when a machine uses `stock: 'image'`. | Upload / paint a 512² image. Default: a soft white wall. |
+| `labels` | The **can designs**: one packed sheet the cans sample. | **Add separate PNGs, one per can design**; Salsa packs them (below). |
+
+### Can designs (`labels`) ✅
+
+```ts
+const errs = await sm.packVendingCanLabels3D(skinName, [pngDataUrl1, pngDataUrl2, /* …up to 8 */]);
+// [] = OK. Then regenerate the city to see it (like any skin change).
+```
+
+- **1–8 images, one per can design.** Salsa packs them into a 4×2 sheet, with padding so labels never bleed into
+  each other, and draws the silver rims. With fewer than 8, designs repeat. Each machine shows a mix of them.
+- **Sizes don't need to match; no need to enforce it.** Each image is **stretched to its can's label**, so any
+  size works. For no distortion, author at **1:2 portrait** (e.g. 256×512). What you draw is the **front of the
+  can**; the back mirrors it.
+- The skin must already exist (a built-in `red` / `blue` / `cyan`, or one added with `addGarpSkin3D`, which gives it
+  a body). The skin's other slots are kept.
+- **Guide image:** `sm.vendingLabelTemplate3D()` returns a PNG data URL of the sheet layout (numbered cells, rims,
+  safe area). `sm.garpSlotRegions3D('salsa/vending', 'labels')` returns the 8 label rects, if you'd rather overlay
+  them.
+
+**Suggested UI** (in the Skins panel, on a vending skin): a **"Can designs"** strip of thumbnails, with **+ Add
+PNG**, ✕ per design and drag-to-reorder. On any change, call `packVendingCanLabels3D(skin, allImages)`. Keep the
+PNG list in Frogmarks' own state so the user can edit it later: Salsa stores only the packed sheet.
+
+> ⚠ **Body skins made before 2026-09-29 appear mirrored.** The body unwrap mapped every face mirrored (an imported
+> logo read backwards). The face regions are unchanged; only the direction inside each face was fixed. A body skin
+> painted or uploaded before this needs flipping horizontally within each face region, or repainting. The built-in
+> solid-colour skins are unaffected.
+
+## Adverts — your own images on the city's signs ✅ (2026-09-29)
+
+The `salsa/signage` pool puts the user's own images on the city's advertising signage: the dense wall of real
+pictures on a Shibuya street. Add vertical kanban, billboards, square panels and long shop strips, and every sign
+in the city shows one of them.
+
+**How it works**
+- **Four buckets, by aspect (width ÷ height).**
+
+  | Bucket | Aspect | Typical signs | Per page | Cell (px) | Author at |
+  |---|---|---|---|---|---|
+  | `portrait` | below 0.6 (1:3 – 1:4) | vertical blade signs, sign stacks | 4 | 120×504 | 256×1024 |
+  | `square` | 0.6 – 1.4 | small panels, the lower sign of a stack | 4 | 248×248 | 512×512 |
+  | `landscape` | 1.4 – 4 (16:9 – 3:1) | rooftop billboards, LED screens | 2 | 504×248 | 1024×512 |
+  | `fascia` | 4 and over (~6:1) | tenant signs over shops, konbini bands, floor signs, wrap bands | 4 | 504×120 | 1536×256 |
+
+  Every sign face is classified by **its own** aspect, so a wide LED screen can land in `square` or `landscape`.
+- **Salsa packs.** Each bucket's images go onto 512² pages (the GARP atlas size). Each image is stretched to its
+  cell, and its edges bleed into the padding so neighbours never mix. You never see the pages.
+- **Cover crop.** On each sign, the image **fills the face and is cropped to fit**, centred. It's never letterboxed
+  or distorted. Keep the important part of the image near the centre.
+- **Lit or unlit, per image.** Lit (the default) is a backlit lightbox: the image glows at full brightness at night.
+  Unlit is a poster: the scene lights it, so it goes dark at night. LED screens are always lit.
+- **Picking.** Each sign picks an image from its bucket by a stable hash, so the same sign shows the same image on
+  every rebuild. Adding an image only changes the signs that the new image takes over; every other sign keeps its
+  picture. Both faces of a blade sign show the same image.
+- **Fallback.** If a bucket has no images, its signs keep the procedural lightbox with lettering. With no images
+  at all, the city is exactly as before, and saved cities look identical.
+- **Procedural signs** (2026-09-30, persona-polish C1/C2/B5) spell **real Japanese shop words** (ラーメン, 薬,
+  カラオケ, 居酒屋, 不動産 …) chosen by the district and the shop type, in horizontal or vertical (tate) layouts. Each
+  sign is a **lightbox**: a casing with side faces, a bevelled lit face, and brackets on blade signs. Sign colours
+  come from a curated palette per district mood, including white and black lightboxes. None of this needs host
+  wiring.
+- **The sign stays.** The lightbox stays as the sign's frame and edges. The image sits just in front of its face
+  and replaces the lettering.
+- **The city rebuilds on its own.** After a change, it rebuilds in the background. Several changes in quick
+  succession cause only one rebuild.
+- **Saved with the document.** The images are saved in `garp.json` (key `signage`). The pages are packed again on
+  load.
+
+**API** (all on `sm`)
+
+| Call | Purpose |
+|---|---|
+| `sm.addSignageImage3D(bucket \| 'auto', source, { lit?, name?, regen? }): Promise<{ id, bucket, errors }>` | Add an image. `source` = a data URL (or any URL the image loader can read). `'auto'` picks the bucket from the image's aspect. The image is flattened onto white, capped at 1024 px and stored as JPEG. `errors` is empty on success. |
+| `sm.removeSignageImage3D(id, regen = true): Promise<boolean>` | Remove an image. Returns `false` if the id is unknown. |
+| `sm.setSignageImageLit3D(id, lit, regen = true): boolean` | Switch an image between lit and unlit. The pages aren't repacked; only the city rebuilds. |
+| `sm.listSignageImages3D(): { id, bucket, lit, aspect, name?, dataUrl }[]` | Every sign image, in the order added. Use `dataUrl` as the thumbnail. Shop-window images are listed separately (see [Shop windows](#shop-windows--interiors-and-posters-on-the-shop-glass--2026-09-30)). |
+| `sm.signageBuckets3D(): { bucket, label, aspect, minAspect, maxAspect, recommendedPx, perPage, cellPx, count }[]` | The four sign buckets: one drop zone each. `maxAspect` is `Infinity` for fascia. |
+| `sm.packSignage3D(): Promise<void>` | Force a repack and an atlas rebuild. You don't normally need this. |
+| `sm.setSignageShare3D(share, regen = true)` / `sm.getSignageShare3D()` | The share of eligible signs that show an image, from 0 to 1 (default 1). Lower it to mix images with procedural lettered signs. Saved with the document. |
+| `sm.clearSignage3D(regen = true): Promise<void>` | Remove every sign image. The city goes back to procedural signs. Shop-window images stay. |
+
+**Suggested Frogmarks "Adverts" panel.** This is a library, like Skins: an always-available panel, not an edit mode.
+- **One section per bucket** from `signageBuckets3D()`. Each shows its label, the aspect hint, the recommended
+  size and the count.
+- A **drop zone** per section: files dropped there call `addSignageImage3D(bucket, dataUrl, { name: file.name })`.
+  A drop zone for the whole panel can use `'auto'` and let Salsa sort the images. The response's `bucket` shows
+  where each image went.
+- A **thumbnail grid** per section from `listSignageImages3D()`. Each thumbnail has a ✕ button
+  (`removeSignageImage3D`) and a **Lit** toggle (`setSignageImageLit3D`, with a small bulb icon).
+- Optionally, a **"Signs with images" slider** (`setSignageShare3D`) and a **Clear all** button.
+- No "Regenerate" button is needed: every call rebuilds the city by default. Pass `regen: false` to batch changes
+  yourself, then call the last change with `regen` on.
+- The engine owns the image list. It persists with the document, so the panel can always re-read
+  `listSignageImages3D()`.
+- The `salsa/signage` pool is **hidden** from `sm.garp.listPools()`, so the Skins panel never shows it.
+
+**Console harness:** `salsaGarp.demoAdverts()` adds 12 generated test images (3 per bucket; the third of each is
+unlit). Each shows its bucket letter and number, with an arrow pointing right: if the arrow points left, the face
+is mirrored. `salsaGarp.pickAdverts('auto')` opens a file dialog, `salsaGarp.adverts()` lists the images and
+`salsaGarp.clearAdverts()` removes them all.
+
+**Limits (v1)**
+- Resolution is one cell of a 512² page, as in the table above. At street distance that reads well. Close up, a
+  billboard is about 500 px wide.
+- The GARP atlas has no mipmaps (the same as the vending machines), so distant signs can shimmer a little.
+- There's no video for screens yet.
+- Picking uses a stable hash only: there are no per-image weights yet.
+
+## Shop windows — interiors and posters on the shop glass ✅ (2026-09-30)
+
+The same pool also puts the user's images **inside the city's shopfronts**. Without images, every shop window shows
+the procedural interior (fluorescent ceiling and rows of coloured shelf blocks). Add a few photos or drawings of shop
+interiors and posters, and the shopfronts show those instead.
+
+**How it works**
+- **Two buckets, no aspect sorting.** A sign never picks these, and `'auto'` never sorts into them.
+
+  | Bucket | What it is | Per page | Cell (px) | Author at |
+  |---|---|---|---|---|
+  | `interior` | The back wall of a shop, seen through the glass: shelves, a counter, a menu wall | 2 | 504×248 | 1024×512 (3:2 – 2:1) |
+  | `poster` | A sheet stuck on the inside of the glass: a sale poster, an opening-hours card | 6 | 162×248 | 512×724 (A-series) |
+
+- **Real depth, not a flat picture.** A bay that picks an interior image becomes a real recessed room behind a clear
+  pane. The image is on the back wall, 0.6 – 1.1 m deep, with pale lit floor, ceiling and side walls. Walk past it and
+  the room shifts with true parallax. The image is cover-cropped to each bay's shape.
+- **Posters** go on about half the shop bays, at eye height, at a stable spot across the pane. They go on the glass
+  of an image-interior bay and of a procedural one.
+- **Lit or unlit, per image.** Lit (the default) glows with the shop at night. Unlit is lit by the scene only.
+- **Picking and fallback** work as for adverts: a stable hash per bay, with the same bay showing the same picture on
+  every rebuild. With an empty `interior` bucket, every bay keeps the procedural interior. With no shop images at
+  all, the city is exactly as before. The bays on a corner shared by two shopfront edges keep the procedural
+  interior, so the rooms never cross.
+- **Saved with the document** in `garp.json`, alongside the adverts. The share is saved as `signage.shopShare`.
+
+**API** (all on `sm`)
+
+| Call | Purpose |
+|---|---|
+| `sm.addShopImage3D('interior' \| 'poster', source, { lit?, name?, regen? }): Promise<{ id, bucket, errors }>` | Add a shop-window image. `source` is a data URL (or any URL the image loader can read). Stored as for adverts: flattened onto white, capped at 1024 px, JPEG. |
+| `sm.removeShopImage3D(id, regen = true): Promise<boolean>` | Remove a shop-window image. |
+| `sm.setShopImageLit3D(id, lit, regen = true): boolean` | Switch an image between lit and unlit. |
+| `sm.listShopImages3D(): { id, bucket, lit, aspect, name?, dataUrl }[]` | Every shop-window image, in the order added. |
+| `sm.shopImageBuckets3D(): { bucket, label, aspect, minAspect, maxAspect, recommendedPx, perPage, cellPx, count }[]` | The two shop buckets: one drop zone each. |
+| `sm.setShopImageShare3D(share, regen = true)` / `sm.getShopImageShare3D()` | The share of shop bays that show a shop image, from 0 to 1 (default 1). Lower it to mix images with procedural interiors. Saved with the document. |
+| `sm.clearShopImages3D(regen = true): Promise<void>` | Remove every shop-window image. The shops go back to procedural interiors. Adverts stay. |
+
+**Suggested Frogmarks "Shop windows" panel,** next to Adverts and built the same way:
+- **Two sections** from `shopImageBuckets3D()` (Shop interior, Window poster). Each has a drop zone that calls
+  `addShopImage3D(bucket, dataUrl, { name: file.name })`.
+- A **thumbnail grid** per section from `listShopImages3D()`, with a ✕ button (`removeShopImage3D`) and a **Lit**
+  toggle (`setShopImageLit3D`).
+- Optionally, a **"Shops with images" slider** (`setShopImageShare3D`) and a **Clear all** button
+  (`clearShopImages3D`).
+
+**Console harness:** `salsaGarp.demoShopImages()` adds 3 generated interiors (BOOKS 本 / DRUG 薬 / CAFE カフェ shelf
+walls) and 3 posters. `salsaGarp.shopImages()` lists them and `salsaGarp.clearShopImages()` removes them.
+
+**Limits (v1)**
+- Only the back wall is an image. The floor, ceiling and side walls are plain pale surfaces.
+- An interior cell is 504×248 px, which is fine at street distance but soft when you press your nose to the glass.
+
+---
+
 ## The mental model (three nouns)
 
 - **Pool** — a family of skins for one prop type. It has an **id** (`salsa/vending`), a **version**, and a list
-  of **slots**. The vending pool's slots are `['body', 'products']`.
-- **Skin** — one coordinated look: **a texture per slot** (`body` + `products`). The randomizer picks a
-  **whole skin**, so a machine can never wear brand A's body over brand B's products.
+  of **slots**. The vending pool's slots are `['body', 'products', 'labels']`.
+- **Skin** — one coordinated look: **a texture per slot** (`body` + `products` + `labels`). The randomizer picks a
+  **whole skin**, so a machine can never wear brand A's body over brand B's cans.
 - **Variant** = a skin the *user* authored and added at runtime. Adding one makes it eligible on every machine
   from the **next city (re)generation** (selection is a deterministic position hash over the *current* pool).
 
@@ -154,8 +328,13 @@ await sm.rebuildGarpAtlas3D([512, 512]);              // resolves every source �
 | `sm.exportMeshTextureDataUrl3D(meshId): Promise<string \| null>` | Read a UV-painted mesh's current texture out as a PNG data URL (for "save current paint as a variant"). |
 | `sm.garp.listPools(): {id,name,version,slots,skins}[]` | Enumerate pools. **`slots` is `{ name, live }[]`** (one authoring canvas per slot). **`skins` is `{ name }[]`** — the LIST of existing skins: map it for the variant list + per-skin delete button (`.length` for the count). |
 | `sm.setGarpSlotLive3D(poolId, slot, live)` | Declare whether a custom pool's slot renders in-world (drives the badge). The engine sets vending's for you. |
-| `sm.garpSlotRegions3D(poolId, slot): {label,u0,v0,u1,v1}[]` | The slot canvas's UV regions (0..1, y-down) — draw as labelled overlays. `body` → six face rects; plain quads → one `(full)`. |
+| `sm.garpSlotRegions3D(poolId, slot): {label,u0,v0,u1,v1}[]` | The slot canvas's UV regions (0..1, y-down) — draw as labelled overlays. `body` → six face rects; `labels` → 8 can-label rects; plain quads → one `(full)`. |
+| `sm.packVendingCanLabels3D(skinName, images): Promise<string[]>` | Pack 1–8 can-design images (data URLs) into the skin's `labels` sheet + rebuild. See "Can designs". |
+| `sm.vendingLabelTemplate3D(): string` | A PNG data URL showing the label-sheet layout (a guide for artists). |
+| `sm.packGarpSheet3D(images, cols, rows, size?, padPx?): Promise<string \| null>` | Generic: pack images into a padded grid sheet (data URL) — for other props with many small varied items. |
 | `sm.garp.getPool(id)` / `removePool(id)` | Inspect / drop a pool. |
+
+*(The Adverts calls, `addSignageImage3D` / `removeSignageImage3D` / `setSignageImageLit3D` / `listSignageImages3D` / `packSignage3D` / `signageBuckets3D` / `setSignageShare3D` / `clearSignage3D`, are in the [Adverts](#adverts--your-own-images-on-the-citys-signs--2026-09-29) section. The Shop windows calls, `addShopImage3D` / `removeShopImage3D` / `setShopImageLit3D` / `listShopImages3D` / `shopImageBuckets3D` / `setShopImageShare3D` / `clearShopImages3D`, are in the [Shop windows](#shop-windows--interiors-and-posters-on-the-shop-glass--2026-09-30) section.)*
 
 *(The Skins↔UV-Paint bridge calls — `paintGarpSlot3D` / `paintVendingBody3D` / `garpPaintTargetOf3D` / `saveMeshAsGarpSkin3D` / `cancelGarpPaint3D` — are in the [Bridges](#bridge-1--skins--uv-paint-author-a-variant-by-painting-the-3d-form) section above.)*
 
@@ -183,8 +362,11 @@ A `window.salsaGarp` dev harness exercises the whole path before you build UI:
 ```js
 salsaGarp.vending(6)                         // drop a row of demo machines with coordinated body+products skins
 salsaGarp.pools()                            // list registered pools (id, version, slot names, skin count)
-salsaGarp.addVendingSkin('coke', myDataUrl)  // add a variant from an uploaded/base64 image → regenerate to see it
+salsaGarp.addVendingSkin('coke', myDataUrl)  // add a BODY variant from an uploaded/base64 image → regenerate to see it
 salsaGarp.saveVendingSkin(meshId, 'mybrand') // save a UV-painted mesh's texture as a variant (paint it first)
+salsaGarp.pickCans('red')                    // pick 1–8 can PNGs (file dialog) → packed into red's labels → regenerate
+salsaGarp.packCans('red', [url1, url2])      // same, from data URLs
+salsaGarp.labelTemplate()                    // the label-sheet layout guide (PNG data URL)
 salsaGarp.rebuild()                          // force an atlas rebuild
 ```
 

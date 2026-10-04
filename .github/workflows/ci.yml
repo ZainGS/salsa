@@ -1,4 +1,6 @@
-# Salsa CI — typecheck + the full vitest suite on every push and pull request (audit 2026-09-28 T1).
+# Salsa CI — `npm run check` on every push and pull request (audit 2026-09-28 T1/T2): source sanity (0-byte / BOM /
+# mixed EOL / mojibake), tsc --noEmit, ESLint (type-aware, tools/lint toolchain), full vitest suite (includes the
+# WGSL static check). Same command as local; see docs/dev/checks-and-ci.md.
 #
 # Requirements for this to pass on a clean checkout:
 #   • The toolchain in package.json / package-lock.json (TS 7, rolldown-vite, vitest) must be the committed one.
@@ -28,14 +30,18 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.12.0   # matches the local nvm-windows version
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            tools/lint/package-lock.json
 
       - name: Install
         run: npm ci
 
-      - name: Typecheck
-        run: npm run typecheck
+      - name: Install lint toolchain (tools/lint, TypeScript 5.9 for typescript-eslint)
+        run: npm run lint:install
 
-      - name: Tests
-        run: npm run test:run
+      # One step so the summary lists every failing check; check.mjs keeps going after a failure.
+      - name: Check (sanity, typecheck, lint, tests)
+        run: npm run check

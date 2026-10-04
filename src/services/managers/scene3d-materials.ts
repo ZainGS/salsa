@@ -56,6 +56,29 @@ export class Scene3DMaterials {
     return n;
   }
 
+  /** Opt ONE mesh in/out of the RETRO COLOUR (PS1 colour depth + dither) for scope 'optIn' (material bit 31).
+   *  Persists with the mesh. False if the mesh is gone. */
+  setMeshRetroColor(meshId: string, on: boolean): boolean {
+    const mesh = this.host.getMesh(meshId);
+    if (!mesh) return false;
+    mesh.material.retroColor = on;
+    mesh.materialDirty = true;   // flags live in the instance material block → re-pack
+    mesh.stateDirty = true;      // persist
+    this.ctx.scheduleRender();
+    return true;
+  }
+
+  getMeshRetroColor(meshId: string): boolean { return !!this.host.getMesh(meshId)?.material.retroColor; }
+
+  /** Retro colour on a whole procedural CHARACTER (body + clothing + hair + charms + face decal). Regenerated parts
+   *  inherit it from the body (Scene3DCharacter._inheritCharacterStyle). Returns the number of meshes changed. */
+  setCharacterRetroColor(bodyMeshId: string, on: boolean): number {
+    let n = 0;
+    if (this.setMeshRetroColor(bodyMeshId, on)) n++;
+    for (const id of this.host.getProceduralBodyParts(bodyMeshId)) if (this.setMeshRetroColor(id, on)) n++;
+    return n;
+  }
+
   /** Set the render style on EVERY 3D mesh in the scene at once (face decals skipped). Returns the count changed. */
   setRenderStyleAll(style: RenderStyle): number {
     let n = 0;

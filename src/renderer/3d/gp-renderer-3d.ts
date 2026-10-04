@@ -19,6 +19,7 @@
  *     jointIndex uniform is -1, so the shader skips the transform).
  */
 
+import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import {
   GP_STROKE_VERTEX, GP_STROKE_FRAGMENT,
   GP_FILL_VERTEX, GP_FILL_FRAGMENT,
@@ -129,6 +130,12 @@ export class GpRenderer3D {
   private _device: GPUDevice;
   private _format: GPUTextureFormat;
 
+  // P2: built as non-blocking cache handles; the resolved pipelines below are refreshed at each draw entry (null
+  // while compiling → the draw is skipped).
+  private _strokeH: PipelineHandle<GPURenderPipeline> | null = null;
+  private _fillH:   PipelineHandle<GPURenderPipeline> | null = null;
+  private _overlayTriH:  PipelineHandle<GPURenderPipeline> | null = null;
+  private _overlayLineH: PipelineHandle<GPURenderPipeline> | null = null;
   private _strokePipeline: GPURenderPipeline | null = null;
   private _fillPipeline:   GPURenderPipeline | null = null;
 
@@ -194,6 +201,7 @@ export class GpRenderer3D {
     canvasH: number,
     frame: number,
   ): void {
+    this._strokePipeline = this._strokeH?.get() ?? null; this._fillPipeline = this._fillH?.get() ?? null;
     if (!this._strokePipeline || !this._fillPipeline) return;
     this._strokeSlotN = 0; this._fillSlotN = 0;   // reuse pooled per-draw buffers from slot 0 this frame
     const vp = this._getViewProjection(camera, canvasW, canvasH);
@@ -241,6 +249,8 @@ export class GpRenderer3D {
   ): void {
     if (!overlay || (overlay.hoveredTri === null && overlay.planeQuad === null)) return;
     this._ensureOverlayPipelines();
+    this._overlayTriPipeline = this._overlayTriH?.get() ?? null; this._overlayLinePipeline = this._overlayLineH?.get() ?? null;
+    if (!this._overlayTriPipeline || !this._overlayLinePipeline) return;   // P2: still compiling
 
     const vp = this._getViewProjection(camera, canvasW, canvasH);
     if (!this._overlayUniBuf) return;
@@ -509,7 +519,7 @@ export class GpRenderer3D {
   }
 
   private _ensureOverlayPipelines(): void {
-    if (this._overlayTriPipeline) return;
+    if (this._overlayTriH) return;
     const device = this._device;
     const format = this._format;
 
@@ -556,8 +566,9 @@ export class GpRenderer3D {
       depthStencil: depthAlways,
     };
 
-    this._overlayTriPipeline  = device.createRenderPipeline({ ...base, primitive: { topology: 'triangle-list', cullMode: 'none' } });
-    this._overlayLinePipeline = device.createRenderPipeline({ ...base, primitive: { topology: 'line-list',     cullMode: 'none' } });
+    const cache = GPUPipelineCache.for(device);
+    this._overlayTriH  = cache.render({ ...base, label: 'GPOverlayTri', primitive: { topology: 'triangle-list', cullMode: 'none' } });
+    this._overlayLineH = cache.render({ ...base, label: 'GPOverlayLine', primitive: { topology: 'line-list',     cullMode: 'none' } });
 
     this._overlayUniBuf = device.createBuffer({
       size:  64, // mat4
@@ -614,7 +625,8 @@ export class GpRenderer3D {
       depthCompare: 'less-equal',
     };
 
-    this._strokePipeline = device.createRenderPipeline({
+    this._strokeH = GPUPipelineCache.for(device).render({
+      label: 'GPStroke',
       layout: device.createPipelineLayout({ bindGroupLayouts: [strokeBGL0, skinBGL] }),
       vertex:    { module: strokeVS, entryPoint: 'vsMain' },
       fragment:  { module: strokeFS, entryPoint: 'fsMain', targets: [{ format, blend: blendAlpha }] },
@@ -630,7 +642,8 @@ export class GpRenderer3D {
       ],
     });
 
-    this._fillPipeline = device.createRenderPipeline({
+    this._fillH = GPUPipelineCache.for(device).render({
+      label: 'GPFill',
       layout: device.createPipelineLayout({ bindGroupLayouts: [fillBGL0, skinBGL] }),
       vertex:    { module: fillVS, entryPoint: 'vsMain' },
       fragment:  { module: fillFS, entryPoint: 'fsMain', targets: [{ format, blend: blendAlpha }] },

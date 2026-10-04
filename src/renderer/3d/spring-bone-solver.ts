@@ -45,6 +45,7 @@ const _qbAxis      = vec3.create();   // quatBetweenInto axis / basis
 const _cosAb       = vec3.create();   // closestOnSegmentInto edge
 const _cosTmp      = vec3.create();   // closestOnSegmentInto q-p0
 const _sGdir       = vec3.create();   // per-chain gravity dir
+const _sWScale     = vec3.create();   // world-scaled joint scale (scaled characters)
 const _sHead       = vec3.create();   // joint head (world) — live whole iteration
 const _sAxis       = vec3.create();   // bone axis (local) — live until restAxis
 const _sRestAxis   = vec3.create();   // rest tip axis (world) — live whole iteration
@@ -106,10 +107,19 @@ function resolveCollidersInto(skel: Skeleton3D): number {
         if (!wc) { wc = { p0: vec3.create(), p1: vec3.create(), radius: 0 }; _colliderPool[n] = wc; }
         transformPointInto(wc.p0, j.worldMatrix, c.offset);
         if (c.tail) transformPointInto(wc.p1, j.worldMatrix, c.tail); else vec3.copy(wc.p1, wc.p0);
-        wc.radius = c.radius;
+        wc.radius = c.radius * worldScaleOf(j.worldMatrix);   // radius is in rig units, like offset/tail
         n++;
     }
     return n;
+}
+
+/** Uniform world scale of a joint matrix (length of its X basis column). Rig lengths (bone length, collider radius,
+ *  hit radius, gravity pull) are authored in RIG units; a character whose object transform is SCALED (the Play auto
+ *  player shrunk to real size in a 15 m/unit city) must have them scaled into world units too, else a 1/15-size
+ *  character got full-size hair tails. Snapped to exactly 1 near 1 so an unscaled rig solves bit-identically. */
+function worldScaleOf(m: ArrayLike<number>): number {
+    const s = Math.hypot(m[0], m[1], m[2]);
+    return Number.isFinite(s) && s > 0 && Math.abs(s - 1) > 1e-6 ? s : 1;
 }
 
 /** Bone axis (head→tip, LOCAL frame) written into `outAxis`; returns its length, or -1 for a degenerate bone. */
@@ -159,8 +169,11 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
             const parent = joints[J.parentIndex];
             if (!parent) continue;
             const next = joints[chain.jointIndices[n + 1]];   // undefined at the tip
-            const boneLen = boneLocalInto(_sAxis, J, next);   // _sAxis: bone axis, live until restAxis below
-            if (boneLen < 0) continue;
+            const boneLenLocal = boneLocalInto(_sAxis, J, next);   // _sAxis: bone axis, live until restAxis below
+            if (boneLenLocal < 0) continue;
+            // World scale of this bone (the parent's world matrix carries the character's object-transform scale).
+            const ws = worldScaleOf(parent.worldMatrix);
+            const boneLen = boneLenLocal * ws;
 
             // Head (joint origin) world position — fixed by the parent (rigid); only the tip swings.
             const head = transformPointInto(_sHead, parent.worldMatrix, J.localPosition);   // live whole iter
@@ -184,7 +197,7 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
             vec3.scale(vel, vel, 1 - drag);                                  // drag
             const nextTip = vec3.add(_sNextTip, st.curr, vel);              // inertia carries the swing (accumulator)
             vec3.scaleAndAdd(nextTip, nextTip, vec3.subtract(_sSpringTemp, restTip, st.curr), stiff * step);   // spring back to the FK pose
-            vec3.scaleAndAdd(nextTip, nextTip, gdir, chain.gravity * step); // gravity
+            vec3.scaleAndAdd(nextTip, nextTip, gdir, chain.gravity * ws * step); // gravity (rig units → world)
 
             // ── Rigid bone length: keep the tip exactly `len` from the head ──
             let dir = vec3.subtract(_sDir, nextTip, head);
@@ -198,7 +211,7 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
                 const closest = closestOnSegmentInto(_sClosest, nextTip, col.p0, col.p1);
                 const delta = vec3.subtract(_sDelta, nextTip, closest);
                 const dist = vec3.length(delta);
-                const minDist = col.radius + chain.hitRadius;
+                const minDist = col.radius + chain.hitRadius * ws;
                 if (dist < minDist) {
                     if (dist > 1e-6) vec3.scale(delta, delta, 1 / dist); else vec3.copy(delta, dir);
                     vec3.scaleAndAdd(nextTip, closest, delta, minDist);     // push out to the surface
@@ -218,7 +231,7 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
                 continue;
             }
 
-            if (vec3.squaredDistance(nextTip, st.curr) > SETTLE2) moving = true;
+            if (vec3.squaredDistance(nextTip, st.curr) > SETTLE2 * ws * ws) moving = true;
             vec3.copy(st.prev, st.curr);
             vec3.copy(st.curr, nextTip);
 
@@ -228,11 +241,12 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
             const deltaRot = quatBetweenInto(_sDeltaRot, restAxisWorld, newAxisWorld);
             const newWorldRot = quat.multiply(tmpQuat, deltaRot, restWorldRot);
             quat.normalize(newWorldRot, newWorldRot);
+            const sc = ws === 1 ? J.localScale : vec3.set(_sWScale, J.localScale[0] * ws, J.localScale[1] * ws, J.localScale[2] * ws);
             mat4.fromRotationTranslationScale(
                 J.worldMatrix as unknown as mat4,
                 newWorldRot,
                 head as unknown as vec3,
-                J.localScale as unknown as vec3,
+                sc as unknown as vec3,
             );
             // skinMatrix = worldMatrix × inverseBindMatrix
             mat4.mul(tmpMat, J.worldMatrix as unknown as mat4, J.inverseBindMatrix as unknown as mat4);

@@ -7,6 +7,7 @@ _g.GPUBufferUsage  ??= { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, IN
 _g.GPUTextureUsage ??= { COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16 };
 
 import { Pipeline3D } from './pipeline-3d';
+import { GPUPipelineCache } from '../core/gpu-pipeline-cache';
 
 // docs/specs/pipeline-warmup.md — verifies the deferred-pipeline warm logic WITHOUT a real GPU: a minimal fake
 // device counts sync vs async pipeline compiles. (The actual shader compilation + no-freeze is browser-verified.)
@@ -26,7 +27,7 @@ function fakeDevice() {
   return { dev: dev as unknown as GPUDevice, calls };
 }
 
-const TOTAL = 36;   // every render pipeline: 18 core (+2 transparent doubleSided) + 10 plain + SSAO 1 + SSR peel 1 + SSR resolve/heal/feather 3 + weight-paint 2 + skinned shadow 1 (E1 tail c)
+const TOTAL = 37;   // every render pipeline: 18 core (+2 transparent doubleSided) + 10 plain + SSAO 1 + SSR peel 1 + SSR resolve/heal/feather 3 + weight-paint 2 + skinned shadow 1 (E1 tail c) + face-kit multiply 1
 
 describe('Pipeline3D granular warm-up', () => {
   it('the constructor compiles NOTHING — every pipeline is registered lazily', () => {
@@ -73,5 +74,28 @@ describe('Pipeline3D granular warm-up', () => {
     expect(calls.sync).toBe(2);
     await p.warmAllAsync();
     expect(calls.async).toBe(TOTAL - 2);    // warm compiles only the 27 the getters didn't
+  });
+
+  it('P2: inside a LIVE frame a getter never blocks — null + one async compile, then the pipeline', async () => {
+    const { dev, calls } = fakeDevice();
+    const p = new Pipeline3D(dev);
+    const cache = GPUPipelineCache.for(dev);
+    cache.frame(() => expect(p.skinnedOpaqueTexturedPlainPipeline).toBeNull());
+    expect(calls.sync).toBe(0);
+    expect(calls.async).toBe(1);
+    await new Promise((r) => setTimeout(r, 0));
+    cache.frame(() => expect(p.skinnedOpaqueTexturedPlainPipeline).toBeTruthy());
+    expect(calls.sync).toBe(0);
+  });
+
+  it('P2.2: warmPipelines queues the named getters (unknown names ignored)', async () => {
+    const { dev, calls } = fakeDevice();
+    const p = new Pipeline3D(dev);
+    expect(p.handleOf('shadowPassPipeline')).toBeTruthy();
+    expect(p.handleOf('opaqueTexturedNoCullPlainShadowPipeline')).toBeTruthy();
+    expect(p.handleOf('noSuchPipeline')).toBeNull();
+    p.warmPipelines(['shadowPassPipeline', 'opaqueUntexturedPlainPipeline', 'noSuchPipeline']);
+    await GPUPipelineCache.for(dev).whenIdle();
+    expect(calls.async).toBe(2);
   });
 });

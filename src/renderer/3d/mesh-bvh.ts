@@ -60,7 +60,13 @@ export class MeshBVH {
     const triCount = idxs.length / 3 | 0;
     const triIndices: number[] = Array.from({ length: triCount }, (_, i) => i);
     const nodes: BVHNode[] = [];
-    buildNode(verts, idxs, triIndices, 0, triCount, nodes);
+    // performance-plan P10.D: the triangle centroids are computed ONCE (they were recomputed inside the sort comparator,
+    // ~2 log n times per triangle per level) and each node splits at the median by quickselect instead of a full sort.
+    // The split is still the centroid median on the longest axis; only the order WITHIN each half differs.
+    const s = FLOATS_PER_VERT;
+    const cents: Float64Array[] = [new Float64Array(triCount), new Float64Array(triCount), new Float64Array(triCount)];
+    for (let t = 0; t < triCount; t++) for (let a = 0; a < 3; a++) cents[a][t] = centroid(verts, idxs, s, t, a);
+    buildNode(verts, idxs, triIndices, 0, triCount, nodes, cents);
     return new MeshBVH(nodes, triIndices, verts, idxs);
   }
 
@@ -71,11 +77,49 @@ export class MeshBVH {
   intersect(
     ox: number, oy: number, oz: number,
     dx: number, dy: number, dz: number,
+    tMax = Infinity,
   ): BVHHit | null {
-    return this._nodes.length > 0
-      ? this._traverseNode(0, ox, oy, oz, dx, dy, dz)
-      : null;
+    // P6 (performance-plan.md): `tMax` caps the search — nodes entered beyond it are pruned and hits beyond it ignored.
+    // A short Play collision ray (a wall ray reaches one step) no longer walks the whole tree for the nearest hit
+    // somewhere down the street. With tMax = Infinity the traversal (and its tie-breaking) is exactly the old one.
+    if (this._nodes.length === 0) return null;
+    if (tMax !== Infinity && nodeEntryT(this._nodes[0], ox, oy, oz, dx, dy, dz) > tMax) return null;
+    return this._traverseNode(0, ox, oy, oz, dx, dy, dz, tMax);
   }
+
+  /**
+   * P6 (performance-plan.md): does any triangle's bounding box overlap the local-space box? Conservative (a triangle
+   * whose AABB overlaps but whose surface misses still counts), never a false negative: a ray segment that stays inside
+   * the box can only hit a triangle this returns true for. Iterative, zero allocations after the first call.
+   */
+  overlapsBox(minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): boolean {
+    const nodes = this._nodes;
+    if (nodes.length === 0) return false;
+    const stack = this._stack;
+    let sp = 0;
+    stack[sp++] = 0;
+    const s = FLOATS_PER_VERT, v = this._verts, ix = this._idxs, tris = this._triIndices;
+    while (sp > 0) {
+      const n = nodes[stack[--sp]];
+      if (n.maxX < minX || n.minX > maxX || n.maxY < minY || n.minY > maxY || n.maxZ < minZ || n.minZ > maxZ) continue;
+      if (n.triCount > 0) {
+        const end = n.triOffset + n.triCount;
+        for (let i = n.triOffset; i < end; i++) {
+          const b = tris[i] * 3;
+          const i0 = ix[b] * s, i1 = ix[b + 1] * s, i2 = ix[b + 2] * s;
+          if (Math.max(v[i0], v[i1], v[i2]) < minX || Math.min(v[i0], v[i1], v[i2]) > maxX) continue;
+          if (Math.max(v[i0 + 1], v[i1 + 1], v[i2 + 1]) < minY || Math.min(v[i0 + 1], v[i1 + 1], v[i2 + 1]) > maxY) continue;
+          if (Math.max(v[i0 + 2], v[i1 + 2], v[i2 + 2]) < minZ || Math.min(v[i0 + 2], v[i1 + 2], v[i2 + 2]) > maxZ) continue;
+          return true;
+        }
+        continue;
+      }
+      stack[sp++] = n.left;
+      stack[sp++] = n.right;
+    }
+    return false;
+  }
+  private readonly _stack: number[] = [];
 
   // ── Private traversal ─────────────────────────────────────────────────────
 
@@ -83,6 +127,7 @@ export class MeshBVH {
     idx: number,
     ox: number, oy: number, oz: number,
     dx: number, dy: number, dz: number,
+    tCap: number,
   ): BVHHit | null {
     const node = this._nodes[idx];
 
@@ -104,7 +149,7 @@ export class MeshBVH {
           this._verts[i1], this._verts[i1 + 1], this._verts[i1 + 2],
           this._verts[i2], this._verts[i2 + 1], this._verts[i2 + 2],
         );
-        if (t !== null && t < bestT) { bestT = t; bestTri = tri; }
+        if (t !== null && t < bestT && t <= tCap) { bestT = t; bestTri = tri; }
       }
       return bestTri >= 0 ? { t: bestT, triIndex: bestTri } : null;
     }
@@ -112,21 +157,25 @@ export class MeshBVH {
     // Internal — test both children, visit the closer one first.
     // If the closer child returns a hit with t ≤ the farther child's entry t,
     // the farther child cannot produce a closer hit → skip it.
-    const tL = nodeEntryT(this._nodes[node.left],  ox, oy, oz, dx, dy, dz);
-    const tR = nodeEntryT(this._nodes[node.right], ox, oy, oz, dx, dy, dz);
+    let tL = nodeEntryT(this._nodes[node.left],  ox, oy, oz, dx, dy, dz);
+    let tR = nodeEntryT(this._nodes[node.right], ox, oy, oz, dx, dy, dz);
+    if (tL > tCap) tL = Infinity;   // entered beyond the cap → nothing in it can count
+    if (tR > tCap) tR = Infinity;
 
     if (tL === Infinity && tR === Infinity) return null;
-    if (tL === Infinity) return this._traverseNode(node.right, ox, oy, oz, dx, dy, dz);
-    if (tR === Infinity) return this._traverseNode(node.left,  ox, oy, oz, dx, dy, dz);
+    if (tL === Infinity) return this._traverseNode(node.right, ox, oy, oz, dx, dy, dz, tCap);
+    if (tR === Infinity) return this._traverseNode(node.left,  ox, oy, oz, dx, dy, dz, tCap);
 
-    const [firstIdx, secondIdx, tSecond] = tL <= tR
-      ? [node.left,  node.right, tR]
-      : [node.right, node.left,  tL];
+    const leftFirst = tL <= tR;
+    const firstIdx = leftFirst ? node.left : node.right;
+    const secondIdx = leftFirst ? node.right : node.left;
+    const tSecond = leftFirst ? tR : tL;
 
-    const firstHit = this._traverseNode(firstIdx, ox, oy, oz, dx, dy, dz);
+    const firstHit = this._traverseNode(firstIdx, ox, oy, oz, dx, dy, dz, tCap);
     if (firstHit && firstHit.t <= tSecond) return firstHit;
 
-    const secondHit = this._traverseNode(secondIdx, ox, oy, oz, dx, dy, dz);
+    // A hit in the second child only wins when it is no farther than the first (ties keep the first, as before).
+    const secondHit = this._traverseNode(secondIdx, ox, oy, oz, dx, dy, dz, firstHit ? Math.min(tCap, firstHit.t) : tCap);
     if (!firstHit)  return secondHit;
     if (!secondHit) return firstHit;
     return firstHit.t <= secondHit.t ? firstHit : secondHit;
@@ -147,6 +196,7 @@ function buildNode(
   start:      number,
   end:        number,
   nodes:      BVHNode[],
+  cents:      Float64Array[],
 ): number {
   const count = end - start;
 
@@ -179,16 +229,31 @@ function buildNode(
   const extX = maxX - minX, extY = maxY - minY, extZ = maxZ - minZ;
   const axis = extX >= extY && extX >= extZ ? 0 : extY >= extZ ? 1 : 2;
 
-  // Sort the slice by triangle centroid on the chosen axis
-  const slice = triIndices.slice(start, end);
-  slice.sort((a, b) => centroid(verts, idxs, s, a, axis) - centroid(verts, idxs, s, b, axis));
-  for (let i = 0; i < slice.length; i++) triIndices[start + i] = slice[i];
-
+  // Partition the slice at the centroid MEDIAN on the chosen axis (P10.D: quickselect over precomputed centroids — a
+  // full comparator sort per node made the build O(n log² n) with a centroid recomputed per compare).
   const mid = (start + end) >> 1;
-  nodes[nodeIdx].left  = buildNode(verts, idxs, triIndices, start, mid, nodes);
-  nodes[nodeIdx].right = buildNode(verts, idxs, triIndices, mid,   end, nodes);
+  selectNth(triIndices, cents[axis], start, end - 1, mid);
+  nodes[nodeIdx].left  = buildNode(verts, idxs, triIndices, start, mid, nodes, cents);
+  nodes[nodeIdx].right = buildNode(verts, idxs, triIndices, mid,   end, nodes, cents);
 
   return nodeIdx;
+}
+
+/** Reorder tri[lo..hi] so tri[k] holds the k-th smallest key C[tri[·]] with every key before it ≤ and after it ≥
+ *  (Hoare quickselect, median-of-three pivot). */
+function selectNth(tri: number[], C: Float64Array, lo: number, hi: number, k: number): void {
+  while (hi > lo) {
+    const m = (lo + hi) >> 1;
+    const a = C[tri[lo]], b = C[tri[m]], c = C[tri[hi]];
+    const pivot = a < b ? (b < c ? b : a < c ? c : a) : (a < c ? a : b < c ? c : b);
+    let i = lo, j = hi;
+    while (i <= j) {
+      while (C[tri[i]] < pivot) i++;
+      while (C[tri[j]] > pivot) j--;
+      if (i <= j) { const t = tri[i]; tri[i] = tri[j]; tri[j] = t; i++; j--; }
+    }
+    if (k <= j) hi = j; else if (k >= i) lo = i; else return;
+  }
 }
 
 /** Average position of a triangle's three vertices along one axis. */

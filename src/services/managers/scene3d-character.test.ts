@@ -103,7 +103,12 @@ describe('§5.1 Scene3DCharacter (extracted subsystem)', () => {
   it('registerBody stores params; getBodyParams + serialize round-trip them', () => {
     const params = { height: 1.7, tag: 'a' } as unknown as import('./body-generator').BodyParams;
     ch.registerBody('body', params, [] as never, [] as never, [] as never);
-    expect(ch.getBodyParams('body')).toBe(params);
+    expect(ch.getBodyParams('body')).toEqual(params);
+    // …as a COPY: a host that edits what it got (Frogmarks binds its sliders to it) must not change our stored params —
+    // that made setBodyParams see "no change" and skip the regenerate (sliders dead on an existing character).
+    const got = ch.getBodyParams('body')!;
+    (got as { height: number }).height = 9;
+    expect(ch.getBodyParams('body')!.height).toBe(1.7);
 
     const serialized = ch.serializeBodyParams();
     expect(serialized).toEqual([{ bodyMeshId: 'body', params }]);
@@ -124,7 +129,7 @@ describe('§5.1 Scene3DCharacter (extracted subsystem)', () => {
     cap.drop();
     expect(ch.getBodyParams('body')).toBeNull();   // dropped
     cap.restore();
-    expect(ch.getBodyParams('body')).toBe(params);  // undo brings the exact value back
+    expect(ch.getBodyParams('body')).toEqual(params);  // undo brings the exact value back
 
     // capturing a body with no overlays is a harmless no-op
     const empty = ch.captureBodyOverlaysForDeletion('ghost');

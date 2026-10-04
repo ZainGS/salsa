@@ -83,6 +83,8 @@ export class FlyController {
   }
 
   private _tick(dt: number): void {
+    // Stuck-key watchdog: a lost keyup (focus change / dialog) used to fly the camera forward forever.
+    this.kb.releaseIfStale(typeof performance !== 'undefined' ? performance.now() : Date.now());
     if (!this.kb.anyMoveHeld()) { this.loop.stop(); return; }   // idle → stop (no wasted frames)
     const input = this.kb.readFly();
     const spd = this.speed * (this.kb.isHeld('ShiftLeft') || this.kb.isHeld('ShiftRight') ? this.boost : 1);

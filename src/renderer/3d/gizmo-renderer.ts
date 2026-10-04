@@ -10,6 +10,7 @@
  * Also provides CPU-side hit testing for axis/plane picking during drag.
  */
 
+import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { mat4, vec3, vec4 } from 'gl-matrix';
 import { Camera3D } from './camera-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
@@ -1084,7 +1085,14 @@ export class GizmoRenderer {
   private swapChainFormat: GPUTextureFormat;
 
   // Pipeline (shared by both gizmo and selection box — same vertex format)
-  private pipeline!: GPURenderPipeline;
+  /** P2: set a cache-handle pipeline; false (caller returns, drawing nothing) while it is still compiling. */
+  private _setPipe(pass: GPURenderPassEncoder, h: PipelineHandle<GPURenderPipeline>): boolean {
+    const p = h.get();
+    if (!p) return false;
+    pass.setPipeline(p);
+    return true;
+  }
+  private pipeline!: PipelineHandle<GPURenderPipeline>;   // P2: non-blocking cache handles (draws skip while compiling — see _setPipe)
   private bgl!: GPUBindGroupLayout;
 
   // Gizmo GPU buffers (pre-allocated, overwritten each frame)
@@ -1101,8 +1109,8 @@ export class GizmoRenderer {
   private _boneVertBuf!:     GPUBuffer;
   private _boneIdxBuf!:      GPUBuffer;
   private _boneUniBuf!:      GPUBuffer;
-  private _boneFillPipe!:    GPURenderPipeline; // triangle-list, depth write enabled (for edge occlusion)
-  private _boneLinePipe!:    GPURenderPipeline;
+  private _boneFillPipe!:    PipelineHandle<GPURenderPipeline>; // triangle-list, depth write enabled (for edge occlusion)
+  private _boneLinePipe!:    PipelineHandle<GPURenderPipeline>;
   private _boneEdgeVertBuf!: GPUBuffer;
 
   // Ground grid GPU buffers (world-space line geometry, model = identity, own uniform to avoid aliasing)
@@ -1113,7 +1121,7 @@ export class GizmoRenderer {
 
   // Textured artboard quad (illustration × free3D): shows the 2D illustration on the artboard plane. Its own
   // pipeline (pos+uv, texture+sampler, PREMULTIPLIED alpha, depth-write so 3D objects occlude it correctly).
-  private _artboardTexPipe?: GPURenderPipeline;
+  private _artboardTexPipe?: PipelineHandle<GPURenderPipeline>;
   private _artboardTexBgl?: GPUBindGroupLayout;
   private _artboardTexSampler?: GPUSampler;
   private _artboardTexUniBuf?: GPUBuffer;   // vp(64) + model(64) + params(16: opacity)
@@ -1217,7 +1225,8 @@ export class GizmoRenderer {
       depthCompare: 'always',
     };
 
-    this.pipeline = this.device.createRenderPipeline({
+    this.pipeline = GPUPipelineCache.for(this.device).render({
+      label: 'Gizmo',
       layout,
       vertex: vertState,
       fragment: fragState,
@@ -1227,7 +1236,8 @@ export class GizmoRenderer {
 
     // Bone fill pipeline: writes depth so edges can depth-test against bone surfaces.
     // Sorted back-to-front draw order ensures the nearest bone's depth wins the buffer.
-    this._boneFillPipe = this.device.createRenderPipeline({
+    this._boneFillPipe = GPUPipelineCache.for(this.device).render({
+      label: 'GizmoBoneFill',
       layout,
       vertex: vertState,
       fragment: fragState,
@@ -1237,7 +1247,8 @@ export class GizmoRenderer {
 
     // Bone edge pipeline: depth-tests against the fill depths written above, so edges
     // are hidden wherever a nearer bone's fill covers them.
-    this._boneLinePipe = this.device.createRenderPipeline({
+    this._boneLinePipe = GPUPipelineCache.for(this.device).render({
+      label: 'GizmoBoneLine',
       layout,
       vertex: vertState,
       fragment: fragState,
@@ -1451,7 +1462,7 @@ export class GizmoRenderer {
 
     const bg = this.uniformBindGroup(this._selBoxUniBuf);   // cached (audit 5.12)
 
-    pass.setPipeline(this.pipeline);
+    if (!this._setPipe(pass, this.pipeline)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._selBoxVertBuf);
     pass.setIndexBuffer(this._selBoxIdxBuf, 'uint32');
@@ -1531,7 +1542,7 @@ export class GizmoRenderer {
 
     const bg = this.uniformBindGroup(this._gridUniBuf);   // cached (audit 5.12)
 
-    pass.setPipeline(this._boneLinePipe);                    // line-list, depth less-equal, no depth write
+    if (!this._setPipe(pass, this._boneLinePipe)) return;                    // line-list, depth less-equal, no depth write
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._gridVertBuf);
     pass.draw(vertCount);
@@ -1564,7 +1575,7 @@ export class GizmoRenderer {
     this.device.queue.writeBuffer(this._gridUniBuf, 0, uData);
     const bg = this.uniformBindGroup(this._gridUniBuf);
 
-    pass.setPipeline(this._boneLinePipe);
+    if (!this._setPipe(pass, this._boneLinePipe)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._artboardVertBuf);
     pass.draw(vertCount);
@@ -1597,7 +1608,8 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
-    this._artboardTexPipe = this.device.createRenderPipeline({
+    this._artboardTexPipe = GPUPipelineCache.for(this.device).render({
+      label: 'GizmoArtboardTex',
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._artboardTexBgl] }),
       vertex: {
         module: shader, entryPoint: 'vs_main',
@@ -1654,7 +1666,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         { binding: 2, resource: this._artboardTexSampler! },
       ],
     });
-    pass.setPipeline(this._artboardTexPipe!);
+    if (!this._setPipe(pass, this._artboardTexPipe!)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._artboardTexVertBuf!);
     pass.draw(6);
@@ -1680,7 +1692,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     this.device.queue.writeBuffer(this._gridUniBuf, 0, uData);
     const bg = this.uniformBindGroup(this._gridUniBuf);
 
-    pass.setPipeline(this._boneLinePipe);
+    if (!this._setPipe(pass, this._boneLinePipe)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._frustumVertBuf);
     pass.draw(vertCount);
@@ -1751,7 +1763,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     this.device.queue.writeBuffer(this._snapVizUniBuf, 0, uData);
 
     const bg = this.uniformBindGroup(this._snapVizUniBuf);   // cached (audit 5.12)
-    pass.setPipeline(this.pipeline);  // triangle-list, depth-always → draws on top of everything
+    if (!this._setPipe(pass, this.pipeline)) return;  // triangle-list, depth-always → draws on top of everything
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._snapVizBuf);
     pass.draw(vertCount);
@@ -1824,7 +1836,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     this.device.queue.writeBuffer(this._emitterIconUniBuf, 0, uData);
 
     const bg = this.uniformBindGroup(this._emitterIconUniBuf);
-    pass.setPipeline(this.pipeline);   // triangle-list, depth-always -> on top of the scene
+    if (!this._setPipe(pass, this.pipeline)) return;   // triangle-list, depth-always -> on top of the scene
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._emitterIconBuf);
     pass.draw(vertCount);
@@ -1874,7 +1886,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     const bg = this.uniformBindGroup(this.uniformBuffer);   // cached (audit 5.12)
 
-    pass.setPipeline(this.pipeline);
+    if (!this._setPipe(pass, this.pipeline)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this.vertexBuffer);
     pass.setIndexBuffer(this.indexBuffer, 'uint32');
@@ -1969,7 +1981,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     const bg = this.uniformBindGroup(this._arrayUniBuf);   // cached (audit 5.12)
 
-    pass.setPipeline(this.pipeline);
+    if (!this._setPipe(pass, this.pipeline)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._arrayVertBuf);
     pass.setIndexBuffer(this._arrayIdxBuf, 'uint32');
@@ -2090,7 +2102,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     const bg = this.uniformBindGroup(this._faceHandleUniBuf);   // cached (audit 5.12)
 
-    pass.setPipeline(this.pipeline);
+    if (!this._setPipe(pass, this.pipeline)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._faceHandleVertBuf);
     pass.setIndexBuffer(this._faceHandleIdxBuf, 'uint32');
@@ -2248,7 +2260,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     const bg = this.uniformBindGroup(this._boneUniBuf);   // cached (audit 5.12)
 
     // Fill pass — depth write enabled so edges can occlude against bone surfaces.
-    pass.setPipeline(this._boneFillPipe);
+    if (!this._setPipe(pass, this._boneFillPipe)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._boneVertBuf);
     pass.setIndexBuffer(this._boneIdxBuf, 'uint32');
@@ -2257,7 +2269,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     // Edge outline pass (drawn after fill so edges appear on top)
     if (lineVertCount > 0) {
       this.device.queue.writeBuffer(this._boneEdgeVertBuf, 0, lineVerts, 0, lineVertCount * 7);
-      pass.setPipeline(this._boneLinePipe);
+      if (!this._setPipe(pass, this._boneLinePipe)) return;
       pass.setBindGroup(0, bg);
       pass.setVertexBuffer(0, this._boneEdgeVertBuf);
       pass.draw(lineVertCount);
@@ -2390,7 +2402,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     const bg = this.uniformBindGroup(this.uniformBuffer);   // cached (audit 5.12)
 
-    pass.setPipeline(this.pipeline);
+    if (!this._setPipe(pass, this.pipeline)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this.vertexBuffer);
     pass.setIndexBuffer(this.indexBuffer, 'uint32');
@@ -2461,7 +2473,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     const bg = this.uniformBindGroup(this.uniformBuffer);   // cached (audit 5.12)
 
-    pass.setPipeline(this.pipeline);
+    if (!this._setPipe(pass, this.pipeline)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this.vertexBuffer);
     pass.setIndexBuffer(this.indexBuffer, 'uint32');
@@ -2577,7 +2589,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     const bg = this.uniformBindGroup(this._ikUniBuf);   // cached (audit 5.12)
 
-    pass.setPipeline(this._boneFillPipe);
+    if (!this._setPipe(pass, this._boneFillPipe)) return;
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._ikVertBuf);
     pass.setIndexBuffer(this._ikIdxBuf, 'uint32');

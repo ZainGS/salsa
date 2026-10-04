@@ -20,6 +20,20 @@ import type { BuildingParams } from '../../world/building';
 import type { LayoutPreviewLayer } from '../../world/types';
 import type { Scene3DManager } from './scene3d-manager';
 import { DEFAULT_METERS_PER_UNIT } from './building-manager';
+import type { EdgeKind } from '../../world/building-geom';
+import { FACADE_SWATCHES } from '../../world/palette';
+
+/** The starter block's street row (B11): a Japanese mix instead of brick townhouses. */
+const STARTER_ROW = ['zakkyo', 'izakaya', 'konbini', 'apato', 'mansion', 'retro-shophouse', 'jp-house'];
+const ROW_JOINT = 0.2;   // metres between neighbours in the starter row (party walls)
+/** Persona polish B4: the starter row shows the facade range — a metal-panel pencil building, a pale tile mansion with
+ *  a cornice, a cream-render shophouse — in the city's muted swatches (plain params: the Creator edits them as usual). */
+const STARTER_FACADE: Record<string, Partial<BuildingParams>> = {
+    'zakkyo': { material: 'panel', baseColor: FACADE_SWATCHES.panel[2], ledges: true },
+    'mansion': { baseColor: FACADE_SWATCHES.tile[2], cornice: true },
+    'retro-shophouse': { material: 'plaster', baseColor: FACADE_SWATCHES.plaster[3] },
+};
+import { applyObjectStyle, isEmptyStyle, mergeObjectStyle, patchClearsField, sanitizeObjectStyle, type ObjectStyle, type ObjectStylePatch } from './object-style';
 
 /** Block-local placement of one building (METRES): ground position + yaw. */
 type Placement = { x: number; y: number; z: number; ry: number };
@@ -33,6 +47,7 @@ interface BlockRec {
     buildings: BlockBuildingSpec[];
     transform: Placement;           // the block's own placement (world)
     scale: number;                  // world units per metre (display scale of the whole block)
+    style?: ObjectStyle;            // the whole block's persisted LOOK (render style / toon / rim), re-applied on rebuild
 }
 
 /** Persisted marker (container.worldParams) — distinct `kind` so no other manager adopts a block. */
@@ -41,11 +56,32 @@ interface BlockMarker {
     buildings: { params: Partial<BuildingParams>; placement: Placement }[];
     transform: Placement;
     scale?: number;
+    style?: ObjectStyle;
 }
 
 export class BlockManager {
     private _blocks = new Map<string, BlockRec>();
     private _counter = 0;
+    /** The style a NEW block starts with — set by the Environment style (ShapeManager); undefined = none. */
+    defaultStyle: (() => ObjectStyle | undefined) | null = null;
+
+    /** Set (merge) a block's persisted LOOK — every building in it. A `null` field clears it (rebuilds); setting
+     *  applies in place. Persists in the block marker. False if `id` isn't a block. */
+    setStyle(id: string, patch: ObjectStylePatch): boolean {
+        const rec = this._blocks.get(id);
+        if (!rec) return false;
+        const rebuild = patchClearsField(rec.style, patch);
+        const next = mergeObjectStyle(rec.style, patch);
+        rec.style = isEmptyStyle(next) ? undefined : next;
+        if (rebuild) this._rebuild(rec);
+        else { if (rec.group) applyObjectStyle(rec.group, rec.style); this._stamp(rec); }
+        this.scene3d.requestRender3D();
+        return true;
+    }
+    /** A block's persisted look ({} = none). Null if `id` isn't a block. */
+    getStyle(id: string): ObjectStyle | null { const r = this._blocks.get(id); return r ? { ...(r.style ?? {}) } : null; }
+    /** Every block's id. */
+    ids(): string[] { return [...this._blocks.keys()]; }
 
     constructor(private readonly scene3d: Scene3DManager) {
         // DEV console harness (before Frogmarks has a Block UI):
@@ -84,14 +120,21 @@ export class BlockManager {
      *  `{ starter: false }` for an empty block, or `{ starter: N }` for N buildings. Auto-frames when non-empty. */
     create(transform: Partial<Placement> = {}, opts: { starter?: boolean | number } = {}): string {
         const container = this.scene3d.createCityContainer(`Block ${++this._counter}`);
-        const rec: BlockRec = { container, group: null, buildings: [], transform: { ...IDENTITY_P, ...transform }, scale: 1 / DEFAULT_METERS_PER_UNIT };
+        const style = this.defaultStyle?.();   // the Environment style, if one is set
+        const rec: BlockRec = { container, group: null, buildings: [], transform: { ...IDENTITY_P, ...transform }, scale: 1 / DEFAULT_METERS_PER_UNIT,
+            ...(isEmptyStyle(style) ? {} : { style: { ...style } }) };
         this._blocks.set(container.id, rec);
         const n = opts.starter === false ? 0 : opts.starter === true || opts.starter === undefined ? 3 : Math.max(0, Math.floor(opts.starter));
-        let x = 0;   // place adjacent by WIDTH (+ a small alley), not a fixed gap — narrow buildings shouldn't sit far apart
+        // ★ A JAPANESE street row (B11) — pencil building, izakaya, konbini, apaato, mansion… — instead of three
+        // brick townhouses. Placed SHOULDER TO SHOULDER (a 0.2 m joint), so the shared sides become party walls
+        // (see _frontage) and the row reads as a street wall.
+        let x = 0;
         for (let i = 0; i < n; i++) {
-            const params = resolveBuildingParams({ archetype: 'brick-townhouse', julietBalconies: true, windowTrim: true, seed: i + 1 });
+            const arch = STARTER_ROW[i % STARTER_ROW.length];
+            const params = resolveBuildingParams({ archetype: arch, seed: i + 1, ...(STARTER_FACADE[arch] ?? {}) });
+            if (i > 0) x += params.width / 2;
             rec.buildings.push({ params, placement: { x, y: 0, z: 0, ry: 0 } });
-            x += params.width + 1;   // footprint is centred at the placement, so step by full width + 1 m
+            x += params.width / 2 + ROW_JOINT;   // footprint is centred at the placement
         }
         if (n > 0) { this._rebuild(rec); this.scene3d.frameGroup(container); }
         else { this.scene3d.setGroupTransform(container, { ...rec.transform, s: rec.scale }); this._stamp(rec); }
@@ -101,12 +144,13 @@ export class BlockManager {
     isBlock(id: string): boolean { return this._blocks.has(id); }
 
     /** Add a building to a block at a block-local placement (METRES). Returns its index, or -1 if the block is unknown.
-     *  Blocks are the detailed-building showcase, so `julietBalconies` + `windowTrim` default ON (the caller can turn
-     *  them off) — otherwise the block draws plain shells with nothing to instance. */
+     *  Western archetypes (non-sash windows) default `julietBalconies` + `windowTrim` ON (the instancing showcase);
+     *  Japanese sash archetypes keep their own detail (sash frames, AC units, balconies) — no forced juliets (B4). */
     addBuilding(id: string, params: Partial<BuildingParams>, placement: Partial<Placement> = {}): number {
         const rec = this._blocks.get(id);
         if (!rec) return -1;
-        rec.buildings.push({ params: resolveBuildingParams({ julietBalconies: true, windowTrim: true, ...params }), placement: { ...IDENTITY_P, ...placement } });
+        const western = !resolveBuildingParams(params).windowSash;
+        rec.buildings.push({ params: resolveBuildingParams({ ...(western ? { julietBalconies: true, windowTrim: true } : {}), ...params }), placement: { ...IDENTITY_P, ...placement } });
         this._rebuild(rec);
         return rec.buildings.length - 1;
     }
@@ -190,8 +234,8 @@ export class BlockManager {
         if (!rec) return null;
         const keys = new Set<string>();
         let total = 0;
-        for (const b of rec.buildings) {
-            for (const L of buildBuilding(b.params).layers) {
+        for (const [bi, b] of rec.buildings.entries()) {
+            for (const L of buildBuilding(b.params, undefined, undefined, this._frontage(rec, bi)).layers) {
                 if (!L.instances) continue;
                 keys.add(`${L.name}|${L.instanceKey}|${L.color.join(',')}`);
                 total += L.instances.length;
@@ -214,6 +258,7 @@ export class BlockManager {
                 buildings: wp.buildings.map(b => ({ params: resolveBuildingParams(b.params), placement: { ...IDENTITY_P, ...b.placement } })),
                 transform: { ...IDENTITY_P, ...(wp.transform ?? {}) },
                 scale: wp.scale && wp.scale > 0 ? wp.scale : 1 / DEFAULT_METERS_PER_UNIT,
+                style: sanitizeObjectStyle(wp.style),
             };
             this._blocks.set(child.id, rec);
             this._rebuild(rec);
@@ -239,7 +284,30 @@ export class BlockManager {
             buildings: rec.buildings.map(b => ({ params: b.params, placement: b.placement })),
             transform: rec.transform,
             scale: rec.scale,
+            ...(isEmptyStyle(rec.style) ? {} : { style: rec.style }),
         } satisfies BlockMarker;
+    }
+
+    /** Per-edge frontage for building `bi` (its default rectangle footprint: edges 0 = back −Z, 1 = +X side,
+     *  2 = front +Z, 3 = −X side). A side edge that abuts a neighbour in the row (same yaw, same z, sides within
+     *  ~0.6 m) is a PARTY wall — plain, nothing protruding; the back is OPEN (AC / pipes / stairs). Returns
+     *  undefined (the standalone all-street behaviour) for anything not in a simple straight row. */
+    private _frontage(rec: BlockRec, bi: number): EdgeKind[] | undefined {
+        const b = rec.buildings[bi], P = b.placement;
+        if (rec.buildings.length < 2 || Math.abs(P.ry) > 1e-3) return undefined;
+        const hw = Math.max(2, b.params.width) / 2;
+        let left = false, right = false;
+        for (let j = 0; j < rec.buildings.length; j++) {
+            if (j === bi) continue;
+            const o = rec.buildings[j], Q = o.placement;
+            if (Math.abs(Q.ry) > 1e-3 || Math.abs(Q.z - P.z) > 1.5) continue;
+            const ohw = Math.max(2, o.params.width) / 2;
+            const gap = Math.abs(Q.x - P.x) - hw - ohw;
+            if (gap < -0.5 || gap > 0.6) continue;
+            if (Q.x > P.x) right = true; else left = true;
+        }
+        if (!left && !right) return undefined;
+        return ['open', right ? 'party' : 'street', 'street', left ? 'party' : 'street'];
     }
 
     /** Rotate a building-local (x,z) into block-local space by the building's placement yaw + position (metres). */
@@ -258,8 +326,8 @@ export class BlockManager {
         type Grp = { name: string; geometry: LayoutPreviewLayer['geometry']; color: [number, number, number]; emissive?: number; pattern?: LayoutPreviewLayer['pattern']; instanceKey: string; transforms: { x: number; y: number; z: number; ry: number }[] };
         const groups = new Map<string, Grp>();
 
-        for (const b of rec.buildings) {
-            const { layers } = buildBuilding(b.params);
+        for (const [bi, b] of rec.buildings.entries()) {
+            const { layers } = buildBuilding(b.params, undefined, undefined, this._frontage(rec, bi));
             const nonInst: LayoutPreviewLayer[] = [];
             for (const L of layers) {
                 if (L.instances && L.instanceKey) {
@@ -286,6 +354,7 @@ export class BlockManager {
             this.scene3d.addExplicitArrayInstances(group, { name: g.name, geometry: g.geometry, color: g.color, emissive: g.emissive, pattern: g.pattern, transforms: g.transforms });
         }
 
+        applyObjectStyle(group, rec.style);   // the persisted look survives the rebuild
         this.scene3d.setGroupTransform(rec.container, { ...rec.transform, s: rec.scale });
         this._stamp(rec);
         this.scene3d.cacheGroupBounds(rec.container);

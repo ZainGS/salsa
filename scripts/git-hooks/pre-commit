@@ -1,0 +1,15 @@
+#!/bin/sh
+# OPTIONAL Salsa pre-commit hook: NOT installed automatically. Enable / disable (from the repo root):
+#
+#   git config core.hooksPath scripts/git-hooks      # enable
+#   git config --unset core.hooksPath                # disable
+#
+# Runs `npm run check:fast` (source sanity + tsc --noEmit + ESLint without type info + the WGSL static check),
+# roughly 30 s. The full test suite is left to `npm run check` / CI. Skip once with `git commit --no-verify`.
+# See docs/dev/checks-and-ci.md.
+if [ -n "$SALSA_SKIP_HOOKS" ]; then exit 0; fi
+npm run --silent check:fast || {
+  echo ""
+  echo "pre-commit: checks failed (commit aborted). Fix them, or commit with --no-verify to skip once."
+  exit 1
+}

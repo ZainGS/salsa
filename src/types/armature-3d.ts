@@ -206,8 +206,43 @@ export interface SkeletonKeyframeTrack {
  *                with slowly-spinning clover/flower motifs scattered through the cells
  * - 'dim'      — semi-transparent dark overlay drawn OVER the scene
  * - 'none'     — no background (scene visible as normal)
+ * - 'sky'      — the stylised SKY DOME (visual-polish #9): a view-direction sky (zenith → horizon gradient, horizon
+ *                glow, sun, moon + halo, stars, painted anime clouds) from `sky`; color1/color2 = the screen
+ *                gradient it falls back to while its pipeline compiles or without a camera.
  */
-export type ArmatureBgMode = 'wavy' | 'solid' | 'gradient' | 'checkers' | 'dim' | 'none';
+export type ArmatureBgMode = 'wavy' | 'solid' | 'gradient' | 'checkers' | 'dim' | 'none' | 'sky';
+
+type SkyC3 = [number, number, number];
+/** The stylised SKY DOME's per-frame look (ArmatureBgMode 'sky'; src/renderer/3d/sky-dome-pass.ts). All colours are
+ *  display values like the gradient's; directions point TOWARD the body (unit, Y up). Built per time of day by
+ *  src/world/sky.ts `skyDomeParams` for the city; any host may fill it by hand. */
+export interface SkyDomeParams {
+    zenith: SkyC3;
+    horizon: SkyC3;
+    /** Below the horizon (the city's fog colour, so far geometry meets the backdrop with no seam). */
+    ground: SkyC3;
+    /** Horizon → zenith curve: t = 1 - (1 - up)^bias (larger = the zenith colour reaches lower; 3 ≈ the old screen
+     *  gradient's look at street level, with a finite slope at the horizon so it never reads as a line). */
+    gradientBias: number;
+    /** Horizon GLOW band (city light pollution at night): colour, strength 0..1 and e-folding height in radians. */
+    glowColor: SkyC3; glowAmount: number; glowHeight: number;
+    sunDir: SkyC3; sunColor: SkyC3;
+    /** Sun disc visibility 0..1 and the halo strength (both 0 = no sun drawn). */
+    sunDisc: number; sunHalo: number;
+    moonDir: SkyC3; moonColor: SkyC3;
+    /** Moon visibility 0..1, angular RADIUS in radians, halo strength. */
+    moon: number; moonSize: number; moonHalo: number;
+    /** Star brightness 0..1 (0 = none). */
+    stars: number;
+    /** Painted cloud layer opacity 0..1 (0 = none); colours of the lit tops / shaded undersides / the bright rim. */
+    clouds: number; cloudLit: SkyC3; cloudShade: SkyC3; cloudRim: SkyC3; cloudRimAmount: number;
+    /** Toward the light the clouds take (sun by day, moon at night). */
+    cloudLightDir: SkyC3;
+    /** Added to the undersides of low clouds (the city glow at night). */
+    cloudGlow: SkyC3;
+    /** The cloud SHAPES: seed + coverage 0..1 (re-laid out only when these change) and the drift in rad/s. */
+    cloudSeed: number; cloudCoverage: number; cloudDrift: number;
+}
 
 export interface ArmatureBgOptions {
     mode: ArmatureBgMode;
@@ -217,6 +252,8 @@ export interface ArmatureBgOptions {
     color2?: [number, number, number, number];
     /** Darkness level for 'dim' mode, 0–1 (default 0.5). */
     dimStrength?: number;
+    /** 'sky' mode: the dome's look (absent = the screen gradient). */
+    sky?: SkyDomeParams;
 }
 
 /**
@@ -298,6 +335,42 @@ export interface SkeletonAnimClip {
   endFrame: number;
   fps: number;
   tracks: SkeletonKeyframeTrack[];
+  /** Locomotion cycle clips only (optional): the ground speed the clip's feet are planted for at playback rate 1, in
+   *  the rig's local units per second. The Play-mode animator plays the clip at speed / groundSpeed so the feet don't
+   *  skate (the runtime default gaits in default-locomotion.ts set it; authored clips usually don't). */
+  groundSpeed?: number;
+  /** Jump clips only (optional): the clip phase (0..1) where the feet leave the ground — the wind-up crouch plays
+   *  before it, the air (by air phase) after it (the runtime default Jump sets it; authored clips don't = 0). */
+  takeoffPhase?: number;
+  /** Jump VARIANT clips only (optional, runtime default jumps): when the Play animator picks this variant — relative
+   *  weights from a stand / walk / run and for a tap / hold, a mirrored-pair `family`, the leg that leads (`side`) and
+   *  its own landing clip (`land`). See game/locomotion-animator.ts JumpVariantInfo. */
+  jumpVariant?: { stand: number; walk: number; run: number; tap: number; hold: number; family?: string; side?: 'L' | 'R'; land?: string };
+  /** Locomotion cycle clips only (optional, runtime default gaits): the cycle phases where the legs PASS each other
+   *  (mid-stance of each leg) — the Play animator's settle step on a stop walks on to the nearest one while fading. */
+  passPhases?: number[];
   /** IK chain property tracks (target, poleTarget, blendWeight). */
   ikTracks?: IKKeyframeTrack[];
+  /** Optional FACE events for a procedural character's eyes, fired as playback crosses each frame: a gaze JUMP
+   *  (eyes move in saccades, not glides — and each gaze change re-renders the eye texture, so a few discrete jumps
+   *  are both realistic and cheap) and/or a blink. Gaze is an OFFSET from the character's gaze when the clip started;
+   *  `restore` returns the eyes there. Clips without it play exactly as before. */
+  faceTrack?: ClipFaceEvent[];
+}
+
+/** One face event in a clip — see SkeletonAnimClip.faceTrack. Gaze: x + = screen-right, y + = down (−1..1). */
+export interface ClipFaceEvent {
+  frame: number;
+  gaze?: [number, number];
+  blink?: boolean;
+  /** Return the eyes to where they were when the clip started (and the face kit to its resting expression, if the
+   *  clip changed it). */
+  restore?: boolean;
+  /** FACE KIT (face-features.ts): blend to an expression ('neutral' | 'smile' | 'open' | 'frown' | 'surprised', or
+   *  'default' = the character's resting one). Ignored by faces without the kit. */
+  expression?: string;
+  /** 0..1 strength of `expression` (default 1). */
+  weight?: number;
+  /** A quick brow raise (brow-raise units, ~0.3–0.6). */
+  browRaise?: number;
 }

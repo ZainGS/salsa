@@ -8,6 +8,9 @@
  * Uses the delegate-manager pattern — domain logic lives in managers under src/services/managers/.
  */
 
+import { splitPassStats } from '../renderer/3d/pass-stats';
+import { GPUPipelineCache, type PipelineWarmupStatus } from '../renderer/core/gpu-pipeline-cache';
+import { getWorkerJobService, type WorkerJobProgress, type WorkerJobStats } from './workers/worker-job-service';
 import { LayerManager } from './layer-manager';
 import { PackagingManager, type PackagingMarker, type PackagingPersistEntry } from '../packaging/packaging-manager';
 import { createPackagingHost } from '../packaging/packaging-host-impl';
@@ -84,6 +87,10 @@ import { DocumentPersistence, DocumentManifest, DocumentSavePayload, DocumentInf
 import { DocumentStateCoordinator, type RestoreIssue } from './persistence/document-state-coordinator';
 import { PixelFormat, isFormatSupported } from './persistence/pixel-codec';
 import { packProject as _packProject, unpackProject as _unpackProject } from './persistence/project-package';
+import { runWhenIdle } from './persistence/idle-gate';
+import { DeviceRecoveryCoordinator, gpuOnlyFromRestorePayload } from './persistence/device-recovery-coordinator';
+import { gpuPixelEpoch, bumpGpuPixelEpoch } from '../renderer/raster/gpu-pixel-epoch';
+import { sweepGpuFields, type GpuDeviceStatusInfo, type GpuDeviceStatusListener } from '../renderer/core/gpu-device-recovery';
 import { packFrogcart, unpackFrogcart, type FrogcartMeta, type FrogcartManifest, type FrogcartPlayerConfig } from './persistence/frogcart';
 import { mat4, vec4 } from 'gl-matrix';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive } from '../scene-graph/shapes/mesh-3d';
@@ -94,8 +101,12 @@ import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
 import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
 import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig, HighlightStyle } from '../renderer/3d/renderer-3d';
+import { STREAM_HITCH, STREAM_HITCH_LIMITS, streamHitchStats, resetStreamHitchStats, type StreamHitchOptions } from '../renderer/3d/stream-hitch';
+import { shadowQualitySpec, shadowQualityShown, type ShadowQualityPreset } from '../renderer/3d/shadow-quality';
+import type { FogHorizonSettings } from '../renderer/3d/fog-horizon';
 import { Material3D, applyMaterialPatch, type SceneWind3D, type SkinRampSettings } from '../renderer/3d/material-3d';
 import type { ScriptBehavior } from './scripting/script-types';
+import { exportCharacterPreset, applyCharacterPreset, CHARACTER_PRESET_VERSION, type CharacterPresetHost } from './managers/character-preset';
 import type { ScriptSnippet } from './scripting/script-context-dts';
 import { MeshGeometry } from '../renderer/3d/mesh-generators';
 import { booleanMesh, type Tri, type BooleanOp } from '../scene-graph/shapes/mesh-boolean';
@@ -108,7 +119,11 @@ import { RasterManager } from './managers/raster-manager';
 import { TextManager } from './managers/text-manager';
 import { AnimationManager } from './managers/animation-manager';
 import { Scene3DManager } from './managers/scene3d-manager';
+import { StructureVersion } from './structure-version';
 import { WorldManager } from './managers/world-manager';
+import { WorldCrowd } from './managers/world-crowd';
+import type { SceneBudget3D, SceneBudgetLimits3D } from './managers/scene3d-manager';
+import { groupBoundsStats } from './managers/group-bounds';
 import { BuildingManager } from './managers/building-manager';
 import { BlockManager } from './managers/block-manager';
 import type { BuildingParams, BuildingMeta } from '../world/building';
@@ -130,8 +145,15 @@ import { creator3DTypes, creator3DSchema, creator3DDefaults, type CreatorParamSc
 import { decalQuadGeometry, decalPlacement, type DecalSource, type DecalHit, type V3 } from './managers/decal-geometry';
 import { resolveDecalBitmap } from './managers/decal-source';
 import { GarpManager, GARP_BLANK_LAYER } from './managers/garp-manager';
+import { SignageController, type AddSignageOptions, type SignageImageInfo, type SignageBucketInfo, type SignageAddItem } from './managers/signage-controller';
+import { GarpAtlasBuilder } from './managers/garp-atlas-builder';
+import { composeAtlasSheet, atlasComposeSupported } from './workers/atlas-lane';
+import { garpGridSheetOps, paintSheetOps, vendingLabelSheetOps, type SheetPlan } from './workers/atlas-sheet-ops';
+import type { AdvertBucket, ShopImageBucket } from '../world/adverts';
+import { mergeObjectStyle, isEmptyStyle, type ObjectStyle, type ObjectStylePatch } from './managers/object-style';
 import { pickSkin, type GarpPool } from '../world/garp';
-import { VENDING_BRANDS, vendingGarpPool, vendingSkinKey, vendingShellGeometry, vendingProductsGeometry, VENDING_BODY_UV_REGIONS } from '../world/vending';
+import { VENDING_BRANDS, vendingGarpPool, vendingSkinKey, vendingShellGeometry, vendingProductsGeometry, VENDING_BODY_UV_REGIONS,
+    VENDING_LABEL_CELLS, VENDING_LABEL_PAD, vendingLabelCell } from '../world/vending';
 import { crateGarpPool, crateSkinKey, CRATE_SKIN_NAMES } from '../world/crate';
 import { binGarpPool, binSkinKey } from '../world/trash-bin';
 import { ventGarpPool, ventSkinKey } from '../world/vent';
@@ -140,12 +162,19 @@ import { stallGarpPool, stallSkinKey } from '../world/stall';
 import { posterGarpPool, posterSkinKey } from '../world/poster';
 import { warningGarpPool, warningSkinKey } from '../world/road-sign';
 import { cityMetresPerUnit as worldMetresPerUnit } from '../world/types';
+import { dropRuntimeNodesFromSceneJSON } from './managers/play-auto-player';
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 import type { FoliageParams, FoliageMeta } from '../world/foliage';
 import type { FaceBlinkConfig, LegIdleMode } from './managers/scene3d-manager';
 import type { EyeParams } from './managers/eye-generator';
+import {
+    defaultFaceFeatureParams, FACE_EXPRESSION_NAMES, BROW_STYLES, NOSE_STYLES,
+    type FaceFeatureParams, type FaceExpressionName, type ExpressionWeights, type BrowStyle, type NoseStyle,
+} from './managers/face-features';
 import type { HairParams } from './managers/hair-generator';
+import { hairStyleList, hairStylePreset } from './managers/hair-generator';
 import type { ClothingParams } from './managers/clothing-generator';
+import { randomCharacterParams } from './managers/character-randomizer';
 import type { AttachmentType, AttachmentParams, AttachmentPlacement } from './managers/attachment-generator';
 import type { SnapVizData } from './managers/transform-controller-3d';
 import type { Submesh3D } from '../scene-graph/shapes/mesh-3d';
@@ -166,11 +195,18 @@ import { DecalManager } from './managers/decal-manager';
 import { ShellUIManager } from './managers/shell-ui-manager';
 import { UIManager } from './managers/ui-manager';
 import { UIFormOverlay } from '../ui/ui-form-overlay';
+import { UI_KIT_PRESETS } from '../ui/kit/kit-presets';
+import { KIT_SCHEMA, KIT_KIND_LABELS, KIT_COLOR_TOKENS, KIT_ANCHORS, KIT_INTROS } from '../ui/kit/kit-schema';
+import { UI_KIT_TRANSITIONS, UI_KIT_CLIPS, type UIKitWidget, type UIKitKind, type UIKitClip, type UIKitTransitionType, type UIKitPropSpec } from '../ui/kit/kit-types';
 import { UISoundPlayer } from '../ui/ui-sound';
 import type { UIStateMachine, UILayerData, UIEvent, UIValue, ShapeInteractionProps, TransitionAnimation, HtmlFormElement } from '../ui/ui-types';
 import { MeshEditPointerController, type MeshEditSelectionMode } from './managers/mesh-edit-pointer-controller';
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
+import type { ResolutionScaleSettings, ResolutionScaleState } from '../renderer/core/resolution-scaler';
+import type { TemporalAASettings, TemporalAAState } from '../renderer/3d/temporal-aa';
+import type { CityLodStats } from './managers/world-lod-settings';
+import type { SimLodSettings, SimLodStats } from '../world/sim-lod';
 import { EphemeraService } from './ephemera/ephemera-service';
 import { EphemeraOverlay } from './ephemera/ephemera-overlay';
 import { GROUND_SURFACES, resolveGroundRecipe, type GroundSurfaceName, type GroundSurfaceSpec } from '../world/ground-surfaces';
@@ -188,6 +224,20 @@ const CREATOR_STAGE_BG: import('../types/armature-3d').ArmatureBgOptions = {
     color1: [0.945, 0.950, 0.965, 1],
     color2: [0.775, 0.795, 0.835, 1],
 };
+
+/** Engine-roadmap step 3 A/B switches (see ShapeManager.setStep3Options3D). */
+export interface Step3Options3D {
+    incrementalTileBounds: boolean; cachedGroupBounds: boolean; collisionCells: boolean; runBoxes: boolean;
+    slicedUploads: boolean; crowdCellsInWorker: boolean; crowdPrefetchLead: boolean; overlaysFogCulled: boolean;
+    backdropFollowsWindow: boolean; refreshReattached: boolean; orthoViewCentre: boolean; pruneGroupBoxCache: boolean;
+    /** Step 3b (performance-plan §P13 "Step 3b"). */
+    incrementalCollisionGrid: boolean; slicedReassembly: boolean; packInstances: boolean; scopedBackdropLod: boolean;
+}
+/** Step 2 A/B switches (see ShapeManager.setFrameScanOptions3D). */
+export interface FrameScanOptions3D {
+    splitRenderList: boolean; incrementalRenderList: boolean; incrementalDrawOrder: boolean; prewarmNewOnly: boolean;
+    cachedSkeletonSync: boolean; cachedRenderStats: boolean; iterativeSceneWalk: boolean; coalesceStructureBumps: boolean;
+}
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
@@ -292,6 +342,51 @@ class ShapeManager {
      *  illustration open (including the first) then hits already-hot pipelines. Idempotent. See
      *  docs/specs/pipeline-warmup.md. */
     public bootAndWarm(): void { this.webgpuRenderer?.warmPipelinesNow(); }
+
+    // ── P2.3 shader-compile status (docs/ui/performance.md) ──
+    /** Shader/pipeline compile status for a "Preparing shaders… n/m" toast: `pending` queued or compiling, `total`
+     *  requested so far, `compiled`, `failed`, `waitingDraws` (pending ones a frame already skipped — content is
+     *  visibly missing while > 0), `ready` (= pending 0). Before the GPU device exists: all zero, ready. */
+    public getPipelineWarmup3D(): PipelineWarmupStatus {
+        const dev = this._deviceOrNull();
+        const c = dev ? GPUPipelineCache.peek(dev) : null;
+        return c ? c.status() : { pending: 0, total: 0, compiled: 0, failed: 0, waitingDraws: 0, ready: true };
+    }
+    // ── P3.1 worker-job progress (docs/ui/performance.md §Worker jobs) — for a host loading overlay ──
+    /** Live background-work snapshot: `{ queued, running, done, total, active, jobs: [{ id, kind, label, priority, p,
+     *  running }] }`. `done/total` count since the service last went idle (a loading fraction); `label` is a short
+     *  human string ('Building city', 'Updating city', 'City tile', 'Generating character', 'Packing images', 'Saving'). */
+    public getWorkerJobProgress3D(): WorkerJobProgress { return getWorkerJobService().progress(); }
+    /** Subscribe to worker-job progress (coalesced, ≤ 1 call per microtask; fires on enqueue / start / progress /
+     *  finish, then once with `active: false` when everything settles). Returns an unsubscribe function. */
+    public onWorkerJobProgress3D(listener: (p: WorkerJobProgress) => void): () => void { return getWorkerJobService().onProgress(listener); }
+    /** Diagnostics: live workers per lane, the hardware cap, totals and per-kind timings (runs / worker / fallback / ms). */
+    public getWorkerJobStats3D(): WorkerJobStats { return getWorkerJobService().stats(); }
+
+    /** Subscribe to compile-status changes (coalesced, at most one call per microtask). Safe to call before the
+     *  device is ready — it attaches once it is. Returns an unsubscribe function. */
+    public onPipelineWarmup3D(listener: (s: PipelineWarmupStatus) => void): () => void {
+        let off: (() => void) | null = null, dead = false;
+        const attach = () => {
+            const dev = this._deviceOrNull();
+            if (dead || !dev) return;
+            const c = GPUPipelineCache.for(dev);
+            off = c.onStatus(listener);
+            listener(c.status());
+        };
+        if (this._deviceOrNull()) attach();
+        else void this.webgpuRenderer?.whenReady().then(attach);
+        return () => { dead = true; off?.(); };
+    }
+    /** Resolves when no pipeline is queued or compiling (e.g. before a scripted capture). */
+    public async whenPipelinesReady3D(): Promise<void> {
+        await this.webgpuRenderer?.whenReady();
+        const dev = this._deviceOrNull();
+        if (dev) await GPUPipelineCache.for(dev).whenIdle();
+    }
+    private _deviceOrNull(): GPUDevice | null {
+        try { return (this.webgpuRenderer?.getDevice() as GPUDevice | undefined) ?? null; } catch { return null; }
+    }
 
     // --- rAF glue to the renderer ---
     public scheduleRender() { this.webgpuRenderer?.scheduleRender(); }
@@ -430,7 +525,8 @@ class ShapeManager {
             beginInteractive: () => this.beginInteractive(),
             endInteractive: () => this.endInteractive(),
             emitSceneGraphChanged: () => this.emitSceneGraphChanged(),
-            sceneStructureVersion: () => this._sceneStructureVersion,
+            sceneStructureVersion: () => this.getSceneStructureVersion(),
+            bumpSceneStructure: () => { this._bumpStructure(); this.scheduleRender(); },
             setSelectedNode: (nodeId: string) => this.setSelectedNode(nodeId),
         };
 
@@ -469,6 +565,15 @@ class ShapeManager {
         // cityMetresPerUnit, and the shared _resolveDecalBitmap bridge.
         this._decalMgr = new DecalManager(ctx, { scene3d: this.scene3d, ephemera: this._ephemera, uvPaintTextures: this._uvPaintTextures });
         this.world = new WorldManager(this.scene3d);
+        this.scene3d.playWetness = () => this.world.playWetness;   // Play landing dust: splashes on a wet street (2026-10-04)
+        // P5.W4: a city build starting = the built-in GARP placeholder skins are needed in a few seconds (its reassembly
+        // instantiates vending / clutter) → pre-encode their PNGs OFF-THREAD meanwhile (no-op once done / registered).
+        this.world.onCityBuildStateChange.subscribe(({ building }) => { if (building) this._prewarmGarpPlaceholders(); });
+        // ADVERTS (docs/ui/garp.md §Adverts): every city build pulls the signage catalog from the GARP library.
+        this.world.setAdvertsProvider(() => this._garp.signage.catalog());
+        // Play is scale-correct in a city (Round 4): the controller's metre defaults (height, speeds, jump, camera
+        // follow) and the auto default player's size convert with the city's metres-per-unit. null = no city = 1.
+        this.scene3d.setPlayMetresPerUnitProvider(() => (this.world.getCityContainerId() ? this.cityMetresPerUnit() : null));
         // GARP (docs/specs/city-props-garp.md §2): scene instantiation resolves an instanced layer's per-copy skin
         // NAME → dedicated-GARP-atlas layer through this. It lazily registers the vending pool on first use (sync →
         // layers are assigned in the SAME call the city instantiates in, so fascias get correct textureIndex even
@@ -509,10 +614,14 @@ class ShapeManager {
         this._creators.set('vent', this.vents);
         this._creators.set('a-board', this.aBoards);
         this._creators.set('stall', this.stalls);
+        // New creator objects + blocks START with the Environment style (each then keeps its own, persisted).
+        const envDefault = () => this.scene3d.environmentStyle;
+        for (const m of this._creators.values()) m.defaultStyle = envDefault;
+        this.blocks.defaultStyle = envDefault;
         // DEV harness for the generic creator system + focus stage (try it before Frogmarks wires the panel):
         //   salsaCreator.types()                 → registered typeIds
         //   salsaCreator.add('vending')          → create + enter the focus stage, returns the id
-        //   salsaCreator.set(id, { productCols: 3 })   → live-edit
+        //   salsaCreator.set(id, { cansPerShelf: 6 })  → live-edit
         //   salsaCreator.stage(id) / .exit()     → enter / leave the focus stage
         //   salsaCreator.schema('vending')       → the panel schema
         if (typeof window !== 'undefined') {
@@ -581,12 +690,48 @@ class ShapeManager {
                 rebuild: (w = 512, h = 512) => this.rebuildGarpAtlas3D([w, h]),
                 // Add a user vending fascia variant from an image data URL, then REGENERATE the city to see it
                 // (selection is position-hashed over the runtime pool). e.g. salsaGarp.addVendingSkin('coke', myDataUrl)
+                // (body only — the backdrop + can labels fall back to the pool defaults; add cans with packCans/pickCans)
                 addVendingSkin: (name: string, dataUrl: string) =>
-                    this.addGarpSkin3D('salsa/vending', name, { body: { kind: 'image', dataUrl }, products: { kind: 'image', dataUrl } }),
+                    this.addGarpSkin3D('salsa/vending', name, { body: { kind: 'image', dataUrl } }),
+                // Can designs → a skin's `labels` sheet (1–8 image data URLs), then regenerate the city.
+                packCans: (skin: string, dataUrls: string[]) => this.packVendingCanLabels3D(skin, dataUrls),
+                // Same, from a FILE PICKER (multi-select PNGs): salsaGarp.pickCans('red') → then regenerate the city.
+                pickCans: (skin: string) => new Promise<string[]>((resolve) => {
+                    const input = document.createElement('input');
+                    input.type = 'file'; input.accept = 'image/*'; input.multiple = true;
+                    input.onchange = async () => {
+                        const files = [...(input.files ?? [])];
+                        const urls = await Promise.all(files.map((f) => new Promise<string>((res) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.readAsDataURL(f); })));
+                        resolve(await this.packVendingCanLabels3D(skin, urls));
+                    };
+                    input.click();
+                }),
+                labelTemplate: () => this.vendingLabelTemplate3D(),   // a PNG data URL of the sheet layout
                 // Save a paint-preview mesh (from paintBody) as a new variant, using its tagged pool/slot. Regenerate
                 // the city to see it. (Bridge 2 — the same call the UV Paint "Save as skin variant" button makes.)
                 saveVendingSkin: (meshId: string, name: string) => this.saveMeshAsGarpSkin3D(meshId, name),
                 removeVendingSkin: (name: string) => this.removeGarpSkin3D('salsa/vending', name),   // then regenerate the city
+                // ADVERTS: salsaGarp.demoAdverts() adds generated test images to every bucket; pickAdverts('auto')
+                // opens a file dialog; adverts() lists; clearAdverts() resets. The city rebuilds by itself.
+                demoAdverts: async () => (await this.addSignageImages3D(SignageController.demoImages().map((d) => ({ bucket: d.bucket, source: d.dataUrl, opts: { lit: d.lit } })))).map((r) => r.id),   // ONE pack/atlas/city rebuild
+                pickAdverts: (bucket: AdvertBucket | 'auto' = 'auto') => new Promise<(string | null)[]>((resolve) => {
+                    const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*'; inp.multiple = true;
+                    inp.onchange = async () => {
+                        const items: SignageAddItem[] = [];
+                        for (const f of Array.from(inp.files ?? [])) {
+                            const url = await new Promise<string>((res) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.readAsDataURL(f); });
+                            items.push({ bucket, source: url, opts: { name: f.name } });
+                        }
+                        resolve((await this.addSignageImages3D(items)).map((r) => r.id));   // batched: one rebuild
+                    };
+                    inp.click();
+                }),
+                adverts: () => this.listSignageImages3D().map(({ dataUrl: _d, ...r }) => r),
+                clearAdverts: () => this.clearSignage3D(),
+                // SHOP WINDOWS (C4): generated shop-interior + poster test images; shopImages() lists; clearShopImages() resets.
+                demoShopImages: async () => (await this.addSignageImages3D(SignageController.demoShopImages().map((d) => ({ bucket: d.bucket, source: d.dataUrl, opts: { lit: d.lit } })))).map((r) => r.id),
+                shopImages: () => this.listShopImages3D().map(({ dataUrl: _d, ...r }) => r),
+                clearShopImages: () => this.clearShopImages3D(),
                 // Bridge 1 — paint the body skin on the ACTUAL machine shell (its unwrap). Returns the mesh id; paint
                 // it (3D + UV pane), then salsaGarp.saveVendingSkin(id, 'name'), or salsaGarp.cancelPaint().
                 paintBody: () => this.paintVendingBody3D(),
@@ -605,6 +750,7 @@ class ShapeManager {
         });
         this.webgpuRenderer.setUIKeyHandler((key, shift) => this.ui.handleKey(key, shift));
         this.webgpuRenderer.setUIScrimProvider(() => this.ui.getActiveOverlay());
+        this.ui.attachKitOverlay(this.webgpuRenderer);   // UI kit: screen-space HUD/menu widgets, post-process immune
         // World-control effects (Phase 3): freezeWorld/setWorldSpeed scale the 3D world clock + all animation
         // players; setCamera moves the 3D camera. 2D keyframe playback is host-driven — hosts observing the
         // effectHook can pause their own timelines.
@@ -661,9 +807,18 @@ class ShapeManager {
         // Publish player movement as UI-machine variables each Play tick (§4.3). Change-gated (the runtime
         // already ignores unchanged/undeclared, but rounding speed avoids re-firing float-threshold transitions
         // every frame). A creator declares `player.speed` etc. and conditions transitions on them.
+        // The change-gate cache is per (run, layer): a value cached in run 1 / on another layer was never re-published,
+        // so a transition conditioned on e.g. player.grounded=true never fired in run 2 (bug-hunt 2026-10-01).
+        const resetPlayerParams = () => { this._lastPlayerParams = { speed: -1, moving: false, grounded: false, airborne: false, rising: false }; this._lastPlayerParamsLayer = null; };
+        this.scene3d.onPlayStateChanged.subscribe(resetPlayerParams);
         this.scene3d.setPlayerParamHandler((loco) => {
             const active = this.ui.activeUILayerId;
             if (!active) return;
+            if (active !== this._lastPlayerParamsLayer) {
+                resetPlayerParams(); this._lastPlayerParamsLayer = active;
+                // first tick on this layer: publish the booleans too (the false defaults above would gate them out)
+                for (const k of ['moving', 'grounded', 'airborne', 'rising'] as const) { this.ui.setUIVariable(active, `player.${k}`, loco[k]); this._lastPlayerParams[k] = loco[k]; }
+            }
             const speed = Math.round(loco.planarSpeed * 10) / 10;
             if (speed !== this._lastPlayerParams.speed) { this.ui.setUIVariable(active, 'player.speed', speed); this._lastPlayerParams.speed = speed; }
             const set = (k: 'moving' | 'grounded' | 'airborne' | 'rising') => {
@@ -715,6 +870,7 @@ class ShapeManager {
         // Packaging box-panel composite machinery (extracted). Needs the live-texture links (panels sample the
         // composite) + ephemera (vector-proxy render reads placements); both are constructed above / field-init.
         this._pkgComposite = new PackagingComposite(ctx, { liveTexture: this._liveTexture, ephemera: this._ephemera });
+        this._initDeviceRecovery();   // GPU device-lost recovery (docs/ui/device-recovery.md)
         this._meshEditPointerController = new MeshEditPointerController(
             this.scene3d,
             this.meshEdit,
@@ -793,6 +949,9 @@ class ShapeManager {
             getDitherConfig: () => this.getDitherConfig(),
             setDitherConfig: (c) => this.setDitherConfig(c),
             getRasterLayers: () => this.getRasterLayers(),
+            isBusy: () => this.scene3d.isPlayModeActive() || this.ui.interactive || this._uiPlayerMode || !!this.webgpuRenderer?.isDeviceLost,   // same gate as _createPersistence
+            busyEpoch: () => this._persistBusyEpoch(),
+            onSaveDeferred: () => this._notifyPersistDeferred('save'),
         });
     }
 
@@ -1092,7 +1251,7 @@ class ShapeManager {
     public enableRasterSelection(tool: 'rect' | 'ellipse' | 'lasso' | 'magic-wand' = 'rect') {
         // Commit any in-progress transform before switching
         const info = this.rasterSelectionService?.getSelectionInfo();
-        if (info?.isTransforming) this.rasterSelectionService?.commitTransform();
+        if (info?.isTransforming) void this.rasterSelectionService?.commitTransform();
         this.rasterDrawingService?.disable();
         this.rasterMoveService?.disable();
         this.rasterSelectionService?.setTool(tool);
@@ -1103,14 +1262,14 @@ class ShapeManager {
     /** Disable selection tool mode. */
     public disableRasterSelection() {
         const info = this.rasterSelectionService?.getSelectionInfo();
-        if (info?.isTransforming) this.rasterSelectionService?.commitTransform();
+        if (info?.isTransforming) void this.rasterSelectionService?.commitTransform();
         this.rasterSelectionService?.disable();
     }
 
     /** Enable the raster move/grab tool (translates the active layer's pixels). */
     public enableRasterMove() {
         const info = this.rasterSelectionService?.getSelectionInfo();
-        if (info?.isTransforming) this.rasterSelectionService?.commitTransform();
+        if (info?.isTransforming) void this.rasterSelectionService?.commitTransform();
         this.rasterDrawingService?.disable();
         this.rasterSelectionService?.disable();
         this.rasterMoveService?.enable();
@@ -1595,37 +1754,37 @@ class ShapeManager {
 
     /** Create a rectangular selection. Coordinates are in texel space. */
     public rasterSelectRect(x: number, y: number, w: number, h: number, feather: number = 0): void {
-        this.getSelectionEngine()?.selectRect({ x, y, w, h }, feather);
+        void this.getSelectionEngine()?.selectRect({ x, y, w, h }, feather);
     }
 
     /** Create an elliptical selection inside the given bounding rect. */
     public rasterSelectEllipse(x: number, y: number, w: number, h: number, feather: number = 0): void {
-        this.getSelectionEngine()?.selectEllipse({ x, y, w, h }, feather);
+        void this.getSelectionEngine()?.selectEllipse({ x, y, w, h }, feather);
     }
 
     /** Create a lasso (freeform polygon) selection. Points are [{x,y},...] in texel coords. */
     public rasterSelectLasso(points: Array<{ x: number; y: number }>): void {
-        this.getSelectionEngine()?.selectLasso(points);
+        void this.getSelectionEngine()?.selectLasso(points);
     }
 
     /** Select the entire canvas. */
     public rasterSelectAll(): void {
-        this.getSelectionEngine()?.selectAll();
+        void this.getSelectionEngine()?.selectAll();
     }
 
     /** Deselect all (clear selection). */
     public rasterDeselectAll(): void {
-        this.getSelectionEngine()?.deselectAll();
+        void this.getSelectionEngine()?.deselectAll();
     }
 
     /** Invert the selection. */
     public rasterInvertSelection(): void {
-        this.getSelectionEngine()?.invertSelection();
+        void this.getSelectionEngine()?.invertSelection();
     }
 
     /** Delete selected pixels (set to transparent). */
     public rasterDeleteSelection(): void {
-        this.getSelectionEngine()?.deleteSelection();
+        void this.getSelectionEngine()?.deleteSelection();
     }
 
     /** Cut selected pixels (copy + delete). */
@@ -1645,7 +1804,7 @@ class ShapeManager {
 
     /** Begin transforming the selected pixels (lift into floating layer). */
     public rasterBeginTransform(): void {
-        this.getSelectionEngine()?.beginTransform();
+        void this.getSelectionEngine()?.beginTransform();
     }
 
     /** Update the in-progress transform (call during drag). */
@@ -1655,7 +1814,7 @@ class ShapeManager {
 
     /** Commit the transform (stamp floating pixels at new position). */
     public rasterCommitTransform(): void {
-        this.getSelectionEngine()?.commitTransform();
+        void this.getSelectionEngine()?.commitTransform();
     }
 
     /** Cancel the transform (put pixels back where they were). */
@@ -2664,14 +2823,25 @@ class ShapeManager {
         this.scheduleRender();
     }
 
-    private _sceneStructureVersion = 0;
-    /** Monotonic structural-change counter (see ManagerContext.sceneStructureVersion). */
-    getSceneStructureVersion(): number { return this._sceneStructureVersion; }
+    /** Structural-change counter (see ManagerContext.sceneStructureVersion). Step 2 (services/structure-version.ts):
+     *  bumps are COALESCED — any number of structure notifications between two reads advance it once, at the read —
+     *  so the version-keyed caches (getAllMeshes, the array sync list, collision, sim-LOD bodies…) re-walk at most
+     *  once per batch of changes. A reader always sees a new value after any change since its previous read. */
+    private readonly _structureVersion = new StructureVersion();
+    /** Step 2 A/B: coalesce structure bumps between reads (default on). Off = every notification increments. */
+    static get coalesceStructureBumps(): boolean { return ShapeManager._coalesce; }
+    static set coalesceStructureBumps(v: boolean) { ShapeManager._coalesce = v; }
+    private static _coalesce = true;
+    getSceneStructureVersion(): number { return this._structureVersion.read(); }
+    private _bumpStructure(): void {
+        this._structureVersion.coalesce = ShapeManager._coalesce;
+        this._structureVersion.bump();
+    }
 
     public emitSceneGraphChanged() {
         // Bump BEFORE any early return so batched / mid-restore structural changes still invalidate
         // any cached mesh lists. Over-invalidation is harmless; a missed bump would risk a stale cache.
-        this._sceneStructureVersion++;
+        this._bumpStructure();
         if (this._isRestoring) {
             // During document restore, only schedule a render — don't fire the
             // scene-graph-changed event yet.  A single event is emitted at the
@@ -3115,17 +3285,103 @@ class ShapeManager {
     // ── Play mode (scene target — the ▶ button) ──────────────────────────────────────────────────────────────
     /** Enter Play mode: a first-person character controller drives the camera via a fixed-timestep game loop.
      *  Non-destructive (camera-only; restored on exit). Feed input with setPlayInput3D. */
-    public enterPlayMode3D(opts?: { start?: [number, number, number]; config?: Partial<import('../game/character-controller').CharacterConfig>; keyboard?: boolean; mouseLook?: boolean; collision?: boolean; playerMeshId?: string }): void { this.scene3d.enterPlayMode3D(opts); }
+    public enterPlayMode3D(opts?: { start?: [number, number, number]; config?: Partial<import('../game/character-controller').CharacterConfig>; keyboard?: boolean; mouseLook?: boolean; gamepad?: boolean; collision?: boolean; playerMeshId?: string }): void { this.scene3d.enterPlayMode3D(opts); }
     /** Exit Play mode → restore the pre-play camera + edit view. */
     public exitPlayMode3D(): void { this.scene3d.exitPlayMode3D(); }
     public get isPlaying3D(): boolean { return this.scene3d.isPlaying3D; }
-    /** Feed per-frame intent while playing: { forward, right, look } ∈ [-1,1], { jump } edge-triggered, { lookYaw,
-     *  lookPitch } direct mouse-look radian deltas. */
+    /** Feed per-frame intent while playing: { forward, right, look } ∈ [-1,1], { jump } = the jump BUTTON held (Round 8:
+     *  the press edge jumps, releasing early shortens it; keep it true while held), { lookYaw, lookPitch } direct
+     *  mouse-look radian deltas. */
     public setPlayInput3D(input: Partial<import('../game/character-controller').CharacterInput>): void { this.scene3d.setPlayInput3D(input); }
     /** Assign the mesh Play drives as the "Player" avatar (null to clear). Third-person follows it; first-person
      *  hides it. Follow distance/height come from the CharacterConfig (thirdPersonDistance/thirdPersonHeight). */
     public setPlayerObject3D(meshId: string | null): void { this.scene3d.setPlayerObject3D(meshId); }
     public get playerObjectId3D(): string | null { return this.scene3d.playerObjectId3D; }
+    // Play settings (polish-round-3 T5; docs/ui/play-mode.md §Play settings). Persisted with the document; live while playing.
+    /** First-person PLAYER HEIGHT (camera eye height above the feet). World units, or METRES when `metresPerUnit` is
+     *  given (pass `cityMetresPerUnit()` in a city doc). null = automatic (1.6 m in world units / 0.9 × the Player avatar). */
+    public setPlayerEyeHeight3D(height: number | null, metresPerUnit?: number): void { this.scene3d.playSettings.setEyeHeight(height, metresPerUnit); }
+    /** The set eye height (units, or metres with `metresPerUnit`), or null = automatic. */
+    public getPlayerEyeHeight3D(metresPerUnit?: number): number | null { return this.scene3d.playSettings.getEyeHeight(metresPerUnit); }
+    /** The eye height used when none is set (world units) — a slider's initial value. */
+    public getDefaultPlayerEyeHeight3D(): number { return this.scene3d.getDefaultPlayerEyeHeight3D(); }
+    /** Third-person Play with no Player set spawns a runtime default animated character (never saved). Default on. */
+    public setAutoDefaultPlayer3D(on: boolean): void { this.scene3d.playSettings.setAutoDefaultPlayer(on); }
+    public getAutoDefaultPlayer3D(): boolean { return this.scene3d.playSettings.autoDefaultPlayer; }
+    /** Player RUN SPEED in metres / second (Round 8: Shift toggles into it; Play starts walking). The full-input speed
+     *  of the run gait; an analog stick scales it. Scene-scale independent (converted with the city's metres-per-unit in
+     *  a city). null = default (5.2 m/s). Persisted as globalScene.play.moveSpeed only when non-default (an older save's
+     *  value keeps meaning "full-input run speed"); live while playing. */
+    public setPlayerMoveSpeed3D(metresPerSecond: number | null): void { this.scene3d.playSettings.setMoveSpeed(metresPerSecond); }
+    /** The effective player run speed in m/s (the default 5.2 when unset). */
+    public getPlayerMoveSpeed3D(): number { return this.scene3d.playSettings.getMoveSpeed(); }
+    /** Player WALK SPEED in m/s (Round 8) — the default gait's full-input speed. null = default (1.6 m/s). Never above
+     *  the run speed. Persisted as globalScene.play.walkSpeed only when non-default; live while playing. */
+    public setPlayerWalkSpeed3D(metresPerSecond: number | null): void { this.scene3d.playSettings.setWalkSpeed(metresPerSecond); }
+    /** The effective walk speed in m/s. */
+    public getPlayerWalkSpeed3D(): number { return this.scene3d.playSettings.getWalkSpeed(); }
+    /** Third-person follow DISTANCE in metres (R6.2). null = automatic (2.6 x the avatar height, else 4.5 m). Converted
+     *  with the city's metres-per-unit in a city. Persisted as globalScene.play.cameraDistance; live while playing. */
+    public setPlayCameraDistance3D(metres: number | null): void { this.scene3d.playSettings.setCameraDistance(metres); }
+    /** The set third-person follow distance in metres, or null = automatic. */
+    public getPlayCameraDistance3D(): number | null { return this.scene3d.playSettings.getCameraDistance(); }
+    /** Third-person vertical FIELD OF VIEW in degrees (R6.2; default 72, clamped 30-110). null = default. Persisted as
+     *  globalScene.play.fovDeg; live while playing. First-person keeps the editor camera's FOV. */
+    public setPlayCameraFov3D(deg: number | null): void { this.scene3d.playSettings.setFov(deg); }
+    public getPlayCameraFov3D(): number { return this.scene3d.playSettings.getFov(); }
+    /** JUMP VARIETY (2026-10-03, default on): each jump picks one of the runtime default jump variants (tuck / reach /
+     *  swing / stride / hop / the classic; weighted by standing / walking / running and tap / hold, never the same twice
+     *  running). An authored Jump clip is never replaced. Persisted as globalScene.play.jumpVariety (only when off). */
+    public setPlayJumpVariety3D(on: boolean): void { this.scene3d.playSettings.setJumpVariety(on); }
+    public getPlayJumpVariety3D(): boolean { return this.scene3d.playSettings.jumpVariety; }
+    /** MOTION LOOSENESS 0..1 (2026-10-03, default 0.5): the secondary motion over the runtime default gaits (upper-body
+     *  follow-through on starts / stops, per-cycle arm variation, head drift); 0 = the clips exactly. null = default.
+     *  Persisted as globalScene.play.motionLooseness; live while playing. */
+    public setPlayMotionLooseness3D(v: number | null): void { this.scene3d.playSettings.setMotionLooseness(v); }
+    public getPlayMotionLooseness3D(): number { return this.scene3d.playSettings.getMotionLooseness(); }
+    /** WALK STYLE (2026-10-03, default 'natural'): 'natural' = the runtime default Walk (heel-to-toe roll, the pelvis
+     *  highest at mid-stance); 'stomp' = the runtime Stomp clip (a heavy, flat-footed tread — e.g. wading through swamp
+     *  water). Swaps only the engine's runtime Walk, never an authored one; live while playing. Persisted as
+     *  globalScene.play.walkStyle (only when 'stomp'). Per-avatar alternative: setPlayerLocomotionSet3D({ walk: 'Stomp' }). */
+    public setPlayWalkStyle3D(style: 'natural' | 'stomp'): void { this.scene3d.playSettings.setWalkStyle(style); }
+    public getPlayWalkStyle3D(): 'natural' | 'stomp' { return this.scene3d.playSettings.walkStyle; }
+    /** LANDING DUST (2026-10-04, default on): stylised dust puffs on jump landings (sized by Land / Land Deep / Land
+     *  Soft), tiny puffs at each foot strike while running on dry ground, splashes on a wet street (city rain / wet
+     *  sheen); coloured by the ground, lit + fogged by the scene, scaled to the avatar. Live while playing. Persisted as
+     *  globalScene.play.landingDust (only when off). */
+    public setPlayLandingDust3D(on: boolean): void { this.scene3d.playSettings.setLandingDust(on); }
+    public getPlayLandingDust3D(): boolean { return this.scene3d.playSettings.landingDust; }
+    /** IDLE VARIETY (2026-10-04, default on): standing still, the runtime Stand idle now and then plays a random one-shot
+     *  variant (look around, stretch, check the wrist, foot tap, adjust glasses with a glasses charm) — seeded, never the
+     *  same twice running, cancelled at once by any input. Never over an authored Idle clip. Live while playing.
+     *  Persisted as globalScene.play.idleVariety (only when off). */
+    public setPlayIdleVariety3D(on: boolean): void { this.scene3d.playSettings.setIdleVariety(on); }
+    public getPlayIdleVariety3D(): boolean { return this.scene3d.playSettings.idleVariety; }
+    /** Diagnostics: the Play dust (bursts emitted by kind since Play started, live particles) and the idle variants
+     *  played this session (null outside an engine-driven Play avatar). */
+    public getPlayPolishStats3D(): { dust: Record<string, number>; dustLive: number; idleVariants: string[]; idleVariant: string | null } {
+        return this.scene3d.getPlayPolishStats3D();
+    }
+    /** Walk / run state (true = running). Round 8: Play starts WALKING; Shift (a press) or L3 / Y on a gamepad toggles it. */
+    public getPlayerRunning3D(): boolean { return this.scene3d.getPlayerRunning3D(); }
+    /** Force walk (false) / run (true); live while playing and carried to the next Play run. */
+    public setPlayerRunning3D(running: boolean): void { this.scene3d.setPlayerRunning3D(running); }
+    /** Fires with the new state whenever walk/run changes (for a HUD badge). */
+    public get onPlayerRunChanged3D(): import('../renderer/util/event-emitter').EventEmitter<boolean> { return this.scene3d.onPlayerRunChanged; }
+    /** Sneak state while playing (Round 8: Ctrl held, or C / gamepad B toggled). False when not playing. */
+    public getPlayerSneaking3D(): boolean { return this.scene3d.getPlayerSneaking3D(); }
+    /** Toggle-style sneak from the host (e.g. an on-screen button); resets every Play run. No-op when not playing. */
+    public setPlayerSneaking3D(on: boolean): void { this.scene3d.setPlayerSneaking3D(on); }
+    /** Fires with the new sneak state (for a HUD badge). */
+    public get onPlayerSneakChanged3D(): import('../renderer/util/event-emitter').EventEmitter<boolean> { return this.scene3d.onPlayerSneakChanged; }
+    /** The active gait while playing: 'walk' | 'run' | 'sneak' (null when not playing). */
+    public getPlayerGait3D(): 'walk' | 'run' | 'sneak' | null { return this.scene3d.getPlayerGait3D(); }
+    /** Live camera numbers while playing (mode, current + target distance, FOV, yaw, pitch, body facing), else null. */
+    public getPlayCameraState3D() { return this.scene3d.getPlayCameraState3D(); }
+    /** The engine locomotion animator's live state (idle/move/jump/fall, weights, walk-run mix), else null. */
+    public getPlayerAnimationState3D() { return this.scene3d.getPlayerAnimationState3D(); }
+    /** The auto default player's mesh id while it is in the scene (third-person Play), else null. */
+    public get autoPlayerId3D(): string | null { return this.scene3d.autoPlayer.meshId; }
     /** Wire the avatar's walk/idle/run/jump/fall clips + a handler the Play loop calls with a clip name on each
      *  locomotion transition (the host plays it on the avatar). Pass (null, null) to disable. See game/locomotion.ts. */
     public setPlayerAnimation3D(clips: import('../game/locomotion').LocomotionClips | null, handler: ((clipName: string) => void) | null): void { this.scene3d.setPlayerAnimation3D(clips, handler); }
@@ -3133,7 +3389,7 @@ class ShapeManager {
     /** Bind the Play-mode locomotion slots (idle/walk/run/jump/fall) to Animation Library entries or clip
      *  names/ids on the avatar. The engine self-wires crossfading playback — the walk animates with no host
      *  code. Pass null to clear. (docs/specs/animation-library-and-triggers.md §4.4) */
-    public setPlayerLocomotionSet3D(set: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null): void { this.scene3d.setPlayerLocomotionSet3D(set); }
+    public setPlayerLocomotionSet3D(set: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string; jumps?: string[] } | null): void { this.scene3d.setPlayerLocomotionSet3D(set); }
     public getPlayerLocomotionSet3D() { return this.scene3d.getPlayerLocomotionSet3D(); }
     /** Enable/disable the 1D locomotion blend tree (continuous idle↔walk↔run mix by speed) — object to tune walk/run
      *  speeds, `true` for defaults, null/false for discrete crossfades. Requires a locomotion set. */
@@ -3154,6 +3410,7 @@ class ShapeManager {
     /** Last-published player.* values (change-gate for the UI-variable publisher). */
     private _lastPlayerParams: { speed: number; moving: boolean; grounded: boolean; airborne: boolean; rising: boolean } =
         { speed: -1, moving: false, grounded: false, airborne: false, rising: false };
+    private _lastPlayerParamsLayer: string | null = null;
 
     private _playTriggerHostHandler: ((event: import('../game/trigger-volumes').TriggerEvent) => void) | null = null;
     /** Optional RAW trigger handler (enter/exit events) for custom game logic. Runs IN ADDITION to the built-in
@@ -3328,6 +3585,16 @@ class ShapeManager {
         this.scheduleRender();
         return true;
     }
+
+    /** T7.2 — "RETURN TO THE SCENE" (the 3D fit button beside the zoom controls): frame all VISIBLE scene content
+     *  from the current view direction, ignoring far decoration (sky stars/moon, void grid, apron, border glow).
+     *  In City mode it frames the CITY. Returns false when there's nothing to frame. Alias: resetView3D. */
+    public frameScene3D(padding: number = 1.1): boolean {
+        if (this.world?.cityMode && this.world.frameCity(padding)) return true;
+        return this.scene3d.frameScene3D({ padding });
+    }
+    /** Alias of {@link frameScene3D}. */
+    public resetView3D(padding: number = 1.1): boolean { return this.frameScene3D(padding); }
 
     /** Frame all meshes in view. */
     public frameAllMeshes3D(padding: number = 1.25): boolean {
@@ -4915,8 +5182,8 @@ class ShapeManager {
         return this.scene3d.importAnimationLibrary3D(json, opts);
     }
 
-    /** Set the render style on a mesh ('default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'). */
-    public setRenderStyle3D(nodeId: string, style: 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'): boolean {
+    /** Set the render style on a mesh ('default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud' | 'unlit'). */
+    public setRenderStyle3D(nodeId: string, style: 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud' | 'unlit'): boolean {
         return this.scene3d.setRenderStyle(nodeId, style);
     }
 
@@ -5607,7 +5874,10 @@ class ShapeManager {
         params?: Partial<import('./managers/body-generator').BodyParams>,
         x = 0, y = 0, z = 0,
     ): Promise<{ meshId: string; skeletonId: string }> {
-        return this.scene3d.createProceduralBody3D(params, x, y, z);
+        // In a city: real human size (1.7 m) and, for the origin / illustration-centre default, spawned on the floor the
+        // camera is looking at (Scene3DManager.resolveCharacterSpawn3D / _applySceneCharacterScale). Unchanged elsewhere.
+        const [sx, sy, sz] = this.scene3d.resolveCharacterSpawn3D([x, y, z]);
+        return this.scene3d.createProceduralBody3D(params, sx, sy, sz);
     }
 
     /**
@@ -5630,28 +5900,43 @@ class ShapeManager {
         undershirt?: ClothingParams; // params.slot should be 'undershirt'
         underpants?: ClothingParams; // params.slot should be 'underpants'
         skinTone?: string;           // hex, e.g. '#e8b89a'
+        rimLight?: boolean;          // per-character rim light (setCharacterRimLight3D); omit → unchanged (off)
+        matte?: boolean;             // matte cel skin + cloth (setCharacterMatte3D); omit → unchanged (off = glossy specular)
+        face?: Partial<FaceFeatureParams> | false;   // face kit (brows / mouth / nose / shading); omit → the defaults, false → eyes only
     }): Promise<{ meshId: string; skeletonId: string; nodeIds: string[] }> {
-        const [x, y, z] = opts.position ?? [0, 0, 0];
+        // In a city the character is built at real human size (1.7 m, every part: the body transform carries the
+        // skeleton + overlays) and a default position (none / origin / the 2D illustration centre) becomes the floor the
+        // camera is looking at. Outside a city: unchanged (the generated size at `position`).
+        const [x, y, z] = this.scene3d.resolveCharacterSpawn3D(opts.position);
         this.beginSceneGraphBatch3D();
         try {
-            const { meshId, skeletonId } = await this.scene3d.createProceduralBody3D(opts.body, x, y, z);
-            this.ensureFace3D(meshId);
-            const exprId = this.createFaceExpression3D(meshId, opts.expressionName ?? 'Neutral');
-            if (exprId && opts.eyes) this.setFaceExpressionProcedural3D(meshId, exprId, opts.eyes);
-            if (opts.hair)   this.setHairParams3D(meshId, opts.hair);
-            if (opts.top)        this.setClothingParams3D(meshId, opts.top);
-            if (opts.bottom)     this.setClothingParams3D(meshId, opts.bottom);
-            if (opts.undershirt) this.setClothingParams3D(meshId, opts.undershirt);
-            if (opts.underpants) this.setClothingParams3D(meshId, opts.underpants);
-            if (opts.socks)      this.setClothingParams3D(meshId, opts.socks);   // under the shoes
-            if (opts.shoes)      this.setClothingParams3D(meshId, opts.shoes);
+            // Garments FIRST, then hair (fitted against all of them): hair-first regenerated the hair once per new
+            // garment, and shoes-after-bottom regenerated the bottom (it piles onto the shoes) — ~5 redundant
+            // generator runs. Body + garments + hair are generated in ONE 'character' worker job (performance-plan
+            // P3.2d) and PRIMED, so the setters below only wrap + upload (any input mismatch just generates here).
+            const garments = [opts.top, opts.undershirt, opts.underpants, opts.socks, opts.shoes, opts.bottom]
+                .filter((g): g is ClothingParams => !!g);
+            const { meshId, skeletonId } = await this.scene3d.createProceduralCharacter3D({ body: opts.body, garments, hair: opts.hair ?? null }, x, y, z);
+            try {
+                this.ensureFace3D(meshId);
+                const exprId = this.createFaceExpression3D(meshId, opts.expressionName ?? 'Neutral');
+                if (exprId && opts.eyes) this.setFaceExpressionProcedural3D(meshId, exprId, opts.eyes);
+                for (const g of garments) this.setClothingParams3D(meshId, g);   // socks under shoes; bottom onto shoes
+                if (opts.hair) this.setHairParams3D(meshId, opts.hair);
+            } finally {
+                this.scene3d.clearPrimedCharacterParts3D(meshId);
+            }
             if (opts.skinTone) this.setSkinTone3D(meshId, opts.skinTone);
+            if (opts.face !== false) this.setFaceFeatures3D(meshId, { ...(opts.face ?? {}), enabled: opts.face?.enabled ?? true });   // after hair + skin (brow colour, fringe)
+            if (opts.rimLight !== undefined) this.setCharacterRimLight3D(meshId, opts.rimLight);
+            if (opts.matte !== undefined) this.scene3d.setCharacterMatte3D(meshId, opts.matte);
             // The 3D nodes this character added (flat siblings under root): body + face decal + hair + any of
             // the 6 garment slots. Returned so the host pushes just these into its mesh/outliner lists — no full
             // re-scan. Fetch each with getMesh3D(id) / getNode3D(id).
             const nodeIds = [
                 meshId,
                 this.scene3d.getEyesMeshId(meshId),
+                ...this.scene3d.faceKit.getFaceKitMeshIds(meshId),
                 this.scene3d.getHairMeshId(meshId),
                 this.scene3d.getClothingMeshId(meshId, 'top'),
                 this.scene3d.getClothingMeshId(meshId, 'bottom'),
@@ -5664,6 +5949,20 @@ class ShapeManager {
         } finally {
             this.endSceneGraphBatch3D();   // one coalesced onSceneGraphChanged for the whole character
         }
+    }
+
+    /** Parameters for a NEW random character (seeded; same seed → same character) — eyes ≈0.4×0.2 with no bottom
+     *  lash, hair cards with 6 cap layers, rim light on, uncropped top, bottoms' looseness ≥ 0.016; colours/styles
+     *  random. Pass the result to createFullCharacter3D (tweak any field first), or use createRandomCharacter3D.
+     *  See docs/ui/character-creator.md "Random character". */
+    public randomCharacterParams3D(seed?: number, body?: Partial<import('./managers/body-generator').BodyParams>): import('./managers/character-randomizer').RandomCharacterParams {
+        return randomCharacterParams(seed, body);
+    }
+    /** Create a NEW random character in one call (randomCharacterParams3D → createFullCharacter3D). `body` merges
+     *  over the random body shape (e.g. the host's body sliders). */
+    public async createRandomCharacter3D(opts: { seed?: number; position?: [number, number, number]; body?: Partial<import('./managers/body-generator').BodyParams> } = {}): Promise<{ meshId: string; skeletonId: string; nodeIds: string[] }> {
+        const p = randomCharacterParams(opts.seed, opts.body);
+        return this.createFullCharacter3D({ ...p, position: opts.position });
     }
 
     /** Set a body's skin tone (hex, e.g. '#e8b89a') — live; persists with the document. */
@@ -5696,6 +5995,20 @@ class ShapeManager {
     public getBodyParams3D(bodyMeshId: string): import('./managers/body-generator').BodyParams | null {
         return this.scene3d.getBodyParams(bodyMeshId);
     }
+
+    // ── Character scale (2026-10-04; docs/ui/character-creator.md "Scaling a character") ──
+    /** A character's size: uniform `scale` (1 = generated size), standing `height` (world units) / `heightMetres`,
+     *  `restHeight` (at scale 1), the metres per unit used and the scene's own (null outside a city). null = not a body. */
+    public getCharacterScale3D(bodyMeshId: string): { scale: number; height: number; heightMetres: number; restHeight: number; metresPerUnit: number; sceneMetresPerUnit: number | null } | null {
+        return this.scene3d.getCharacterScale3D(bodyMeshId);
+    }
+    /** Scale the WHOLE character (body, skeleton, clothes, hair, face, eyes, charms, springs) uniformly — no regeneration,
+     *  feet kept on the ground, saved with the document, undoable; Play's camera / capsule / stride follow. */
+    public setCharacterScale3D(bodyMeshId: string, scale: number): boolean { return this.scene3d.setCharacterScale3D(bodyMeshId, scale); }
+    /** Scale a character to stand `height` tall (metres by default — the city's scale in a city, else 1 unit = 1 m). */
+    public setCharacterHeight3D(bodyMeshId: string, height: number, unit: 'metres' | 'units' = 'metres'): number | null { return this.scene3d.setCharacterHeight3D(bodyMeshId, height, unit); }
+    /** "Fit to city": scale a character to `metres` (default 1.7 m) at the scene's metre scale. Returns the new scale. */
+    public fitCharacterToScene3D(bodyMeshId: string, metres?: number): number | null { return this.scene3d.fitCharacterToScene3D(bodyMeshId, metres); }
 
     /**
      * Live ghost preview of a procedural body — call on every slider change to show a translucent
@@ -5880,20 +6193,102 @@ class ShapeManager {
         // Re-register when MISSING or an OLD version (a save from before the body-shell unwrap restores a v1
         // `fascia` pool → machines would resolve blank; re-seeding migrates it to the current `body` contract).
         const existing = this._garp.getPool('salsa/vending');
-        if (existing && existing.version >= pool.version) return;
+        if (existing && existing.version >= pool.version) {
+            // ★ Upgrade by SLOT, not version (addSkin bumps version per added skin, so a saved pool with user skins
+            //   is "newer" yet can predate the `labels` slot). Add the slot + placeholder sheets IN PLACE, keeping skins.
+            if (!existing.slots.includes('labels') && !this._prewarmCapture) this._upgradeVendingLabelsSlot(existing);
+            return;
+        }
         const textures: Record<string, DecalSource> = {};
-        VENDING_BRANDS.forEach((b) => {
-            // `body` = a solid brand colour (the shell's front); `products` = a slightly darker tone (not shown
-            // in-city yet). Both are simple image placeholders until the host registers real art.
+        VENDING_BRANDS.forEach((b, i) => {
+            // `body` = a solid brand colour; `products` = a soft LIT back wall (the backdrop behind the cans);
+            // `labels` = a placeholder can sheet. All placeholders until the host registers real art.
             textures[vendingSkinKey(b.name, 'body')]     = { kind: 'image', dataUrl: this._solidColorDataUrl(b.body) };
-            textures[vendingSkinKey(b.name, 'products')] = { kind: 'image', dataUrl: this._solidColorDataUrl([b.body[0] * 0.7, b.body[1] * 0.7, b.body[2] * 0.7]) };
+            textures[vendingSkinKey(b.name, 'products')] = { kind: 'image', dataUrl: this._vendingBackdropUrl(b.glow) };
+            textures[vendingSkinKey(b.name, 'labels')]   = { kind: 'image', dataUrl: this._vendingPlaceholderLabelsUrl(i) };
         });
-        // The pool DEFAULT products texture (for body-only user variants — see vendingGarpPool.defaults).
-        textures[vendingSkinKey('_default', 'products')] = { kind: 'image', dataUrl: this._solidColorDataUrl([0.5, 0.5, 0.52]) };
+        // The pool DEFAULTS (for body-only user variants — see vendingGarpPool.defaults).
+        textures[vendingSkinKey('_default', 'products')] = { kind: 'image', dataUrl: this._vendingBackdropUrl([0.92, 0.94, 0.96]) };
+        textures[vendingSkinKey('_default', 'labels')]   = { kind: 'image', dataUrl: this._vendingPlaceholderLabelsUrl(0) };
+        if (this._prewarmCapture) return;               // P5.W4 prewarm: only the drawn canvases were wanted
         this.registerGarpPool3D(pool, textures);        // sync → layers assigned
         // Both `body` and `products` are now instanced on city machines → both live (default). (products = the flat
         // display panel behind the glass.)
         void this.rebuildGarpAtlas3D([512, 512]);       // async → pixels + re-render
+    }
+
+    /** Add the `labels` slot (+ placeholder can sheets) to an OLDER registered vending pool, keeping every skin.
+     *  Built-in brand skins get their own placeholder sheet; user skins use the pool default. */
+    private _upgradeVendingLabelsSlot(existing: GarpPool): void {
+        const builtIn = new Map(VENDING_BRANDS.map((b, i) => [b.name, i] as const));
+        const textures: Record<string, DecalSource> = { [vendingSkinKey('_default', 'labels')]: { kind: 'image', dataUrl: this._vendingPlaceholderLabelsUrl(0) } };
+        const skins = existing.skins.map((sk) => {
+            const bi = builtIn.get(sk.name);
+            if (bi === undefined || sk.slots.labels) return sk;
+            const key = vendingSkinKey(sk.name, 'labels');
+            textures[key] = { kind: 'image', dataUrl: this._vendingPlaceholderLabelsUrl(bi) };
+            return { ...sk, slots: { ...sk.slots, labels: key } };
+        });
+        this.registerGarpPool3D({
+            ...existing, slots: [...existing.slots, 'labels'], skins,
+            defaults: { ...(existing.defaults ?? {}), labels: vendingSkinKey('_default', 'labels') },
+        }, textures);
+        void this.rebuildGarpAtlas3D([512, 512]);
+    }
+
+    /** A 512² LIT BACK WALL for the vending backdrop placeholder: a soft vertical gradient from `tint` to near-white. */
+    private _vendingBackdropUrl(tint: [number, number, number]): string {
+        return this._garpSkinUrl('backdrop:' + tint.join(','), (ctx) => {
+            const c = (k: number) => `rgb(${Math.round((tint[0] * k + (1 - k)) * 255)}, ${Math.round((tint[1] * k + (1 - k)) * 255)}, ${Math.round((tint[2] * k + (1 - k)) * 255)})`;
+            const g = ctx.createLinearGradient(0, 0, 0, 512);
+            g.addColorStop(0, c(0.25)); g.addColorStop(1, c(0.7));
+            ctx.fillStyle = g; ctx.fillRect(0, 0, 512, 512);
+        });
+    }
+
+    /** Draw a vending LABEL SHEET (the 4×2 `labels` layout, vendingLabelCell): per cell, `art` paints the label rect,
+     *  the padding around it is BLED from the same art (so filtering never pulls in a neighbour), and the rim band
+     *  gets a silver gradient (the can's neck + top sample it). Returns a 512² PNG data URL. */
+    private _drawVendingLabelSheet(art: (ctx: CanvasRenderingContext2D, cell: number, x: number, y: number, w: number, h: number) => void, placeholderKey?: string): string {
+        if (placeholderKey) return this._placeholderPng(placeholderKey, (ctx) => this._paintVendingLabelSheet(ctx, art));
+        const S = 512;
+        const canvas = document.createElement('canvas'); canvas.width = S; canvas.height = S;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return '';
+        this._paintVendingLabelSheet(ctx, art);
+        return canvas.toDataURL('image/png');
+    }
+    private _paintVendingLabelSheet(ctx: CanvasRenderingContext2D, art: (ctx: CanvasRenderingContext2D, cell: number, x: number, y: number, w: number, h: number) => void): void {
+        const S = 512, pad = VENDING_LABEL_PAD * S;
+        for (let i = 0; i < VENDING_LABEL_CELLS; i++) {
+            const { cell, rim, label } = vendingLabelCell(i);
+            const [x0, y0, x1, y1] = [cell[0] * S - pad, cell[1] * S - pad, cell[2] * S + pad, cell[3] * S + pad];   // unpadded cell
+            const [lx, ly, lw, lh] = [label[0] * S, label[1] * S, (label[2] - label[0]) * S, (label[3] - label[1]) * S];
+            // Bleed: the art stretched over the whole unpadded cell first, then drawn exactly into the label rect.
+            ctx.save(); ctx.beginPath(); ctx.rect(x0, y0, x1 - x0, y1 - y0); ctx.clip();
+            art(ctx, i, x0, y0, x1 - x0, y1 - y0);
+            ctx.restore();
+            ctx.save(); ctx.beginPath(); ctx.rect(lx, ly, lw, lh); ctx.clip();
+            art(ctx, i, lx, ly, lw, lh);
+            ctx.restore();
+            // Rim band (+ the padding above it): brushed aluminium.
+            const ry0 = y0, ry1 = rim[3] * S;
+            const g = ctx.createLinearGradient(x0, 0, x1, 0);
+            g.addColorStop(0, '#8d9096'); g.addColorStop(0.45, '#e4e6ea'); g.addColorStop(1, '#9a9da3');
+            ctx.fillStyle = g; ctx.fillRect(x0, ry0, x1 - x0, ry1 - ry0);
+        }
+    }
+
+    /** Placeholder can labels for built-in brand `brandIdx`: 8 bold two-tone cans (a hue per cell, rotated per brand). */
+    private _vendingPlaceholderLabelsUrl(brandIdx: number): string {
+        const HUES = ['#e8453c', '#2f7fd6', '#f2c230', '#4caf6a', '#f08bb6', '#8a5cd6', '#f07a2a', '#3cc6c8'];
+        return this._drawVendingLabelSheet((ctx, cell, x, y, w, h) => {
+            const base = HUES[(cell + brandIdx * 3) % HUES.length], accent = HUES[(cell + brandIdx * 3 + 4) % HUES.length];
+            ctx.fillStyle = base; ctx.fillRect(x, y, w, h);
+            ctx.fillStyle = '#ffffff'; ctx.fillRect(x, y + h * 0.30, w, h * 0.16);             // a white band
+            ctx.fillStyle = accent; ctx.beginPath(); ctx.arc(x + w * 0.5, y + h * 0.62, w * 0.26, 0, Math.PI * 2); ctx.fill();   // a logo disc
+            ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.fillRect(x + w * 0.2, y + h * 0.36, w * 0.6, h * 0.04);   // a "name" bar
+        }, 'labels:' + brandIdx);
     }
 
     /** Generic: register a GARP `pool` with drawn placeholder skins (`draws` maps skin KEY → a 512² canvas draw fn).
@@ -5902,15 +6297,64 @@ class ShapeManager {
         const existing = this._garp.getPool(pool.id);
         if (existing && existing.version >= pool.version) return;
         const textures: Record<string, DecalSource> = {};
-        for (const key of Object.keys(draws)) textures[key] = { kind: 'image', dataUrl: this._garpSkinUrl(draws[key]) };
+        for (const key of Object.keys(draws)) textures[key] = { kind: 'image', dataUrl: this._garpSkinUrl('skin:' + key, draws[key]) };
+        if (this._prewarmCapture) return;   // P5.W4 prewarm: only the drawn canvases were wanted
         this.registerGarpPool3D(pool, textures);
         void this.rebuildGarpAtlas3D([512, 512]);
     }
-    /** A 512² PNG data URL from a canvas draw callback (built-in GARP placeholder skins). */
-    private _garpSkinUrl(draw: (ctx: CanvasRenderingContext2D) => void): string {
+    /** A 512² PNG data URL from a canvas draw callback (built-in GARP placeholder skins), cached by `key`. */
+    private _garpSkinUrl(key: string, draw: (ctx: CanvasRenderingContext2D) => void): string {
+        return this._placeholderPng(key, draw);
+    }
+
+    // ── P5.W4: built-in GARP placeholder PNGs, pre-encoded OFF the main thread ─────────────────────────────────
+    // The first city of a session registers the built-in vending / crate / clutter pools from INSIDE its reassembly
+    // (the GARP layer resolver), and every placeholder skin was a 512² canvas → toDataURL('image/png') there: ~70 ms
+    // per pool family of synchronous PNG encode. Now, when a city build STARTS, the same draws are captured (no
+    // registration) and encoded in the 'atlas' worker (composeAtlasSheet: the drawn bitmap, PNG-encoded) into a
+    // per-recipe cache, one family per frame; by the time the reassembly asks, the URLs are ready. A miss (no worker
+    // support, or the build won the race) encodes synchronously exactly as before. Same pixels either way (a 1:1
+    // bitmap copy of the same draw; PNG is lossless) — only the encoder's byte stream may differ.
+    private readonly _placeholderUrls = new Map<string, string>();
+    /** Non-null while a prewarm captures draws: the ensure*Garp paths draw, queue the canvas, and skip registration. */
+    private _prewarmCapture: Array<{ key: string; canvas: HTMLCanvasElement }> | null = null;
+    private _prewarmStarted = false;
+    /** One built-in 512² placeholder PNG: the cache, else draw + encode now (or, in a prewarm, queue the canvas). */
+    private _placeholderPng(key: string, draw: (ctx: CanvasRenderingContext2D) => void): string {
+        const hit = this._placeholderUrls.get(key);
+        if (hit) return hit;
         const canvas = document.createElement('canvas'); canvas.width = 512; canvas.height = 512;
         const ctx = canvas.getContext('2d'); if (ctx) draw(ctx);
-        return canvas.toDataURL('image/png');
+        if (this._prewarmCapture) { this._prewarmCapture.push({ key, canvas }); return ''; }
+        const url = canvas.toDataURL('image/png');
+        this._placeholderUrls.set(key, url);
+        return url;
+    }
+    /** Pre-encode every not-yet-registered built-in placeholder skin off-thread (once per session; see above). */
+    private _prewarmGarpPlaceholders(): void {
+        if (this._prewarmStarted || typeof document === 'undefined' || typeof requestAnimationFrame === 'undefined' || !atlasComposeSupported()) return;
+        this._prewarmStarted = true;
+        // One pool family per frame: draw (cheap canvas fills) → snapshot → the atlas worker encodes.
+        const families: Array<() => void> = [
+            () => this._ensureVendingGarp(), () => this._ensureCrateGarp(),
+            ...['salsa/bin', 'salsa/vent', 'salsa/aboard', 'salsa/stall', 'salsa/poster', 'salsa/warning'].map(id => () => this._ensureClutterGarp(id)),
+        ];
+        const step = (): void => {
+            const fam = families.shift();
+            if (!fam) return;
+            const cap: Array<{ key: string; canvas: HTMLCanvasElement }> = [];
+            this._prewarmCapture = cap;
+            try { fam(); } catch { /* a draw failed → that family encodes on demand */ } finally { this._prewarmCapture = null; }
+            for (const { key, canvas } of cap) {
+                void createImageBitmap(canvas).then(bmp => composeAtlasSheet(
+                    { plan: { width: canvas.width, height: canvas.height, ops: [{ t: 'img', src: 0, x: 0, y: 0, w: canvas.width, h: canvas.height }] }, sources: [bmp], encode: { mime: 'image/png' } },
+                    { priority: 'background', label: 'Preparing props' }))
+                    .then(r => { if (r.dataUrl && !this._placeholderUrls.has(key)) this._placeholderUrls.set(key, r.dataUrl); })
+                    .catch(() => { /* encodes on demand */ });
+            }
+            requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
     }
 
     /** Register the built-in CRATE-label pool + placeholder skins (drawn wood-crate faces). Idempotent. The host
@@ -5923,6 +6367,7 @@ class ShapeManager {
         // Whole-crate BODY colours (GARP reskins the ENTIRE face, not a label): plain wood · produce red · cargo blue.
         const stamp: Record<string, [number, number, number]> = { plain: [0.52, 0.37, 0.22], fruit: [0.58, 0.26, 0.22], cargo: [0.22, 0.31, 0.46] };
         for (const n of CRATE_SKIN_NAMES) textures[crateSkinKey(n)] = { kind: 'image', dataUrl: this._crateSkinDataUrl(stamp[n] ?? [0.52, 0.37, 0.22]) };
+        if (this._prewarmCapture) return;               // P5.W4 prewarm: only the drawn canvases were wanted
         this.registerGarpPool3D(pool, textures);        // sync → atlas layers assigned
         void this.rebuildGarpAtlas3D([512, 512]);       // async → pixels + re-render
     }
@@ -5983,30 +6428,84 @@ class ShapeManager {
     /** A 512×512 crate face in `base` colour — the WHOLE face is the crate (plank bands + a frame), so a GARP skin
      *  reskins the entire crate. No label patch (that read as a grey square floating on every face). */
     private _crateSkinDataUrl(base: [number, number, number]): string {
-        const canvas = document.createElement('canvas');
-        canvas.width = 512; canvas.height = 512;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
+        return this._placeholderPng('crate:' + base.join(','), (ctx) => {
             const c = (m: number): string => `rgb(${Math.round(Math.min(255, base[0] * 255 * m))},${Math.round(Math.min(255, base[1] * 255 * m))},${Math.round(Math.min(255, base[2] * 255 * m))})`;
             ctx.fillStyle = c(1);   ctx.fillRect(0, 0, 512, 512);                             // crate body, full face
             ctx.strokeStyle = c(0.58); ctx.lineWidth = 10;
             for (let y = 48; y < 512; y += 96) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(512, y); ctx.stroke(); }  // plank gaps
             ctx.strokeStyle = c(0.48); ctx.lineWidth = 18; ctx.strokeRect(14, 14, 484, 484); // crate frame / corner battens
-        }
-        return canvas.toDataURL('image/png');
+        });
     }
 
     /** A 512×512 solid-colour PNG data URL — the built-in body-skin placeholders (a flat brand colour). */
     private _solidColorDataUrl(rgb: [number, number, number]): string {
-        const canvas = document.createElement('canvas');
-        canvas.width = 512; canvas.height = 512;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
+        return this._placeholderPng('solid:' + rgb.join(','), (ctx) => {
             ctx.fillStyle = `rgb(${Math.round(rgb[0] * 255)}, ${Math.round(rgb[1] * 255)}, ${Math.round(rgb[2] * 255)})`;
             ctx.fillRect(0, 0, 512, 512);
-        }
-        return canvas.toDataURL('image/png');
+        });
     }
+
+    // ── ADVERTS — the GARP signage pool (docs/ui/garp.md §Adverts) ─────────────────────────────────────
+    // The user's own images on the city's sign faces. Forwarded straight to the SignageController (browser half:
+    // decode / pack / rebuild); the image list lives in the GARP registry (persisted in garp.json).
+    private _signageCtl: SignageController | null = null;
+    private get _signage(): SignageController {
+        return this._signageCtl ??= new SignageController({
+            garp: this._garp,
+            resolveBitmap: (src) => this._resolveDecalBitmap(src),
+            rebuildAtlas: () => this.rebuildGarpAtlas3D([512, 512]),
+            refreshCity: () => this.world.refreshAdverts(),
+            compose: (job) => composeAtlasSheet(job, { priority: 'visible' }),   // page packing + normalise OFF-THREAD
+            seedBitmap: (src, bmp) => this._garpAtlas.seed(src, bmp),
+        });
+    }
+    /** Add an advert image to a bucket ('auto' = by the image's aspect). Packs, rebuilds the atlas and (batched)
+     *  the city. Returns the new id (null + errors on failure). */
+    public addSignageImage3D(bucket: AdvertBucket | 'auto', source: string, opts?: AddSignageOptions): Promise<{ id: string | null; bucket: AdvertBucket | null; errors: string[] }> {
+        return this._signage.add(bucket, source, opts);
+    }
+    /** BATCH add: the same per-item results as addSignageImage3D in a loop, but ONE re-pack + atlas rebuild + city
+     *  rebuild for the whole batch (any bucket, incl. the shop-window ones). */
+    public addSignageImages3D(items: readonly SignageAddItem[]): Promise<{ id: string | null; bucket: AdvertBucket | null; errors: string[] }[]> {
+        return this._signage.addMany(items);
+    }
+    /** Remove an advert image (re-packs; the city rebuilds). False when the id is unknown. */
+    public removeSignageImage3D(id: string, regen = true): Promise<boolean> { return this._signage.remove(id, regen); }
+    /** Backlit (glows at night) vs an unlit poster, per image. False when the id is unknown. */
+    public setSignageImageLit3D(id: string, lit: boolean, regen = true): boolean { return this._signage.setLit(id, lit, regen); }
+    /** Every advert image (panel rows: id, bucket, lit, aspect, name, dataUrl thumbnail), in add order. */
+    public listSignageImages3D(): SignageImageInfo[] { return this._signage.list(); }
+    /** Force a re-pack + atlas rebuild (normally automatic). */
+    public packSignage3D(): Promise<void> { return this._signage.pack(); }
+    /** The four buckets (label, aspect range, recommended size, images per page, cell px, current count). */
+    public signageBuckets3D(): SignageBucketInfo[] { return this._signage.buckets(); }
+    /** Fraction 0..1 of eligible city signs that show an image (default 1); the rest keep procedural lettering. */
+    public setSignageShare3D(share: number, regen = true): void { this._signage.setShare(share, regen); }
+    public getSignageShare3D(): number { return this._signage.share; }
+    /** Remove every advert image (the city returns to procedural signs). Shop-window images stay. */
+    public clearSignage3D(regen = true): Promise<void> { return this._signage.clear(regen); }
+
+    // ── SHOP WINDOWS (persona-polish C4; docs/ui/garp.md §Shop windows) ─────────────────────────────────
+    // Shop-interior + poster images on the city's shopfront glass. Same pool / storage / packing / persistence as the
+    // adverts (two extra buckets no sign classifies into); forwarded straight to the SignageController.
+    /** Add a shop-window image: 'interior' (a shop's back wall, seen with real parallax through clear glass) or
+     *  'poster' (a sheet on the inside of the glass). Returns the new id (null + errors on failure). */
+    public addShopImage3D(bucket: ShopImageBucket, source: string, opts?: AddSignageOptions): Promise<{ id: string | null; bucket: AdvertBucket | null; errors: string[] }> {
+        return this._signage.addShop(bucket, source, opts);
+    }
+    /** Remove a shop-window image (re-packs; the city rebuilds). False when the id is unknown. */
+    public removeShopImage3D(id: string, regen = true): Promise<boolean> { return this._signage.remove(id, regen); }
+    /** Lit (glows at night with the shop) vs unlit, per image. */
+    public setShopImageLit3D(id: string, lit: boolean, regen = true): boolean { return this._signage.setLit(id, lit, regen); }
+    /** Every shop-window image (panel rows), in add order. */
+    public listShopImages3D(): SignageImageInfo[] { return this._signage.listShop(); }
+    /** The two shop buckets (label, aspect range, recommended size, images per page, cell px, current count). */
+    public shopImageBuckets3D(): SignageBucketInfo[] { return this._signage.shopBuckets(); }
+    /** Fraction 0..1 of shop bays that show a shop image (default 1); the rest keep the procedural interior. */
+    public setShopImageShare3D(share: number, regen = true): void { this._signage.setShopShare(share, regen); }
+    public getShopImageShare3D(): number { return this._signage.shopShare; }
+    /** Remove every shop-window image (shops return to the procedural interiors). */
+    public clearShopImages3D(regen = true): Promise<void> { return this._signage.clearShop(regen); }
 
     /** Remove a user (or built-in) skin from a GARP pool, then rebuild — for the panel's delete/iterate action.
      *  Returns validation problems. Regenerate the city to drop it from machines (position hash re-picks). */
@@ -6031,6 +6530,13 @@ class ShapeManager {
         if (poolId === 'salsa/vending' && slot === 'body') {
             return VENDING_BODY_UV_REGIONS.map((r) => ({ label: r.label, u0: r.rect[0], v0: r.rect[1], u1: r.rect[2], v1: r.rect[3] }));
         }
+        if (poolId === 'salsa/vending' && slot === 'labels') {
+            // The 8 can-label areas of the packed sheet (the rim band above each is drawn by the packer).
+            return Array.from({ length: VENDING_LABEL_CELLS }, (_, i) => {
+                const l = vendingLabelCell(i).label;
+                return { label: `can ${i + 1}`, u0: l[0], v0: l[1], u1: l[2], v1: l[3] };
+            });
+        }
         return [{ label: '(full)', u0: 0, v0: 0, u1: 1, v1: 1 }];
     }
 
@@ -6045,36 +6551,37 @@ class ShapeManager {
     /** Resolve every registered GARP texture (ephemera render / uploaded image → bitmap, via the decal path) and
      *  (re)build the dedicated GARP atlas. `size` is the one fixed resolution the atlas packs (mismatches skipped).
      *  Async because ephemera rasterises through an <img>. Safe to re-run; drops to the 1×1 placeholder if empty. */
-    public async rebuildGarpAtlas3D(size: [number, number] = [512, 512]): Promise<void> {
-        const build = this._garp.textureBuildList();
-        const layers: { layer: number; bitmap: ImageBitmap }[] = [];
-        for (const { source, layer } of build) {
-            const bmp = await this._resolveDecalBitmap(source);
-            // ★ The atlas packs ONE fixed size per pool; an uploaded image is whatever the user's PNG is. Without
-            //   this, uploadGarpAtlas SKIPS the mismatch → the fascia renders BLANK (silent). Fit every bitmap to
-            //   the atlas size (contain-letterbox → undistorted, whole image) so uploads always show.
-            if (bmp) layers.push({ layer, bitmap: await this._fitBitmapToRect(bmp, size[0], size[1]) });
-        }
-        this.renderer3D.uploadGarpAtlas(layers, size);
-        this._garp.markAtlasClean();
-        this.renderer3D.markInstancesDirty();   // re-pack so any garpLayer meshes pick up their atlas layer
-        this.scheduleRender();
+    public rebuildGarpAtlas3D(size: [number, number] = [512, 512]): Promise<void> {
+        // COALESCED + per-source bitmap CACHE (garp-atlas-builder.ts, perf-plan P3.2e): overlapping requests share one
+        // in-flight build + one trailing build; only changed textures are decoded / fitted.
+        return this._garpAtlas.rebuild(size);
+    }
+    private _garpAtlasBuilder: GarpAtlasBuilder | null = null;
+    private get _garpAtlas(): GarpAtlasBuilder {
+        return this._garpAtlasBuilder ??= new GarpAtlasBuilder({
+            garp: this._garp,
+            resolveBitmap: (src) => this._resolveDecalBitmap(src),
+            beforeBuild: () => this._signage.ensurePacked(),   // ADVERTS: pack any changed / restored signage pages first
+            upload: (layers, sz) => this.renderer3D.uploadGarpAtlas(layers, sz),
+            afterUpload: () => {
+                this._garp.markAtlasClean();
+                this.renderer3D.markInstancesDirty();   // re-pack so any garpLayer meshes pick up their atlas layer
+                this.scheduleRender();
+            },
+        });
     }
 
-    /** Resize a bitmap to exactly w×h, CONTAIN-fit (preserve aspect, transparent letterbox) so the whole image
-     *  shows undistorted — the GARP atlas requires one fixed size per pool. No-op when already the target size. */
-    private async _fitBitmapToRect(bmp: ImageBitmap, w: number, h: number): Promise<ImageBitmap> {
-        if (bmp.width === w && bmp.height === h) return bmp;
-        try {
-            const canvas = new OffscreenCanvas(w, h);
-            const ctx = canvas.getContext('2d');
-            if (!ctx) return bmp;
-            const scale = Math.min(w / bmp.width, h / bmp.height);
-            const dw = bmp.width * scale, dh = bmp.height * scale;
-            ctx.clearRect(0, 0, w, h);
-            ctx.drawImage(bmp, (w - dw) / 2, (h - dh) / 2, dw, dh);
-            return await createImageBitmap(canvas);
-        } catch { return bmp; }
+    /** Compose a sheet OFF-THREAD ('atlas' lane), falling back to the main-thread canvas `legacy` painter on failure. */
+    private async _composeSheetDataUrl(plan: SheetPlan, bitmaps: ImageBitmap[], legacy: () => string | null): Promise<string | null> {
+        if (atlasComposeSupported()) {
+            try {
+                // Clone-send (no transfer) so the legacy path still has the bitmaps if the job fails.
+                const r = await composeAtlasSheet(
+                    { plan, sources: bitmaps, encode: { mime: 'image/png' } }, { priority: 'interactive', transfer: false });
+                if (r.dataUrl) return r.dataUrl;
+            } catch { /* legacy */ }
+        }
+        return legacy();
     }
 
     /**
@@ -6086,6 +6593,63 @@ class ShapeManager {
      * The new variant is eligible on every pooled instance from the NEXT (re)generation (selection is by position
      * hash over the runtime pool). Returns validation problems ([] = OK).
      */
+    /**
+     * PACK the user's CAN DESIGNS into a skin's `labels` sheet (docs/specs/vending-machine-redesign.md): 1–8 image data
+     * URLs, one per can design → one 512² sheet (4×2 cells, padded, rim bands drawn), registered as `skinName`'s
+     * `labels` texture, atlas rebuilt. Each image is STRETCHED to its label cell (author at 1:2 portrait for no
+     * distortion; sizes needn't match); fewer than 8 repeat to fill the cells. Keeps the skin's other slots. A NEW
+     * skin name is refused (a skin needs a `body`, which has no default) — add it with addGarpSkin3D first, or use a
+     * built-in brand name (red / blue / cyan). Returns problems ([] = OK).
+     */
+    public async packVendingCanLabels3D(skinName: string, images: string[]): Promise<string[]> {
+        this._ensureVendingGarp();
+        const prev = this._garp.getPool('salsa/vending')?.skins.find((sk) => sk.name === skinName);
+        // A skin must have a body (the pool defaults only products + labels) — don't register a half skin.
+        if (!prev) return [`no vending skin "${skinName}" — add it first (addGarpSkin3D with a body), or use a built-in brand`];
+        const bitmaps = (await Promise.all(images.slice(0, VENDING_LABEL_CELLS).map((u) => this._resolveDecalBitmap({ kind: 'image', dataUrl: u }))))
+            .filter((b): b is ImageBitmap => !!b);
+        if (!bitmaps.length) return ['no readable images'];
+        // Composed OFF-THREAD from the pure vendingLabelSheetOps plan (same cells / rims as _drawVendingLabelSheet).
+        const sheet = (await this._composeSheetDataUrl(vendingLabelSheetOps(bitmaps.length), bitmaps,
+            () => this._drawVendingLabelSheet((ctx, cell, x, y, w, h) => ctx.drawImage(bitmaps[cell % bitmaps.length], x, y, w, h)))) ?? '';
+        const key = `salsa/vending/${skinName}/labels`;
+        this._garp.registerTexture(key, { kind: 'image', dataUrl: sheet });
+        const errs = this._garp.addSkin('salsa/vending', { ...prev, slots: { ...prev.slots, labels: key } });
+        await this.rebuildGarpAtlas3D([512, 512]);
+        return errs;
+    }
+
+    /** Generic sheet packer: `images` (data URLs) into a `cols`×`rows` grid on a `size`² canvas, each STRETCHED to its
+     *  cell with `padPx` of bled padding per side (no filtering bleed between cells). Returns a PNG data URL, or null
+     *  if no image could be read. For other props with many small varied items (books, snacks, signs). */
+    public async packGarpSheet3D(images: string[], cols: number, rows: number, size = 512, padPx = 4): Promise<string | null> {
+        const bitmaps = (await Promise.all(images.map((u) => this._resolveDecalBitmap({ kind: 'image', dataUrl: u })))).filter((b): b is ImageBitmap => !!b);
+        if (!bitmaps.length) return null;
+        // One pure plan (bleed into the padding, then the art inset), painted off-thread or by the canvas fallback.
+        const plan = garpGridSheetOps(bitmaps.length, cols, rows, size, padPx);
+        return this._composeSheetDataUrl(plan, bitmaps, () => {
+            if (typeof document === 'undefined') return null;
+            const canvas = document.createElement('canvas'); canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return null;
+            paintSheetOps(ctx, plan.ops, bitmaps);
+            return canvas.toDataURL('image/png');
+        });
+    }
+
+    /** A blank TEMPLATE for the vending can-label sheet (512² PNG data URL): each cell's label area with its number
+     *  and a dashed safe area, the rim bands in grey — so a user can see the layout (their own PNGs go in
+     *  packVendingCanLabels3D as separate 1:2 images; this is a guide, not required). */
+    public vendingLabelTemplate3D(): string {
+        return this._drawVendingLabelSheet((ctx, cell, x, y, w, h) => {
+            ctx.fillStyle = '#f4f4f6'; ctx.fillRect(x, y, w, h);
+            ctx.strokeStyle = '#9aa0aa'; ctx.setLineDash([6, 4]); ctx.lineWidth = 2;
+            ctx.strokeRect(x + w * 0.1, y + h * 0.06, w * 0.8, h * 0.88);
+            ctx.setLineDash([]); ctx.fillStyle = '#6a7080'; ctx.font = `bold ${Math.round(w * 0.3)}px sans-serif`;
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(String(cell + 1), x + w / 2, y + h / 2);
+        });
+    }
+
     public async addGarpSkin3D(poolId: string, skinName: string, slotSources: Record<string, DecalSource>): Promise<string[]> {
         const slots: Record<string, string> = {};
         for (const [slot, source] of Object.entries(slotSources)) {
@@ -6472,12 +7036,18 @@ class ShapeManager {
      * them into this one. Add any new Map-holding registry HERE rather than special-casing its restore.
      */
     public clearDocumentRegistriesForLoad(): void {
-        this.scene3d?.clearForDocumentLoad3D();          // character rigs, kitbash catalog + baked parts, GLB store
+        // FIRST: leave City mode + drop the previous doc's world (graph, traffic, streaming, in-flight builds). Its
+        // exitCityMode lighting hand-back is then overwritten by the settings reset below (bug-hunt 2026-10-01).
+        try { this.world?.clearForDocumentLoad(); } catch (e) { console.warn('[load] world reset failed', e); }
+        this.scene3d?.clearForDocumentLoad3D();          // Play stop, character rigs, kitbash catalog + baked parts, GLB store
         this.scene3d?.resetGlobalScene3DSettingsForLoad(); // fog/PS1/SSAO/… back to defaults before the doc's own
+        this.world?.resetStyleForLoad();                   // the previous doc's city look (restoreFromSave sets the new one)
         this._cdKits.clear();                            // restoreCDKitsFromSave3D skipped ids it already "had"
         this._garp.clear();
         this.ui.restore([]);                             // UI layers (only cleared when the new doc had some)
         this._uiStopAllClipPlayers();
+        this._uiSound?.stopAll();                        // previous doc's (looping) UI sounds kept playing
+
     }
 
     /** Regenerate ALL procedural objects (City + buildings + foliage) from a loaded save's params-only markers.
@@ -6522,6 +7092,279 @@ class ShapeManager {
 
     // ── Neighborhood Blocks (Tier-2 instancing — many buildings drawn from a few shared geometries) ──
     public createBlock3D(transform?: { x?: number; y?: number; z?: number; ry?: number }, opts?: { starter?: boolean | number }): string { return this.blocks.create(transform, opts); }
+
+    // ── Environment styling (2026-09-29) — render style / toon shadows / rim on regenerated objects, PERSISTED ──────
+    // Each call takes a PATCH: a value sets that field, `null` clears it (back to the generator's own look).
+    // renderStyle: 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'.
+    /** A whole neighborhood BLOCK's look (every building in it). Saved with the block. False if not a block. */
+    public setBlockStyle3D(id: string, patch: ObjectStylePatch): boolean { return this.blocks.setStyle(id, patch); }
+    public getBlockStyle3D(id: string): ObjectStyle | null { return this.blocks.getStyle(id); }
+    /** A CREATOR object's look (building / foliage / vending / bench-type props…). Saved with it. False if unknown. */
+    public setCreatorStyle3D(id: string, patch: ObjectStylePatch): boolean { return this._creatorOwning(id)?.setStyle(id, patch) ?? false; }
+    public getCreatorStyle3D(id: string): ObjectStyle | null { return this._creatorOwning(id)?.getStyle(id) ?? null; }
+    /** The CITY's look (was render-style-only and lost on reload). Saved with the city; carries to new cities. */
+    public setCityStyle3D(patch: ObjectStylePatch): void { this.world.setStyle(patch); }
+    public getCityStyle3D(): ObjectStyle { return this.world.getStyle(); }
+    /** The ENVIRONMENT style: applies the patch to the city + every block + every creator object at once, and NEW
+     *  ones start with it. Characters and plain meshes are untouched. Saved with the document. */
+    public setEnvironmentStyle3D(patch: ObjectStylePatch): void {
+        const next = mergeObjectStyle(this.scene3d.environmentStyle, patch);
+        this.scene3d.environmentStyle = isEmptyStyle(next) ? undefined : next;
+        this.world.setStyle(patch);
+        for (const id of this.blocks.ids()) this.blocks.setStyle(id, patch);
+        for (const m of this._creators.values()) for (const id of m.ids()) m.setStyle(id, patch);
+        this.scheduleRender();
+    }
+    public getEnvironmentStyle3D(): ObjectStyle { return { ...(this.scene3d.environmentStyle ?? {}) }; }
+
+    // ── PERFORMANCE (docs/ui/performance.md §Resolution scaling / §LOD settings; the City panel's Performance group) ──
+    /** RESOLUTION SCALING: render the 3D scene at a fraction of the canvas and upscale it (UI, gizmos and text stay
+     *  full size). mode 'off' (default) | 'fixed' (always `scale`) | 'auto' (keep the GPU frame time under `targetMs`
+     *  between `minScale` and `maxScale`). A per-machine viewport preference (localStorage), never saved in documents.
+     *  Exports, thumbnails and video frames always render at full resolution. */
+    public setResolutionScale3D(opts: Partial<ResolutionScaleSettings>): ResolutionScaleState { return this.webgpuRenderer.setResolutionScale(opts); }
+    /** The resolution-scaling setting + `current` (the scale the 3D scene renders at now) + `gpuMs` (smoothed). */
+    public getResolutionScale3D(): ResolutionScaleState { return this.webgpuRenderer.getResolutionScale(); }
+    /** TEMPORAL AA / UPSCALING (engine-roadmap step 6; docs/ui/performance.md §Temporal anti-aliasing and upscaling):
+     *  mode 'off' (default) | 'taa' (native-resolution TAA instead of FXAA) | 'taau' (render the 3D scene at `scale`,
+     *  default 0.65, or at the resolution-scaling scale when that is Fixed / Auto, and reconstruct full size); `sharpen`
+     *  0..1; `retroOff` (default true: PS1 / pixel looks keep TAA off); `inkOff` (default false). A per-machine viewport
+     *  preference (localStorage), never saved in documents. Exports and snapshots render natively with FXAA. */
+    public setTemporalAA3D(opts: Partial<TemporalAASettings>): TemporalAAState { return this.webgpuRenderer.setTemporalAA(opts); }
+    /** The temporal AA setting + `active` / `reason` (why it is off: 'off' | 'retro' | 'ink' | 'capture' | 'compiling'),
+     *  `renderScale` (the internal scale of the last TAA frame), `samples` and `velocityDraws`. */
+    public getTemporalAA3D(): TemporalAAState { return this.webgpuRenderer.getTemporalAA(); }
+
+    /** ENGINE-ROADMAP STEP 2 A/B switches (docs/ui/performance.md §Editor overhead; all default ON, a per-session
+     *  setting, never saved). Each one switches a per-frame / per-structure-change scan back to the old code path:
+     *   - splitRenderList: the 2D steps see only 2D nodes, the 3D draws read cached per-kind lists;
+     *   - incrementalRenderList: a structure walk merges new nodes into the previous zIndex order (no full sort);
+     *   - incrementalDrawOrder: the main pass draw rank merges new meshes by numeric key codes (no string re-sort);
+     *   - prewarmNewOnly: a roster change queues only pipeline names not queued before (no per-mesh strings);
+     *   - cachedSkeletonSync: the character skeleton sync loops over the skinned meshes only;
+     *   - cachedRenderStats: getRenderStats3D sums cached per-mesh figures;
+     *   - iterativeSceneWalk: getAllMeshes / getAllSkeletons share one stack walk per structure version;
+     *   - coalesceStructureBumps: structure notifications between two reads of the structure version count once. */
+    public setFrameScanOptions3D(o: Partial<FrameScanOptions3D>): FrameScanOptions3D {
+        const wr = this.webgpuRenderer as unknown as { setFrameScanOptions?: (o: object) => unknown } | undefined;
+        if (o.splitRenderList !== undefined || o.incrementalRenderList !== undefined) wr?.setFrameScanOptions?.({ splitRenderList: o.splitRenderList, incrementalRenderList: o.incrementalRenderList });
+        if (o.incrementalDrawOrder !== undefined || o.prewarmNewOnly !== undefined) this.renderer3D.setStructureOptions({ incrementalDrawOrder: o.incrementalDrawOrder, prewarmNewOnly: o.prewarmNewOnly });
+        const S2 = Scene3DManager.STEP2;
+        if (o.cachedSkeletonSync !== undefined) S2.cachedSkeletonSync = !!o.cachedSkeletonSync;
+        if (o.cachedRenderStats !== undefined) S2.cachedRenderStats = !!o.cachedRenderStats;
+        if (o.iterativeSceneWalk !== undefined) S2.iterativeSceneWalk = !!o.iterativeSceneWalk;
+        if (o.coalesceStructureBumps !== undefined) { ShapeManager.coalesceStructureBumps = !!o.coalesceStructureBumps; this.getSceneStructureVersion(); }
+        this.scheduleRender();
+        return this.getFrameScanOptions3D();
+    }
+    public getFrameScanOptions3D(): FrameScanOptions3D {
+        const wr = this.webgpuRenderer as unknown as { getFrameScanOptions?: () => { splitRenderList: boolean; incrementalRenderList: boolean } } | undefined;
+        const a = wr?.getFrameScanOptions?.() ?? { splitRenderList: false, incrementalRenderList: false };
+        const b = this.renderer3D.setStructureOptions({});
+        const S2 = Scene3DManager.STEP2;
+        return { ...a, ...b, cachedSkeletonSync: S2.cachedSkeletonSync, cachedRenderStats: S2.cachedRenderStats, iterativeSceneWalk: S2.iterativeSceneWalk, coalesceStructureBumps: ShapeManager.coalesceStructureBumps };
+    }
+    /** ENGINE-ROADMAP STEP 3 A/B switches (docs/ui/performance.md §Lighter tiles; all default ON, per session, never
+     *  saved). Each one switches a step-3 change back to the old code path:
+     *   - incrementalTileBounds: the City gizmo bounds after a tile settles fold cached per-geometry boxes, in slices;
+     *   - cachedGroupBounds: every cacheGroupBounds call folds cached per-geometry boxes (no whole-vertex walk);
+     *   - collisionCells: Play collision rays inside a ready collision cell walk its merged BVH (built in a worker);
+     *   - runBoxes: full tiles / the centre carry the cells' per-256-triangle run boxes (build-side: new builds);
+     *   - slicedUploads: ≤ Renderer3D.UPLOAD_FRAME_BUDGET (4 MB) of geometry written a frame, big ones in slices;
+     *   - crowdCellsInWorker: the instanced crowd's near / mid cells build in the 'near' worker lane;
+     *   - crowdPrefetchLead: those cells prefetch ahead by a second of the camera's travel;
+     *   - overlaysFogCulled: road paint / wear / gutters / storefronts are culled past the fog horizon's Far;
+     *   - backdropFollowsWindow: the apron / void grid / border glow are rebuilt around the window's focus tile;
+     *   - refreshReattached: a re-attached tile / restored centre takes the current glow / style at once;
+     *   - orthoViewCentre: under ortho the tile window centres on the view centre, not the far-off eye;
+     *   - pruneGroupBoxCache: the renderer's array-group box cache drops the entries of groups that left.
+     *  Step 3b (§P13 "Step 3b"):
+     *   - incrementalCollisionGrid: the Play collision broadphase adds / removes / re-cells only the meshes that
+     *     changed on a structure change (collision-snapshot.ts) instead of rebuilding it (same query answers);
+     *   - slicedReassembly: a streamed tile's group is wrapped, warmed and attached in slices inside the per-frame
+     *     budget (WorldManager._reassembleSlice), entering the scene complete;
+     *   - packInstances: the world worker sends a tile's instance lists as typed arrays (packed-instances.ts), unpacked
+     *     per layer by those slices (the tile's worker-message task no longer rebuilds ~8 k objects; new builds);
+     *   - scopedBackdropLod: the backdrop swap (focus-tile change) applies the LOD to its own groups instead of making
+     *     the next LOD frame re-walk and re-stamp the whole world. */
+    public setStep3Options3D(o: Partial<Step3Options3D>): Step3Options3D {
+        if (o.incrementalTileBounds !== undefined) WorldManager.STEP3.incrementalTileBounds = !!o.incrementalTileBounds;
+        if (o.runBoxes !== undefined) WorldManager.STEP3.runBoxes = !!o.runBoxes;
+        if (o.cachedGroupBounds !== undefined) Scene3DManager.STEP3.cachedGroupBounds = !!o.cachedGroupBounds;
+        if (o.collisionCells !== undefined) Scene3DManager.STEP3.collisionCells = !!o.collisionCells;
+        if (o.slicedUploads !== undefined) Renderer3D.slicedUploads = !!o.slicedUploads;
+        if (o.crowdCellsInWorker !== undefined) WorldCrowd.inWorker = !!o.crowdCellsInWorker;
+        if (o.crowdPrefetchLead !== undefined) WorldCrowd.LEAD_S = o.crowdPrefetchLead ? 1.0 : 0;
+        if (o.backdropFollowsWindow !== undefined) WorldManager.STEP3.backdropFollowsWindow = !!o.backdropFollowsWindow;
+        if (o.refreshReattached !== undefined) WorldManager.STEP3.refreshReattached = !!o.refreshReattached;
+        if (o.orthoViewCentre !== undefined) WorldManager.STEP3.orthoViewCentre = !!o.orthoViewCentre;
+        if (o.pruneGroupBoxCache !== undefined) Renderer3D.pruneGroupBoxCache = !!o.pruneGroupBoxCache;
+        if (o.incrementalCollisionGrid !== undefined) Scene3DManager.STEP3B.incrementalCollisionGrid = !!o.incrementalCollisionGrid;
+        if (o.slicedReassembly !== undefined) WorldManager.STEP3B.slicedReassembly = !!o.slicedReassembly;
+        if (o.packInstances !== undefined) WorldManager.STEP3B.packInstances = !!o.packInstances;
+        if (o.scopedBackdropLod !== undefined) WorldManager.STEP3B.scopedBackdropLod = !!o.scopedBackdropLod;
+        if (o.overlaysFogCulled !== undefined && !!o.overlaysFogCulled !== WorldManager.STEP3.overlaysFogCulled) {
+            WorldManager.STEP3.overlaysFogCulled = !!o.overlaysFogCulled;
+            this.world?.restampLod();
+        }
+        this.scheduleRender();
+        return this.getStep3Options3D();
+    }
+    public getStep3Options3D(): Step3Options3D {
+        return {
+            incrementalTileBounds: WorldManager.STEP3.incrementalTileBounds, cachedGroupBounds: Scene3DManager.STEP3.cachedGroupBounds,
+            collisionCells: Scene3DManager.STEP3.collisionCells, runBoxes: WorldManager.STEP3.runBoxes, slicedUploads: Renderer3D.slicedUploads,
+            crowdCellsInWorker: WorldCrowd.inWorker, crowdPrefetchLead: WorldCrowd.LEAD_S > 0, overlaysFogCulled: WorldManager.STEP3.overlaysFogCulled,
+            backdropFollowsWindow: WorldManager.STEP3.backdropFollowsWindow, refreshReattached: WorldManager.STEP3.refreshReattached,
+            orthoViewCentre: WorldManager.STEP3.orthoViewCentre, pruneGroupBoxCache: Renderer3D.pruneGroupBoxCache,
+            incrementalCollisionGrid: Scene3DManager.STEP3B.incrementalCollisionGrid, slicedReassembly: WorldManager.STEP3B.slicedReassembly,
+            packInstances: WorldManager.STEP3B.packInstances, scopedBackdropLod: WorldManager.STEP3B.scopedBackdropLod,
+        };
+    }
+    /** Step 3 diagnostics: Play collision (cells, rays, hood; null outside Play), geometry uploads (last / max MB a frame,
+     *  geometries being sliced), the tile-bounds walk, the crowd cell builds. */
+    public getStep3Stats3D(): { collision: unknown; uploads: unknown; bounds: typeof groupBoundsStats; crowd: unknown } {
+        const pool = this.renderer3D.getGeomPoolStats();
+        return {
+            collision: this.scene3d.getCollisionStats3D(),
+            uploads: { lastMB: pool.uploadLastMB, maxMB: pool.uploadMaxMB, slicing: pool.slicing, slicedGeoms: pool.slicedGeoms, budgetMB: Renderer3D.UPLOAD_FRAME_BUDGET / 1048576 },
+            bounds: { ...groupBoundsStats },
+            crowd: (this.world as unknown as { _crowd?: { stats: unknown } } | undefined)?._crowd?.stats ?? null,
+        };
+    }
+    /** P16 STREAMING HITCHES (performance-plan §P16, docs/ui/performance.md §Streaming hitches): A/B switches, all on by
+     *  default, per session (never saved). `indexedSlotFree` (coalesced, size-bucketed instance-slot free space),
+     *  `slicedGroupPacks` (new array groups packed under a per-frame instance budget, nearest in view first, not drawn
+     *  until packed), `deferredEviction` (a removed tile detaches at once, its renderer cleanup runs under a per-frame
+     *  time budget), `uploadLedger` (instance + geometry writes share one per-frame byte budget, no geometry write over
+     *  2 MB, fresh geometry never written whole by a compaction), `lodStampMemo` (LOD tier lookups once per name; a
+     *  world restamp skips groups already stamped), `snapshotMeshVersion` (the Play collision snapshot trusts a
+     *  member by its own geometry version). Returns the options after the patch. */
+    public setStreamHitchOptions3D(o: Partial<StreamHitchOptions>): StreamHitchOptions {
+        for (const k of Object.keys(STREAM_HITCH) as (keyof StreamHitchOptions)[]) if (o[k] !== undefined) STREAM_HITCH[k] = !!o[k];
+        this.scheduleRender();
+        return this.getStreamHitchOptions3D();
+    }
+    public getStreamHitchOptions3D(): StreamHitchOptions { return { ...STREAM_HITCH }; }
+    /** P16 diagnostics: group packs deferred, deferred evictions (done / max queued / flushed by a re-attach), the
+     *  upload ledger's bytes, LOD stamp skips + memo hits, the collision snapshot's last sync; `reset` zeroes them. */
+    public getStreamHitchStats3D(reset = false): typeof streamHitchStats & { evictPending: number; limits: typeof STREAM_HITCH_LIMITS; snapshotSync: unknown } {
+        const out = { ...streamHitchStats, evictPending: this.renderer3D.pendingEvictions, limits: { ...STREAM_HITCH_LIMITS },
+            snapshotSync: (this.scene3d.getCollisionStats3D() as { snapshotSync?: unknown } | null)?.snapshotSync ?? null };
+        if (reset) resetStreamHitchStats();
+        return out;
+    }
+    /** STEP 3 BUDGETS: this frame's drawn triangles / draw calls (every pass that ran), the resident geometry MB, the
+     *  instanced copies, and the keys over budget + a one-line `warning` for a HUD (null when within). Defaults: 3 M
+     *  triangles, 2 k draw calls, 500 MB of geometry, 200 k instances. Cheap: poll it with the stats HUD. */
+    public getSceneBudget3D(): SceneBudget3D { return this.scene3d.getSceneBudget3D(); }
+    /** Set the budgets (a patch; 0 = no limit for that key; null = the defaults). Session setting, never saved. */
+    public setSceneBudget3D(limits: Partial<SceneBudgetLimits3D> | null): SceneBudgetLimits3D { return this.scene3d.setSceneBudget3D(limits); }
+    /** Play collision diagnostics (collision cells, rays through cells vs the per-mesh path, the hood). Null outside Play. */
+    public getCollisionStats3D(): ReturnType<Scene3DManager['getCollisionStats3D']> { return this.scene3d.getCollisionStats3D(); }
+
+    /** Step 2 diagnostics: render-list sizes + structure-walk counters, draw-rank / prewarm counters, structure version. */
+    public getFrameScanStats3D(): { renderList: unknown; structure: unknown; structureVersion: number; structureBumps: number } {
+        const wr = this.webgpuRenderer as unknown as { getRenderListStats?: () => unknown } | undefined;
+        return { renderList: wr?.getRenderListStats?.() ?? null, structure: this.renderer3D.getStructureStats(), structureVersion: this._structureVersion.peek(), structureBumps: this._structureVersion.bumps };
+    }
+    /** SHADOW QUALITY PRESET (engine-roadmap step 7, performance-plan P14; docs/ui/performance.md §Shadow quality):
+     *  'low' | 'medium' | 'high' | 'ultra' sets the PCF kernel, the cascade count + size + refresh and the far map's size
+     *  + refresh together (shadow-quality.ts). In City mode it is the city LOD settings' `shadow.quality` (saved with the
+     *  city; the same as setCityLodSettings3D({ shadow: { quality } })); outside a city it writes the scene's own shadow
+     *  settings (map size and cascades are saved with the document's global settings; the PCF kernel is per session). */
+    public setShadowQualityPreset3D(q: ShadowQualityPreset): { quality: ShadowQualityPreset | 'custom'; scope: 'city' | 'scene' } {
+        if (this.world.cityMode) { this.world.setLodSettings({ shadow: { quality: q } }); return this.getShadowQualityPreset3D(); }
+        const sp = shadowQualitySpec(q), r3 = this.renderer3D;
+        r3.setShadowQuality(sp.pcf === '3x3' ? 1 : 0);
+        r3.setShadowMapSize(sp.farMapSize);
+        r3.setShadowCascades({ cascades: sp.cascades, mapSize: sp.cascadeMapSize, updateInterval: sp.cascadeInterval });
+        this._sceneShadowQuality = q;
+        this.scheduleRender();
+        return this.getShadowQualityPreset3D();
+    }
+    private _sceneShadowQuality: ShadowQualityPreset = 'high';
+    /** The preset in use ('custom' once a setting it owns was changed on its own) and where it lives. */
+    public getShadowQualityPreset3D(): { quality: ShadowQualityPreset | 'custom'; scope: 'city' | 'scene' } {
+        if (this.world.cityMode) return { quality: this.world.getLodSettingsView().shadow.qualityShown, scope: 'city' };
+        const q = this._sceneShadowQuality, sp = shadowQualitySpec(q), r3 = this.renderer3D, c = r3.shadowCascades;
+        const same = sp.cascades === c.cascades && (!r3.shadowsEnabled || sp.farMapSize === r3.shadowMapSize) && (c.cascades === 1 || sp.cascadeMapSize === c.mapSize);
+        return { quality: same ? shadowQualityShown(q, r3.shadowPcfRadius === 1 ? '3x3' : '5x5', c.cascades) : 'custom', scope: 'scene' };
+    }
+    /** P14 A/B switches (per session, never saved; all default on): `farRanges` (the far shadow map's casters
+     *  submit only their sub-mesh runs inside the light box / shadow reach), `cascadeCache` (near cascades keep a
+     *  cached static layer and redraw only the dynamic casters), `cascadeSlackTexels` (how far the cascade box may
+     *  lag before it re-centres; 0 = every texel), `sunStepDeg` (the shadow maps follow the sun in steps of this angle;
+     *  0 = every change), `joinDefer` (a static caster new to a cached static layer is drawn with the dynamic casters
+     *  until enough have joined: streamed tiles no longer re-render the static layers one by one), `farStaticCache`
+     *  (the P4.2 far-map cache). Returns the current values. */
+    public setShadowCacheOptions3D(o: Partial<{ farRanges: boolean; cascadeCache: boolean; cascadeSlackTexels: number; sunStepDeg: number; joinDefer: boolean; farStaticCache: boolean }>): { farRanges: boolean; cascadeCache: boolean; cascadeSlackTexels: number; sunStepDeg: number; joinDefer: boolean; farStaticCache: boolean } {
+        const R = Renderer3D, r3 = this.renderer3D;
+        if (o.farRanges !== undefined) R.shadowRangeCulling = !!o.farRanges;
+        if (o.cascadeCache !== undefined) R.cascadeStaticCache = !!o.cascadeCache;
+        if (typeof o.cascadeSlackTexels === 'number' && isFinite(o.cascadeSlackTexels)) R.CASCADE_FOLLOW_SLACK_TEXELS = Math.max(0, Math.min(1024, o.cascadeSlackTexels));
+        if (typeof o.sunStepDeg === 'number' && isFinite(o.sunStepDeg)) R.SUN_SHADOW_STEP_DEG = Math.max(0, Math.min(5, o.sunStepDeg));
+        if (o.joinDefer !== undefined) R.staticJoinDefer = !!o.joinDefer;
+        if (o.farStaticCache !== undefined) r3.shadowStaticCache = !!o.farStaticCache;
+        this.scheduleRender();
+        return { farRanges: R.shadowRangeCulling, cascadeCache: R.cascadeStaticCache, cascadeSlackTexels: R.CASCADE_FOLLOW_SLACK_TEXELS, sunStepDeg: R.SUN_SHADOW_STEP_DEG, joinDefer: R.staticJoinDefer, farStaticCache: r3.shadowStaticCache };
+    }
+    /** P14 diagnostics: far-map cache counters (static re-renders and why, dynamic-layer passes, direct renders, caster
+     *  counts, triangles) + near-cascade counters (static re-renders, dynamic composites, re-centres, list sizes). */
+    public getShadowCacheStats3D(): ReturnType<Renderer3D['getShadowCacheStatsP14']> { return this.renderer3D.getShadowCacheStatsP14(); }
+    /** P15 GPU-DRIVEN main pass (performance-plan.md §P15; per session, never saved; default OFF): `enabled` = the main
+     *  pass's batched opaque segment is culled on the GPU (frustum, distance LOD, fog horizon) over a persistent record
+     *  table and drawn from a render bundle of indirect draws; `lean` = the CPU then skips building the camera lists
+     *  nobody reads; `mdi` = use Chrome's experimental multi-draw-indirect when the device has it and the draw order
+     *  has few state buckets. Returns the current values (+ whether the device has multi-draw and the cull compiled). */
+    public setGpuDriven3D(o: Parameters<Renderer3D['setGpuDriven']>[0]): ReturnType<Renderer3D['setGpuDriven']> { const r = this.renderer3D.setGpuDriven(o); this.scheduleRender(); return r; }
+    /** Step 8 (performance-plan §P21): the specialised mesh shader variants: `{ enabled }` switches them (A/B; same
+     *  pixels), `{ max }` caps the variant keys; returns the keys in use, compiled / pending pipelines and compile ms. */
+    public setShaderVariants3D(o: Parameters<Renderer3D['setShaderVariants']>[0] = {}): ReturnType<Renderer3D['setShaderVariants']> { const r = this.renderer3D.setShaderVariants(o); this.scheduleRender(); return r; }
+    public getShaderVariants3D(): ReturnType<Renderer3D['setShaderVariants']> { return this.renderer3D.setShaderVariants({}); }
+    /** P15 diagnostics: records / draw order / buckets, the GPU-reported counters (one frame late, `age`), rebuilds,
+     *  bundle re-records, uploads, the draw mode and CPU ms. */
+    public getGpuDrivenStats3D(): ReturnType<Renderer3D['getGpuDrivenStats']> { return this.renderer3D.getGpuDrivenStats(); }
+    /** GPU CULLING MODE (docs/ui/performance.md §GPU-driven rendering): 'auto' (default: per frame the GPU path when
+     *  the frame is CPU-bound, the classic CPU path when it is GPU-bound) / 'on' / 'off' (the CPU path exactly). A
+     *  per-machine preference (localStorage), never document data. Returns what getGpuCullingMode3D returns. */
+    public setGpuCullingMode3D(mode: Parameters<Renderer3D['setGpuCullingMode']>[0]): ReturnType<Renderer3D['setGpuCullingMode']> { const r = this.renderer3D.setGpuCullingMode(mode); this.scheduleRender(); return r; }
+    /** The mode, the active path ('gpu' / 'cpu') and why (`reason`, `reasonText` e.g. 'CPU-bound'), the auto
+     *  controller's state (switches, the last decision and its inputs) and the sub-bundle omission counters. */
+    public getGpuCullingMode3D(): ReturnType<Renderer3D['getGpuCullingMode']> { return this.renderer3D.getGpuCullingMode(); }
+    /** P15 verification: the next GPU-driven frame's verdicts vs the CPU path's lists (missing = an error). */
+    public verifyGpuDriven3D(): ReturnType<Renderer3D['verifyGpuDriven']> { this.scheduleRender(); return this.renderer3D.verifyGpuDriven(); }
+    /** CITY LOD SETTINGS: per-family draw-distance multipliers, global multiplier, aerial bias, zoom tiers, twin
+     *  distances, shadow options (PCF / slack / cascades), debug tint. Live (no regen); saved with the city, opt-in. */
+    public setCityLodSettings3D(patch: Parameters<WorldManager['setLodSettings']>[0]): ReturnType<WorldManager['setLodSettings']> { return this.world.setLodSettings(patch); }
+    /** The LOD settings + the family table (multiplier, draw distance in units and metres) + cascades + F. */
+    public getCityLodSettings3D(): ReturnType<WorldManager['getLodSettingsView']> { return this.world.getLodSettingsView(); }
+    /** Live LOD readout: per-family shown / LOD-hidden / zoom-hidden counts + triangles, this frame's renderer
+     *  counters (fps, GPU ms, triangles, draw calls, culled, LOD-hidden) and the current render scale. Calling it keeps
+     *  GPU timing on for 3 s (a polling panel gets GPU ms without auto scaling). */
+    public getCityLodStats3D(): CityLodStats {
+        const wr = this.webgpuRenderer, r3 = this.renderer3D;
+        wr.leaseGpuTiming(3000);
+        const fs = r3.getFrameStats3D(), t = wr.getRenderTiming(), res = wr.getResolutionScale();
+        const ps = splitPassStats(fs);
+        return {
+            families: this.world.getLodStats(id => r3.isArrayGroupLodHidden(id)),
+            frame: { fps: t.fps, gpuMs: wr.getGpuFrameMs(), cpuMs: t.frameMs, trisDrawn: fs.trisDrawn, trisVisible: fs.trisVisible, drawCalls: fs.drawCalls,
+                meshesCulled: fs.meshesCulled, groupsCulled: fs.groupsCulled, lodHidden: fs.lodHidden, lodTrisHidden: fs.lodTrisHidden, shadowTris: fs.shadowTris,
+                trisMain: ps.tris.main, trisShadow: ps.tris.shadow, trisOther: ps.tris.other, drawsMain: ps.draws.main, drawsShadow: ps.draws.shadow, drawsOther: ps.draws.other },
+            resolution: { mode: res.mode, current: res.current },
+        };
+    }
+    /** SIMULATION LOD (performance-plan §P13, docs/ui/performance.md §Simulation LOD): merge a patch into the
+     *  sim-LOD settings — `enabled` (the A/B switch), the band radii `nearM` / `midM` (metres), the rates `midHz` /
+     *  `farHz` / `offscreenHz` (0 = frozen) and `fogFreeze`. Live; saved with the city LOD settings (non-default
+     *  fields only). Also reachable as `setCityLodSettings3D({ sim })`. */
+    public setSimLod3D(patch: Parameters<WorldManager['setSimLod']>[0]): ReturnType<WorldManager['setSimLod']> { return this.world.setSimLod(patch); }
+    /** The sim-LOD settings (a copy). */
+    public getSimLod3D(): SimLodSettings { return { ...this.scene3d.simLod.settings }; }
+    /** Sim-LOD readout: things per band (near / mid / far / offscreen / frozen) and updates done / skipped in each
+     *  system's last pass (walkers, cars, trains, otherMovers, liveCrowd, characters, springs), summed in `total`. */
+    public getSimLodStats3D(): SimLodStats { return this.scene3d.simLod.stats(); }
     public isBlock3D(id: string): boolean { return this.blocks.isBlock(id); }
     public addBuildingToBlock3D(id: string, params: Partial<BuildingParams>, placement?: { x?: number; y?: number; z?: number; ry?: number }): number { return this.blocks.addBuilding(id, params, placement); }
     public setBlockBuildingPlacement3D(id: string, index: number, placement: { x?: number; y?: number; z?: number; ry?: number }): boolean { return this.blocks.setBuildingPlacement(id, index, placement); }
@@ -7133,9 +7976,47 @@ class ShapeManager {
         this.scene3d.setFaceGaze(bodyMeshId, x, y);
     }
 
+    // ── Face kit: brows / mouth / nose / blush / hair shadow + expressions (face-features.ts; character-creator.md §2.6) ──
+    /** The new-character face-kit params (seed a Face panel). */
+    public getDefaultFaceFeatures3D(): FaceFeatureParams { return defaultFaceFeatureParams(); }
+    /** Patch a character's face kit — live (call on every slider change). The first call turns the kit on for a face
+     *  that never had it (e.g. a character saved before the kit). `{ enabled: false }` hides it (params kept). Persists. */
+    public setFaceFeatures3D(bodyMeshId: string, patch: Partial<FaceFeatureParams>): boolean { return this.scene3d.faceKit.setFaceFeatures(bodyMeshId, patch); }
+    /** A character's face-kit params (a copy), or null if the kit was never turned on for it. */
+    public getFaceFeatures3D(bodyMeshId: string): FaceFeatureParams | null { return this.scene3d.faceKit.getFaceFeatures(bodyMeshId); }
+    /** Show an expression: 'neutral' | 'smile' | 'open' | 'frown' | 'surprised' | 'default' (the resting one), or a blend
+     *  of weights ({ smile: 0.6, open: 0.3 }). `blendMs` (default 180, 0 = snap), `weight` (scales a named one), `holdMs`
+     *  (then back to rest). Runtime only — the RESTING expression is the `expression` param. False without a face kit. */
+    public setCharacterExpression3D(bodyMeshId: string, expr: FaceExpressionName | ExpressionWeights | 'default', opts?: { blendMs?: number; weight?: number; holdMs?: number }): boolean {
+        return this.scene3d.faceKit.setCharacterExpression(bodyMeshId, expr, opts);
+    }
+    /** The current expression ({ name: dominant, weights }), or null without a face kit. */
+    public getCharacterExpression3D(bodyMeshId: string): { name: FaceExpressionName; weights: ExpressionWeights } | null { return this.scene3d.faceKit.getCharacterExpression(bodyMeshId); }
+    /** The expression names (for a picker). */
+    public getCharacterExpressionNames3D(): FaceExpressionName[] { return [...FACE_EXPRESSION_NAMES]; }
+    /** The option lists for the Face panel's dropdowns. */
+    public getFaceFeatureOptions3D(): { browStyles: BrowStyle[]; noseStyles: NoseStyle[]; expressions: FaceExpressionName[] } {
+        return { browStyles: [...BROW_STYLES], noseStyles: [...NOSE_STYLES], expressions: [...FACE_EXPRESSION_NAMES] };
+    }
+    /** A quick brow raise (e.g. on a reaction); `amount` ~0.3–0.6. */
+    public pulseCharacterBrows3D(bodyMeshId: string, amount = 0.45): void { this.scene3d.faceKit.pulseBrows(bodyMeshId, amount); }
+
     // ── Procedural hair (chunky low-poly; presets + sliders) ─────────────────────
     /** Default hairstyle params (the "Twintails" reference) to seed a slider panel. */
     public getDefaultHairParams3D(): HairParams { return this.scene3d.getDefaultHairParams(); }
+    /** The anime hair STYLE presets (hairMode 'locks'; docs/ui/character-creator.md "Hair styles") for a style picker. */
+    public getHairStyles3D(): { name: string; label: string }[] { return hairStyleList(); }
+    /** Full HairParams for a style preset (`lockSeed` varies the per-lock jitter); null for an unknown name. */
+    public getHairStylePreset3D(name: string, lockSeed = 0): HairParams | null { return hairStylePreset(name, lockSeed); }
+    /** Apply a style preset to a body's hair, keeping its colours (root / tip / gradient / fade) unless `keepColors` is false. */
+    public applyHairStyle3D(bodyMeshId: string, name: string, keepColors = true): boolean {
+        const cur = this.getHairParams3D(bodyMeshId);
+        const pre = hairStylePreset(name, cur?.lockSeed ?? 0);
+        if (!pre) return false;
+        if (keepColors && cur) { pre.rootColor = cur.rootColor; pre.tipColor = cur.tipColor; pre.gradient = cur.gradient; pre.tipFade = cur.tipFade; }
+        this.setHairParams3D(bodyMeshId, pre);
+        return true;
+    }
     /** Build/update a body's procedural hair from params — live (call on each slider change). */
     public setHairParams3D(bodyMeshId: string, params: HairParams): void {
         // Hair regenerates with a NEW mesh id; carry the user's render style + painted/uploaded texture.
@@ -7172,6 +8053,14 @@ class ShapeManager {
      * (setIdleAnimation3D). `clips` = eligible clip names (default = the built-in one-shots). enabled:false stops.
      */
     public setIdleBreaks3D(bodyMeshId: string, opts: { enabled?: boolean; minSec?: number; maxSec?: number; clips?: string[] }): void { this.scene3d.setIdleBreaks(bodyMeshId, opts); }
+    /**
+     * Play a clip ONCE over the character's idle — the idle keeps moving everything the clip doesn't (breathing, sway,
+     * weight shift), the clip crossfades in/out, and its eye events fire. Turns the idle on for the clip if it was off.
+     * Works in armature mode too (a "Play with idle" option). `clip` = clip name ('Wave') or id. False if not found.
+     */
+    public playClipOverIdle3D(bodyMeshId: string, clip: string): boolean { return this.scene3d.animation.playClipOverIdle(bodyMeshId, clip); }
+    /** Whether a character is currently playing a clip over its idle (or an idle break). */
+    public isPlayingOverIdle3D(bodyMeshId: string): boolean { return this.scene3d.animation.isPlayingOverIdle(bodyMeshId); }
     /**
      * Toggle procedural SQUASH & STRETCH — a volume-preserving torso scale derived from how extended/compressed
      * the body is each frame (reach/arms-up → stretch taller+thinner; crouch → squash shorter+wider). Layers on
@@ -7214,19 +8103,9 @@ class ShapeManager {
      *  attached parts (face/hair/clothing). A render-style-independent modifier (works on Cel/Cel-HD/PBR);
      *  uses the scene light, so it's strongest when the character is backlit. The "Enable Rim Light" toggle. */
     public setCharacterRimLight3D(bodyMeshId: string, on: boolean): void {
-        const ids = [
-            bodyMeshId,
-            this.scene3d.getEyesMeshId(bodyMeshId),
-            this.scene3d.getHairMeshId(bodyMeshId),
-            this.scene3d.getClothingMeshId(bodyMeshId, 'top'),
-            this.scene3d.getClothingMeshId(bodyMeshId, 'bottom'),
-        ];
-        for (const id of ids) {
-            if (!id) continue;
-            const m = this.scene3d.getMesh(id);
-            if (m) { m.material.rimEnabled = on; m.gpuDirty = true; }
-        }
-        this.scheduleRender();
+        // Now covers EVERY part (was body + eyes + hair + top/bottom only — shoes/socks/base layers were missed) and
+        // re-packs the material flags + persists (was gpuDirty only).
+        this.scene3d.setCharacterRimLight3D(bodyMeshId, on);
     }
     /** Bake a body's hair to GLB + register it as a kitbash 'hair' part. Returns the part id or null. */
     public bakeHairToPart3D(bodyMeshId: string, name: string): string | null {
@@ -7332,6 +8211,15 @@ class ShapeManager {
     }
     /** Remove a body's garment for one slot. */
     public removeClothing3D(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): void { this.scene3d.removeClothing(bodyMeshId, slot); }
+    /** HIDE BODY UNDER CLOTHES (clothing fit round 2, docs/ui/character-creator.md §4): skin the character's opaque garments
+     *  fully cover (and keep covering through the probe poses) isn't drawn, so it can't poke through. Default on;
+     *  persisted per garment (`hideBody` in its params). */
+    public getHideBodyUnderClothes3D(bodyMeshId: string): boolean { return (this.scene3d as any).getHideBodyUnderClothes?.(bodyMeshId) ?? true; }
+    public setHideBodyUnderClothes3D(bodyMeshId: string, on: boolean): void { (this.scene3d as any).setHideBodyUnderClothes?.(bodyMeshId, on); }
+    /** SKIRT HEM SWING (Play): 0 = off, 1 = default, up to 1.5; null when the character has no skirt. Persisted as the
+     *  bottom's `hemSwing`. */
+    public getSkirtSwing3D(bodyMeshId: string): number | null { return (this.scene3d as any).getSkirtSwing?.(bodyMeshId) ?? null; }
+    public setSkirtSwing3D(bodyMeshId: string, amount: number): void { (this.scene3d as any).setSkirtSwing?.(bodyMeshId, amount); }
     /** Bake a body's garment (slot) to GLB + register it as a kitbash slot part. Returns the part id or null. */
     public bakeClothingToPart3D(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants', name: string): string | null {
         return this.scene3d.bakeClothingToPart(bodyMeshId, slot, name);
@@ -7396,28 +8284,48 @@ class ShapeManager {
     // string and re-apply it to a body. Independent of document persistence — a reliable way to keep a look
     // as a preset or back one up. (Face/eye decals + painted textures are PNG blobs, NOT included here yet —
     // they ride the full document save; v1 covers the procedural generators, which is the bulk of the look.)
-    /** Export `bodyMeshId` (or the first procedural body) as a JSON character preset string. */
+    /** Export `bodyMeshId` (or the first procedural body) as a JSON character preset string — the COMPLETE look
+     *  (v2, audit 2026-09-28 C2): body, skin tone, hair, every clothing slot, charms, procedural eyes, render style.
+     *  (Hand-drawn face textures are PNGs and ride the document save, not a preset.) */
     public exportCharacter3D(bodyMeshId?: string): string {
         const id = bodyMeshId ?? this._firstProceduralBody3D();
-        const body = id ? (this.scene3d.serializeBodyParams().find(b => b.bodyMeshId === id)?.params ?? null) : null;
-        const hair = id ? (this.scene3d.serializeHairRigs().find(h => h.bodyMeshId === id)?.params ?? null) : null;
-        const clothing: Record<string, ClothingParams> = {};
-        if (id) for (const c of this.scene3d.serializeClothingRigs()) if (c.bodyMeshId === id) clothing[c.slot] = c.params;
-        const renderStyle = id ? (this.scene3d.getMesh(id)?.material.renderStyle ?? 'default') : 'default';
-        return JSON.stringify({ kind: 'salsa-character', version: 1, body, hair, clothing, renderStyle });
+        if (!id) return JSON.stringify({ kind: 'salsa-character', version: CHARACTER_PRESET_VERSION, body: null, hair: null, clothing: {} });
+        return JSON.stringify(exportCharacterPreset(this._characterPresetHost(), id));
     }
-    /** Apply a JSON character preset (from exportCharacter3D) to a body. Body first (it regenerates + re-fits),
-     *  then hair / clothing / render style. */
+    /** Apply a JSON character preset (from exportCharacter3D) to a body — REPLACES the look: every clothing slot is
+     *  applied or removed, charms replaced, eyes replaced. Old v1 presets still import (their missing sections — skin,
+     *  charms, face — are left as they are). */
     public async importCharacter3D(bodyMeshId: string, preset: string | object): Promise<void> {
-        let data: any;
-        try { data = typeof preset === 'string' ? JSON.parse(preset) : preset; }
-        catch { throw new Error('importCharacter3D: invalid JSON'); }
-        if (!data || data.kind !== 'salsa-character') throw new Error('importCharacter3D: not a salsa-character preset');
-        if (data.body)             await this.setBodyParams3D(bodyMeshId, data.body);
-        if (data.hair)             this.setHairParams3D(bodyMeshId, data.hair);
-        if (data.clothing?.top)    this.setClothingParams3D(bodyMeshId, data.clothing.top);
-        if (data.clothing?.bottom) this.setClothingParams3D(bodyMeshId, data.clothing.bottom);
-        if (data.renderStyle && data.renderStyle !== 'default') this.setRenderStyle3D(bodyMeshId, data.renderStyle);
+        await applyCharacterPreset(this._characterPresetHost(), bodyMeshId, preset);
+    }
+    private _characterPresetHost(): CharacterPresetHost {
+        return {
+            getBodyParams: (id) => this.getBodyParams3D(id),
+            setBodyParams: (id, params) => this.setBodyParams3D(id, params),
+            getSkinTone: (id) => this.getSkinTone3D(id),
+            setSkinTone: (id, hex) => this.setSkinTone3D(id, hex),
+            getHairParams: (id) => this.getHairParams3D(id),
+            setHairParams: (id, params) => this.setHairParams3D(id, params),
+            removeHair: (id) => this.removeHair3D(id),
+            getClothingParams: (id, slot) => this.getClothingParams3D(id, slot),
+            setClothingParams: (id, params) => this.setClothingParams3D(id, params),
+            removeClothing: (id, slot) => this.removeClothing3D(id, slot),
+            listAttachments: (id) => this.listAttachments3D(id),
+            addAttachment: (id, type, placement, params) => this.addAttachment3D(id, type, placement, params),
+            removeAttachment: (aid) => this.removeAttachment3D(aid),
+            getFaceExpressions: (id) => this.getFaceExpressions3D(id),
+            ensureFace: (id) => this.ensureFace3D(id),
+            createFaceExpression: (id, name) => this.createFaceExpression3D(id, name),
+            deleteFaceExpression: (id, e) => this.deleteFaceExpression3D(id, e),
+            setFaceExpressionProcedural: (id, e, params) => this.setFaceExpressionProcedural3D(id, e, params),
+            setActiveFaceExpression: (id, e) => this.setActiveFaceExpression3D(id, e),
+            setFaceBlinkExpression: (id, e) => this.setFaceBlinkExpression3D(id, e),
+            setFaceBlinkConfig: (id, cfg) => this.setFaceBlinkConfig3D(id, cfg),
+            getFaceFeatures: (id) => this.getFaceFeatures3D(id),
+            setFaceFeatures: (id, params) => { this.setFaceFeatures3D(id, params); },
+            getRenderStyle: (id) => this.scene3d.getMesh(id)?.material.renderStyle ?? 'default',
+            setRenderStyle: (id, style) => this.setRenderStyle3D(id, style as Parameters<ShapeManager['setRenderStyle3D']>[1]),
+        };
     }
     /** The first procedural body mesh id in the scene, or null (convenience for export with no id). */
     private _firstProceduralBody3D(): string | null {
@@ -8387,6 +9295,24 @@ class ShapeManager {
         this.scheduleRender();
     }
 
+    /** Per-object NO FOG (Material3D.noFog, docs/specs/fog-horizon.md): `true` = this mesh ignores the scene fog
+     *  entirely (no fog, height fog or aerial haze; never culled, faded or outline-cut by the fog horizon) — for sky
+     *  domes, clouds, backdrops, UI-like props; `'hardEdge'` = only while Hard fog edge is on (the city's sky / cloud
+     *  layers default to this); `false` = fogged as usual. Material-only (no geometry rebuild); persists with the mesh
+     *  material. Returns false if the mesh is gone. */
+    public setMeshNoFog3D(meshId: string, mode: boolean | 'hardEdge'): boolean {
+        const m = this.scene3d.getMesh(meshId);
+        if (!m) return false;
+        applyMaterialPatch(m, { noFog: mode === 'hardEdge' ? 'hardEdge' : !!mode });
+        this.scheduleRender();
+        return true;
+    }
+    /** A mesh's no-fog setting (false when unset), or null if the mesh is gone. */
+    public getMeshNoFog3D(meshId: string): boolean | 'hardEdge' | null {
+        const m = this.scene3d.getMesh(meshId);
+        return m ? (m.material.noFog ?? false) : null;
+    }
+
     /** P4b: make this mesh THE planar mirror — a true mirrored re-render of the scene (back faces included,
      *  pixel-exact, works in ortho and perspective). One reflector per scene: the first flagged mesh wins.
      *  The mirror plane is the mesh's local +Z face (a flat panel's front); persists with the mesh material.
@@ -8466,6 +9392,30 @@ class ShapeManager {
         this.scheduleRender();
     }
 
+    /** HARD FOG EDGE (2026-10-01): `true` = only the plain fog draws (aerial haze + height fog are suppressed, not
+     *  cleared) so linear near/far give a sharp cutoff, and a city stops rescaling / replacing the fog. Turning it off
+     *  hands the fog back to the city (re-applies its time-of-day fog). Saved with the document's global settings. */
+    public setFogHardEdge3D(on: boolean): void {
+        this.renderer3D.fogHardEdge = !!on;
+        this.world?.onFogHardEdgeChanged();
+        this.scheduleRender();
+    }
+    public getFogHardEdge3D(): boolean { return this.renderer3D.fogHardEdge; }
+
+    /** FOG HORIZON (docs/specs/fog-horizon.md, docs/ui/city-quality.md "Fog horizon"): merge a patch into the fog-horizon
+     *  settings (`{ reset: true }` = the defaults first) and return them. `buildingsOnly` stops every non-building
+     *  family at the fog's Far (silhouette skyline), `includeAttachments` keeps signs / awnings / rooftop equipment in
+     *  it, `fadeM` (metres, 0 = pop) and `fadeStyle` ('dither' | 'dither-coarse') shape the dissolve band, and
+     *  `silhouetteOutlines` = false keeps the post ink outlines off fog-coloured pixels. Live (no regen); applies only
+     *  while Hard edge is on and the fog is linear. Saved with the document's global settings (only non-default fields). */
+    public setFogHorizon3D(patch: Partial<FogHorizonSettings> & { reset?: boolean }): FogHorizonSettings {
+        const r = this.renderer3D.setFogHorizon(patch ?? {});
+        this.scheduleRender();
+        return r;
+    }
+    /** The fog-horizon settings (a copy). */
+    public getFogHorizon3D(): FogHorizonSettings { return this.renderer3D.fogHorizon; }
+
     /** Get current fog config. */
     public getFog3D(): FogConfig {
         return { ...this.renderer3D.fogConfig };
@@ -8500,8 +9450,18 @@ class ShapeManager {
     public setMeshOutline3D(meshId: string, style: Partial<HighlightStyle>): boolean { return this.scene3d.setMeshOutline3D(meshId, style); }
     /** Remove a persistent outline from a mesh. */
     public clearMeshOutline3D(meshId: string): boolean { return this.scene3d.setMeshOutline3D(meshId, null); }
+    /** E3 CHARACTER OUTLINES: outline every procedural character (body + clothes + hair) now and every one created
+     *  later; null = off (default). Scenery is never outlined. Returns the number of characters updated. Persists. */
+    public setCharacterOutlines3D(style: Partial<HighlightStyle> | null): number { return this.scene3d.setCharacterOutlines3D(style); }
+    public getCharacterOutlines3D(): Partial<HighlightStyle> | null { return this.scene3d.getCharacterOutlines3D(); }
     /** The mesh's persistent outline style, or null if none. */
     public getMeshOutline3D(meshId: string): HighlightStyle | null { return this.scene3d.getMeshOutline3D(meshId); }
+    /** STACKED outlines — extra rings OUTSIDE the mesh's outline, inner → outer (e.g. red outline + white ring:
+     *  `setMeshOutlineRings3D(id, [{ color: [1,1,1,1], width: 0.02 }])`). Each ring's `width` = its own thickness;
+     *  other fields default to the main outline's. [] / null clears. Persists. Needs setMeshOutline3D set first. */
+    public setMeshOutlineRings3D(meshId: string, rings: Partial<HighlightStyle>[] | null): boolean { return this.scene3d.setMeshOutlineRings3D(meshId, rings); }
+    /** The extra outline rings (inner → outer), [] if none. */
+    public getMeshOutlineRings3D(meshId: string): HighlightStyle[] { return this.scene3d.getMeshOutlineRings3D(meshId); }
 
     /** Global "skin softness" — wrapped/half-Lambert diffuse strength 0..1 applied to soft-lit materials (the
      *  procedural body skin by default). 0 = normal Lambert (hard shading), 1 = flattest anime look. Persists. */
@@ -8517,6 +9477,50 @@ class ShapeManager {
     /** The scene-global skin toon-ramp look (bands / softness / shadowFloor / warm shadowTint). Merged + clamped. Persists. */
     public setSkinRampSettings3D(patch: Partial<SkinRampSettings>): void { this.scene3d.setSkinRampSettings3D(patch); }
     public getSkinRampSettings3D(): SkinRampSettings { return this.scene3d.getSkinRampSettings3D(); }
+    /** Sketch render style PAPER amount 0..1 (scene-wide): 1 = off-white paper + colour wash, 0 = full colour + pencil
+     *  hatching. Default 0.75 (the original). Suggested UI: a "Paper" slider shown when a mesh uses Sketch. Persists. */
+    public setSketchPaper3D(amount: number): void { this.scene3d.setSketchPaper3D(amount); }
+    /** TOON SHADOWS — the scene-wide look for `toonShadow` materials in the Cel / Cel-HD styles: `bands` (1–4),
+     *  `softness` (0–0.5), `shadowValue` (0–1, how bright the shadow is), `shadowTint` (rgb multiplier — a cool lavender
+     *  = anime shadows), `saturation` (0–1). Merge-style; persists. docs/specs/film-look-and-toon-shadows.md §B. */
+    public setToonShadows3D(patch: Partial<import('../renderer/3d/material-3d').ToonShadowSettings>): void { this.scene3d.setToonShadows3D(patch); }
+    public getToonShadows3D(): import('../renderer/3d/material-3d').ToonShadowSettings { return this.scene3d.getToonShadows3D(); }
+    /** Opt one mesh into toon shadows (visible in Cel / Cel-HD). Persists on the material. */
+    public setMeshToonShadow3D(meshId: string, on: boolean): boolean { return this.scene3d.setMeshToonShadow3D(meshId, on); }
+    /** WHICH meshes get the PS1 colour depth + dither: 'all' (default, the original) or 'optIn' (only meshes opted in
+     *  with setMeshRetroColor3D / setCharacterRetroColor3D). Persists with the document (PS1Config.colorScope). */
+    public setRetroColorScope3D(scope: 'all' | 'optIn'): void { this.renderer3D.setPS1({ colorScope: scope }); this.scheduleRender(); }
+    public getRetroColorScope3D(): 'all' | 'optIn' { return this.renderer3D.ps1Config.colorScope ?? 'all'; }
+    /** Opt one mesh in/out of the retro colour (used when the scope is 'optIn'). Persists. False if the mesh is gone. */
+    public setMeshRetroColor3D(meshId: string, on: boolean): boolean { return this.scene3d.materials.setMeshRetroColor(meshId, on); }
+    public getMeshRetroColor3D(meshId: string): boolean { return this.scene3d.materials.getMeshRetroColor(meshId); }
+    /** Retro colour on a whole character (body + clothes + hair + charms); regenerated parts inherit it. Returns count. */
+    public setCharacterRetroColor3D(bodyMeshId: string, on: boolean): number { return this.scene3d.materials.setCharacterRetroColor(bodyMeshId, on); }
+    /** Toon shadows on a whole character (body + hair + every garment). */
+    public setCharacterToonShadows3D(bodyMeshId: string, on: boolean): void { this.scene3d.setCharacterToonShadows3D(bodyMeshId, on); }
+    /** MATTE (visual-polish item 10): the character's skin and every garment without specular — matte cel skin + cloth
+     *  instead of glossy plastic highlights in Cel / Cel-HD (hair keeps its sheen) — now and whenever a garment is
+     *  regenerated. Stored on the body, persists. New random characters get it on; saved characters keep theirs
+     *  (absent = off). False if the id is gone. */
+    public setCharacterMatte3D(bodyMeshId: string, on: boolean): boolean { return this.scene3d.setCharacterMatte3D(bodyMeshId, on); }
+    public getCharacterMatte3D(bodyMeshId: string): boolean { return this.scene3d.getCharacterMatte3D(bodyMeshId); }
+    /** PLAY CHARACTER OUTLINES (item 10): while Play runs, characters with no outline of their own (and the scene's
+     *  character outlines off) get the default thin ink line — runtime only. New documents: on; documents saved before
+     *  it existed: off. Persists with the document; takes effect at the next Play. */
+    public setPlayCharacterOutlines3D(on: boolean): void { this.scene3d.setPlayCharacterOutlines3D(on); }
+    public getPlayCharacterOutlines3D(): boolean { return this.scene3d.getPlayCharacterOutlines3D(); }
+    /** RIM LIGHT look for `rimEnabled` materials (setCharacterRimLight3D / material.rimEnabled): `strength` (0 = the
+     *  original built-in rim, up to 2), `width` (0–1, how far in from the edge), `hardness` (0 soft … 1 crisp toon
+     *  edge), `color`. Merge-style; persists. */
+    public setRimLight3D(patch: Partial<import('../renderer/3d/material-3d').RimLightSettings>): void { this.scene3d.setRimLight3D(patch); }
+    public getRimLight3D(): import('../renderer/3d/material-3d').RimLightSettings { return this.scene3d.getRimLight3D(); }
+    public getSketchPaper3D(): number { return this.scene3d.getSketchPaper3D(); }
+
+    // ── Character skinning method (audit 2026-09-28 C1 Phase 3) ─────────
+    /** 'linear' (original) or 'dualQuat' (volume-preserving joints). Pass a skeleton id or any mesh of the character
+     *  (body / clothes / hair) — the whole character switches together. New procedural bodies are 'dualQuat'. */
+    public setSkinningMethod3D(id: string, method: 'linear' | 'dualQuat'): boolean { return this.scene3d.setSkinningMethod3D(id, method); }
+    public getSkinningMethod3D(id: string): 'linear' | 'dualQuat' | null { return this.scene3d.getSkinningMethod3D(id); }
 
     // ── Script Behaviors (docs/specs/script-behaviors.md) ────────────────
     /** Attach/replace a node's behavior source (TS or JS). Runs Play-only + non-destructive; compiled at Play start. */
@@ -8557,8 +9561,10 @@ class ShapeManager {
      * sm.setPostProcessing3D({ bloom: { enabled: true, threshold: 0.8, intensity: 1.2 } });
      * sm.setPostProcessing3D({ vignette: { enabled: true, intensity: 0.4 } });
      * sm.setPostProcessing3D({ colorGrade: { enabled: true, saturation: 0.2, contrast: 0.1 } });
+     * // FILM look (grain + colour fringing + halation on the bloom) — docs/specs/film-look-and-toon-shadows.md:
+     * sm.setPostProcessing3D({ film: { enabled: true, grain: 0.06, grainSize: 1.5, aberration: 0.0025, halation: 0.35 } });
      * // Disable all:
-     * sm.setPostProcessing3D({ bloom: { enabled: false }, vignette: { enabled: false }, colorGrade: { enabled: false } });
+     * sm.setPostProcessing3D({ bloom: { enabled: false }, vignette: { enabled: false }, colorGrade: { enabled: false }, film: { enabled: false } });
      * ```
      */
     public setPostProcessing3D(config: Parameters<typeof this.scene3d.setPostProcessing3D>[0]): void {
@@ -9242,6 +10248,15 @@ class ShapeManager {
      */
     public getClothVertexIndex(meshId: string, col: number, row: number) {
         return this.scene3d.getClothVertexIndex(meshId, col, row);
+    }
+    /** Coarse slot index for pins (-1 = cutout). Frogmarks cloth-builder feature-detects this; it existed only on
+     *  Scene3DManager, so the host's cutout check silently never ran (bug-hunt 2026-10-01). */
+    public getClothVertexSlot(meshId: string, col: number, row: number): number | null {
+        return this.scene3d.getClothVertexSlot(meshId, col, row);
+    }
+    /** Fine dense vertex index for stitches (-1 = cutout). See getClothVertexSlot. */
+    public getClothVertexDenseIndex(meshId: string, col: number, row: number): number | null {
+        return this.scene3d.getClothVertexDenseIndex(meshId, col, row);
     }
 
     // ── Live cloth config updates ────────────────────────────────────
@@ -10857,7 +11872,7 @@ class ShapeManager {
             this.currentPreviewShape.y = y;
 
             // Sync colors if a new one has been selected
-            if(this.currentPreviewShape.fillColor != this.shapeColor)
+            if(this.currentPreviewShape.fillColor !== this.shapeColor)
             {
                 this.currentPreviewShape.fillColor = this.shapeColor;
             }
@@ -10903,6 +11918,9 @@ class ShapeManager {
      */
     public getSceneGraphJSONForDocument(): string {
         const scene: any = this.sceneGraph.toJSON();
+        // Runtime-only nodes (the Play auto default player: body, skeleton, face decal, hair, garments) never reach a
+        // document, even when a save lands mid-Play (they're only in the graph while playing).
+        dropRuntimeNodesFromSceneJSON(scene.root, new Set(this.scene3d.autoPlayer.runtimeNodeIds()));
         const strip = (n: any): void => {
             if (n?.type === 'SkinnedMesh3D') {
                 if (n.config) delete n.config.geometry;
@@ -11805,7 +12823,7 @@ class ShapeManager {
             return;
         }
 
-        if (!node || (node as Shape).getType() != 'SDFText') return;
+        if (!node || (node as Shape).getType() !== 'SDFText') return;
 
         // 2) Merge the incoming changes
         if (props.font        !== undefined) (node as SDFText).font        = props.font;
@@ -12406,7 +13424,11 @@ class ShapeManager {
         // Don't AUTO-save a transient frame: Play mode (walked-to positions, mid-stride pose) — and, since audit
         // 2026-09-28 P11, UI preview / Player mode too, where playAnimation / seekAnimation pose skeletons and a
         // save would persist the scrubbed pose over the authored one. Autosave resumes (and saves) once they end.
-        p.setBusyPredicate(() => this.scene3d.isPlayModeActive() || this.ui.interactive || this._uiPlayerMode);
+        // + device lost: a save gathered then would read back a dead device (raster layers fail, painted textures go
+        // missing); the recovery's restore runs under the load guard and saves resume after it.
+        p.setBusyPredicate(() => this.scene3d.isPlayModeActive() || this.ui.interactive || this._uiPlayerMode || !!this.webgpuRenderer?.isDeviceLost);
+        p.setBusyEpochProvider(() => this._persistBusyEpoch());   // a loss + recovery during the gather → re-save
+        p.setDeferredCallback(() => this._notifyPersistDeferred('save'));
         return p;
     }
 
@@ -12667,6 +13689,7 @@ class ShapeManager {
      * brush engine's stroke-end callback.
      */
     public notifyStrokeEnd(): void {
+        bumpGpuPixelEpoch();   // a host-reported stroke may have changed GPU-only pixels (device-lost shadow; over-counting is safe)
         this.persistence?.notifyStrokeEnd();
     }
 
@@ -12707,7 +13730,7 @@ class ShapeManager {
     /** Serialize all Skeleton3D nodes — paired with getScene3DNodeStates() for project save. */
     public getScene3DSkeletonStates(): any[] {
         if (!this.scene3d) return [];
-        return this.scene3d.getAllSkeletons().map(s => this.scene3d!.serializeSkeletonForSave(s));
+        return this.scene3d.getAllSkeletons().filter(s => !s.excludeFromDocument).map(s => this.scene3d!.serializeSkeletonForSave(s));
     }
 
     /**
@@ -12800,6 +13823,245 @@ class ShapeManager {
      *   a.click();
      */
     public async packProject(): Promise<Blob> {
+        // ★ An export made during Play / UI preview / Player mode is DEFERRED until it ends (bug-hunt 2026-10-01, the
+        // G2 follow-up): gathering then would pack the in-game frame. Same rule + reasoning as DocumentPersistence.saveNow
+        // (see idle-gate.ts): Stop restores the editor state, so a gather right after Stop is the editor state. A document
+        // load while waiting rejects (IdleGateStaleError) instead of exporting the other document.
+        const epoch = this._docLoadEpoch;
+        return runWhenIdle(() => this._isEditorBusyForPersist(), () => this._packProjectNow(), {
+            isStale: () => this._docLoadEpoch !== epoch,
+            busyEpoch: () => this._persistBusyEpoch(),
+            onDeferred: () => this._notifyPersistDeferred('export'),
+        });
+    }
+
+    /** True while a gather would capture a transient frame (3D Play, UI preview, Player mode) — the persistence gate. */
+    private _isEditorBusyForPersist(): boolean {
+        return !!(this.scene3d?.isPlayModeActive?.() || this.ui?.interactive || this._uiPlayerMode || this.webgpuRenderer?.isDeviceLost);
+    }
+    /** Bumped by every document restore (the deferred-export stale check). */
+    private _docLoadEpoch = 0;
+    /** Moves when a busy period starts that a gather could span unnoticed (a GPU device loss + recovery). */
+    private _persistBusyEpoch(): number { return this.webgpuRenderer?.getDeviceStatus?.().lostCount ?? 0; }
+
+    // ── GPU device-lost recovery (docs/ui/device-recovery.md) ──────────────────────────────────────────────────────
+    // WebGPURenderer stops rendering on a loss and gets a new device; the DeviceRecoveryCoordinator (installed here as
+    // its recovery handler) snapshots the document from CPU data + the read-back shadow, lets the renderer rebuild every
+    // GPU owner, and restores the snapshot through the normal document restore. The forwards below are the host API.
+    private _deviceRecovery?: DeviceRecoveryCoordinator;
+
+    /** GPU device status: 'ok' | 'lost' | 'recovering' | 'failed' | 'unavailable', loss / recovery counters, and what
+     *  the last recovery could not bring back. */
+    public getDeviceStatus(): GpuDeviceStatusInfo { return this.webgpuRenderer.getDeviceStatus(); }
+    /** Subscribe to every device status change (lost → recovering → ok | failed). Returns the unsubscribe function. */
+    public onDeviceStatusChange(fn: GpuDeviceStatusListener): () => void { return this.webgpuRenderer.onDeviceStatusChange(fn); }
+    /** Subscribe to device LOSSES only (the 'lost' transition). Returns the unsubscribe function. */
+    public onDeviceLost(fn: GpuDeviceStatusListener): () => void {
+        return this.webgpuRenderer.onDeviceStatusChange((info) => { if (info.status === 'lost') fn(info); });
+    }
+    /** Retry a recovery (e.g. after 'failed', or with autoRecoverDevice off). Resolves true when rendering is back. */
+    public recoverDevice(): Promise<boolean> { return this.webgpuRenderer.recoverDevice(); }
+    /** Automatic recovery on loss (default on). */
+    public setAutoRecoverDevice(on: boolean): void { this.webgpuRenderer.autoRecoverDevice = !!on; }
+    /** TEST HOOK: destroy the device as if the GPU process had reset (the same path a real loss takes). */
+    public simulateDeviceLoss(): void { this.webgpuRenderer.simulateDeviceLoss(); }
+    /** Read back the GPU-only document data now (raster layers, cels, painted textures) so a loss right after can't
+     *  cost it. Saves do this too; a timer does it every `ms` (default 60 s, 0 = off) while something draws. */
+    public refreshDeviceReadbackShadow(): Promise<boolean> { return this._deviceRecovery?.refreshShadow() ?? Promise.resolve(false); }
+    public setDeviceReadbackShadowInterval(ms: number): void { this._deviceRecovery?.setShadowInterval(ms); }
+    /** True when the read-back shadow matches the GPU exactly (no raster / painted-texture edit since it was taken):
+     *  a loss right now would cost nothing. */
+    public isDeviceReadbackShadowCurrent(): boolean { return this._deviceRecovery?.shadowCurrent ?? false; }
+
+    /** A save / export asked for while the editor is busy (Play, UI preview, Player mode, device lost) waits until it
+     *  is idle. Subscribe for a host notice ("Export will finish when you stop Play"); called once per waiting request
+     *  with what waits and why. Returns the unsubscribe function. */
+    public onPersistDeferred(fn: (info: { kind: 'save' | 'export'; reason: 'play' | 'ui-preview' | 'player' | 'device-lost' }) => void): () => void {
+        this._persistDeferredListeners.add(fn);
+        return () => { this._persistDeferredListeners.delete(fn); };
+    }
+    private readonly _persistDeferredListeners = new Set<(info: { kind: 'save' | 'export'; reason: 'play' | 'ui-preview' | 'player' | 'device-lost' }) => void>();
+    private _notifyPersistDeferred(kind: 'save' | 'export'): void {
+        const reason = this.webgpuRenderer?.isDeviceLost ? 'device-lost' as const
+            : this.scene3d?.isPlayModeActive?.() ? 'play' as const
+            : this._uiPlayerMode ? 'player' as const : 'ui-preview' as const;
+        console.info(`[Salsa] ${kind} deferred until the editor is idle (${reason})`);
+        for (const fn of [...this._persistDeferredListeners]) { try { fn({ kind, reason }); } catch (e) { console.warn('[Salsa] onPersistDeferred listener threw', e); } }
+    }
+
+    /** True while the device-lost recovery's own restore runs (it puts back the SAME document). */
+    private _deviceRestoreActive = false;
+
+    /** After a document restore the GPU holds exactly the payload's pixels: that is an exact read-back shadow. */
+    private _seedDeviceShadowFromRestore(payload: DocumentSavePayload, clean: boolean): void {
+        const rec = this._deviceRecovery;
+        if (!rec) return;
+        if (!clean) { rec.seedShadow(null); return; }
+        const rlm = this.rasterLayerManager;
+        const layerIds = (rlm?.getLayerMetadata() ?? []).map((l) => l.id);
+        const celIds: string[] = [];
+        for (const l of rlm?.getLayerMetadata() ?? []) if (l.animationType === 'animated') for (const c of rlm!.getCels(l.id)) celIds.push(c.id);
+        rec.seedShadow(gpuOnlyFromRestorePayload(payload, gpuPixelEpoch(), rlm ? rlm.getCanvasSize() : null, layerIds, celIds));
+    }
+
+    private _initDeviceRecovery(): void {
+        const r = this.webgpuRenderer;
+        if (!r || typeof r.setDeviceRecoveryHandler !== 'function') return;
+        const rec = this._deviceRecovery = new DeviceRecoveryCoordinator({
+            leaveTransientModes: () => { if (this.scene3d?.isPlayModeActive()) this.scene3d.exitPlayMode3D(); },
+            gather: (gpuOnly) => this.docState.gather(true, { gpuOnly }),
+            readBackGpuOnly: () => this.docState.gatherGpuOnly(),
+            hasGpuOnlyContent: () => (this.rasterLayerManager?.getLayers().some((l) => (l.type ?? 'layer') === 'layer') ?? false)
+                || this._uvPaintTextures.size > 0
+                || (this.scene3d?.getFaceTextureExports().some((f) => !f.procedural) ?? false),
+            gpuPixelEpoch: () => gpuPixelEpoch(),
+            restore: async (payload) => {
+                this._deviceRestoreActive = true;
+                try { await this.restoreDocumentState(payload); } finally { this._deviceRestoreActive = false; }
+            },
+            resetManagersForNewDevice: () => this._resetManagersForNewDevice(),
+            captureRuntime: () => this._captureDeviceRuntime(),
+            applyRuntime: (s) => this._applyDeviceRuntime(s as ReturnType<ShapeManager['_captureDeviceRuntime']>),
+            listContent: () => new Set<object>(this.scene3d?.getAllMeshes() ?? []),
+            resetSurvivors: (before) => {
+                for (const m of this.scene3d?.getAllMeshes() ?? []) {
+                    if (!before.has(m)) continue;   // created by the restore on the new device
+                    m.gpuVertexBuffer = null; m.gpuIndexBuffer = null;
+                    m.diffuseTexture = null; m.normalMapTexture = null; m.paintTexture = null;
+                    m.gpuDirty = true;
+                }
+            },
+            deviceHealthy: () => !r.isDeviceLost,
+        });
+        r.setDeviceRecoveryHandler((install) => rec.recover(install));
+        // Raster layer textures: re-created blank on the new device BEFORE the raster engines re-bind (order 60) and the
+        // restore re-uploads their pixels — the layer stack must never point at a dead texture (setSize copies from it).
+        r.registerGpuResourceOwner('raster-layers', () => { this.rasterLayerManager?.recreateTexturesForNewDevice(); }, 40);
+    }
+
+    /** Manager-held GPU objects that outlive a document load (the restore re-creates the document's own). */
+    private _resetManagersForNewDevice(): string[] {
+        const lost: string[] = [];
+        const step = (name: string, fn: () => void) => { try { fn(); } catch (e) { lost.push(`${name}: ${e instanceof Error ? e.message : String(e)}`); } };
+        // Lazily created engines: dropped → re-created on the new device at next use.
+        step('raster engines', () => {
+            this.floodFillEngine = undefined;
+            this.textEffectEngine = undefined;
+            (this.text as unknown as { _textEffectEngine?: unknown })._textEffectEngine = undefined;
+            (this._pkgComposite as unknown as { _pkgCompositor?: unknown })._pkgCompositor = undefined;
+            if (this._uvPaintSess) (this._uvPaintSess as unknown as { controller?: unknown }).controller = undefined;
+        });
+        // Owners whose old-device buffers / textures are all lazily re-created (sweep = null them).
+        step('raster move', () => { if (this.rasterMoveService) sweepGpuFields(this.rasterMoveService); });
+        step('raster text', () => {
+            const rts = this.rasterTextService as unknown as Record<string, unknown> | undefined;
+            if (!rts) return;
+            sweepGpuFields(rts);
+            for (const k of Object.keys(rts)) {   // its lazily made stamp engine captured the old resources
+                const v = rts[k] as { destroy?: unknown } | null;
+                if (v && typeof v === 'object' && v.constructor?.name === 'RasterTextStamp') rts[k] = undefined;
+            }
+        });
+        step('mesh paint', () => { if (this.meshPaint) sweepGpuFields(this.meshPaint); });
+        step('3D managers', () => { lost.push(...this.scene3d.resetGpuResourcesForDeviceLoss()); });
+        // UV-paint textures are document content: the restore disposes + rebuilds them (from the snapshot's PNGs).
+        return lost;
+    }
+
+    /** View state a document restore doesn't carry: the live camera + orbit pose, City mode, UI preview / Player mode. */
+    /** A recovery's runtime view state not yet re-applied (its city is still rebuilding): a second loss before then
+     *  must keep THAT state — the live camera then is still the pre-reveal one. */
+    private _pendingDeviceRuntime: ReturnType<ShapeManager['_captureDeviceRuntimeNow']> | null = null;
+    private _captureDeviceRuntime(): ReturnType<ShapeManager['_captureDeviceRuntimeNow']> {
+        return this._pendingDeviceRuntime ?? this._captureDeviceRuntimeNow();
+    }
+    private _captureDeviceRuntimeNow() {
+        const plain = (o: unknown, keys?: string[]): Record<string, unknown> => {
+            const out: Record<string, unknown> = {};
+            if (!o) return out;
+            const rec = o as Record<string, unknown>;
+            for (const k of keys ?? Object.keys(rec)) {
+                const v = rec[k];
+                if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') out[k] = v;
+                else if (v instanceof Float32Array || v instanceof Float64Array) out[k] = Array.from(v);
+            }
+            return out;
+        };
+        const orbit = this.scene3d?.getOrbitController?.();
+        return {
+            cam: plain(this.webgpuRenderer.peekRenderer3D()?.getCamera()),
+            orbit: plain(orbit, ['radius', 'azimuth', 'elevation', 'minRadius', 'maxRadius', 'minElevation', 'maxElevation']),
+            cityMode: !!this.world?.cityMode,
+            // City traffic is a runtime toggle (a rebuild restarts it): keep a host's "traffic off" through the rebuild.
+            trafficOff: !!this.world?.cityMode && !this.world.isBuildingCity() && !this.world.trafficRunning,   // (mid-build: not started yet)
+            // the build that ENTERS City mode (its reveal frames the camera); an edit rebuild keeps the user's view
+            cityBuilding: !!this.world?.cityMode && this.world.isBuildingCity() && (this.world as unknown as { _pendingCityEnter?: boolean })._pendingCityEnter === true,
+            // The city's params (or the in-flight build's): a loss during the FIRST build has no city marker in the
+            // document yet, so re-entering without them would build the default city (devlost drive 'build').
+            cityParams: this.world?.cityMode ? (() => {
+                const w = this.world as unknown as { _inflightFullParams?: () => unknown; params: unknown };
+                const p = w._inflightFullParams?.() ?? w.params;
+                try { return p ? JSON.parse(JSON.stringify(p)) as Record<string, unknown> : null; } catch { return null; }
+            })() : null,
+            uiInteractive: !!this.ui?.interactive, playerMode: this._uiPlayerMode,
+        };
+    }
+
+    private _applyDeviceRuntime(s: ReturnType<ShapeManager['_captureDeviceRuntime']> | null): void {
+        if (!s) return;
+        const put = (o: unknown, st: Record<string, unknown>) => {
+            if (!o) return;
+            const rec = o as Record<string, unknown>;
+            for (const [k, v] of Object.entries(st)) {
+                const cur = rec[k];
+                if (Array.isArray(v) && (cur instanceof Float32Array || cur instanceof Float64Array) && cur.length === v.length) cur.set(v);
+                else if (typeof v !== 'object') rec[k] = v;
+            }
+            for (const k of ['_viewDirty', '_projDirty', '_vpDirty']) if (k in rec) rec[k] = true;
+        };
+        const applyView = () => {
+            put(this.webgpuRenderer.peekRenderer3D()?.getCamera(), s.cam);
+            put(this.scene3d?.getOrbitController?.(), s.orbit);
+            this.scheduleRender();
+        };
+        // City mode: the restore exits it and rebuilds the city (async); re-entering joins that build, and the city's
+        // own framing runs when it lands — so the pre-loss view goes back once more after the build.
+        if (s.cityMode && this.world) {
+            if (!this.world.cityMode) {
+                // Restored from the city marker (built or building) → resume / join it; no city came back (lost mid
+                // first build) → build the one that was building.
+                const resume = this.world.hasWorld || this.world.isBuildingCity() || !s.cityParams;
+                this.world.enterCityMode(resume ? undefined : s.cityParams as Parameters<WorldManager['enterCityMode']>[0]);
+            }
+            // Wait for the rebuild (its reveal frames the camera), also when the restore re-entered City mode itself
+            // (tiled worlds) — the build may start a moment after the restore returns, so wait up to 1.5 s to see one.
+            const t0 = Date.now();
+            let seen = false;
+            this._pendingDeviceRuntime = s;
+            const wait = () => {
+                if (this.webgpuRenderer.isDeviceLost || this._pendingDeviceRuntime !== s) return;   // lost again: the next recovery re-applies s
+                // (the city's orbit controller is re-created by its enter tail at the reveal: wait for it too)
+                const busy = this.world.isBuildingCity() || this.world.isUpdatingCity()
+                    || (Object.keys(s.orbit).length > 0 && !this.scene3d?.getOrbitController?.())
+                    // a tiled world frames itself once its streamed tiles settle (WorldManager._onTilesSettled)
+                    || (this.world as unknown as { _reframeAfterTiles?: boolean })._reframeAfterTiles === true;
+                if (busy) seen = true;
+                if ((busy || (!seen && Date.now() - t0 < 1500)) && Date.now() - t0 < 120_000) { setTimeout(wait, 100); return; }
+                this._pendingDeviceRuntime = null;
+                if (s.trafficOff && this.world.trafficRunning) this.world.stopTraffic();
+                // Lost during the city's own (first) build: the pose captured then was the pre-city one (orbit limits
+                // included) — let the city's framing stand, as it would have without the loss.
+                console.log(`[Salsa][gpu] city back after the recovery (${Date.now() - t0} ms, build seen: ${seen}); view ${s.cityBuilding ? 'left to the city framing' : 're-applied'}`);
+                if (!s.cityBuilding) { applyView(); setTimeout(() => { if (!this.webgpuRenderer.isDeviceLost) applyView(); }, 300); }   // + once after the reveal's own framing frame
+            };
+            setTimeout(wait, 100);
+        }
+        applyView();
+        if (s.playerMode && !this._uiPlayerMode) this.enterUIPlayerMode();
+        else if (s.uiInteractive && !this.ui.interactive) this.ui.setInteractive(true);
+    }
+
+    private async _packProjectNow(): Promise<Blob> {
         // ★ The package IS the autosave payload (audit 2026-09-28 P4). This used to hand-assemble its own subset — it
         // dropped UV paint / face textures, baked parts, packaging and GARP, and re-serialized 3D nodes without the
         // procedural-child filter (so they came back LOOSE). Gathering with forceAll3D includes every model + the
@@ -12888,6 +14150,7 @@ class ShapeManager {
         this.ui.setInteractive(false);
         this.interactionService.suppressBoxSelect = false;
         this._uiStopAllClipPlayers();
+        this._uiSound?.stopAll();   // bug-hunt 2026-10-01: a looping playSound kept playing in the editor after Stop
         this.scheduleRender();
     }
 
@@ -13034,6 +14297,7 @@ class ShapeManager {
             getDocIdentity: () => ({ id: this.currentDocId, name: this.currentDocName }),
             getPixelFormat: () => this.persistence?.getConfig().pixelFormat ?? 'png',
             upgradePixelFormatToPng: () => { this.persistence?.setConfig({ pixelFormat: 'png' }); },
+            onGpuOnlyGathered: (d) => this._deviceRecovery?.noteGpuOnly(d),   // the device-lost read-back shadow
         });
     }
 
@@ -13055,7 +14319,11 @@ class ShapeManager {
             .filter((p, i, a): p is DocumentPersistence => !!p && a.indexOf(p) === i);
         await Promise.all(guarded.map((p) => p.suspend()));
         try {
+            // A deferred packProject() for the previous document must not pack this one. A device-lost recovery's
+            // restore puts back the SAME document, so an export waiting for it must survive (docs/ui/device-recovery.md).
+            if (!this._deviceRestoreActive) { this._docLoadEpoch++; this._pendingDeviceRuntime = null; }   // (another document: drop a recovery's pending view)
             const report = await this.docState.restore(payload);
+            this._seedDeviceShadowFromRestore(payload, report.issues.length === 0);
             // Restored animated live-text nodes reappear without going through createLiveText, so their continuous-
             // render lease was never acquired → they rendered frozen until selected. Re-acquire it here.
             this._liveText.reconcileLiveTextAnimationLeases();
@@ -13075,6 +14343,7 @@ class ShapeManager {
             const reason = `document restore failed: ${e instanceof Error ? e.message : String(e)}`;
             this._lastRestoreIssues = [{ area: 'document', message: reason, blocksSave: true }];
             for (const p of guarded) p.setSaveBlocked(reason);
+            this._deviceRecovery?.seedShadow(null);   // the GPU holds a partial document: no exact shadow
             throw e;
         } finally {
             for (const p of guarded) p.resume();
@@ -13438,6 +14707,11 @@ class ShapeManager {
     public unregisterUISound(assetId: string): void { this._uiSound?.unregister(assetId); }
     /** AssetIds with a registered URL (for the authoring panel's sound picker). */
     public listUISounds(): string[] { return this._uiSound?.listSounds() ?? []; }
+    /** Play a registered UI sound by id (Frogmarks Player's postMessage 'playSound' command calls this — it was a
+     *  phantom API before bug-hunt 2026-10-01, so the command silently no-op'd). */
+    public playUISound(assetId: string, volume?: number, loop?: boolean): void { this._uiSound?.play(assetId, volume, loop); }
+    /** Raster selection feather (px of soft edge) — the Frogmarks feather slider calls this (was a phantom API). */
+    public setRasterSelectionFeather(px: number): void { this.rasterSelectionService?.setFeather(px); }
 
     // ── HTML forms (Phase 4) ──
     /** Add (or replace, by id) a native form control on a UI layer's machine. Defaults to the active UI layer. */
@@ -13454,6 +14728,36 @@ class ShapeManager {
     public get uiInteractive(): boolean { return this.ui.interactive; }
     /** Advance UI timers — the host calls this each frame while in interactive preview (no-op otherwise). */
     public tickUI(dtMs: number): void { this.ui.tick(dtMs); }
+
+    // ── UI KIT (screen-space HUD / menu / transition pieces — docs/ui/persona-ui-kit.md) ──
+    /** Insertable single-piece presets [{id, label, kind}]. */
+    public listUIKitPresets(): { id: string; label: string; kind: string }[] { return UI_KIT_PRESETS.map((p) => ({ id: p.id, label: p.label, kind: p.kind })); }
+    /** Every kind's property schema (generic panel controls) + labels, transitions and clips. */
+    public getUIKitSchema(): { kinds: Record<string, { label: string; props: UIKitPropSpec[] }>; transitions: string[]; clips: string[]; colorTokens: string[]; anchors: string[]; intros: string[] } {
+        const kinds: Record<string, { label: string; props: UIKitPropSpec[] }> = {};
+        for (const k of Object.keys(KIT_SCHEMA) as UIKitKind[]) kinds[k] = { label: KIT_KIND_LABELS[k], props: KIT_SCHEMA[k] };
+        return { kinds, transitions: [...UI_KIT_TRANSITIONS], clips: [...UI_KIT_CLIPS], colorTokens: [...KIT_COLOR_TOKENS], anchors: [...KIT_ANCHORS], intros: [...KIT_INTROS] };
+    }
+    /** Insert a preset on a UI layer (default: the active one; a "UI Kit" layer is created when there is none). */
+    public insertUIKitPreset(presetId: string, layerId?: string): UIKitWidget | null { const w = this.ui.insertKitPreset(presetId, layerId); this.scheduleRender(); return w; }
+    /** Insert a demo: 'hud' (new "Persona HUD" layer) or 'pause' (pause menu; merged into a HUD demo layer). */
+    public insertUIKitDemo(kind: 'hud' | 'pause'): { layerId: string; widgetIds: string[] } { const r = this.ui.insertKitDemo(kind); this.scheduleRender(); return r; }
+    public addUIKitWidget(kind: UIKitKind, layerId?: string): UIKitWidget { return this.ui.addKitWidget(kind, layerId); }
+    /** A layer's kit widgets (live objects — edit through updateUIKitWidget). */
+    public getUIKitWidgets(layerId?: string): UIKitWidget[] { return this.ui.listKitWidgets(layerId); }
+    public getUIKitWidget(id: string): UIKitWidget | null { return this.ui.findKitWidget(id)?.widget ?? null; }
+    /** Patch a widget (top-level fields; `props` merges key by key). */
+    public updateUIKitWidget(id: string, patch: Partial<Omit<UIKitWidget, 'id' | 'props'>> & { props?: Record<string, number | string | boolean> }): boolean { return this.ui.updateKitWidget(id, patch); }
+    public removeUIKitWidget(id: string): boolean { return this.ui.removeKitWidget(id); }
+    /** Play a clip on a widget (intro | slide | pop | punch | drop | spin | shake | wobble | pulse). */
+    public playUIKitClip(id: string, clip?: string): void { this.ui.playKitClip(id, (clip ?? 'intro') as UIKitClip); }
+    /** Preview a kit transition (slash | shatter | stripeBurst | panelSlide | zoomPunch) — works in edit mode too. */
+    public previewUIKitTransition(type: string, durationMs?: number): void { this.ui.previewKitTransition(type as UIKitTransitionType, durationMs); }
+    /** Menu helpers (Player / host buttons): move the shown menu's selection, activate the selected item. */
+    public uiKitMenuMove(delta: number, menuId?: string): number | null { return this.ui.kitMenuMove(delta, menuId); }
+    public uiKitMenuActivate(menuId?: string): boolean { return this.ui.kitMenuActivate(menuId); }
+    /** Freeze the kit's UI clock at ms (frame-sequence capture); null = live. */
+    public setUIKitClock(ms: number | null): void { this.ui.kit.setClock(ms); this.scheduleRender(); }
     /** Subscribe to UI events (state/variable changes, custom emitEvent). Returns an unsubscribe fn. */
     public onUIEvent(cb: (e: UIEvent) => void): () => void { return this.ui.onUIEvent(cb); }
 

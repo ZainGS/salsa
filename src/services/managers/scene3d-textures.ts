@@ -100,6 +100,10 @@ export class Scene3DTextures {
     return true;
   }
 
+  /** Device-lost recovery: forget the library (its GPU textures died with the device). The document restore refills a
+   *  fresh one from the saved entries' data URLs. */
+  resetForDeviceLoss(): void { this._textureLibrary = undefined; }
+
   // ── Texture library ──────────────────────────────────────────────
 
   getTextureLibrary(): TextureLibrary {

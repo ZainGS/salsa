@@ -1,6 +1,9 @@
 # SSAO — Screen-Space Ambient Occlusion
 
-**Status:** 📋 spec (2026-07-30) → building v1. Realises [city-visual-upgrade.md](./city-visual-upgrade.md) §2A
+**Status:** 📋 spec (2026-07-30) → building v1. **Status (2026-10-04): BUILT** — Stages 1 + 2, half-res
+(`SSAOConfig.resolutionScale` 0.5), city persistence in `worldParams.lighting.ssao` (`sm.world.setSSAO`, city looks
+carry `ssao: true`), engine API `sm.scene3d.setSSAO3D(on, cfg)` (off by default outside city looks). **Not built:** the
+automatic disable for cel / PS1 styles (the shader always multiplies ambient by AO). Versions: [ssao-versions.md](ssao-versions.md). Realises [city-visual-upgrade.md](./city-visual-upgrade.md) §2A
 ("SSAO, flagged future"). **Companion:** memory `project_lighting_shadows` (shadows/lighting scope), `project_audit_2026_07`
 (uber-shader cost caveat).
 

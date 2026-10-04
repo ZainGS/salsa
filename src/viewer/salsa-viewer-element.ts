@@ -88,7 +88,7 @@ export class SalsaViewerElement extends HTMLElement {
       // No WebGPU — try to show thumbnail from the pending URL as a static preview
       const url = this._pendingUrl ?? this.getAttribute('url');
       if (url) {
-        this._peekAndShowThumbnail(url);
+        void this._peekAndShowThumbnail(url);
       } else {
         this._showFallback(shadow, 'WebGPU required (Chrome 113+ or Edge 113+)');
       }
@@ -96,7 +96,7 @@ export class SalsaViewerElement extends HTMLElement {
     }
 
     this._core = new SalsaViewerCore(this._canvas);
-    this._core.init().then(ok => {
+    void this._core.init().then(ok => {
       if (!ok) {
         this._showFallback(shadow, 'WebGPU initialization failed');
         return;
@@ -106,7 +106,7 @@ export class SalsaViewerElement extends HTMLElement {
       this._core!.resize();
 
       const url = this._pendingUrl ?? this.getAttribute('url');
-      if (url) this._load(url);
+      if (url) void this._load(url);
     });
   }
 
@@ -119,7 +119,7 @@ export class SalsaViewerElement extends HTMLElement {
   attributeChangedCallback(name: string, _old: string | null, value: string | null): void {
     if (name === 'url' && value) {
       if (this._core) {
-        this._load(value);
+        void this._load(value);
       } else {
         this._pendingUrl = value;
       }

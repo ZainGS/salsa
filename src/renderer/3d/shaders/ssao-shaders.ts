@@ -16,6 +16,64 @@
  * to get wrong. NOTE: never put a backtick in a WGSL comment (these are template literals).
  */
 
+import { FOG_FADE_WGSL } from './mesh3d-shaders';
+
+// The full scene layout through fogEye (fog horizon: the prepasses read resolution / fogParams / toonParams.w /
+// fogEye to dissolve fading meshes like the colour pass; WGSL has no @offset, so every field up to it is declared).
+const SCENE_UNIFORMS_FULL_WGSL = /* wgsl */`
+struct SceneUniforms {
+  viewProjection:   mat4x4<f32>,
+  cameraPosition:   vec4<f32>,
+  ambientColor:     vec4<f32>,
+  lightDirection:   vec4<f32>,
+  lightColor:       vec4<f32>,
+  ps1Config:        vec4<f32>,
+  resolution:       vec4<f32>,
+  lightSpaceMatrix: mat4x4<f32>,
+  shadowParams:     vec4<f32>,
+  fogColor:         vec4<f32>,
+  fogParams:        vec4<f32>,
+  ps1Config2:       vec4<f32>,
+  lightCounts:      vec4<f32>,
+  pointLights:      array<vec4<f32>, 32>,
+  skinRampParams:   vec4<f32>,
+  styleParams:      vec4<f32>,
+  toonParams:       vec4<f32>,
+  rimParams:        vec4<f32>,
+  heightFog:        vec4<f32>,
+  cascadeMatrices:  array<mat4x4<f32>, 2>,
+  cascadeParams:    vec4<f32>,
+  cascadeBias:      vec4<f32>,
+  aerialParams:     vec4<f32>,
+  fogEye:           vec4<f32>,
+};
+`;
+
+// FOG HORIZON fade band in a prepass (2026-10-01): the SAME rule as the colour pass (coverage from the fog eye, the
+// same 4x4 Bayer pattern), so a dissolving mesh stops occluding the AO / SSR exactly where its pixels vanish. The
+// prepass runs at a fraction of the colour pass (half-res by default), so the pattern is indexed by the colour pass's
+// pixel (from the fragment's own clip position and scene.resolution) in cells of one prepass texel: at full res it is
+// the colour pass's pattern pixel for pixel, at half res every texel stands for the 2x2 pixels it covers (the coarse
+// style's cells then match exactly, the fine style keeps its coverage per texel).
+const PREPASS_FOG_FADE_WGSL = /* wgsl */`
+${FOG_FADE_WGSL}
+fn prepassFadeKeep(worldPos: vec3<f32>, flags2: u32, hlodCov: f32) -> bool {
+  let fhFlags = u32(scene.toonParams.w);
+  let clip = scene.viewProjection * vec4<f32>(worldPos, 1.0);
+  let ndc = clip.xy / max(abs(clip.w), 1e-6) * sign(clip.w);
+  let px = vec2<f32>((ndc.x * 0.5 + 0.5) * scene.resolution.x, (0.5 - ndc.y * 0.5) * scene.resolution.y);
+  let cell = max(1.0, round(abs(dpdx(px.x))));   // colour-pass pixels per prepass texel (uniform control flow here)
+  // HLOD CROSS-FADE (performance-plan P17; flags2 bit 5, the coverage in normalMatrix column 3 .y): the colour pass's
+  // Bayer dissolve in the same colour-pass pixel cells, so a dissolving tier stops occluding the AO / SSR where its
+  // pixels vanish (it used to stay whole here and pop at the end of the swap).
+  if ((flags2 & 32u) != 0u && !fhDitherKeep(hlodCov, floor(max(px, vec2<f32>(0.0)) / cell), false)) { return false; }
+  if ((fhFlags & 2u) == 0u || !fhFades(flags2, fhFlags)) { return true; }
+  let edge = scene.fogParams.x + max(scene.fogParams.y - scene.fogParams.x, 0.001);
+  let c = select(cell, max(cell, 2.0), (fhFlags & 4u) != 0u);
+  return fhDitherKeep(fhCoverage(length(scene.fogEye.xyz - worldPos), edge, scene.fogEye.w), floor(max(px, vec2<f32>(0.0)) / c), false);
+}
+`;
+
 // ── MeshInstance (must match the 224-byte storage stride; see mesh-instance-layout.test) ──────────
 const MESH_INSTANCE_WGSL = /* wgsl */`
 struct MeshInstance {
@@ -43,15 +101,16 @@ ${MESH_INSTANCE_WGSL}
 
 @group(0) @binding(0) var<storage, read> u_instances: array<MeshInstance>;
 
-// Only the leading viewProjection is read — the bound buffer is larger, which WGSL permits.
-struct SceneUniforms { viewProjection: mat4x4<f32>, };
+${SCENE_UNIFORMS_FULL_WGSL}
 @group(0) @binding(1) var<uniform> scene: SceneUniforms;
+${PREPASS_FOG_FADE_WGSL}
 
 struct VSOut {
   @builtin(position) clipPos: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
   @location(1) worldNrm: vec3<f32>,
   @location(2) matCode:  f32,
+  @location(3) @interpolate(flat) idx: u32,
 };
 
 struct FSOut {
@@ -78,11 +137,13 @@ fn vs_main(
   let matte = ((flags >> 25u) & 1u) == 1u;
   let code = clamp(inst.roughness, 0.0, 1.0) + select(0.0, 2.0, inst.metalness > 0.05);
   out.matCode = select(code, -1.0, matte);
+  out.idx = idx;
   return out;
 }
 
 @fragment
-fn fs_main(@location(0) worldPos: vec3<f32>, @location(1) worldNrm: vec3<f32>, @location(2) matCode: f32) -> FSOut {
+fn fs_main(@location(0) worldPos: vec3<f32>, @location(1) worldNrm: vec3<f32>, @location(2) matCode: f32, @location(3) @interpolate(flat) idx: u32) -> FSOut {
+  if (!prepassFadeKeep(worldPos, u32(u_instances[idx].normalMatrix[3].x), u_instances[idx].normalMatrix[3].y)) { discard; }   // fog horizon fade band + HLOD dissolve
   var out: FSOut;
   out.worldPos = vec4<f32>(worldPos, 1.0);   // .w = 1 marks a real surface (clear value has .w = 0)
   out.normalMat = vec4<f32>(normalize(worldNrm), matCode);
@@ -104,9 +165,9 @@ ${MESH_INSTANCE_WGSL}
 
 @group(0) @binding(0) var<storage, read> u_instances: array<MeshInstance>;
 
-// Only the leading viewProjection is read - the bound buffer is larger, which WGSL permits.
-struct SceneUniforms { viewProjection: mat4x4<f32>, };
+${SCENE_UNIFORMS_FULL_WGSL}
 @group(0) @binding(1) var<uniform> scene: SceneUniforms;
+${PREPASS_FOG_FADE_WGSL}
 
 // The FRONT world-pos layer (first prepass output). Bound REAL here (the peel writes a different target).
 @group(0) @binding(10) var frontWorldPosTex: texture_2d<f32>;
@@ -114,6 +175,7 @@ struct SceneUniforms { viewProjection: mat4x4<f32>, };
 struct VSOut {
   @builtin(position) clipPos: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
+  @location(1) @interpolate(flat) idx: u32,
 };
 
 @vertex
@@ -128,11 +190,13 @@ fn vs_main(
   var out: VSOut;
   out.clipPos = scene.viewProjection * worldPos;
   out.worldPos = worldPos.xyz;
+  out.idx = idx;
   return out;
 }
 
 @fragment
-fn fs_main(@builtin(position) fragCoord: vec4<f32>, @location(0) worldPos: vec3<f32>) -> @location(0) vec4<f32> {
+fn fs_main(@builtin(position) fragCoord: vec4<f32>, @location(0) worldPos: vec3<f32>, @location(1) @interpolate(flat) idx: u32) -> @location(0) vec4<f32> {
+  if (!prepassFadeKeep(worldPos, u32(u_instances[idx].normalMatrix[3].x), u_instances[idx].normalMatrix[3].y)) { discard; }   // fog horizon fade band + HLOD dissolve
   // Camera-forward depth axis, same extraction as the SSR trace (persp w-row, ortho z-row) - ortho-safe.
   let wvec = vec3<f32>(scene.viewProjection[0].w, scene.viewProjection[1].w, scene.viewProjection[2].w);
   let zvec = vec3<f32>(scene.viewProjection[0].z, scene.viewProjection[1].z, scene.viewProjection[2].z);

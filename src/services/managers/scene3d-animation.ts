@@ -16,14 +16,14 @@
 import type { ManagerContext } from './manager-context';
 import { AnimationPlayer3D, AnimationPlayer3DConfig } from '../../renderer/3d/animation-player-3d';
 import type { SkeletonAnimClip, NLATrack, NLAClipSegment } from '../../types/armature-3d';
-import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, sampleClipPose, blendPoses, overlayPoseMasked, addPoseMasked, writePoseToSkeleton, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
+import { applySkeletonClipAtFrame, rebaseClipRest, evaluateNLAAtFrame, snapshotSkeletonPose, sampleClipPose, blendPoses, overlayPoseMasked, addPoseMasked, writePoseToSkeleton, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { AnimRegion, AdaptivePoseSample } from '../../types/armature-3d';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { FrameLinkAnimation3D, DEFAULT_FRAME_LINK_ANIMATION_3D } from '../../types/keyframe-3d';
-import { DEFAULT_BREAK_CLIP_NAMES } from './default-animations';
+import { DEFAULT_BREAK_CLIP_NAMES, DEFAULT_ONESHOT_CLIP_NAMES, defaultRestRotation } from './default-animations';
 import { solveAllIKChains } from '../../renderer/3d/ik-solver';
 import { buildDefaultPoses, buildDefaultClips, DEFAULT_CLIP_NAMES } from './default-animations';
 import { quat } from 'gl-matrix';
@@ -35,7 +35,8 @@ export type LegIdleMode = 'none' | 'fk' | 'ik';
 
 /** The torso/head/shoulder joints the idle drives (by name) — everything else inherits via FK.
  *  Exported: the ghost body preview reuses the same idle math on its throwaway skeleton. */
-export const IDLE_JOINTS = ['lowerback', 'spine', 'chest', 'neck', 'head', 'shoulder_L', 'shoulder_R'] as const;
+export const IDLE_JOINTS = ['lowerback', 'spine', 'chest', 'neck', 'head', 'shoulder_L', 'shoulder_R',
+    'clavicle_L', 'clavicle_R', 'lowerarm_L', 'lowerarm_R', 'hand_L', 'hand_R'] as const;   // arms: secondary motion (2026-09-28)
 export const LEG_IDLE_JOINTS = ['hips', 'upperleg_L', 'lowerleg_L', 'foot_L', 'upperleg_R', 'lowerleg_R', 'foot_R'] as const;
 /** Runtime state for one body's procedural idle. */
 type IdleRig = {
@@ -55,6 +56,10 @@ export interface Scene3DAnimationHost {
     getMesh(id: string): Mesh3D | null;
     getAllMeshes(): Mesh3D[];
     getBodyParams(bodyMeshId: string): import('./body-generator').BodyParams | null;
+    /** Keep a procedural body's hanging arms out of its torso after a pose (Scene3DManager.clearArmsForSkeleton). */
+    clearArmsForSkeleton?(skel: Skeleton3D): unknown;
+    /** Apply a clip face event (gaze jump / blink / restore) to the procedural body driven by `skel`. */
+    clipFaceEvent?(skel: Skeleton3D, ev: import('../../types/armature-3d').ClipFaceEvent): void;
     /** Skeleton currently open in the bone overlay (Edit Armature), or null. */
     getBoneOverlaySkeletonId(): string | null;
     /** Clip lookup across all skeletons (the clip-authoring seam stays on the manager). */
@@ -67,6 +72,17 @@ export interface Scene3DAnimationHost {
     isBoneOverlayActive(): boolean;
     /** Flip the idle half of the manager's cooperative live-rAF-loop cohort (idle + focus-bg holds). */
     setIdleLiveHold(on: boolean): void;
+    /** R6.1: true when the renderer culled every part of this skeleton last frame (the idle may skip it). */
+    isSkeletonAnimCulled?(skeletonId: string): boolean;
+    /** SIM LOD (src/world/sim-lod.ts): reset a system's per-frame counters. */
+    simLodBegin?(system: string): void;
+    /** SIM LOD: should this character's idle update this frame (distance / view / fog band, player + selection +
+     *  posing + scripts exempt)? Absent or sim LOD off = always. */
+    simLodDue?(skeletonId: string, bodyMeshId: string): boolean;
+    /** Play mode: true while the Play locomotion (the engine LocomotionAnimator, or a host clip handler) owns this
+     *  skeleton's pose. The idle (and its breaks) must yield: it runs as a pre-render callback AFTER the Play tick, so
+     *  it overwrote the gait every frame and the Player slid around in its idle pose (play-mode.md "idle vs gait"). */
+    isSkeletonPlayDriven?(skeletonId: string): boolean;
 }
 
 export class Scene3DAnimation {
@@ -145,6 +161,7 @@ export class Scene3DAnimation {
     playSkeletonClip(skeletonId: string, clip: SkeletonAnimClip): AnimationPlayer3D {
         const skeleton = this.host.getSkeleton(skeletonId);
         if (!skeleton) throw new Error(`Skeleton not found: ${skeletonId}`);
+        clip = this._fitDefaultOneShot(skeleton, clip);
 
         const player = new AnimationPlayer3D({
             startFrame: clip.startFrame,
@@ -154,13 +171,40 @@ export class Scene3DAnimation {
         });
 
         this._armPlaybackSnapshot(skeletonId, skeleton, player);
+        let lastFrame = clip.startFrame - 1;
         player.onFrame(frame => {
             applySkeletonClipAtFrame(clip, skeleton, frame);
+            this._fireFaceEvents(skeleton, clip, lastFrame, frame); lastFrame = frame;
             this.host.keepSpringsAlive(skeleton.id);   // hair jiggles during playback, settles after it stops
             this.ctx.scheduleRender();
         });
 
         return player;
+    }
+
+    /** Fire the clip's face events whose frame lies in (prev, cur] — handling a loop wrap (cur < prev). */
+    private _fireFaceEvents(skel: Skeleton3D, clip: SkeletonAnimClip, prev: number, cur: number): void {
+        const evs = clip.faceTrack;
+        if (!evs?.length || !this.host.clipFaceEvent) return;
+        for (const ev of evs) {
+            const hit = cur >= prev ? (ev.frame > prev && ev.frame <= cur) : (ev.frame > prev || ev.frame <= cur);
+            if (hit) this.host.clipFaceEvent(skel, ev);
+        }
+    }
+
+    /**
+     * A STOCK one-shot (Stretch / Scratch Head / Wave — unedited, compared against a fresh default) played on a
+     * character that doesn't stand in the exact default stance (arms fitted wider on a heavier body, or the user's own
+     * pose) is re-based so it leaves from and returns to where the character actually is, instead of snapping to the
+     * default stance at its ends. Only tracks that start AT the default stance move; anything else plays as authored.
+     */
+    private _fitDefaultOneShot(skel: Skeleton3D, clip: SkeletonAnimClip): SkeletonAnimClip {
+        if (!DEFAULT_ONESHOT_CLIP_NAMES.includes(clip.name)) return clip;
+        const stock = buildDefaultClips(skel.data.joints).find(c => c.name === clip.name);
+        if (!stock || !Scene3DAnimation._eqNoId(stock, clip)) return clip;   // edited by the user → play it as is
+        const base = new Map<number, readonly number[]>();
+        skel.data.joints.forEach((j, i) => base.set(i, j.constraintRotation ?? j.ikRotation ?? j.localRotation));
+        return rebaseClipRest(clip, base, (ji) => defaultRestRotation(skel.data.joints[ji]?.name ?? ''));
     }
 
     /** Before a clip starts writing the live animation frame into joint.localRotation, snapshot the authored
@@ -181,10 +225,13 @@ export class Scene3DAnimation {
     playSkeletonClipBlended(skeletonId: string, clip: SkeletonAnimClip, fromPose: SkeletonPose, blendFrames: number): AnimationPlayer3D {
         const skeleton = this.host.getSkeleton(skeletonId);
         if (!skeleton) throw new Error(`Skeleton not found: ${skeletonId}`);
+        clip = this._fitDefaultOneShot(skeleton, clip);
 
         const player = new AnimationPlayer3D({ startFrame: clip.startFrame, endFrame: clip.endFrame, fps: clip.fps, loop: true });
         const start = clip.startFrame;
+        let lastFrame = clip.startFrame - 1;
         player.onFrame(frame => {
+            this._fireFaceEvents(skeleton, clip, lastFrame, frame); lastFrame = frame;
             const elapsed = frame - start;
             if (blendFrames > 0 && elapsed < blendFrames) {
                 // Ramp fromPose → the clip's pose at this frame. Unanimated joints fall back to fromPose (passed
@@ -473,6 +520,9 @@ export class Scene3DAnimation {
         if (j.skeletonData?.joints) {
             let idleRig: IdleRig | undefined;
             for (const r of this._idleRigs.values()) if (r.skelId === skel.id) { idleRig = r; break; }
+            // While this skeleton is being POSED in armature mode the idle is paused and the live joints ARE the authored
+            // pose (the base is only re-captured when posing ends) — so persist the live pose, not the stale base.
+            if (idleRig && this._posingSkels.has(skel.id)) idleRig = undefined;
             if (idleRig) {
                 for (const jj of j.skeletonData.joints) {
                     const base = idleRig.base.get(jj.name);
@@ -623,6 +673,7 @@ export class Scene3DAnimation {
         // Body-ADAPTIVE arm blend: slerp the captured samples by this body's girth (so a hand-on-hip pose
         // fits thin AND fat bodies). Done AFTER the base rotations (which are the fallback look).
         if (pose.adaptive?.samples.length) this._applyAdaptivePose(skel, pose.adaptive);
+        else this.host.clearArmsForSkeleton?.(skel);   // keep hanging arms out of THIS body's torso (arm-clearance.ts)
         skel.computeWorldMatrices();
         skel.matricesDirty = true;
         this.ctx.emitSceneGraphChanged();
@@ -771,12 +822,27 @@ export class Scene3DAnimation {
     ensureIdleCallback(): void {
         if (!this._idleSolveCallback) {
             this._idleSolveCallback = () => {
-                if (this._idleRigs.size === 0 || this.host.isBoneOverlayActive()) return false;
+                if (this._idleRigs.size === 0) return false;
+                // Armature posing pauses the idle — except for a body playing a clip OVER its idle (playClipOverIdle).
+                const posing = this.host.isBoneOverlayActive();
+                this._syncIdleWithPosing(posing);   // enter → snap to the clean base; leave → the new pose BECOMES the base
+                if (posing && ![...this._idleBreaks.values()].some(b => b.active?.overIdle)) return false;
                 const now = performance.now();
                 let animating = false;
+                this.host.simLodBegin?.('characters');
                 for (const [bodyMeshId, rig] of this._idleRigs) {
                     const skel = this.host.getSkeleton(rig.skelId);
                     if (!skel) continue;
+                    if (posing && !this._idleBreaks.get(bodyMeshId)?.active?.overIdle) continue;
+                    // Play: the locomotion owns the Player's rig (Stand / Walk / Run / Jump …) — never overwrite it.
+                    if (this.host.isSkeletonPlayDriven?.(rig.skelId)) continue;
+                    // R6.1: the renderer culled this whole character last frame (out of view with a margin, no shadow
+                    // into the view) → skip its pose work. Everything here is driven by absolute time (rig.t0 /
+                    // break t0), so it resumes at the right phase; the skeleton's skin buffer stays dirty-free.
+                    if (this.host.isSkeletonAnimCulled?.(rig.skelId)) { animating = true; continue; }
+                    // SIM LOD: mid-distance idles pose at ~10 Hz, far / off-screen ones at ~2 Hz, fogged ones never —
+                    // the same absolute-time rule, so a skipped frame just resumes at the right phase.
+                    if (this.host.simLodDue && !this.host.simLodDue(rig.skelId, bodyMeshId)) { animating = true; continue; }
                     // Idle BREAK: a one-shot personality clip occasionally plays OVER the base idle, then settles
                     // back. While it plays it drives the joints (the procedural idle is skipped that frame).
                     if (this._tickIdleBreak(skel, rig, bodyMeshId, now)) { animating = true; continue; }
@@ -787,7 +853,60 @@ export class Scene3DAnimation {
                 return animating;   // keep the render loop ticking while idling
             };
         }
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._idleSolveCallback);   // idempotent (dedupes by ref)
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._idleSolveCallback, 'idle');   // idempotent (dedupes by ref)
+    }
+
+    /** SIM LOD exemption: a timeline / clip / NLA preview is playing (the user is watching characters animate). */
+    hasActivePlayback(): boolean {
+        if (this._animPlayer?.playing) return true;
+        for (const e of this._playbackSnapshots.values()) if (e.player.playing) return true;
+        for (const p of this._nlaPlayers.values()) if (p.playing) return true;
+        return false;
+    }
+
+    /** Skeletons whose idle rig was paused for armature posing (their pose is re-captured when posing ends). */
+    private _posingSkels = new Set<string>();
+    /**
+     * Keep the procedural idle in step with ARMATURE POSING. The idle re-applies `rig.base` + breathing every frame, and
+     * `base` was captured when the idle turned on — so a pose made in armature mode was overwritten the moment you left
+     * it (the "stuck in T-pose" bug: the idle's base was the old T-pose). Now:
+     *  • posing STARTS → the paused character snaps to its clean base (you pose from the authored stance, not a
+     *    mid-breath frame);
+     *  • posing ENDS → the pose you made is re-captured as the new base, and the idle carries on from it.
+     */
+    private _syncIdleWithPosing(posing: boolean): void {
+        if (posing) {
+            for (const [bodyMeshId, rig] of this._idleRigs) {
+                if (this._posingSkels.has(rig.skelId) || this._idleBreaks.get(bodyMeshId)?.active?.overIdle) continue;
+                const skel = this.host.getSkeleton(rig.skelId);
+                if (!skel) continue;
+                this._posingSkels.add(rig.skelId);
+                for (const [name, q] of rig.base) {
+                    const j = skel.data.joints.find(jt => jt.name === name);
+                    if (j) { j.localRotation = [...q] as [number, number, number, number]; j.localScale = [1, 1, 1]; }
+                }
+                skel.computeWorldMatrices(); skel.matricesDirty = true;
+            }
+            return;
+        }
+        if (this._posingSkels.size === 0) return;
+        for (const rig of this._idleRigs.values()) {
+            if (!this._posingSkels.has(rig.skelId)) continue;
+            const skel = this.host.getSkeleton(rig.skelId);
+            if (!skel) continue;
+            for (const name of rig.base.keys()) {
+                const j = skel.data.joints.find(jt => jt.name === name);
+                if (j) rig.base.set(name, [...(j.constraintRotation ?? j.ikRotation ?? j.localRotation)] as [number, number, number, number]);
+            }
+        }
+        this._posingSkels.clear();
+    }
+
+    /** The idle's captured base pose for a body (joint name → rotation), or null when its idle is off. Mutable: a caller
+     *  that corrects the authored pose while the idle runs (arm clearance) writes the new rotation here too, or the
+     *  next idle frame would put the old one back. */
+    getIdleBase(bodyMeshId: string): Map<string, [number, number, number, number]> | null {
+        return this._idleRigs.get(bodyMeshId)?.base ?? null;
     }
 
     setIdleAnimation(bodyMeshId: string, on: boolean, intensity = 1): void {
@@ -818,9 +937,10 @@ export class Scene3DAnimation {
             if (!wasOn) this.ctx.interactionService.beginInteractive();
         } else {
             const rig = this._idleRigs.get(bodyMeshId);
+            const posedLive = !!rig && this._posingSkels.delete(rig.skelId);   // turned off mid-posing → keep the pose being made
             if (rig) {   // restore the base pose so the character settles back to its rest stance
                 this._teardownLegIK(skel, rig);   // disable leg chains + clear their ikRotation (BEFORE we re-FK)
-                for (const [name, q] of rig.base) {
+                if (!posedLive) for (const [name, q] of rig.base) {
                     const j = skel.data.joints.find(jt => jt.name === name);
                     if (j) j.localRotation = [...q] as [number, number, number, number];
                 }
@@ -888,7 +1008,48 @@ export class Scene3DAnimation {
     getLegIdleMode(bodyMeshId: string): LegIdleMode { return this._legIdleModes.get(bodyMeshId) ?? 'fk'; }
 
     // ── Idle breaks (random one-shot personality clips between the base idle) ──
-    private _idleBreaks = new Map<string, { enabled: boolean; minSec: number; maxSec: number; clips: string[]; active: { clipId: string; t0: number } | null; nextAt: number }>();
+    private _idleBreaks = new Map<string, { enabled: boolean; minSec: number; maxSec: number; clips: string[]; active: { clipId: string; t0: number; clip?: SkeletonAnimClip; lastFrame?: number; overIdle?: boolean; idleOffAfter?: boolean; restore?: Map<number, [number, number, number, number]> } | null; nextAt: number }>();
+
+    /** A break/over-idle copy of a clip, re-based onto the rig's idle base (rebaseClipRest, default-stance tracks only). */
+    private _layeredClipCopy(skel: Skeleton3D, rig: IdleRig, src: SkeletonAnimClip): SkeletonAnimClip {
+        const base = new Map<number, readonly number[]>();
+        skel.data.joints.forEach((j, i) => { const q = rig.base.get(j.name); if (q) base.set(i, q); });
+        return rebaseClipRest(src, base, (ji) => defaultRestRotation(skel.data.joints[ji]?.name ?? ''));
+    }
+
+    /**
+     * Play a clip ONCE layered OVER the procedural idle: the idle keeps breathing / swaying / shifting every joint the
+     * clip doesn't animate (a wave no longer freezes the rest of the body), the clip crossfades in and out, its face
+     * events fire, and stock one-shots leave from + return to the character's real stance. If the idle is off it's
+     * turned on for the clip and back off after. Also works in armature mode (where the idle is otherwise paused).
+     * `clip` = a clip NAME or id on the body's skeleton. Returns false if the body or clip isn't found.
+     */
+    playClipOverIdle(bodyMeshId: string, clip: string): boolean {
+        const body = this.host.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return false;
+        const skel = body.skeleton;
+        const src = skel.data.clips?.find(c => c.id === clip) ?? skel.data.clips?.find(c => c.name === clip);
+        if (!src) return false;
+        const wasIdle = this._idleRigs.has(bodyMeshId);
+        if (!wasIdle) this.setIdleAnimation(bodyMeshId, true);
+        const rig = this._idleRigs.get(bodyMeshId);
+        if (!rig) return false;
+        const br = this._idleBreaks.get(bodyMeshId) ?? { enabled: false, minSec: 8, maxSec: 20, clips: [], active: null, nextAt: Infinity };
+        // Joints the clip animates that the idle doesn't own: snapshot them so they're put back when it ends (the clip
+        // stops on its last sampled frame, not exactly its end key).
+        const restore = new Map<number, [number, number, number, number]>();
+        for (const t of src.tracks) {
+            const j = skel.data.joints[t.jointIndex];
+            if (t.channel === 'rotation' && j && !rig.base.has(j.name)) restore.set(t.jointIndex, [...j.localRotation] as [number, number, number, number]);
+        }
+        br.active = { clipId: src.id, t0: performance.now(), clip: this._layeredClipCopy(skel, rig, src), lastFrame: -1, overIdle: true, idleOffAfter: !wasIdle, restore };
+        this._idleBreaks.set(bodyMeshId, br);
+        this.ensureIdleCallback();
+        this.ctx.scheduleRender();
+        return true;
+    }
+    /** Whether a body is currently playing a clip over its idle (playClipOverIdle) or an idle break. */
+    isPlayingOverIdle(bodyMeshId: string): boolean { return !!this._idleBreaks.get(bodyMeshId)?.active; }
 
     /**
      * Configure random IDLE BREAKS — the BotW "alive" multiplier: between the base idle, every [minSec,maxSec]
@@ -922,12 +1083,13 @@ export class Scene3DAnimation {
     /** Tick a body's idle break. Returns true if a break is CURRENTLY playing (so the base idle is skipped). */
     private _tickIdleBreak(skel: Skeleton3D, rig: IdleRig, bodyMeshId: string, now: number): boolean {
         const br = this._idleBreaks.get(bodyMeshId);
-        if (!br?.enabled) return false;
+        if (!br || (!br.enabled && !br.active)) return false;
         if (br.active) {
-            const clip = skel.data.clips?.find(c => c.id === br.active!.clipId);
+            const clip = br.active.clip ?? skel.data.clips?.find(c => c.id === br.active!.clipId);
             if (clip) {
                 const tSec = (now - br.active.t0) / 1000;
                 const frame = tSec * clip.fps;
+                this._fireFaceEvents(skel, clip, br.active.lastFrame ?? -1, Math.min(frame, clip.endFrame)); br.active.lastFrame = Math.min(frame, clip.endFrame);
                 if (frame < clip.endFrame) {
                     // Base idle on ALL joints first → untracked joints (legs, the far arm) keep breathing through
                     // the break; the clip + crossfade only override the joints the break actually animates.
@@ -956,10 +1118,18 @@ export class Scene3DAnimation {
                     return true;
                 }
             }
-            br.active = null; br.nextAt = now + this._idleBreakDelay(br);   // finished → schedule the next
-        } else if (now >= br.nextAt) {
+            const idleOff = br.active.idleOffAfter;
+            for (const [ji, q] of br.active.restore ?? []) { const j = skel.data.joints[ji]; if (j) j.localRotation = [...q] as [number, number, number, number]; }
+            br.active = null; br.nextAt = br.enabled ? now + this._idleBreakDelay(br) : Infinity;   // finished → schedule the next
+            if (idleOff) { this.setIdleAnimation(bodyMeshId, false); return true; }   // idle was on just for this clip → off (base restored; skip this frame's idle step)
+        } else if (br.enabled && now >= br.nextAt) {
             const clipId = this._pickIdleBreakClip(skel, br.clips);
-            if (clipId) { br.active = { clipId, t0: now }; return this._tickIdleBreak(skel, rig, bodyMeshId, now); }   // play it now
+            if (clipId) {
+                // Play a copy whose rest keys sit on THIS character's current (idle base) pose — see rebaseClipRest.
+                const src = skel.data.clips?.find(c => c.id === clipId);
+                br.active = { clipId, t0: now, clip: src ? this._layeredClipCopy(skel, rig, src) : undefined };
+                return this._tickIdleBreak(skel, rig, bodyMeshId, now);   // play it now
+            }
             br.nextAt = now + this._idleBreakDelay(br);                     // none eligible → try again later
         }
         return false;
@@ -1039,10 +1209,27 @@ export class Scene3DAnimation {
 
     applyIdle(skel: Skeleton3D, rig: { intensity: number; base: Map<string, [number, number, number, number]>; legMode: LegIdleMode }, t: number): void {
         const k = rig.intensity;
-        const breath = Math.sin(t * Math.PI * 2 * 0.22);            // inhale/exhale
-        const sway   = Math.sin(t * Math.PI * 2 * 0.105);           // weight shift L↔R
-        const sway2  = Math.sin(t * Math.PI * 2 * 0.105 + 1.1);     // a lagged copy for the shoulders
-        const drift  = Math.sin(t * Math.PI * 2 * 0.062);           // slow head look-around
+        // ORGANIC rhythms (round 2, 2026-09-28): pure sines read metronomic. Breath = a real breath SHAPE (quicker
+        // inhale, a beat's pause at the top, longer exhale); sway/drift = two incommensurate tones so the motion never
+        // visibly repeats. All stay in −1..1 like the old sines, so every amplitude below keeps its meaning.
+        const breathAt = (tt: number): number => {
+            const ph = ((tt * 0.22) % 1 + 1) % 1;                       // 0..1 over one ~4.5 s breath
+            const e = (x: number) => x * x * (3 - 2 * x);
+            return ph < 0.38 ? -1 + 2 * e(ph / 0.38) : ph < 0.48 ? 1 : 1 - 2 * e((ph - 0.48) / 0.52);
+        };
+        const tone2 = (tt: number, f: number, ph: number): number =>
+            (Math.sin(tt * Math.PI * 2 * f + ph) + 0.35 * Math.sin(tt * Math.PI * 2 * f * 2.37 + ph * 1.7)) / 1.35;
+        const breath = breathAt(t);                                    // inhale/exhale
+        const sway   = tone2(t, 0.105, 0);                             // weight shift L↔R
+        const sway2  = tone2(t, 0.105, 1.1);                           // a lagged copy for the shoulders
+        const drift  = tone2(t, 0.062, 0.3);                           // slow head look-around
+        // ARM secondary motion (pose & animation audit 2026-09-28 — the idle read "stiff" because only the torso moved
+        // and the arms hung dead still). The arms trail the torso's weight-shift like a pendulum (phase-lagged), float
+        // out a hair + the shoulders lift on each breath, the elbows soften with the breath, the wrists drift slowly.
+        // Each side has its OWN phase so the two arms never move in lockstep (mirror-symmetric motion = mannequin).
+        const swingL = tone2(t, 0.105, 2.0), swingR = tone2(t, 0.105, 2.6);
+        const breathLag = breathAt(t - 0.5);                           // the arms react a beat after the chest
+        const wristL = Math.sin(t * Math.PI * 2 * 0.071 + 0.4), wristR = Math.sin(t * Math.PI * 2 * 0.058 + 2.1);
         let ic = this._idleIdxCache.get(skel);
         if (!ic || ic.n !== skel.data.joints.length) {
             const m = new Map<string, number>();
@@ -1075,8 +1262,15 @@ export class Scene3DAnimation {
         set('chest',      breath * 3.0,  0,            sway * 1.3);             // ribcage breath
         set('neck',      -breath * 1.4,  drift * 1.8, -sway * 1.6);             // head stays level as the chest moves
         set('head',      -breath * 0.5,  drift * 4.0, -sway * 1.1);             // a slow look-around
-        set('shoulder_L', breath * 1.1,  0,            sway2 * 0.9);            // shoulders lift on the inhale + sway
-        set('shoulder_R', breath * 1.1,  0,           -sway2 * 0.9);
+        // shoulder local frame: X = the arm's own axis (roll), Y = swing forward/back, Z = out/in. Right side mirrored.
+        set('shoulder_L', breath * 0.6,  swingL * 1.6,  sway2 * 0.9 + breathLag * 0.6);   // pendulum trail + float out on the inhale
+        set('shoulder_R', breath * 0.6, -swingR * 1.6, -sway2 * 0.9 - breathLag * 0.6);
+        set('clavicle_L', 0, 0,  breath * 1.2);                                            // shoulders rise on the inhale
+        set('clavicle_R', 0, 0, -breath * 1.2);
+        set('lowerarm_L', 0, -(breathLag * 1.8 + swingL * 1.0), 0);                        // elbow softens (hinge = local Y; left flexes −)
+        set('lowerarm_R', 0,  (breathLag * 1.8 + swingR * 1.0), 0);
+        set('hand_L', 0, wristL * 1.5, -wristL * 3.0);                                     // slow wrist drift
+        set('hand_R', 0, -wristR * 1.5, wristR * 3.0);
         // ── Legs (leg idle) ─────────────────────────────────────────────────────────────────────────
         // 'none' → static (torso-only idle). 'fk' → tiny weight-shift on the leg joints directly; the feet
         // oscillate ~1cm (sub-visible, free). 'ik' → drive the PELVIS only; the feet are pinned by foot-IK

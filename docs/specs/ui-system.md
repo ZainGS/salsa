@@ -5,10 +5,39 @@
 
 ### Implementation log
 
+**2026-10-04 — UI KIT (Persona-style screen-space HUD / menus / transitions, +17 tests). Full doc:
+[../ui/persona-ui-kit.md](../ui/persona-ui-kit.md):**
+- **Data:** `UILayerData.kit?: UIKitWidget[]` holds screen-space widgets.
+  - Each widget has a kind, an anchor, an offset in 1920x1080 design px, scale, rotation, z, opacity, `visibleInStates`,
+    an intro and a schema-described `props` bag.
+  - The field is optional, so pre-kit documents round-trip byte-identically.
+- **Kinds (15):** panel, card, tone, heading, ransom, bar, status, date, minimap, prompt, menu, splash, damage,
+  banner, callout. There are 21 presets and two demos: `insertUIKitDemo('hud' | 'pause')`.
+- **Render:** `src/ui/kit/kit-renderer.ts` is one instanced SDF / pattern / text-atlas draw.
+  - It is drawn by `WebGPURenderer.setUIKitOverlayDrawer` onto the **final swapchain image after post-processing**,
+    so it is full resolution under TAAU and resolution scaling and is never graded. This answers the "crisp UI over a
+    lo-res world" open question in §Interaction With Existing Systems for kit pieces.
+  - It is skipped in captures.
+- **Transitions:** `TransitionAnimation.type` gains `slash | shatter | stripeBurst | panelSlide | zoomPunch`.
+  - The kit draws them over everything and times them on its own UI clock.
+  - Covering types hold the OLD state's kit widgets until the screen is covered.
+- **Widget ids act as shape ids:**
+  - visibility (`shapeVisibility`, show / hide / toggle: runtime overrides);
+  - `ShapeInteractionProps` (pointer targets);
+  - `playAnimation` (kit clips: intro / slide / pop / punch / drop / spin / shake / wobble / pulse).
+- **Menus:**
+  - Item ids `<menuId>#<slug>` fire `click` triggers.
+  - Arrow keys, W/S, the d-pad and Enter/A drive the shown menu; `selectedVar` binds the selection both ways.
+  - The highlight snaps with an overshoot and a wobble.
+- **API:** `listUIKitPresets`, `getUIKitSchema`, `insertUIKitPreset`, `insertUIKitDemo`, `add`/`get`/`update`/
+  `removeUIKitWidget`, `playUIKitClip`, `previewUIKitTransition`, `uiKitMenuMove`/`Activate`, `setUIKitClock`.
+- **Frogmarks:** a "Persona kit" section in the UI panel (demos, presets, transition preview, piece list and a
+  schema-driven property editor). The transition Animation select also lists the kit transitions.
+
 **2026-09-08 (later) — `.frogcart` AUDIO BUNDLING (+1 test, 1317 total) + Frogmarks Player LIVE:**
 - Cart format grew `audio.json` ([{assetId, file, mime}]) + `audio/<n>` entries (stored, level 0 — codecs are already compressed). `packFrogcart` takes `sounds: FrogcartSound[]`; `unpackFrogcart` returns them (missing/corrupt registry → silent cart, still loads).
 - `exportFrogcart` fetches every `registerUISound` URL → bytes (unfetchable → warn + skip); `importFrogcart` re-registers bundled audio as object URLs. **A published cart's playSound actions work in the Player with zero host wiring.** `UISoundPlayer.getRegisteredSounds()` exposes the registry to the exporter; `FrogcartSound` exported from main.ts.
-- Frogmarks status: the standalone **Player page (`/player`), Export modal, and dashboard drop zone are LIVE** (host-side). Remaining host-side: Phase 5 authoring panel (incl. a sound picker over `registerUISound`/`listUISounds`), postMessage bridge.
+- Frogmarks status: the standalone **Player page (`/player`), Export modal, and dashboard drop zone are LIVE** (host-side). Phase 5 authoring panel: **list-based panel BUILT in Frogmarks** (layers, states, transitions, variables, shape interactions, sound upload, Preview — docs/ui/ui-authoring-panel.md; audited 2026-10-01). Remaining host-side: the flowchart canvas (draggable nodes/arrows), a live variable inspector during preview, postMessage bridge.
 
 **2026-09-08 — Phase 7 tail: sound, gamepad, hover/press clips, camera tween, persistent vars (+4 tests, 1316 total):**
 - **Sound APPLIED** — `src/ui/ui-sound.ts` `UISoundPlayer` (HTMLAudioElement per assetId; play restarts from 0, loop for beds, setVolume live+remembered, autoplay-policy-safe catch) behind a `UISoundAdapter` seam on UIManager; `playSound`/`stopSound`/`setVolume` effects now applied (+ forwarded to effectHook); interactivity-off calls `stopAll`. Host registry: `sm.registerUISound(assetId, url)` / `unregisterUISound` / `listUISounds` — machines speak assetIds, asset storage stays host-side (`.frogcart` audio bundling = future).

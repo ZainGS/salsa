@@ -326,6 +326,7 @@ export class ArrayToolController {
   private _onWheel(e: WheelEvent): void {
     if (!this._lockedMeshId) return;
     e.preventDefault();
+    if (Math.abs(e.deltaY) < 0.5) return;   // deltaY 0 (horizontal tilt / trackpad jitter) is not a zoom step
     this.setCount(this._count + (e.deltaY < 0 ? 1 : -1));
     this._ctx.scheduleRender();
   }

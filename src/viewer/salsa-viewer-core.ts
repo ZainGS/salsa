@@ -426,6 +426,7 @@ export class SalsaViewerCore {
     const meshes    = this._collectMeshes();
     const particles = this._collectParticles();
     if (meshes.length > 0) this.renderer3D.drawMeshes(pass, meshes, w, h);
+    else this.renderer3D.noStaticMeshesThisFrame();   // zero the frame stats + drop the GPU-driven records (§P15)
     if (particles.length > 0) this.renderer3D.drawParticles(pass, particles, w, h);
 
     pass.end();

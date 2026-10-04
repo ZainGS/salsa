@@ -7,6 +7,8 @@
 Build a **Hair** panel under *Edit Character* that generates **chunky low-poly hair** from presets + sliders — same shape as the Body and Eyes panels. Every control writes into one `HairParams` object and calls `setHairParams3D` for a **live** update on the 3D head.
 
 > **Status legend:** ✅ live now · 🔶 engine pending (don't wire yet). Live sliders, **persistence**, and **save-as-part** are ✅ (2026-06-23); **named presets** are the one 🔶 piece left.
+>
+> **Status (2026-10-04): named styles are BUILT** — a third mode `hairMode: 'locks'` (`src/services/managers/hair-locks.ts`, `HAIR_STYLE_PRESETS`, 15 styles incl. braids / drills / spiky / curls) with `sm.getHairStyles3D()`, `sm.getHairStylePreset3D(name, seed?)`, `sm.applyHairStyle3D(bodyId, name)`. The "no named presets" caveats below are superseded; the style API + lock params are documented in [character-creator.md](./character-creator.md) §2.6 "Hair styles" and [hair-styles.md](../specs/hair-styles.md). (`getHairPresetNames3D` / `getHairPreset3D` were never added — use the style calls.)
 
 ---
 
@@ -192,5 +194,5 @@ shapeManager.removeHair3D(bodyMeshId);
 
 - **Persistence** ✅ (2026-06-23) — hair is saved with the document (and `.frogmarks` export) and regenerates from params on reload. No extra save wiring needed.
 - **Save-as-part** ✅ (2026-06-23) — `bakeHairToPart3D` (→ kitbash hair slot) is live and its GLB persists; wire the button.
-- **No named presets yet** — `getHairPresetNames3D` / `getHairPreset3D` are pending; seed from `getDefaultHairParams3D()` for now.
+- ~~**No named presets yet**~~ — superseded 2026-10-04: use `getHairStyles3D` / `getHairStylePreset3D` / `applyHairStyle3D` (locks mode; see the status note at the top).
 - **First-cut geometry** — sizes/placement are being tuned against live screenshots; field ranges above may shift slightly.

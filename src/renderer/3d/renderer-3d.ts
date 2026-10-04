@@ -14,15 +14,25 @@
  *  - colorDepth: quantization levels (32 = 5-bit/channel, 0 = disabled)
  */
 
+import { planSpanCompaction, planPoolShrink } from './geom-compaction';
+import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle } from '../core/gpu-pipeline-cache';
+import { packDualQuatSkin } from './dual-quat-skin';
 import { mat4, vec3 } from 'gl-matrix';
 import { reflectionMatrix, clipPlaneFor, reflectorPlane, planeTimesMat, obliqueProjectionZO } from './planar-reflection';
 import { transformPoint4 } from './ssr-trace';
+import { encodeMeshFlags2, FLAGS2_FLOAT as FLAGS2_FLOAT_OFFSET, FLAGS2_DISTANCE_FADE, FLAGS2_HAIR_BAND } from './material-3d';
+import { computeFogEye, defaultFogHorizon, fogHorizonActive, fogHorizonEdge, fogHorizonFlags, sanitizeFogHorizon, type FogHorizonSettings } from './fog-horizon';
 import { Camera3D } from './camera-3d';
 import { Pipeline3D, MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE } from './pipeline-3d';
+import { variantKeyOfFlags, variantKeyOfMaterial, ShaderVariantIds, VB_TEXTURED, VB_NOCULL, VB_PATTERNED, VB_SHADOW } from './shader-variants';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
-import { Material3D, encodeMaterialFlags, packRGB8, resolveSceneWind, DEFAULT_SCENE_WIND, type SceneWind3D, resolveSkinRamp, DEFAULT_SKIN_RAMP, type SkinRampSettings } from './material-3d';
-import { MAX_POINT_LIGHTS, packSceneUniforms, selectNearestPointLights, computeLightSpaceMatrix as computeLSM, type PointLight3D } from './scene-uniforms';
+import { Material3D, encodeMaterialFlags, packRGB8, resolveSceneWind, DEFAULT_SCENE_WIND, type SceneWind3D, resolveSkinRamp, DEFAULT_SKIN_RAMP, type SkinRampSettings, resolveToonShadows, DEFAULT_TOON_SHADOWS, type ToonShadowSettings, resolveRimLight, DEFAULT_RIM_LIGHT, type RimLightSettings } from './material-3d';
+import { MAX_POINT_LIGHTS, packSceneUniforms, selectNearestPointLights, computeLightSpaceMatrix as computeLSM, cascadeLightBox, cascadeMatrixFromBox, cascadeCentre, type PointLight3D, type CascadePack, type CascadeLightBox } from './scene-uniforms';
+import { ShadowRunTester, CasterSig, StaticLayerMembers, copyCascadeBox, cascadeBoxHolds, cascadeDepthMargin, cascadeRefresh, newCascadeCacheState, stepSunDirection, type CascadeCacheState } from './shadow-cache';
+import { DEFAULT_SHADOW_CASCADES, sanitizeShadowCascades, cascadeHalfExtents, cascadeBias, type ShadowCascadeSettings } from './shadow-cascades';
+import { ShadowMinMax } from './shadow-minmax';
+import { shadowLodScreenThreshold, shadowLodThreshold, shadowTexel } from './shadow-lod';
 import { Mesh3D, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
@@ -30,22 +40,45 @@ import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, Fa
 import { GhostPreviewRenderer, GhostPreviewData } from './ghost-preview-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from './mesh-edit-overlay-renderer';
 import { WeightPaintVertexOverlayRenderer } from './weight-paint-overlay-renderer';
-import { FrustumCuller } from './frustum-culler';
-import { OutlinePass } from './outline-pass';
-import { MeshHighlightPass, HighlightStyle, HighlightMeshEntry } from './mesh-highlight-pass';
+import { FrustumCuller, shadowReachesView, shadowReachesViewBox } from './frustum-culler';
+import { computeJointBindPositions, computeJointSpheres, computeSkinnedCullRadii, skinnedAABBFromSpheres, type SkinnedCullRadii } from './skinned-cull';
+import { aabbDistanceSq, distanceLodHidden, fovDistanceScale, orthoLodDistance, twinDraws, DISTANCE_LOD_SHOW } from './distance-lod';
+import { buildCullClusters, clusterVerdict, HC_PASS, HC_NOREACH, type ClusterTests } from './cull-clusters';
+import { OcclusionCuller, OccluderCache, DEFAULT_OCCLUDER_NAMES } from './occlusion-culler';
+import { buildCullRanges, selectRanges, type CullRanges, type BoxTester } from './cull-ranges';
+import { SlotRangeAllocator } from './instance-slot-allocator';
+import { STREAM_HITCH, STREAM_HITCH_LIMITS, streamHitchStats } from './stream-hitch';
+import { P20_RENDER } from './lighter-tiles';
+import { TILE_LANDING, P22_RENDER } from './tile-landing';
+import { poolViewOf, dropPoolView, strideOf, indexSizeOf, packedTwin, constTangentBuffer, twinsPending, setTwinReadyCallback, alignVtx, packVertices, type PoolView } from './vertex-pack';
+import { GpuDrivenMain, type GdHost, type GdStats, type GdVerifyResult } from './gpu-scene';
+import { GpuCullAuto, GPU_CULL_REASON_TEXT, loadGpuCullingMode, saveGpuCullingMode, sanitizeGpuCullingMode, type GpuCullingMode, type GpuCullPath, type GpuCullReason, type GpuCullAutoState } from './gpu-cull-auto';
+import type { GdShadowParams } from './gpu-driven';
+import { GD_CODE_TEXTURED, GD_CODE_NOCULL, GD_CODE_PATTERNED, GD_CODE_ATLAS, GD_CODE_VB_OVERRIDE, GD_CODE_PACKED, GD_CODE_VARIANT_MASK, gdBoundReach, setGdBoundReach, type GdFrameParams, type GdBucketRefs } from './gpu-driven';
+import { OutlinePass, type OutlineExtras } from './outline-pass';
+import { MeshHighlightPass, HighlightStyle, HighlightMeshEntry, outlineLayers, outlineAnimates } from './mesh-highlight-pass';
+import { SpriteOutlinePass, type SpriteOutlineDraw } from './sprite-outline-pass';
+import { PostBgKeepPass } from './post-bg-keep-pass';
+import { groundUvWorldScale, GROUND_UV_SCALE_MARKER } from './ground-uv-scale';
+import { SpriteSDFCache, spriteOutlineMode } from './sprite-outline';
 import { SilhouetteOutlinePass } from './silhouette-outline-pass';
 import { smoothNormalsForOutline } from './outline-geometry';
 export type { HighlightStyle } from './mesh-highlight-pass';
 import { BloomPass, createBloomCapturePipeline } from './bloom-pass';
-import { PostProcessPass, PostProcessConfig, DEFAULT_POST_PROCESS_CONFIG } from './post-process-pass';
-export type { PostProcessConfig } from './post-process-pass';
+import { PostProcessPass, PostProcessConfig, defaultPostProcessConfig } from './post-process-pass';
+import { FxaaPass, DEFAULT_ANTI_ALIASING, sanitizeAntiAliasing, type AntiAliasingSettings } from './fxaa-pass';
+export type { PostProcessConfig, FilmConfig } from './post-process-pass';
 export { DEFAULT_POST_PROCESS_CONFIG } from './post-process-pass';
 import { SSAOPass, SSAOConfig, DEFAULT_SSAO_CONFIG } from './ssao-pass';
 export type { SSAOConfig } from './ssao-pass';
 import { LoFiPass } from './lofi-pass';
+import { TemporalAAPass, DEFAULT_TEMPORAL_AA, temporalRenderScale, temporalSamples, temporalJitter, temporalDitherShift, jitterToNdc, unjitterViewProj, invert4, isCameraCut, type TemporalAASettings, type TemporalAAReason, type TaaRigidDraw, type TaaSkinnedDraw } from './temporal-aa';
 import { bakePrefilteredCube, bakeBRDFLUTBytes, cubeMipCount } from './ibl-specular-bake';
-import { type ProceduralSkyParams } from './procedural-sky';
+import { type ProceduralSkyParams, bakeSkyEquirect } from './procedural-sky';
+import { IBLGpuBaker } from './ibl-gpu-bake';
 import { ArmatureBgPass } from './armature-bg-pass';
+import { skyDomeView, type SkyDomeView } from './sky-dome';
+import { IncrementalDrawRank } from './draw-order-rank';
 import type { ArmatureBgOptions } from '../../types/armature-3d';
 import {
   PARTICLE_VERTEX_SHADER,
@@ -61,7 +94,16 @@ export interface Light3DConfig {
 }
 
 /** One draw-list entry (a mesh + its instance slot, optionally a submesh). Pooled + reused per frame. */
-type RendererDrawEntry = { mesh: Mesh3D; idx: number; submesh?: Submesh3D; count?: number; ord?: number };   // count>1 = one instanced-range entry (opaque array groups) instead of N per-instance entries; ord = cached draw rank
+type RendererDrawEntry = { mesh: Mesh3D; idx: number; submesh?: Submesh3D; count?: number; ord?: number; range?: IndexRange;
+  /** P14 LAZY ranges: the mesh's run table, expanded into index sub-ranges only when the far map (frg) / a cached
+   *  static cascade layer (crg) actually renders (_expandRanges), not on every frame's list build. */
+  frg?: CullRanges; crg?: CullRanges;
+  /** P15: the ArrayGroup3D of an instanced-range entry (the GPU scene's object for it); unset for a mesh entry. */
+  gdObj?: object };
+/** P11 cull ranges: an index sub-range of a single-material mesh (offsets into its own index list). */
+type IndexRange = { indexOffset: number; indexCount: number };
+/** A batched pass draw (E2 runs); `range` = draw only that index sub-range (P11). */
+type PassRun = { mesh: Mesh3D; idx: number; count: number; range?: IndexRange };   // count>1 = one instanced-range entry (opaque array groups) instead of N per-instance entries; ord = cached draw rank
 
 /** World-space axis-aligned bounding box. */
 type AABB3 = { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number };
@@ -82,6 +124,10 @@ export interface PS1Config {
   /** Fractional scale of canvas (0.1–1.0). Ignored when renderResolution is set. */
   renderScale?: number;
 
+  /** WHICH meshes the colour depth + dither apply to: 'all' (default — every mesh, the original behaviour) or
+   *  'optIn' (only meshes whose material has `retroColor` — e.g. characters banded, the environment full colour).
+   *  Sent to the shaders as a NEGATIVE colorDepth (so any path that doesn't know the scope simply skips it). */
+  colorScope?: 'all' | 'optIn';
   // ── Bayer dithering ───────────────────────────────────────────────────────
   /** Enable Bayer dithering (pairs with colorDepth). Default false. */
   dither?: boolean;
@@ -100,7 +146,12 @@ export const DEFAULT_PS1_CONFIG: PS1Config = {
   snapGridSize: 0,
   affineStrength: 0,
   colorDepth: 0,
+  colorScope: 'all',
 };
+
+/** A runtime particle source drawn by Renderer3D.drawTransientParticles (not a scene-graph node): `activeCount`
+ *  instances packed in `gpuData` in the particle shader's ParticleInstance layout (12 floats each). */
+export interface TransientParticleSource { readonly activeCount: number; readonly gpuData: Float32Array | null; }
 
 export interface FogConfig {
   /** Fog color (RGB 0–1). */
@@ -162,8 +213,15 @@ export const POCKET_PRESET: PS1Config = {
  * Total = 272 bytes → pad to 288 (16-byte aligned)
  */
 // 72 base floats + lightCounts vec4 + 16 POINT LIGHTS × 2 vec4s (posRadius, colorIntensity) = 204 floats,
-// + skinRampParams vec4 (floats 204-207, the scene-global skin toon-ramp look) = 208 floats.
-const SCENE_UNIFORM_SIZE_PADDED = 832;
+// + skinRampParams vec4 (floats 204-207, the scene-global skin toon-ramp look)
+// + styleParams vec4 (floats 208-211: .x Sketch paper, .y toon shadow tint, .z toon saturation)
+// + toonParams vec4 (212-215) + rimParams vec4 (216-219) = 220 floats.
+/** The edge-outline "threshold" is really the LINE WIDTH in whole pixels (the Sobel pass reads it as a tap radius,
+ *  i32). Values under 1 truncated to 0 → no outline at all (the City panel / Phantom Night sent 0.12–0.18 and drew
+ *  nothing). Clamp to 1..8 px. */
+export function outlineWidthPx(t: number): number { return Math.max(1, Math.min(8, Math.round(Number.isFinite(t) ? t : 1))); }
+
+const SCENE_UNIFORM_SIZE_PADDED = 1088;  // 272 floats (+ heightFog, city-quality P9; + shadow cascades A2; + aerial haze A5; + fog eye, fog horizon)
 // MAX_POINT_LIGHTS + PointLight3D + the uniform-packing math moved to scene-uniforms.ts (C1 Part 2).
 
 /** Size of one MeshInstance in the storage buffer (must match the WGSL struct stride in ALL declarations). */
@@ -180,7 +238,95 @@ const MESH_INSTANCE_STRIDE = 240;   // 60 floats; patternColor @48-51, patternPa
 const INITIAL_INSTANCE_CAPACITY = 4096;
 
 /** A geometry-pool allocation: where a unique geometry lives (draw params) + its byte spans (for the free-list). */
-type GeomAlloc = { baseVertex: number; firstIndex: number; indexCount: number; vtxBytes: number; idxBytes: number };
+/** A pooled geometry's placement. `pk` (P22 packedVertices): stored packed — 32-byte vertices, 16-bit indices
+ *  (vertex-pack.ts); baseVertex / firstIndex are then in those units. vtxBytes / idxBytes are the (padded) spans. */
+type GeomAlloc = { baseVertex: number; firstIndex: number; indexCount: number; vtxBytes: number; idxBytes: number; pk?: boolean };
+/** A geometry being written in slices (step 3): its reserved region, the bytes it stores (P22 pool view) and how much is in. */
+type GeomPartial = { g: import('./mesh-generators').MeshGeometry; v: PoolView; vtxOff: number; idxOff: number; vtxBytes: number; idxBytes: number; vDone: number; iDone: number; lastFrame: number };
+
+
+/** getMeshWorldAABB3D cache entry: local (geometry) box + world box at `matVersion`. P6: also held on the mesh. */
+type MeshAABBEntry = {
+  lMinX: number; lMinY: number; lMinZ: number;
+  lMaxX: number; lMaxY: number; lMaxZ: number;
+  wMinX: number; wMinY: number; wMinZ: number;
+  wMaxX: number; wMaxY: number; wMaxZ: number;
+  matVersion: number;
+  owner: object; dead: boolean; ref: object;
+};
+
+/** Per-frame render profile (Renderer3D.getFrameStats3D / salsaWorld.frameStats()). See the field notes at `_frame`. */
+export interface FrameStats3D {
+  drawCalls: number; meshes: number; arrayGroups: number; instances: number;
+  msTotal: number; msUpload: number; msShadow: number;
+  /** Meshes / explicit array groups / array instances rejected by the CAMERA frustum this frame. */
+  meshesCulled: number; groupsCulled: number; instancesCulled: number;
+  /** Triangles: in the scene / surviving the camera cull (main pass) / actually submitted across ALL passes. */
+  trisTotal: number; trisVisible: number; trisDrawn: number;
+  /** Shadow pass: casters kept / culled by the LIGHT box / dropped because their shadow cannot reach the VIEW, plus
+   *  the pass's draw calls + triangles (0 on a throttled frame — the map is refreshed every Nth frame). */
+  shadowCasters: number; shadowCulled: number; shadowOffView: number; shadowDrawCalls: number; shadowTris: number;
+  /** CPU ms spent building the culled draw lists (camera + light frustum tests). */
+  msCull: number;
+  /** R6.1 skinned parts: visible (effectively visible, with a skeleton) / drawn in the main pass / culled by the
+   *  camera / kept as shadow casters / skeletons whose skin buffer uploaded / skeletons whose idle is paused
+   *  (out of view) / main-pass skinned triangles / CPU ms of the whole drawSkinnedMeshes call. */
+  skinnedMeshes: number; skinnedDrawn: number; skinnedCulled: number; skinnedShadow: number; skinUploads: number;
+  /** Skinned parts dropped by the fog horizon (past the fog edge; also counted in skinnedCulled). */
+  skinnedFogHidden: number;
+  /** Live skinned parts whose main-pass draw was SKIPPED this frame (pipeline still compiling, or buffers not ready).
+   *  >0 = some of a character is missing on screen; not counted in skinnedDrawn (§P15 draw-bug 2026-10-04). */
+  skinnedWaiting: number;
+  skelAnimCulled: number; skinnedTris: number; msSkinned: number;
+  /** R6.1 DISTANCE LOD: meshes + array groups beyond their `drawDistance` from the camera this frame (not drawn in
+   *  any pass), and the triangles that saves in the main pass. */
+  lodHidden: number; lodTrisHidden: number;
+  /** FOG HORIZON (fog-horizon.ts): meshes + array groups culled because they lie wholly past the fog edge and their
+   *  family is not part of the silhouette (Buildings only in fog), and the triangles that saves in the main pass. */
+  fogHidden: number; fogTrisHidden: number;
+  /** persona-polish A2: near-cascade shadow casters (all cascades) / draw calls this frame (0 on a skipped frame) /
+   *  cascade renders since start (a counter) / live cascade count. */
+  cascadeCasters: number; cascadeDrawCalls: number; cascadePasses: number; cascades: number;
+  /** P8 shadow LOD: casters left out of the far map / of the near cascades (summed) because the map's texel is too
+   *  coarse for their `shadowFeatureSize`. */
+  shadowLodFar: number; shadowLodCascade: number;
+  /** P11 PER-PASS submission (draw calls + triangles actually submitted, instanced copies counted) for the static
+   *  (non-skinned) meshes. They sum to drawCalls / trisDrawn except the skinned shadow casters (counted here only).
+   *  main = the colour pass (opaque + transparent), farShadow = the far shadow map (static + dynamic layers),
+   *  cascade = the near cascades, outline = the outline depth-normal prepass, prepass = the SSAO / SSR G-buffer +
+   *  depth-peel prepasses, planar = the planar-mirror re-render, other = overlays. 0 for a pass that did not run
+   *  this frame (the shadow maps are throttled / cached). Skinned characters' MAIN draws are `skinnedTris`. */
+  passMainDraws: number; passMainTris: number; passFarShadowDraws: number; passFarShadowTris: number;
+  passCascadeDraws: number; passCascadeTris: number; passOutlineDraws: number; passOutlineTris: number;
+  passPrepassDraws: number; passPrepassTris: number; passPlanarDraws: number; passPlanarTris: number;
+  passOtherDraws: number; passOtherTris: number;
+  /** P11: the far map's / the cascades' submission the LAST frame each one actually rendered (they are throttled
+   *  and cached, so the per-frame pass* values above are 0 on most frames). */
+  passFarShadowLastDraws: number; passFarShadowLastTris: number; passCascadeLastDraws: number; passCascadeLastTris: number;
+  /** P11 OCCLUSION CULL (Renderer3D.occlusionCulling): meshes + groups in the view but wholly behind the building walls
+   *  (not drawn in the camera passes), the triangles that saves, and the CPU ms of the occluder raster + tests. */
+  occlCulled: number; occlTrisCulled: number; msOccl: number;
+  /** P11 CULL RANGES (Renderer3D.rangeCulling): triangles of meshes in the view dropped because their index run lies
+   *  outside the frustum (main pass) / outside a near cascade's box (summed over cascades), and the runs' box builds
+   *  this frame. */
+  rangeTrisCulled: number; rangeTrisCulledCascade: number; rangeBuilds: number;
+  /** P14 (performance-plan.md): far shadow map triangles dropped by the sub-mesh ranges this frame (the reach-culled
+   *  direct list + the light-box-culled static list, summed); near-cascade counters since start: static-layer
+   *  re-renders, dynamic-layer composites, box re-centres (the slack hold let go). */
+  rangeTrisCulledShadow: number; cascadeStaticRenders: number; cascadeDynPasses: number; cascadeRecentres: number;
+  /** P15 GPU-DRIVEN main pass (Renderer3D.gpuDriven, gpu-scene.ts): 0 = off (the CPU path), 1 = the GPU culls and
+   *  draws the main pass while the CPU still builds its full lists (a prepass / overlay / verification reads them),
+   *  2 = lean (the CPU skips the camera-pass tail of GPU-culled records). gpuMainDraws / gpuMainTris = the GPU's main
+   *  pass draws / triangles of the last READ-BACK frame (GPU-reported, `gpuStatsAge` frames old; also counted into
+   *  drawCalls / trisDrawn / passMain*, and in lean mode the GPU's frustum counts into meshesCulled / groupsCulled /
+   *  instancesCulled / trisVisible). gpuRecords = live records; msGpuSync = CPU ms of the record sync + uploads. */
+  gpuDriven: number; gpuMainDraws: number; gpuMainTris: number; gpuStatsAge: number; gpuRecords: number; msGpuSync: number;
+  /** P15: batched-segment entries the CPU drew after the bundle this frame (meshes not placed in it yet). */
+  gpuOrphanDraws: number;
+}
+
+/** P11: which pass _drawMesh is recording into (per-pass triangle / draw counters). */
+const enum PassBucket { Main = 0, FarShadow = 1, Cascade = 2, Outline = 3, Prepass = 4, Planar = 5, Other = 6 }
 
 export class Renderer3D {
   private device: GPUDevice;
@@ -198,6 +344,9 @@ export class Renderer3D {
     color: [1, 1, 1],
     intensity: 1.0,
   };
+  /** P14 (performance-plan.md): the direction the shadow MAPS use. It follows the sun in steps of
+   *  SUN_SHADOW_STEP_DEG (a running day cycle re-renders them at a bounded rate); the lighting keeps `_light`. */
+  private readonly _shadowDir: [number, number, number] = [0.3, -0.8, -0.5];
   private _ps1: PS1Config = { ...DEFAULT_PS1_CONFIG };
   private _fog: FogConfig = { ...DEFAULT_FOG_CONFIG };
   // Enhanced-visuals toggles (togglable for perf; default OFF = the current look). Written into free uniform slots.
@@ -206,7 +355,12 @@ export class Renderer3D {
                                // the city (whose glazing also sets glassEnhance) is unaffected; the CD kit turns it on
   private _aerialFog = 0;      // aerial-perspective desaturation strength 0..1 (fogColor.w)
   private _softLightStrength = 0.6;   // global wrapped/half-Lambert amount (lightColor.w) for softLighting materials
-  private _skinRamp: SkinRampSettings = { ...DEFAULT_SKIN_RAMP };   // scene-global skin toon-ramp look (skinRampParams, floats 204-207)
+  private _skinRamp: SkinRampSettings = { ...DEFAULT_SKIN_RAMP };
+  /** Sketch style PAPER amount (styleParams.x): 1 = paper + colour wash … 0 = full colour + hatching. 0.75 = original. */
+  private _sketchPaper = 0.75;
+  /** Scene toon-shadow look (toonShadow materials in Cel) + parameterised rim light (rimEnabled materials). */
+  private _toon: ToonShadowSettings = { ...DEFAULT_TOON_SHADOWS, shadowTint: [...DEFAULT_TOON_SHADOWS.shadowTint] as [number, number, number] };
+  private _rim: RimLightSettings = { ...DEFAULT_RIM_LIGHT, color: [...DEFAULT_RIM_LIGHT.color] as [number, number, number] };   // scene-global skin toon-ramp look (skinRampParams, floats 204-207)
   // Scene WIND (foliage-quality S1) — drives every `windSway` material's vertex sway, colour AND shadow
   // pass. Lives in the FREE lightCounts.yzw uniform slots (no buffer resize). Defaults to a gentle breeze.
   private _wind: SceneWind3D = { ...DEFAULT_SCENE_WIND };
@@ -253,10 +407,27 @@ export class Renderer3D {
   private readonly _opaque: RendererDrawEntry[] = [];
   private readonly _transparent: RendererDrawEntry[] = [];
   private readonly _opaqueForPasses: RendererDrawEntry[] = [];
+  /** SHADOW casters — the opaqueForPasses rules, but culled against the LIGHT's ortho box + the shadow-REACH test
+   *  (box swept along the sun must touch the camera frustum) instead of the camera box (polish-round-3 Round 5). A
+   *  caster just off-screen still throws its shadow INTO the view: the old camera-culled list dropped it (shadows
+   *  missing at the screen edges — and with the city chunked per cell that would have become visible popping). */
+  private readonly _shadowList: RendererDrawEntry[] = [];
+  private readonly _shadowSeen = new Set<string>();
+  private readonly _lightCuller = new FrustumCuller();
+  /** Cull the shadow list against the light box (true) or reuse the camera-culled pass list (false = the pre-Round-5
+   *  behaviour, kept as an A/B toggle: `renderer3D.shadowLightCulling = false`). */
+  private _shadowLightCull = true;
+  /** Lowest AABB minY seen last frame — the shadow-reach floor (nothing below it can receive a shadow). */
+  private _sceneFloorY = NaN;
+  private readonly _lightDirN: [number, number, number] = [0, -1, 0];
+  get shadowLightCulling(): boolean { return this._shadowLightCull; }
+  set shadowLightCulling(v: boolean) { this._shadowLightCull = v; }
   private readonly _opaqueVC: RendererDrawEntry[] = [];
   private readonly _opaqueSimple: RendererDrawEntry[] = [];
   // Cached (pipelineKey, geometryKey) draw rank per mesh — rebuilt only on structural change (see the sort site).
-  private readonly _drawOrder = new Map<string, number>();
+  // Step 2 (performance-plan §P13): kept incrementally — a structure change sorts + merges only the new meshes, by
+  // numeric geometry-key codes (draw-order-rank.ts); the ranks equal the old full stable string sort's exactly.
+  private readonly _drawOrder = new IncrementalDrawRank<Mesh3D>();
   private _drawOrderDirty = true;
   private _drawOrderDS = false;
   private readonly _opaqueMulti: RendererDrawEntry[] = [];
@@ -276,7 +447,7 @@ export class Renderer3D {
   private _pushDraw(list: RendererDrawEntry[], mesh: Mesh3D, idx: number, submesh?: Submesh3D, count = 1): void {
     let e = this._drawPool[this._drawPoolN];
     if (e === undefined) { e = { mesh, idx, submesh, count }; this._drawPool[this._drawPoolN] = e; }
-    else { e.mesh = mesh; e.idx = idx; e.submesh = submesh; e.count = count; }
+    else { e.mesh = mesh; e.idx = idx; e.submesh = submesh; e.count = count; e.range = undefined; e.frg = undefined; e.crg = undefined; e.gdObj = undefined; }
     this._drawPoolN++;
     list.push(e);
   }
@@ -288,10 +459,84 @@ export class Renderer3D {
   private readonly _fpTouched: number[] = [];          // reused scratch: slots written by the transforms/material fast path this frame (coalesced into upload runs)
   private _shadowUpdateInterval = 1;                   // render the shadow map every N frames
   private _shadowFramesSince = 999;                    // frames since the last shadow render (first frame renders)
+  // ── CASCADED SHADOWS (persona-polish A2; see shadow-cascades.ts) ── the original map stays the FAR cascade.
+  private _csm: ShadowCascadeSettings = { ...DEFAULT_SHADOW_CASCADES };
+  private _cascadeTex: GPUTexture | null = null;            // depth32float array (one layer per near cascade) or a 1x1 dummy
+  private _cascadeArrayView: GPUTextureView | null = null;  // P6: stable 2d-array view (bind group + min/max build)
+  /** P6 (performance-plan.md): min/max depth tiles of the far map + cascades → the exact PCF shortcut. */
+  private _shadowMM: ShadowMinMax | null = null;
+  /** P6 A/B switch: false = every shadow-receiving fragment runs the full PCF (the pre-P6 path). */
+  static shadowMinMax = true;
+  private _cascadeTexKey = '';
+  private _cascadeLayerViews: GPUTextureView[] = [];
+  private _cascadeCount = 0;                                // near cascades live THIS frame (0 = off)
+  private readonly _cascadePack: CascadePack = { count: 0, matrices: new Float32Array(32), mapSize: 2048, band: 0.15, bias: [0, 0] };
+  private readonly _cascadePrev = new Float32Array(32);     // last RENDERED matrices (a change = re-render)
+  private readonly _cascadeCentreScratch: [number, number, number] = [0, 0, 0];
+  private readonly _cascadeCullers = [new FrustumCuller(), new FrustumCuller()];
+  /** P8: each near cascade's world-space texel (set by _updateCascades) and the per-frame shadow-LOD thresholds. */
+  private readonly _cascadeTexel = [0, 0];
+  private readonly _cascadeLodTex = [0, 0];
+  private _viewH = 0;
+  private readonly _cascadeLists: RendererDrawEntry[][] = [[], []];
+  private _cascadeRunsCache: ({ mesh: Mesh3D; idx: number; count: number }[] | null)[] = [null, null];
+  private _cascadeSceneBufs: GPUBuffer[] = [];
+  private _cascadeMeshBGs: GPUBindGroup[] = [];
+  private _cascadeMeshBGFor: GPUBindGroup | null = null;    // the meshBindGroup the clones were made from
+  private _cascadeSkinBGs: GPUBindGroup[] = [];
+  private _cascadeSkinBGFor: GPUBindGroup | null = null;
+  private _cascadeStale = true;
+  private _cascadeFramesSince = 999;
+  private _sceneTopY = NaN;                                 // highest caster top (last frame) - how far a cascade reaches sunward
+  private _meshBGEntries: GPUBindGroupEntry[] | null = null;       // meshBindGroup's entries (cloned for the cascade passes)
+  private _skinnedMeshBGEntries: GPUBindGroupEntry[] | null = null;
   private _shadowMapStale = true;                      // structural change → refresh the map now
+  // ── P4.2 STATIC FAR-MAP CACHE (docs/specs/performance-plan.md) ──
+  // The far map used to re-render EVERY caster every `_shadowUpdateInterval` frames just so movers stayed current.
+  // Now casters split into STATIC (rendered into `_shadowStaticTex` only when the static set / light box / sun
+  // changes - the set is light-box culled WITHOUT the camera reach test, so a camera-only orbit keeps it valid) and
+  // DYNAMIC (recent movers: traffic / walkers / trains, wind-swayed foliage, billboards, skinned characters). A
+  // refresh = copy static -> sampled map, then draw only the dynamic casters on top (depthLoadOp load). While the
+  // light box itself is moving (pan / zoom / sun sweep) the old direct path runs unchanged (the cache would be
+  // invalid every frame anyway). `shadowStaticCache = false` restores the old behaviour exactly (A/B).
+  private _shadowCacheOn = true;
+  private _shadowStaticTex: GPUTexture | null = null;
+  private _shadowStaticView: GPUTextureView | null = null;
+  private _shadowStaticValid = false;        // _shadowStaticTex holds the static set at `_shadowStaticSigDrawn`
+  private _shadowSampledStatic = false;      // (no-dynamic branch) the sampled map holds exactly the static set
+  private _shadowStaticSig = 0;              // this frame's static-caster signature (built in _buildDrawLists)
+  private _shadowStaticSigDrawn = NaN;
+  private _shadowStaticFramesSince = 999;
+  private _shadowLightMoved = false;         // light box centre/size or sun direction changed this frame
+  private _shadowQuietFrames = 0;
+  private _shadowDynStale = false;           // skinned pose / caster count changed → refresh the dynamic layer now
+  private _shadowDynInMap = false;           // the sampled map currently includes dynamic casters
+  private _shadowCacheListsBuilt = false;    // this frame's _buildDrawLists produced the static/dynamic lists
+  private _shadowCachePath = false;          // last frame took the cached path (routes skinned stale → dynamic only)
+  private readonly _shadowStaticList: RendererDrawEntry[] = [];
+  private readonly _shadowDynList: RendererDrawEntry[] = [];
+  private _shadowStaticRunsCache: { mesh: Mesh3D; idx: number; count: number }[] | null = null;
+  private _shadowDynRunsCache: { mesh: Mesh3D; idx: number; count: number }[] | null = null;
+  private readonly _casterMotion = new WeakMap<Mesh3D, { v: number; f: number; uid: number }>();
+  private _casterUid = 0;
+  private _shadowFrameNo = 0;
+  private _sigSum = 0;
+  private _sigXor = 0;
+  private _shadowCacheStats = { staticRenders: 0, dynPasses: 0, directRenders: 0, staticCasters: 0, dynCasters: 0, farTris: 0, staticStale: 0, staticSig: 0, staticCold: 0 };
   private _instanceCount = 0;
-  private _instanceFreeSlots: number[] = [];   // instance slots freed by evicted meshes — reused by the incremental add path (no full repack)
-  private _instanceHigh = 0;                    // high-water instance slot (append point when the free list is empty)
+  // P5: ONE allocator for every instance slot outside a full repack — single mesh slots AND array-group ranges
+  // (instance-slot-allocator.ts). Replaces the old single-slot free list + high-water: a view switch that shows or
+  // hides whole array groups now allocates / parks their contiguous ranges instead of forcing the full repack.
+  private readonly _slotAlloc = new SlotRangeAllocator();
+  /** Active (placed) array groups: groupId → instance count N its range was allocated for. */
+  private readonly _arrayGroupSlotCount = new Map<string, number>();
+  /** P5 PARKED array groups: hidden since their last pack, their range still holds valid data (owned by the group in
+   *  `_slotAlloc`). Re-shown unchanged (same group/source objects, versions and source material stamp) = zero writes. */
+  private readonly _parkedGroups = new Map<string, { group: ArrayGroup3D; src: Mesh3D; srcVer: number; offVer: number; mat: Float32Array }>();
+  /** setArrayGroups saw a different group SET — the next upload must place / park ranges (incremental path). */
+  private _groupSetDirty = false;
+  private readonly _gsWant = new Set<string>();
+  private readonly _gsPack = new Set<string>();
   private _instanceDataBuf: Float32Array | null = null;
   private _instanceDataView: DataView | null = null;   // P8: cached view over _instanceDataBuf (recreated only on realloc)
   private _whiteLayerScratch: Uint8Array | null = null; // P8: reused all-255 atlas layer-0 buffer (per atlas size)
@@ -340,6 +585,10 @@ export class Renderer3D {
   private _geomKeyAllocs = new Map<string, GeomAlloc>();
   private readonly _geomKeyRefs = new Map<string, number>();   // geometryKey → # of live meshes using it
   private readonly _geomMeshKey = new Map<string, string>();   // meshId → geometryKey (to decrement on evict)
+  // geometryKey → the geometry OBJECT whose bytes are resident (P10.B6: a GPU compaction moves resident bytes, so a key
+  // shared by two different geometries — a key collision — must be re-uploaded from its first live user, exactly as
+  // the CPU full rebuild would, instead of keeping whichever copy was appended first).
+  private readonly _geomKeySrc = new Map<string, import('./mesh-generators').MeshGeometry>();
   private _geomFree: Array<{ vtxOff: number; vtxBytes: number; idxOff: number; idxBytes: number }> = [];   // freed regions (paired vtx+idx spans) for reuse
   private _geomVtxTail = 0;   // byte offset where the next vertex append lands
   private _geomIdxTail = 0;   // byte offset where the next index append lands
@@ -348,18 +597,14 @@ export class Renderer3D {
   // Two-level world AABB cache for getMeshWorldAABB3D.
   // Local AABB (from vertex scan) is stable until geometry changes (gpuDirty).
   // World AABB is stable until the model matrix changes (localMatrixVersion).
-  private _meshAABBCache = new Map<string, {
-    lMinX: number; lMinY: number; lMinZ: number;
-    lMaxX: number; lMaxY: number; lMaxZ: number;
-    wMinX: number; wMinY: number; wMinZ: number;
-    wMaxX: number; wMaxY: number; wMaxZ: number;
-    matVersion: number;
-  }>();
+  // P6: the entry is also held on the mesh (`Mesh3D._r3Aabb`, validated by owner + liveness) so the per-frame cull
+  // skips the map lookup, and a moving mesh's entry is updated in place (it was a fresh object per mover per frame).
+  private _meshAABBCache = new Map<string, MeshAABBEntry>();
 
   // Per-array-group world AABB (over all instance positions + canonical extent) for whole-group frustum culling.
   // Cached per source localMatrixVersion. Only 'explicit' groups get a box (city detail); others return null = never
   // group-culled. City-WIDE groups span everything → box never fails the frustum = no-op (safe with detailGrid=0).
-  private _agAABBCache = new Map<string, { ver: number; box: [number, number, number, number, number, number] | null }>();
+  private _agAABBCache = new Map<string, { ver: number; box: [number, number, number, number, number, number] | null; org: [number, number, number, number, number, number] | null }>();
 
   // Per-mesh vertex buffer overrides (e.g. ClothSimulator.poseVertexBuf).
   // When present, the override is used in place of the internal vertex buffer
@@ -384,7 +629,9 @@ export class Renderer3D {
   setVertexBufferOverride(meshId: string, buf: GPUBuffer | null): void {
     if (buf) this._vertexBufferOverrides.set(meshId, buf);
     else     this._vertexBufferOverrides.delete(meshId);
+    this._vbOverrideGen++;   // P15: the GPU-driven records re-derive their vertex buffer / base vertex
   }
+  private _vbOverrideGen = 0;
 
   // Shadow mapping
   private _shadowsEnabled = false;
@@ -448,7 +695,7 @@ export class Renderer3D {
 
   // ── Particle system ────────────────────────────────────────────────────────
   // Pipeline + buffers are created lazily on first drawParticles() call.
-  private _particlePipeline:      GPURenderPipeline | null = null;
+  private _particlePipeline:      PipelineHandle<GPURenderPipeline> | null = null;   // P2: non-blocking cache handle
   private _particleBGL0:          GPUBindGroupLayout | null = null;
   private _particleBGL1:          GPUBindGroupLayout | null = null;
   private _particleSceneUniBuf:   GPUBuffer | null = null; // viewProj + cameraRight + cameraUp
@@ -460,7 +707,7 @@ export class Renderer3D {
 
   // ── Bloom pass ─────────────────────────────────────────────────────────────
   private _bloomPass:            BloomPass | null = null;
-  private _bloomCapturePipeline: GPURenderPipeline | null = null;
+  private _bloomCapturePipeline: PipelineHandle<GPURenderPipeline> | null = null;
 
   // ── Skinned mesh rendering ─────────────────────────────────────────────────
   // Per-mesh skinned vertex buffer (72-byte stride: standard 48 + joints + weights + pad).
@@ -499,6 +746,438 @@ export class Renderer3D {
   private readonly _skinnedNormalMat = mat4.create();
   private readonly _skinnedIdent = mat4.create();   // identity (mat4.create() IS identity) — never mutated
   private readonly _skinnedVisibleScratch: SkinnedMesh3D[] = [];
+  // ── R6.1 SKINNED CULLING (polish-round-3). `_skinnedVisibleScratch` is the LIVE list: every part that is in the
+  // camera view OR whose shadow can reach the view (or all visible parts while a planar mirror is live). Only live
+  // parts get their instance slot + skin-matrix upload. Per-slot flags (same order as the list / instance slots):
+  // bit 1 = draw in the main pass (in view), bit 2 = cast into the shadow map.
+  /** Frustum-cull skinned meshes (main pass + shadow reach). false = the old draw-everything path, for A/B tests. */
+  skinnedCulling = true;
+  /** Skip the procedural idle for characters that are out of view (with a margin) and cast no visible shadow.
+   *  The idle is time-based, so it resumes at the right phase. Read by Scene3DAnimation via isSkeletonAnimCulled3D. */
+  skinnedAnimCulling = true;
+  private _skinnedFlags = new Uint8Array(64);
+  private readonly _skCuller = new FrustumCuller();
+  /** meshId → bind-space radii + the last world box (cached per pose / model version). */
+  private readonly _skCull = new Map<string, { cr: SkinnedCullRadii; skelId: string; verts: unknown; ji: unknown; jw: unknown;
+    poseVer: number; matVer: number; viaSkel: boolean; ok: boolean; box: Float64Array; flags: number }>();
+  /** skeletonId → joint bind positions + this pose's joint spheres (shared by every part on the skeleton). */
+  private readonly _skSpheres = new Map<string, { bindPos: Float32Array; poseVer: number; spheres: Float32Array }>();
+  /** Skeletons whose every visible part was out of view (with a margin) and cast no visible shadow last frame. */
+  private readonly _skelAnimCulled = new Set<string>();
+  private readonly _skelLiveScratch = new Set<string>();
+  private _lastSkinnedCasters = -1;
+  /** R6.1 DISTANCE LOD master switch (Mesh3D.drawDistance). false = draw everything regardless of distance (A/B). */
+  distanceLod = true;
+  /** Global multiplier on every drawDistance (quality knob: > 1 keeps detail farther). */
+  distanceLodScale = 1;
+  /** World units ADDED to every drawDistance (before the scale) — the city sets it each frame to the camera's distance
+   *  to the city volume, so an aerial overview keeps its detail (the zoom tiers own that case) while at street level
+   *  the per-chunk distances apply unchanged. 0 for everything else. Each mesh takes `Mesh3D.drawDistanceBias` (0..1)
+   *  of it (P7: sub-metre clutter takes none). */
+  distanceLodBias = 0;
+  /** P9: take a mesh's local box from its geometry's precomputed `bounds` when it has them (world builds) instead
+   *  of scanning the vertices. Needed for the shared near/far twin boxes; false = the old vertex scan (A/B). */
+  useGeometryBounds = true;
+  /** P9 HIERARCHICAL CULL master switch (cull-clusters.ts): static meshes are grouped into spatial clusters and a
+   *  cluster outside the view whose shadow cannot reach it skips its members' per-mesh tests. false = the flat loop. */
+  hierarchicalCull = true;
+  /** P9 RESOLUTION-AWARE DRAW DISTANCES (performance-plan P7.11): the distance-LOD and twin distances were tuned for
+   *  a ~900 px tall view; with this on they scale by (view height / LOD_REF_HEIGHT), clamped to LOD_RES_MIN..MAX, so a
+   *  small canvas drops detail sooner (and, with LOD_RES_MAX > 1, a 4K canvas keeps it farther). The height is the
+   *  CANVAS's (lodViewHeight, set by the host renderer each frame — never the dynamic-resolution target, so the auto
+   *  resolution scaler cannot make LOD pop). false = the fixed distances (A/B). */
+  resolutionLod = true;
+  /** The presentation canvas height in device pixels (0 = unknown → no scaling). */
+  lodViewHeight = 0;
+  static LOD_REF_HEIGHT = 900;
+  static LOD_RES_MIN = 0.6;
+  /** Default 1: distances only SHRINK on a small canvas. Measured (tiled 3x3, 2500x1390, scale 1.54): letting them
+   *  grow added +1.5 M tris in Play and +3.3 M from the sky on a view that is already GPU-bound, so growing is opt-in
+   *  (e.g. 2 for a 4K quality setting). */
+  static LOD_RES_MAX = 1.0;
+  /** The resolution factor the draw distances take this frame (1 when off / unknown). */
+  get lodResolutionScale(): number {
+    if (!this.resolutionLod || !(this.lodViewHeight > 0)) return 1;
+    return Math.min(Renderer3D.LOD_RES_MAX, Math.max(Renderer3D.LOD_RES_MIN, this.lodViewHeight / Renderer3D.LOD_REF_HEIGHT));
+  }
+  /** P9: the draw-list build reads a mesh's cached world box inline and its pool allocation / instance slot from
+   *  per-mesh copies (Mesh3D._r3GA / _r3Slot, generation-checked). false = the getMeshWorldAABB3D call + two Map
+   *  lookups per mesh (A/B). */
+  drawListFastPaths = true;
+  private _hcRebuild = true;
+  private _hcMissFrames = 0;
+  private _hcSerial = -1;
+  /** P9: bumped on every _geomAllocs / _meshInstanceSlots change — validates the per-mesh copies (Mesh3D._r3GA /
+   *  _r3Slot) the draw-list build reads instead of two string-keyed Map lookups per mesh. */
+  private _r3Gen = 0;
+  private _hcFloorY = Infinity;
+  private readonly _hcTests: ClusterTests = { inView: null, shadows: false, inLight: null, reaches: null };
+  private readonly _hcInView = (b: Float64Array): boolean => this._culler.testAABB(b[0], b[1], b[2], b[3], b[4], b[5]);
+  private readonly _hcInLight = (b: Float64Array): boolean => this._lightCuller.testAABB(b[0], b[1], b[2], b[3], b[4], b[5]);
+  private readonly _hcReaches = (b: Float64Array): boolean => shadowReachesView(this._culler, this._lightDirN, this._hcFloorY, b[0], b[1], b[2], b[3], b[4], b[5]);
+  /** FOG HORIZON: the squared cull distance this frame (Infinity = off) and the box test against the fog eye. */
+  private _fhCull2 = Infinity;
+  private readonly _outlineInvVP = mat4.create();
+  private _fogBoxPast(minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): boolean {
+    const e = this._fogEye, px = e[0], py = e[1], pz = e[2];
+    const dx = px < minX ? minX - px : px > maxX ? px - maxX : 0;
+    const dy = py < minY ? minY - py : py > maxY ? py - maxY : 0;
+    const dz = pz < minZ ? minZ - pz : pz > maxZ ? pz - maxZ : 0;
+    return dx * dx + dy * dy + dz * dz > this._fhCull2;
+  }
+  /** P9: (re)build the cull clusters over the current mesh roster (static, single-material, resident meshes). */
+  private _buildCullClusters(meshes: Mesh3D[]): void {
+    const n = buildCullClusters(this, meshes, (m) => this.getMeshWorldAABB3D(m, this._aabbScratch),
+      (m) => {
+        if (m.cheapBounds || m.submeshes.length > 0 || m.billboard || m.billboardParent || m.gpuDirty) return false;
+        const a = this._geomAllocs.get(m.id);
+        if (!a) return false;
+        m._hcTris = a.indexCount / 3;
+        return true;
+      }, (m) => m.localMatrixVersion);
+    this._hcStats.clustered = n; this._hcStats.builds++;
+    this._hcSerial = meshes.length ? meshes[0]._hcB : -1;
+  }
+  /** P9 diagnostics: meshes clustered at the last build, builds so far, members skipped last frame. */
+  readonly _hcStats = { clustered: 0, builds: 0, skipped: 0, fogSkipped: 0 };
+
+  // ── P15 GPU-DRIVEN MAIN PASS (gpu-scene.ts, gpu-driven.ts, performance-plan.md §P15; engine-roadmap step 4) ──
+  /** Master switch (default ON since 2026-10-02): the main pass's batched opaque segment (single-material opaque
+   *  meshes + opaque instanced groups) is culled by a compute pass over a persistent GPU record table (frustum,
+   *  distance LOD with its hysteresis, fog horizon; Phase B: near / far twins, P11 cull ranges; the depth prepasses
+   *  reuse it; Phase C: the shadow casters) and drawn from pre-recorded render bundles of drawIndexedIndirect commands
+   *  in the CPU path's draw order. Billboards, always-on-top cards and externally driven twins stay CPU-decided
+   *  (FORCED records); multi-material, vertex-coloured and transparent meshes and the skinned characters stay on the
+   *  CPU path. Pixel-identical to the CPU path; trades CPU for GPU time (performance-plan.md §P15: every record is an
+   *  indirect draw, culled ones included, which costs GPU front-end time on D3D12).
+   *  false = the CPU path exactly (nothing of the GPU scene runs). Also off when the device cannot build the scene. */
+  static gpuDriven = true;
+  /** LEAN: on a frame where no prepass / overlay reads the CPU's camera lists (outlines, SSAO / SSR, a planar mirror,
+   *  hover / per-object outlines, the CPU occlusion cull, a verification), the draw-list loop skips the camera-pass
+   *  tail (frustum, ranges, pushes) of GPU-culled records. false = the CPU still builds every list (A/B). */
+  static gpuDrivenLean = true;
+  /** PHASE B PREPASSES: the outline depth + normal pass, the SSAO / SSR G-buffer pass and the SSR depth peel draw the
+   *  GPU-culled records from render bundles over the main pass's argument blocks (the same camera frustum), and the
+   *  CPU only the rest (multi-material, vertex-coloured, not-yet-placed meshes). Lean mode then stays on with ink
+   *  outlines / SSAO / SSR. false = those passes replay the CPU lists (and lean mode turns off while they run). */
+  static gpuDrivenPrepasses = true;
+  private _gd: GpuDrivenMain | null = null;
+  private _gdOn = false;
+  private _gdLean = false;
+  private _gdStamp = -1;
+  private _gdDrew = false;
+  private _gdWasOn = false;
+  private _gdAtlasSeen = -1;
+  private _gdFdsSeen = false;
+  /** Phase B: the merged (all-patterned) pipeline choice is in force (GpuDrivenMain.mergePatterned + its pipelines ready). */
+  private _gdMergeOk = false;
+  /** The GPU scene could not be created on this device (no compute / indirect support): the CPU path, for good. */
+  private _gdFailed = false;
+  // GPU CULLING MODE (gpu-cull-auto.ts): 'on' / 'off' / 'auto' (default; a per-machine localStorage preference).
+  // In 'auto' the controller picks the path each frame from measured CPU / GPU ms. While it picks the CPU path the GPU
+  // scene stays WARM: the loop still stamps and re-checks the records and finish() keeps them, the order and the
+  // bundles current (no cull dispatch, no lean skip, no GPU shadows), so switching back costs no rebuild and no frame.
+  readonly cullAuto = new GpuCullAuto();
+  private static _cullModeStatic: GpuCullingMode | null = null;
+  private _cullTimer: 'timestamp' | 'estimate' | 'none' = 'none';
+  /** This frame: the GPU scene runs but the CPU path draws (auto mode picked the CPU path). */
+  private _gdWarm = false;
+  /** The path the last frame drew with (a change re-renders the cached shadow layers). */
+  private _gdPathLast: GpuCullPath | null = null;
+  private _cullPathNow: GpuCullPath = 'gpu';
+  private _cullReasonNow: GpuCullReason = 'measuring';
+  /** Records below which auto mode does not bother (no city: the paths cost the same). */
+  static CULL_AUTO_MIN_RECORDS = 256;
+  // Phase C: the GPU decides the records' shadow casters this frame; its inputs; the static layers' bookkeeping
+  private _gdShThis = false;
+  private readonly _gdShL = new Float32Array(24);
+  private readonly _gdShC = [new Float32Array(24), new Float32Array(24)];
+  private readonly _gdS: GdShadowParams = { on: false, light: null, casc: [null, null], cascades: 0, ldir: [0, -1, 0], floorY: Infinity, reach: false,
+    lodFar: 0, lodC0: 0, lodC1: 0, cache: false, split: false, wind: false, join: false, band: false, bandAttach: false, bandIn: 0 };
+  /** Per static layer (far, cascade 0, cascade 1): an epoch mixed into its signature (bumped when the GPU reports a
+   *  leaver, or any change with joiner deferral off), the GPU frame of its last commit, the GPU joiners and since when. */
+  private readonly _gdShEpoch = [0, 0, 0];
+  private readonly _gdShCommit = [-1, -1, -1];
+  private readonly _gdShJoiners = [0, 0, 0];
+  private readonly _gdShJoinTris = [0, 0, 0];
+  private readonly _gdShJoinSince = [-1, -1, -1];
+  private readonly _gdPlanes = new Float32Array(24);
+  private readonly _gdCam = new Float64Array(3);
+  private readonly _gdF: GdFrameParams = { planes: null, cam: this._gdCam, lodOn: false, lodOrtho: false, orthoD2: 0, lodScale: 1, lodBias: 0,
+    fogEye: [0, 0, 0], fogCull2: Infinity, fogCullOther: false, fogCullAttach: false };
+  private readonly _gdScratchBox: AABB3 = { minX: 0, minY: 0, minZ: 0, maxX: 0, maxY: 0, maxZ: 0 };
+
+  /** The renderer side of the GPU scene (closures over this renderer's private state). */
+  private _gdHost(): GdHost {
+    const r = this;
+    const T = GD_CODE_TEXTURED, NC = GD_CODE_NOCULL, PT = GD_CODE_PATTERNED, AT = GD_CODE_ATLAS, VO = GD_CODE_VB_OVERRIDE;
+    return {
+      device: this.device,
+      colorFormat: this._swapChainFormat,
+      depthFormat: 'depth24plus-stencil8',
+      mdi: this.device.features.has('chromium-experimental-multi-draw-indirect' as GPUFeatureName),
+      gen: () => r._r3Gen,
+      refresh: (m) => {
+        if (m._r3o !== r || m._r3g !== r._r3Gen) { m._r3o = r; m._r3g = r._r3Gen; m._r3GA = r._geomAllocs.get(m.id); m._r3Slot = r._meshInstanceSlots.get(m.id) ?? -1; }
+      },
+      box: (m) => r.getMeshWorldAABB3D(m, r._gdScratchBox),
+      vbOverride: (id) => r._vertexBufferOverrides.get(id),
+      vbGen: () => r._vbOverrideGen,
+      stateCode: (m) => {
+        const mat = m.material, tex = !!(mat.hasTexture || mat.hasNormalMap);
+        let c = (tex ? T : 0) | ((r.forceDoubleSided || !!mat.doubleSided) ? NC : 0) | ((r._gdMergeOk || r._usesPatterns(m)) ? PT : 0);
+        if (tex && !!m.textureLibraryId && r._atlasLayerMap.has(m.textureLibraryId)) c |= AT;
+        if (r._vertexBufferOverrides.has(m.id)) c |= VO;
+        else if (r._geomAllocs.get(m.id)?.pk) c |= GD_CODE_PACKED;   // P22: the packed twin + uint16 indices
+        // step 8: the shader-variant id (bits 5+), from the material (this runs before the frame's slot writes)
+        if (Renderer3D.shaderVariants && m.submeshes.length === 0) c |= r._svIds.idOf(variantKeyOfMaterial(mat)) << 5;
+        return c;
+      },
+      texKey: (m, code) => ((code & T) && !(code & AT) ? r.createTextureBindGroup(m) : null),
+      rankedMeshes: () => r._drawOrder.orderedMeshes(),
+      rankOf: (id) => r._drawOrder.get(id),
+      rankChanged: () => r._drawOrder.lastChangedMeshes(),
+      groups: () => r._arrayGroups,
+      groupGen: () => r._groupSetGen,
+      groupFirstSlot: (id) => r._arrayGroupFirstSlot.get(id),
+      groupSource: (g) => r._meshById.get(g.sourceId),
+      groupCount: (g) => getArrayInstanceCount(g.arrayParams),
+      groupBox: (g, src) => r._arrayGroupWorldAABB(g, src),
+      groupLodHidden: (g) => r._lodHiddenGroups.has(g.id),
+      groupOrigin: (g) => r._agAABBCache.get(g.id)?.org ?? null,
+      groupTwinNear: (g) => r._lodTwinNearGroups.has(g.id),
+      geomBuffers: () => ({ vb: r._geomVB, ib: r._geomIB }),
+      shadowFrame: () => r._shadowFrameNo,
+      casterUntil: (m) => r._casterUntil(m),
+      rankCell: (m) => m._r3RankCell,
+      resolve: (code, lead, out: GdBucketRefs) => {
+        // exactly the CPU main pass's choice for a group led by `lead` (_drawMainPass)
+        const P = r.pipeline, sh = r._shadowsEnabled, noCull = (code & NC) !== 0, pat = (code & PT) !== 0;
+        if (code & T) {
+          out.pipeline = sh
+            ? (noCull ? (pat ? P.opaqueTexturedNoCullShadowPipeline : P.opaqueTexturedNoCullPlainShadowPipeline)
+                      : (pat ? P.opaqueTexturedShadowPipeline : P.opaqueTexturedPlainShadowPipeline))
+            : (noCull ? (pat ? P.opaqueTexturedNoCullPipeline : P.opaqueTexturedNoCullPlainPipeline)
+                      : (pat ? P.opaqueTexturedPipeline : P.opaqueTexturedPlainPipeline));
+          out.bg1 = ((code & AT) && r._atlasBindGroup) ? r._atlasBindGroup : r.createTextureBindGroup(lead);
+          out.bg2 = sh ? r._shadowBindGroup : null;
+        } else {
+          out.pipeline = sh
+            ? (noCull ? (pat ? P.opaqueUntexturedNoCullShadowPipeline : P.opaqueUntexturedNoCullPlainShadowPipeline)
+                      : (pat ? P.opaqueUntexturedShadowPipeline : P.opaqueUntexturedPlainShadowPipeline))
+            : (noCull ? (pat ? P.opaqueUntexturedNoCullPipeline : P.opaqueUntexturedNoCullPlainPipeline)
+                      : (pat ? P.opaqueUntexturedPipeline : P.opaqueUntexturedPlainPipeline));
+          out.bg1 = sh ? r._shadowBindGroup : null;
+          out.bg2 = null;
+        }
+        // step 8: the bucket's specialised variant once compiled (a bucket = one variant id = one exact flags value);
+        // a pipeline change re-records the bundle (gdBucketsChanged)
+        const vid = (code >> 5) & GD_CODE_VARIANT_MASK;
+        const base = out.pipeline as GPURenderPipeline | null;
+        if (vid > 0) { const vp = r._variantPipe(r._svIds.keyOf(vid), (code & T) !== 0, noCull, pat); if (vp) out.pipeline = vp; }
+        // P22: a packed bucket draws with the twin (the variant's, or the base pipeline's while that one compiles)
+        if (code & GD_CODE_PACKED) out.pipeline = packedTwin(r.device, out.pipeline as GPURenderPipeline | null) ?? packedTwin(r.device, base);
+        out.bg0 = r.meshBindGroup;
+        out.vb = (code & VO) ? (r._vertexBufferOverrides.get(lead.id) ?? r._geomVB) : r._geomVB;
+        out.ib = r._geomIB;
+      },
+    };
+  }
+
+  /** Does a consumer of this frame need the CPU's camera lists (so lean mode must not skip building them)? */
+  private _gdListsNeeded(): boolean {
+    const pre = !Renderer3D.gpuDrivenPrepasses;   // Phase B: the prepasses draw the GPU set themselves
+    return (pre && ((!!this._outlinePass && this._outlinePass.ready()) || this._ssaoEnabled || this._ssrEnabled)) || this._planarActive
+      || Renderer3D.occlusionCulling || this._hoveredMeshIds.size > 0 || this._meshOutlines.size > 0 || this._hoverOutlineRanges !== null
+      || (this._shadowsEnabled && (!this._shadowLightCull || this._shadowsSuspended)) || (!!this._gd && this._gd.verifyPending);
+  }
+
+  /** Start of drawMeshes: is the GPU main pass on this frame (switch on + cull pipeline compiled)? */
+  private _gdBegin(): void {
+    this._gdDrew = false; this._frame.gpuOrphanDraws = 0; this._gdWarm = false;
+    Renderer3D._cullModeLoaded();   // the stored GPU culling mode ('off' clears gpuDriven once, at start-up)
+    if (!Renderer3D.gpuDriven) {
+      if (this._gdWasOn && this._gd) this._gd.reset();   // stale records must never survive a switch-off
+      this._gdWasOn = false; this._gdOn = false;
+      const f = this._frame; f.gpuDriven = 0; f.gpuMainDraws = 0; f.gpuMainTris = 0; f.gpuStatsAge = -1; f.gpuRecords = 0; f.msGpuSync = 0;
+      return;
+    }
+    if (!this._gd) {
+      if (this._gdFailed) { this._gdOn = false; this._frame.gpuDriven = 0; return; }
+      try { this._gd = new GpuDrivenMain(this._gdHost()); }
+      catch (e) { this._gdFailed = true; this._gdOn = false; this._frame.gpuDriven = 0; console.warn('[gpu-driven] unavailable on this device, using the CPU path', e); return; }
+    }
+    const gd = this._gd;
+    if (!this._gdWasOn) { gd.reset(); this._gdWasOn = true; }
+    this._gdOn = gd.ready;
+    if (!this._gdOn) { this._frame.gpuDriven = 0; this._gdWarm = false; return; }
+    this._gdStamp = gd.beginFrame();
+    // GPU culling mode: 'auto' asks the controller (the GPU scene keeps running WARM on a CPU-path frame)
+    const path = this._gdChoosePath();
+    this._gdWarm = path === 'cpu';
+    if (this._gdPathLast !== null && path !== this._gdPathLast) { this._shadowMapStale = true; this._cascadeStale = true; }   // the cached static layers re-render from the new path's casters
+    this._gdPathLast = path;
+    this._gdLean = !this._gdWarm && Renderer3D.gpuDrivenLean && !this._gdListsNeeded();
+    // Phase B merged pipelines: only once every FULL (patterned) variant the merged buckets need has compiled (reading
+    // the getters requests them); until then the CPU path's per-mesh choice, so no plain mesh waits on a pipeline the
+    // CPU path would not use. A flip re-derives the buckets.
+    let merge = GpuDrivenMain.mergePatterned;
+    if (merge) {
+      const P = this.pipeline;
+      merge = this._shadowsEnabled
+        ? !!(P.opaqueTexturedShadowPipeline && P.opaqueTexturedNoCullShadowPipeline && P.opaqueUntexturedShadowPipeline && P.opaqueUntexturedNoCullShadowPipeline)
+        : !!(P.opaqueTexturedPipeline && P.opaqueTexturedNoCullPipeline && P.opaqueUntexturedPipeline && P.opaqueUntexturedNoCullPipeline);
+    }
+    if (merge !== this._gdMergeOk) { this._gdMergeOk = merge; gd.recode(); }
+  }
+
+  /** After the draw-list loop: sync the records, upload, dispatch the cull (own submit, before the main pass). */
+  private _gdFinish(meshes: Mesh3D[]): void {
+    const gd = this._gd!;
+    const t0 = performance.now();
+    this._ensureDrawOrder(meshes);
+    if (this._perf.atlasRebuilds !== this._gdAtlasSeen || this.forceDoubleSided !== this._gdFdsSeen) {
+      this._gdAtlasSeen = this._perf.atlasRebuilds; this._gdFdsSeen = this.forceDoubleSided; gd.recode();
+    }
+    if (!gd.finish(meshes, this._gdF, this._drawOrder.stats.updates, this._gdS)) { this._gdOn = false; return; }
+    if (this._gdWarm) { this._frame.msGpuSync = performance.now() - t0; return; }   // auto mode on the CPU path: records kept current, nothing dispatched
+    gd.selectSegments();   // sub-bundles: which ones may draw this frame
+    gd.captureVerifyExpect();
+    const enc = this.device.createCommandEncoder({ label: 'GdCullEnc' });
+    gd.encode(enc);
+    this.device.queue.submit([enc.finish()]);
+    gd.afterSubmit();
+    this._frame.msGpuSync = performance.now() - t0;
+  }
+
+  /** After a GPU-drawn main pass: the GPU-reported counters (last read-back frame) into the frame stats. */
+  private _gdAddStats(): void {
+    const s = this._gd!.readStats(), f = this._frame;
+    f.gpuDriven = this._gdLean ? 2 : 1;
+    f.gpuMainDraws = s.draws; f.gpuMainTris = s.tris; f.gpuStatsAge = s.age; f.gpuRecords = s.records;
+    f.drawCalls += s.draws; f.trisDrawn += s.tris;
+    this._passDraws[PassBucket.Main] += s.draws; this._passTris[PassBucket.Main] += s.tris;
+    if (this._gdLean) {   // the CPU skipped the camera tail of GPU-culled records: their frustum verdicts are the GPU's
+      f.meshesCulled += s.meshesCulled; f.groupsCulled += s.groupsCulled; f.instancesCulled += s.instancesCulled;
+      f.trisVisible += Math.max(0, s.tris - s.forcedTris);
+    }
+  }
+
+  /** P15: switch the GPU-driven main pass (Renderer3D.gpuDriven / gpuDrivenLean / multi-draw-indirect use). */
+  setGpuDriven(o: { enabled?: boolean; lean?: boolean; mdi?: boolean; twins?: boolean; prepasses?: boolean; ranges?: boolean; mergePatterned?: boolean; shadows?: boolean; cpuState?: boolean; subBundles?: boolean; rankCellM?: number; rankPatterned?: boolean; shadowCompact?: boolean; boundReach?: boolean }): { enabled: boolean; lean: boolean; mdi: boolean; twins: boolean; prepasses: boolean; ranges: boolean; mergePatterned: boolean; shadows: boolean; cpuState: boolean; subBundles: boolean; rankCellM: number; rankPatterned: boolean; shadowCompact: boolean; boundReach: boolean; mdiAvailable: boolean; ready: boolean } {
+    if (o.enabled !== undefined) Renderer3D.gpuDriven = !!o.enabled;
+    if (o.shadowCompact !== undefined) GpuDrivenMain.shadowCompact = !!o.shadowCompact;   // P15: compact dynamic shadow lists (same casters, takes effect next frame)
+    if (o.boundReach !== undefined) setGdBoundReach(!!o.boundReach);   // P15: the compact lists' CPU bound keeps the shadow-reach test (a tighter K; same casters)
+    if (o.subBundles !== undefined && !!o.subBundles !== GpuDrivenMain.subBundles) { GpuDrivenMain.subBundles = !!o.subBundles; this._gd?.invalidateBundle(); }
+    if (o.rankCellM !== undefined && Number.isFinite(o.rankCellM)) Renderer3D.rankCellM = Math.max(0, +o.rankCellM);   // re-ranks on the next frame (both paths)
+    if (o.rankPatterned !== undefined) Renderer3D.rankPatterned = !!o.rankPatterned;   // re-ranks on the next frame (both paths)
+    if (o.lean !== undefined) Renderer3D.gpuDrivenLean = !!o.lean;
+    if (o.mdi !== undefined) GpuDrivenMain.allowMdi = !!o.mdi;
+    if (o.prepasses !== undefined) Renderer3D.gpuDrivenPrepasses = !!o.prepasses;
+    if (o.cpuState !== undefined) GpuDrivenMain.cpuState = !!o.cpuState;
+    if (o.shadows !== undefined && !!o.shadows !== GpuDrivenMain.shadows) { GpuDrivenMain.shadows = !!o.shadows; this._shadowMapStale = true; this._cascadeStale = true; }
+    if (o.ranges !== undefined && !!o.ranges !== GpuDrivenMain.ranges) { GpuDrivenMain.ranges = !!o.ranges; this._gd?.reset(); }
+    if (o.mergePatterned !== undefined && !!o.mergePatterned !== GpuDrivenMain.mergePatterned) { GpuDrivenMain.mergePatterned = !!o.mergePatterned; this._gd?.reset(); }
+    if (o.twins !== undefined && !!o.twins !== GpuDrivenMain.twins) { GpuDrivenMain.twins = !!o.twins; this._gd?.reset(); }   // every forced flag changes
+    return { enabled: Renderer3D.gpuDriven, lean: Renderer3D.gpuDrivenLean, mdi: GpuDrivenMain.allowMdi, twins: GpuDrivenMain.twins, prepasses: Renderer3D.gpuDrivenPrepasses, ranges: GpuDrivenMain.ranges, mergePatterned: GpuDrivenMain.mergePatterned, shadows: GpuDrivenMain.shadows, cpuState: GpuDrivenMain.cpuState,
+      subBundles: GpuDrivenMain.subBundles, rankCellM: Renderer3D.rankCellM, rankPatterned: Renderer3D.rankPatterned, shadowCompact: GpuDrivenMain.shadowCompact, boundReach: gdBoundReach, mdiAvailable: this.device.features.has('chromium-experimental-multi-draw-indirect' as GPUFeatureName), ready: !!this._gd?.ready };
+  }
+  /** The GPU culling mode, loaded from the per-machine preference on first use. A stored 'off' switches the
+   *  GPU-driven path off (Renderer3D.gpuDriven) once, at load. */
+  private static _cullModeLoaded(): GpuCullingMode {
+    if (Renderer3D._cullModeStatic === null) {
+      Renderer3D._cullModeStatic = loadGpuCullingMode();
+      if (Renderer3D._cullModeStatic === 'off') Renderer3D.gpuDriven = false;
+    }
+    return Renderer3D._cullModeStatic;
+  }
+  /** This frame's path (start of drawMeshes, the GPU scene ready): 'on' = the GPU path; 'auto' = the controller. */
+  private _gdChoosePath(): GpuCullPath {
+    const mode = Renderer3D._cullModeLoaded();
+    if (mode !== 'auto') { this._cullPathNow = 'gpu'; this._cullReasonNow = 'mode-on'; return 'gpu'; }
+    if (this._gd!.recordCount < Renderer3D.CULL_AUTO_MIN_RECORDS) { this._cullPathNow = 'gpu'; this._cullReasonNow = 'headroom'; return 'gpu'; }
+    const p = this.cullAuto.decide(performance.now(), this._cullTimer);
+    this._cullPathNow = p; this._cullReasonNow = this.cullAuto.reason;
+    return p;
+  }
+  /** GPU CULLING MODE: 'on' = the GPU-driven path always; 'off' = the CPU path exactly (nothing of the GPU scene
+   *  runs); 'auto' (default) = per frame, the GPU path when the frame is CPU-bound and the CPU path when it is
+   *  GPU-bound (gpu-cull-auto.ts). Stored as a per-machine preference (localStorage) unless `persist` is false. */
+  setGpuCullingMode(mode: GpuCullingMode, persist = true): ReturnType<Renderer3D['getGpuCullingMode']> {
+    const m = sanitizeGpuCullingMode(mode);
+    Renderer3D._cullModeLoaded();
+    if (m !== Renderer3D._cullModeStatic) this.cullAuto.reset();
+    Renderer3D._cullModeStatic = m;
+    Renderer3D.gpuDriven = m !== 'off';
+    if (persist) saveGpuCullingMode(m);
+    return this.getGpuCullingMode();
+  }
+  /** The mode, the path drawing right now and why, the auto controller's state (switches, the last decision and its
+   *  inputs: CPU / GPU ms medians, the other path's prediction, the budget) and the sub-bundle omission counters. */
+  getGpuCullingMode(): { mode: GpuCullingMode; active: GpuCullPath; reason: GpuCullReason; reasonText: string; warm: boolean; ready: boolean;
+    timer: 'timestamp' | 'estimate' | 'none'; auto: GpuCullAutoState; subBundles: { on: boolean; segments: number; kept: number; omittedDraws: number; omittedTotal: number } } {
+    const mode = Renderer3D._cullModeLoaded();
+    const ready = !!this._gd?.ready && !this._gdFailed;
+    let active: GpuCullPath = 'gpu', reason: GpuCullReason;
+    if (!Renderer3D.gpuDriven) { active = 'cpu'; reason = 'mode-off'; }
+    else if (!ready || !this._gdOn) { active = 'cpu'; reason = 'unavailable'; }
+    else { active = this._cullPathNow; reason = this._cullReasonNow; }
+    const st = this._gd?.stats;
+    return { mode, active, reason, reasonText: GPU_CULL_REASON_TEXT[reason], warm: this._gdWarm, ready, timer: this._cullTimer, auto: this.cullAuto.state(performance.now()),
+      subBundles: { on: GpuDrivenMain.subBundles, segments: st?.segments ?? 0, kept: st?.segKept ?? 0, omittedDraws: st?.segOmitDraws ?? 0, omittedTotal: st?.segOmitTotal ?? 0 } };
+  }
+  /** WebGPURenderer, per frame: does the auto mode need the GPU frame timer (auto, the GPU scene running a city)? */
+  wantsGpuTiming(): boolean {
+    return Renderer3D._cullModeLoaded() === 'auto' && Renderer3D.gpuDriven && this._gdOn && !!this._gd && this._gd.recordCount >= Renderer3D.CULL_AUTO_MIN_RECORDS;
+  }
+  /** WebGPURenderer, per frame: what the GPU frame timer measures this frame. */
+  setGpuTimerSource(t: 'timestamp' | 'estimate' | 'none'): void { this._cullTimer = t; }
+  /** WebGPURenderer: the main-thread ms of the frame just rendered (drawn on the path this frame chose). */
+  noteCullCpuMs(ms: number): void { if (this._gdOn && this._gdPathLast) this.cullAuto.sampleCpu(ms, this._gdPathLast, performance.now()); }
+  /** WebGPURenderer: a GPU frame time from the timestamp queries (1-2 frames late). */
+  noteCullGpuMs(ms: number): void { if (this._gdOn && this._gdPathLast) this.cullAuto.sampleGpu(ms, this._gdPathLast, performance.now()); }
+  /** P15 diagnostics: records, draw order, buckets, the last read-back GPU counters (GPU-reported), rebuilds, bundle
+   *  re-records, uploads, the draw mode (bundle / mdi) and the CPU ms of the sync / rebuild / bundle encode. */
+  getGpuDrivenStats(): GdStats & { on: boolean; lean: boolean } {
+    const s = this._gd ? this._gd.readStats() : null;
+    return { ...(s ?? ({} as GdStats)), on: this._gdOn, lean: this._gdLean };
+  }
+  /** P15 verification: resolves with the next GPU-driven frame's mismatches against the CPU lists (that frame builds
+   *  the full lists). missing = drawn by the CPU path, culled by the GPU (an error); extra = the reverse. */
+  verifyGpuDriven(): Promise<GdVerifyResult | null> {
+    if (!this._gd || !Renderer3D.gpuDriven) return Promise.resolve(null);
+    return new Promise((res) => this._gd!.requestVerify(res));
+  }
+  /** P1.2 ORTHO SCREEN-SIZE LOD: under an orthographic camera, distance LOD (drawDistance + nearTwin) compares each
+   *  mesh's draw distance with orthoLodDistance(orthoSize) — the zoom, uniform across the view — instead of turning
+   *  off. false = the old behaviour (ortho draws everything, far twins only). */
+  orthoScreenLod = true;
+  /** P1.1 ORTHO DEPTH RANGE (docs/specs/performance-plan.md). An ortho camera's depth is LINEAR, and the 2D-ortho
+   *  illustration camera puts its near plane at the eye, right at the front of a big scene (a city). Nearly every
+   *  fragment then stores a depth close to 0, which made the main colour pass ~5x slower on NVIDIA (the coarse depth
+   *  cull stops rejecting hidden fragments): 2D ortho ran at 60 ms vs 10 ms for the same view with the stored depth
+   *  moved off 0. So under ortho every pass that depth-tests against the scene depth buffer maps NDC depth [0, 1] to
+   *  [ORTHO_DEPTH_MIN, 1] with the viewport depth range. Clipping (done on NDC) is untouched, ordering is untouched,
+   *  1.0 stays the cleared "nothing drawn" value; only 1/3 of the depth precision is given up (linear, plenty). The
+   *  host calls applySceneDepthRange at the start of each such pass. false = the plain [0, 1] (A/B). */
+  orthoDepthRemap = true;
+  static readonly ORTHO_DEPTH_MIN = 1 / 3;
+  /** The viewport minDepth for the scene's depth-tested passes this frame (0 = the plain [0, 1]). */
+  sceneDepthRangeMin(): number {
+    return this.orthoDepthRemap && this.camera.mode === 'orthographic' ? Renderer3D.ORTHO_DEPTH_MIN : 0;
+  }
+  /** Set the full-target viewport with this frame's scene depth range on `pass` (no-op for the plain [0, 1], which is
+   *  every pass's default). Call before the pass's first depth-tested 3D draw; later draws in the pass inherit it. */
+  applySceneDepthRange(pass: GPURenderPassEncoder, w: number, h: number): void {
+    const m = this.sceneDepthRangeMin();
+    if (m > 0 && w > 0 && h > 0) pass.setViewport(0, 0, w, h, m, 1);
+  }
+  /** Array groups currently beyond their source's drawDistance (hysteresis state — see Mesh3D.lodHidden). */
+  private readonly _lodHiddenGroups = new Set<string>();
+  /** P8: array groups (instanced twins) whose camera is currently NEAR — the group-twin hysteresis state. */
+  private readonly _lodTwinNearGroups = new Set<string>();
+  /** P8 INSTANCED NEAR/FAR TWINS master switch (the far tree crowns). false = near groups always, far never (A/B). */
+  static groupTwins = true;
   // Reused scratch for computeLightSpaceMatrix (ran every frame while shadows are on — city + character).
   private readonly _lsmEye = vec3.create();
   private readonly _lsmCenter = vec3.create();   // the shadow-box centre: follows the camera focus, texel-snapped
@@ -588,6 +1267,12 @@ export class Renderer3D {
   private _outlinePass: OutlinePass | null = null;
   // Per-mesh hover/selection highlight
   private _highlightPass: MeshHighlightPass | null = null;
+  // ALPHA-SHAPED outlines for transparent-textured sprites (sprite-alpha-outlines.md) — a separate pass + a per-texture
+  // distance-field cache. Only sprites that spriteOutlineMode routes here ('image' also needs the image to have transparency).
+  private _spriteOutlinePass: SpriteOutlinePass | null = null;
+  private _spriteSDF: SpriteSDFCache | null = null;
+  /** A sprite's distance field was still building last frame — keep frames flowing until it lands. */
+  private _spriteSDFPending = false;
   // Screen-space silhouette outline for HOVER (uniform thickness, any angle, no normal tearing — replaces the old
   // expand-normals ring for hover; the 'select' slot still uses the stencil ring above).
   private _silhouettePass: SilhouetteOutlinePass | null = null;
@@ -598,6 +1283,8 @@ export class Renderer3D {
   // persisted source of truth is Mesh3D.outline (scene3d-manager mirrors set/restore into here). Drawn every frame
   // with the same stencil-ring technique as hover/select (drawCustom), one param buffer per outlined mesh.
   private _meshOutlines = new Map<string, HighlightStyle>();
+  /** Extra stacked rings per outlined mesh (Mesh3D.outlineRings), inner → outer. */
+  private _meshOutlineRings = new Map<string, HighlightStyle[]>();
   // Per-mesh SMOOTHED-normal outline geometry (VB + IB): the inverted-hull shell uses averaged normals so hard
   // edges (cubes, buildings) don't TEAR into gaps. Built lazily from mesh.geometry, cached by id, rebuilt on
   // re-assign, freed on evict/clear. (Skinned meshes keep their own normals — characters are already smooth.)
@@ -623,13 +1310,19 @@ export class Renderer3D {
   }
   /** Assign (or clear with null) a persistent outline for a mesh. Drops any cached outline geometry so a re-assign
    *  rebuilds the smoothed shell from the mesh's CURRENT geometry. */
-  setMeshOutline(meshId: string, style: HighlightStyle | null): void {
+  setMeshOutline(meshId: string, style: HighlightStyle | null, rings?: HighlightStyle[] | null): void {
     this._dropOutlineGeom(meshId);
     if (style) this._meshOutlines.set(meshId, style); else this._meshOutlines.delete(meshId);
+    if (style && rings?.length) this._meshOutlineRings.set(meshId, rings); else this._meshOutlineRings.delete(meshId);
   }
+
   getMeshOutline(meshId: string): HighlightStyle | null { return this._meshOutlines.get(meshId) ?? null; }
   /** True if any persistent outline scrolls (speed !== 0) — the host keeps frames flowing while it does. */
-  get hasAnimatedOutline(): boolean { for (const s of this._meshOutlines.values()) if (s.speed !== 0) return true; return false; }
+  get hasAnimatedOutline(): boolean {
+    for (const s of this._meshOutlines.values()) if (outlineAnimates(s)) return true;
+    for (const rs of this._meshOutlineRings.values()) for (const r of rs) if (outlineAnimates(r)) return true;
+    return this._spriteSDFPending && this._meshOutlines.size > 0;
+  }
   /** Configure the hover outline look (thickness + scrolling pattern + glow). patternMode 0 restores the flat ring.
    *  Caller schedules the redraw (scene3d-manager wrapper). */
   setHoverOutlineStyle(style: Partial<HighlightStyle>): void { Object.assign(this._hoverOutlineStyle, style); }
@@ -673,6 +1366,8 @@ export class Renderer3D {
 
   // ── Global scene background (Skybox) ───────────────────────────────────────
   private _sceneBgPass: ArmatureBgPass | null = null;
+  /** Keeps an opaque focus background (armature / mesh edit) out of post-processing — see post-bg-keep-pass.ts. */
+  private _postBgKeepPass: PostBgKeepPass | null = null;
   private _sceneBgOpts: ArmatureBgOptions = { mode: 'none' };
 
   // Post-processing stack
@@ -705,6 +1400,15 @@ export class Renderer3D {
   private _dummyCubeTex: GPUTexture | null = null;         // 1×1×6 fallback
   private _brdfLutTex: GPUTexture | null = null;           // 1×1 placeholder until specular is first baked (then the real 128²)
   private _brdfLutBaked = false;                           // the real split-sum LUT has been computed
+  // P4.1 GPU sky-lighting bake (ibl-gpu-bake.ts). `_shGpuOwned` = SH floats 0-35 of the IBL uniform buffer were
+  // written by the GPU (copyBufferToBuffer), so _writeIBLBuffer must NOT overwrite them with the stale CPU mirror.
+  // `_pendingSkyBake` = a bake requested while the compute pipelines were still compiling (replayed on ready).
+  private _iblGpu: IBLGpuBaker | null = null;
+  private _iblGpuTried = false;
+  private _shGpuOwned = false;
+  private _iblBakeMode: 'auto' | 'cpu' = 'auto';
+  private _pendingSkyBake: { sky: ProceduralSkyParams; sunDir: [number, number, number]; intensity: number; diffuse: boolean; specular: boolean; baseSize: number } | null = null;
+  private _iblBakeStats = { gpu: 0, cpu: 0, pending: 0, lastPath: 'none' as 'gpu' | 'cpu' | 'pending' | 'none', lastMs: 0 };
   private _iblCubeSampler: GPUSampler | null = null;
   private _meshBindGroupCubeTex: GPUTexture | null = null; // change → rebuild the mesh bind group
 
@@ -739,16 +1443,45 @@ export class Renderer3D {
   // Lo-fi render buffer (PS1/3DS low-res + nearest-neighbor blit)
   private _loFiPass: LoFiPass | null = null;
 
+  // ── TEMPORAL AA / UPSCALING (engine-roadmap step 6; temporal-aa.ts; the glue is in the "Temporal AA" section) ──
+  private _taa: TemporalAAPass | null = null;
+  private _taaSet: TemporalAASettings = { ...DEFAULT_TEMPORAL_AA };
+  private _taaOn = false;                     // this frame renders through the TAA path (decided by setTemporalFrame)
+  private _taaReason: TemporalAAReason = 'off';
+  private _taaScale = 1;                      // the internal render scale of this TAA frame
+  private _taaFrameNo = 0;
+  private readonly _taaJit: [number, number] = [0, 0];      // render-target pixels
+  private readonly _taaJitNdc: [number, number] = [0, 0];
+  private _taaDither = 0;                     // scene float 259 (the dither-fade shift), 0 = off
+  private readonly _taaPrevVP = new Float32Array(16);
+  private readonly _taaCurVP = new Float32Array(16);
+  private readonly _taaJitVP = new Float32Array(16);
+  private readonly _taaInvVP = new Float32Array(16);
+  private _taaHasPrev = false;
+  private _taaVelOn = false;                  // the transforms fast path records movers (prev matrices) this frame
+  private readonly _taaMovers: { m: Mesh3D | null; slot: number; sub: number; prev: Float32Array }[] = [];
+  private _taaMoverN = 0;
+  private readonly _taaRigid: TaaRigidDraw[] = [];
+  private readonly _taaSkin: TaaSkinnedDraw[] = [];
+  private readonly _taaSkinPrevModel = new Map<string, Float32Array>();
+  private _taaSkinFrame = -1;                 // the TAA frame drawSkinnedMeshes last ran in
+  private _taaBypassFxaa = false;             // a capture bypassed TAA: FXAA stands in for it
+  private _taaVelDraws = 0;
+
   constructor(device: GPUDevice, camera: Camera3D, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
     this.device = device;
     this.camera = camera;
     this._swapChainFormat = swapChainFormat;
+    this._slotAlloc.onDisown = (owner) => { this._parkedGroups.delete(owner); };   // a parked range was reused → its data is gone
     this.pipeline = new Pipeline3D(device, swapChainFormat);
     this._highlightPass = new MeshHighlightPass(device, this.pipeline.meshBindGroupLayout, swapChainFormat, this.pipeline.skinBindGroupLayout, this.pipeline.textureBindGroupLayout);
     this._silhouettePass = new SilhouetteOutlinePass(device, this.pipeline.meshBindGroupLayout, swapChainFormat);
+    this._spriteOutlinePass = new SpriteOutlinePass(device, this.pipeline.meshBindGroupLayout, swapChainFormat);
+    this._spriteSDF = new SpriteSDFCache(device);
     this._ghostPreviewRenderer = new GhostPreviewRenderer(device, swapChainFormat);
     this._armatureBgPass = new ArmatureBgPass(device, swapChainFormat);
     this._sceneBgPass = new ArmatureBgPass(device, swapChainFormat);
+    this._postBgKeepPass = new PostBgKeepPass(device, swapChainFormat);
 
     // Create scene uniform buffer (updated every frame)
     this.sceneUniformBuffer = device.createBuffer({
@@ -780,6 +1513,7 @@ export class Renderer3D {
     this._iblData[51] = 0.35;  // silhouette-shadow fallback opacity (artist slider; see setSSRParams)
     this._iblData[52] = 1.0;   // deferred SSR resolve (Stage 3b) — setSSRDeferred(false) = inline-trace hatch
     this._writeIBLBuffer();
+    this._getIBLGpu();   // P4.1: start the async sky-bake compute compiles now, so the first sky bake runs on the GPU
   }
 
   /** Warm the deferred render pipelines (plain / SSAO / weight-paint) ahead of use, off the main thread.
@@ -814,6 +1548,35 @@ export class Renderer3D {
   get softLightStrength(): number { return this._softLightStrength; }
   setSkinRamp(patch: Partial<SkinRampSettings>): void { this._skinRamp = resolveSkinRamp(this._skinRamp, patch); }
   get skinRamp(): SkinRampSettings { return this._skinRamp; }
+  /** Sketch style paper amount 0..1 (clamped). */
+  setSketchPaper(v: number): void { this._sketchPaper = Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0.75)); }
+  get sketchPaper(): number { return this._sketchPaper; }
+  /** COLOURED cast shadows (city-quality L3): the hue the in-shadow floor takes (luminance-normalised in the shader,
+   *  so darkness is unchanged). null = neutral grey (the original). */
+  private _shadowTint: [number, number, number] | null = null;
+  setShadowTint(c: [number, number, number] | null): void {
+    this._shadowTint = c && c.every(Number.isFinite) && (c[0] + c[1] + c[2]) > 0 ? [c[0], c[1], c[2]] : null;
+  }
+  get shadowTint(): [number, number, number] | null { return this._shadowTint ? [...this._shadowTint] as [number, number, number] : null; }
+  /** HEIGHT FOG (city-quality P9): density (0 = off), base height (world y), falloff per unit, distance reach.
+   *  Needs the regular fog on (it rides the fog block). */
+  private _heightFog: [number, number, number, number] = [0, 0, 0, 0];
+  setHeightFog(density: number, baseY = 0, falloff = 1, reach = 0.05): void {
+    this._heightFog = [Math.max(0, density || 0), baseY, Math.max(1e-4, falloff), Math.max(1e-4, reach)];
+  }
+  get heightFog(): [number, number, number, number] { return [...this._heightFog] as [number, number, number, number]; }
+  /** AERIAL PERSPECTIVE (persona-polish A5): distance haze that fades CONTRAST and tints toward the fog (horizon)
+   *  colour — `strength` 0..1 (0 = off, the original), `reach` = world distance at which ~63 % of it has built up,
+   *  `contrast` / `tint` = how much of it is contrast loss vs colour shift (0..1). Needs fog on (it rides the fog block). */
+  setAerialHaze(strength: number, reach = 20, contrast = 0.6, tint = 0.5): void {
+    this._aerialHaze = [Math.max(0, Math.min(1, strength || 0)), Math.max(1e-4, reach), Math.max(0, Math.min(1, contrast)), Math.max(0, Math.min(1, tint))];
+  }
+  get aerialHaze(): [number, number, number, number] { return [...this._aerialHaze] as [number, number, number, number]; }
+  private _aerialHaze: [number, number, number, number] = [0, 20, 0.6, 0.5];
+  setToonShadows(patch: Partial<ToonShadowSettings>): void { this._toon = resolveToonShadows(this._toon, patch); }
+  get toonShadows(): ToonShadowSettings { return { ...this._toon, shadowTint: [...this._toon.shadowTint] as [number, number, number] }; }
+  setRimLight(patch: Partial<RimLightSettings>): void { this._rim = resolveRimLight(this._rim, patch); }
+  get rimLight(): RimLightSettings { return { ...this._rim, color: [...this._rim.color] as [number, number, number] }; }
   get glassRefraction(): boolean { return this._glassRefraction > 0.5; }
 
   /** Scene WIND (foliage-quality §2.1) — direction/strength/speed shared by every `windSway` material.
@@ -823,6 +1586,39 @@ export class Renderer3D {
   /** Aerial-perspective strength 0..1 — distant geometry desaturates + fades to the fog colour (needs fog on). */
   setAerialFog(strength: number): void { this._aerialFog = Math.max(0, Math.min(1, strength)); }
   get aerialFog(): number { return this._aerialFog; }
+  /** HARD FOG EDGE (2026-10-01): while on, only the plain linear/exponential fog draws — aerial haze, height fog and
+   *  the aerial desaturation are UPLOADED as off (their stored values are untouched, so turning it off restores them),
+   *  giving the old sharp near/far cutoff. The city also stops rescaling / replacing the fog (WorldManager). Default off. */
+  fogHardEdge = false;
+  /** FOG HORIZON settings (docs/specs/fog-horizon.md; sm.setFogHorizon3D): building-only silhouettes past the fog's
+   *  Far, the dither fade band, silhouette outlines. Active only while fogHardEdge is on and the fog is linear. */
+  private _fogHorizon: FogHorizonSettings = defaultFogHorizon();
+  setFogHorizon(patch: Partial<FogHorizonSettings> & { reset?: boolean }): FogHorizonSettings {
+    this._fogHorizon = sanitizeFogHorizon(patch, this._fogHorizon);
+    return this.fogHorizon;
+  }
+  get fogHorizon(): FogHorizonSettings { return { ...this._fogHorizon }; }
+  /** World units per real metre for the fog-horizon fade band (the city sets it from its scale; 1 elsewhere). */
+  fogHorizonUnitsPerMetre = 1;
+  /** Whether the fog-horizon rules apply this frame (Hard edge on + linear fog). */
+  get fogHorizonActive(): boolean { return fogHorizonActive(this.fogHardEdge, this._fog); }
+  /** The FOG EYE this frame (fog-horizon.ts computeFogEye): perspective = the camera position, ortho = the
+   *  equivalent-perspective eye. Every fog distance (shader fog, fast path, fade band, outline cut, CPU cull) uses it. */
+  readonly _fogEye = new Float64Array(3);
+  /** The fog eye (a copy), as packed into the scene uniforms for the last frame. */
+  get fogEye(): [number, number, number] { return [this._fogEye[0], this._fogEye[1], this._fogEye[2]]; }
+  /** SIM LOD (src/world/sim-lod.ts, performance-plan §P13): the fog-horizon CULL distance (world units, from the fog
+   *  eye) while the CPU fog cull is on — Hard edge + linear fog + "Buildings only in fog", no planar mirror — else
+   *  Infinity. Movers, crowd poses and character idles past it are frozen: the renderer does not draw them. */
+  get simFogEdge(): number {
+    const on = this._fogHorizon.buildingsOnly && this.fogHorizonActive && !this._planarActive && Renderer3D.fogHorizonCpuCull;
+    return on ? fogHorizonEdge(this._fog) * 1.01 : Infinity;
+  }
+  /** SIM LOD: a skinned part's world box from the last frame's skinned cull (min xyz, max xyz), or null. */
+  skinnedBoxOf(meshId: string): Float64Array | null {
+    const e = this._skCull.get(meshId);
+    return e && e.ok ? e.box : null;
+  }
 
   setSceneBg(opts: ArmatureBgOptions): void {
     this._sceneBgOpts = opts;
@@ -840,7 +1636,7 @@ export class Renderer3D {
 
   get iblEnabled(): boolean { return this._iblEnabled; }
   /** Whether crisp prefiltered-cubemap specular IBL is active (vs the soft SH-probe fallback). */
-  get iblSpecularEnabled(): boolean { return this._iblData[38] > 0.5; }
+  get iblSpecularEnabled(): boolean { return this._iblData[38] > 0.5 || !!this._pendingSkyBake?.specular; }
   /** DIFFUSE IBL scale (the SH irradiance on matte surfaces). */
   get iblDiffuseIntensity(): number { return this._iblData[37]; }
   /** SPECULAR (reflection) IBL scale — independent of diffuse. */
@@ -860,6 +1656,8 @@ export class Renderer3D {
   setEnvironmentMap3D(imageData: ImageData, intensity = 1.0): void {
     this._iblEnabled   = true;
     this._iblIntensity = intensity;
+    this._shGpuOwned   = false;   // CPU SH wins again (full-buffer writes resume)
+    if (this._pendingSkyBake) this._pendingSkyBake.diffuse = false;
     const sh = this._computeSHCoeffs(imageData);
     // Pack 9 RGB coefficients into 9 vec4 slots (w = 0)
     for (let i = 0; i < 9; i++) {
@@ -877,10 +1675,131 @@ export class Renderer3D {
    *  cubemap state (enabled/maxMip/intensity, floats 38-40) UNTOUCHED so the two are independently controllable. */
   clearEnvironmentMap3D(): void {
     this._iblEnabled = false;
+    this._shGpuOwned = false;
+    if (this._pendingSkyBake) this._pendingSkyBake.diffuse = false;
     for (let i = 0; i < 36; i++) this._iblData[i] = 0;   // zero SH coeffs only
     this._iblData[36] = 0.0;   // iblEnabled off
     this._iblData[37] = 1.0;   // reset diffuse intensity
     this._writeIBLBuffer();
+  }
+
+  /**
+   * P4.1: bake a procedural sky into BOTH IBL paths - SH9 diffuse (what setEnvironmentMap3D(bakeSkyEquirect(..))
+   * computes on the CPU) and the prefiltered specular cube (bakeSpecularIBL) - on the GPU via compute
+   * (ibl-gpu-bake.ts), with no readback. Falls back to the CPU reference when compute is unavailable / failed or the
+   * mode is forced to 'cpu'. While the compute pipelines are still compiling, the request is held (the previous
+   * lighting stays on screen) and replayed the moment they resolve. Returns which path ran.
+   */
+  bakeSkyLighting(
+    sky: ProceduralSkyParams, sunDir: [number, number, number], intensity = 1.0,
+    opts: { diffuse?: boolean; specular?: boolean; baseSize?: number } = {},
+  ): 'gpu' | 'cpu' | 'pending' {
+    const diffuse = opts.diffuse ?? true, specular = opts.specular ?? true, baseSize = opts.baseSize ?? 32;
+    const t0 = performance.now();
+    const gpu = this._iblBakeMode === 'auto' ? this._getIBLGpu() : null;
+    let path: 'gpu' | 'cpu' | 'pending';
+    if (gpu && gpu.ready) {
+      try { this._runGpuSkyBake(gpu, sky, sunDir, intensity, diffuse, specular, baseSize); path = 'gpu'; }
+      catch (e) { console.warn('[IBL] GPU sky bake failed - CPU fallback', e); this._iblBakeMode = 'cpu'; this._runCpuSkyBake(sky, sunDir, intensity, diffuse, specular, baseSize); path = 'cpu'; }
+    } else if (gpu && !gpu.failed) {
+      const prev = this._pendingSkyBake;
+      this._pendingSkyBake = {
+        sky: { ...sky }, sunDir: [sunDir[0], sunDir[1], sunDir[2]], intensity: diffuse ? intensity : (prev?.intensity ?? intensity),
+        diffuse: diffuse || !!prev?.diffuse, specular: specular || !!prev?.specular, baseSize,
+      };
+      if (diffuse) { this._iblEnabled = true; this._iblIntensity = intensity; }
+      if (!prev) {
+        gpu.hurry();
+        void gpu.whenReady.then((ok) => {
+          const p = this._pendingSkyBake; this._pendingSkyBake = null;
+          if (!p || this._iblGpu !== gpu) return;
+          if (ok) {
+            try { this._runGpuSkyBake(gpu, p.sky, p.sunDir, p.intensity, p.diffuse, p.specular, p.baseSize); }
+            catch (e) { console.warn('[IBL] GPU sky bake failed - CPU fallback', e); this._iblBakeMode = 'cpu'; this._runCpuSkyBake(p.sky, p.sunDir, p.intensity, p.diffuse, p.specular, p.baseSize); }
+          } else this._runCpuSkyBake(p.sky, p.sunDir, p.intensity, p.diffuse, p.specular, p.baseSize);
+          this.onSkyBakeApplied?.();
+        });
+      }
+      path = 'pending';
+    } else {
+      this._runCpuSkyBake(sky, sunDir, intensity, diffuse, specular, baseSize); path = 'cpu';
+    }
+    const st = this._iblBakeStats; st[path]++; st.lastPath = path; st.lastMs = +(performance.now() - t0).toFixed(3);
+    return path;
+  }
+
+  /** Called after a DEFERRED (pipeline-pending) sky bake lands, so the host can schedule a redraw. */
+  onSkyBakeApplied: (() => void) | null = null;
+
+  /** 'auto' = GPU compute bake when available (default), 'cpu' = force the CPU reference (A/B + fallback testing). */
+  setIBLBakeMode(mode: 'auto' | 'cpu'): void { this._iblBakeMode = mode; }
+  /** Bake counters + the main-thread cost of the last bake (ms). */
+  getIBLBakeStats(): { gpu: number; cpu: number; pending: number; lastPath: string; lastMs: number; gpuReady: boolean } {
+    return { ...this._iblBakeStats, gpuReady: !!this._iblGpu?.ready };
+  }
+  /** Debug/verification handle for the headless CPU-vs-GPU comparison (null until first use / unsupported). */
+  get iblGpuBaker(): IBLGpuBaker | null { return this._getIBLGpu(); }
+
+  /** Lazily create the GPU baker (starts the async pipeline compiles). Null when compute is unsupported. */
+  private _getIBLGpu(): IBLGpuBaker | null {
+    if (!this._iblGpuTried) {
+      this._iblGpuTried = true;
+      try { if (IBLGpuBaker.supported(this.device)) this._iblGpu = new IBLGpuBaker(this.device); }
+      catch (e) { console.warn('[IBL] GPU baker unavailable - CPU bake', e); this._iblGpu = null; }
+    }
+    return this._iblGpu && !this._iblGpu.failed ? this._iblGpu : null;
+  }
+
+  private _ensureSpecularCubeTex(baseSize: number, mips: number): GPUTexture {
+    const cur = this._prefilteredCubeTex;
+    if (!cur || cur.width !== baseSize || cur.mipLevelCount !== mips) {
+      cur?.destroy();
+      this._prefilteredCubeTex = this.device.createTexture({
+        size: [baseSize, baseSize, 6], format: 'rgba8unorm-srgb', dimension: '2d', mipLevelCount: mips,
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label: 'IBLPrefilteredCube',
+      });
+    }
+    return this._prefilteredCubeTex!;
+  }
+
+  private _markSpecularBaked(mips: number): void {
+    this._iblData[38] = 1.0;          // iblSpecularEnabled
+    this._iblData[39] = mips - 1;     // specularMaxMip
+    this._meshBindGroupCubeTex = null;   // force main mesh bind group rebuild with the real cube
+    this._skinnedMeshBG = null;          // and the skinned one (its guard only tracks the instance buffer)
+  }
+
+  private _runGpuSkyBake(gpu: IBLGpuBaker, sky: ProceduralSkyParams, sunDir: [number, number, number], intensity: number, diffuse: boolean, specular: boolean, baseSize: number): void {
+    let cube: { tex: GPUTexture; baseSize: number; mipCount: number; samples: number } | null = null;
+    let lut: { tex: GPUTexture; size: number; samples: number } | null = null;
+    const mips = cubeMipCount(baseSize);
+    if (specular) {
+      this._ensureSpecularIBLResources();
+      if (!this._brdfLutBaked) {
+        const size = 128;
+        this._brdfLutTex!.destroy();   // drop the 1x1 placeholder
+        this._brdfLutTex = this.device.createTexture({
+          size: [size, size], format: 'rgba8unorm',
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label: 'IBLBrdfLUT',
+        });
+        lut = { tex: this._brdfLutTex, size, samples: 256 };
+        this._brdfLutBaked = true;
+      }
+      cube = { tex: this._ensureSpecularCubeTex(baseSize, mips), baseSize, mipCount: mips, samples: 48 };
+    }
+    const shDst = diffuse ? this._iblUniformBuffer : null;
+    gpu.bake({ sky, sunDir, shDst, cube, lut });
+    if (diffuse && shDst) {
+      this._iblEnabled = true; this._iblIntensity = intensity; this._shGpuOwned = true;
+      this._iblData[36] = 1.0; this._iblData[37] = intensity;
+    }
+    if (specular) this._markSpecularBaked(mips);
+    this._writeIBLBuffer();
+  }
+
+  private _runCpuSkyBake(sky: ProceduralSkyParams, sunDir: [number, number, number], intensity: number, diffuse: boolean, specular: boolean, baseSize: number): void {
+    if (diffuse) this.setEnvironmentMap3D(bakeSkyEquirect(sky, sunDir) as unknown as ImageData, intensity);
+    if (specular) this._bakeSpecularIBLCpu(sky, sunDir, baseSize);
   }
 
   // ── Post-processing ────────────────────────────────────────────
@@ -894,11 +1813,12 @@ export class Renderer3D {
     if (config.bloom)      Object.assign(pp.bloom,      config.bloom);
     if (config.colorGrade) Object.assign(pp.colorGrade, config.colorGrade);
     if (config.vignette)   Object.assign(pp.vignette,   config.vignette);
+    if (config.film)       Object.assign(pp.film,       config.film);
   }
 
   /** Return the current post-processing configuration (a live reference). */
   getPostProcessConfig(): PostProcessConfig {
-    if (!this._postProcessPass) return { ...DEFAULT_POST_PROCESS_CONFIG };
+    if (!this._postProcessPass) return defaultPostProcessConfig();
     return this._postProcessPass.config;
   }
 
@@ -909,7 +1829,43 @@ export class Renderer3D {
    * if all effects are disabled (caller keeps using srcTex unchanged).
    */
   runPostProcess(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number): GPUTexture | null {
-    return this._postProcessPass?.run(encoder, srcTex, w, h) ?? null;
+    // ANTI-ALIASING (persona-polish A1) runs FIRST, so bloom sees clean edges and film grain is never smeared. Only on
+    // frames that actually drew 3D (a pure 2D doc keeps its own crisp vector AA) and never in the lo-res PS1 mode
+    // (its chunky pixels are the look).
+    let src = srcTex;
+    const drew3D = this._drew3DThisFrame; this._drew3DThisFrame = false;
+    // Temporal AA replaces FXAA on the frames it resolved; a capture that bypassed TAA gets FXAA in its place.
+    const taaDone = this._taaOn && !!this._taa?.resolvedThisFrame;
+    if ((this._aa.mode === 'fxaa' || this._taaBypassFxaa) && !taaDone && drew3D && (!this.getLoResSize(w, h) || this.loResIsDynamic())) {   // resolution scaling keeps FXAA
+      this._fxaaPass ??= new FxaaPass(this.device, this._swapChainFormat);
+      src = this._fxaaPass.run(encoder, srcTex, w, h, this._aa.quality);
+    }
+    const out = this._postProcessPass?.run(encoder, src, w, h, this._worldTimeSec() % 3600) ?? null;   // time → film grain
+    return out ?? (src !== srcTex ? src : null);
+  }
+
+  // ── Anti-aliasing (persona-polish A1) ──
+  private _aa: AntiAliasingSettings = { ...DEFAULT_ANTI_ALIASING };
+  private _fxaaPass: FxaaPass | null = null;
+  /** Set by drawMeshes / drawSkinnedMeshes, consumed by runPostProcess (AA only on frames with 3D content). */
+  private _drew3DThisFrame = false;
+  /** 3D anti-aliasing: mode 'fxaa' (default, quality 'medium') or 'off' (the original, aliased look). */
+  setAntiAliasing(s: Partial<AntiAliasingSettings>): void { this._aa = sanitizeAntiAliasing({ ...this._aa, ...s }); }
+  get antiAliasing(): AntiAliasingSettings { return { ...this._aa }; }
+
+  /** True while an OPAQUE focus background (armature / mesh-edit: wavy / solid / gradient — not 'dim' / 'none') is
+   *  drawn behind the scene. That background is editor UI, so it must not be post-processed (restoreFocusBgAfterPost). */
+  focusBgActive(): boolean {
+    const opaque = (m: string) => m !== 'dim' && m !== 'none';
+    if (this._armatureModeActive) return opaque(this._armatureBgOpts.mode);
+    return this._meshEditBgActive && opaque(this._meshEditBgOpts.mode);
+  }
+
+  /** After post-processing + the copy to the screen: put the UNPROCESSED frame back wherever no 3D surface was drawn
+   *  (the focus background), so bloom / grade / vignette / film only affect the scene. No-op without a focus bg. */
+  restoreFocusBgAfterPost(encoder: GPUCommandEncoder, rawFrame: GPUTexture, target: GPUTextureView, depthView: GPUTextureView): void {
+    if (!this.focusBgActive() || !this._postBgKeepPass) return;
+    this._postBgKeepPass.run(encoder, rawFrame, target, depthView);
   }
 
   /** True if any always-on-top overlay (info card) was captured this frame and needs a post-process-immune draw. */
@@ -936,7 +1892,7 @@ export class Renderer3D {
     if (!buf || !gpu) return;
     const fpi = MESH_INSTANCE_STRIDE / 4;
     const vm = this.camera.getViewMatrix() as Float32Array;
-    for (const m of meshes) {
+    for (let _km = 0; _km < meshes.length; _km++) { const m = meshes[_km];
       const slot = this._meshInstanceSlots.get(m.id);
       if (slot === undefined) continue;   // not placed yet → a full repack will do it
       const offset = slot * fpi;
@@ -988,11 +1944,13 @@ export class Renderer3D {
         stencilLoadOp: 'clear', stencilClearValue: 0, stencilStoreOp: 'store',
       },
     });
-    pass.setPipeline(this.pipeline.postOverlayTexturedPipeline);
+    const postOverlayPipe = this.pipeline.postOverlayTexturedPipeline;
+    if (!postOverlayPipe) { pass.end(); return; }   // P2: still compiling → the card appears a frame later
+    pass.setPipeline(postOverlayPipe);
     pass.setBindGroup(0, this.meshBindGroup!);
     const sharedIB = this._geomIB!;
     for (const { mesh, idx } of this._postOverlayEntries) {
-      const alloc = this._geomAllocs.get(mesh.id); if (!alloc) continue;
+      const alloc = this._geomAllocs.get(mesh.id); if (!alloc || alloc.pk) continue;   // (P22: info cards are never packed world geometry)
       const override = this._vertexBufferOverrides.get(mesh.id);
       pass.setBindGroup(1, this.createTextureBindGroup(mesh));
       pass.setVertexBuffer(0, override ?? this._geomVB!);
@@ -1247,6 +2205,11 @@ export class Renderer3D {
    * one sky). See docs/specs/environment-and-reflections.md (P1b).
    */
   bakeSpecularIBL(sky: ProceduralSkyParams, sunDir: [number, number, number], baseSize = 32): void {
+    this.bakeSkyLighting(sky, sunDir, this._iblIntensity, { diffuse: false, specular: true, baseSize });   // P4.1: GPU when available
+  }
+
+  /** CPU reference for the specular cube + BRDF LUT (the P4.1 fallback). */
+  private _bakeSpecularIBLCpu(sky: ProceduralSkyParams, sunDir: [number, number, number], baseSize = 32): void {
     this._ensureSpecularIBLResources();
     // Bake the real 128² split-sum BRDF LUT once, on first use (it's environment-independent, so never re-baked).
     if (!this._brdfLutBaked) {
@@ -1261,30 +2224,20 @@ export class Renderer3D {
     }
     const mips = cubeMipCount(baseSize);
     const baked = bakePrefilteredCube(sky, sunDir, baseSize, mips, 48);
-    // (Re)create the cube texture if the size/mip layout changed.
-    const cur = this._prefilteredCubeTex;
-    if (!cur || cur.width !== baseSize || cur.mipLevelCount !== mips) {
-      cur?.destroy();
-      this._prefilteredCubeTex = this.device.createTexture({
-        size: [baseSize, baseSize, 6], format: 'rgba8unorm-srgb', dimension: '2d', mipLevelCount: mips,
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label: 'IBLPrefilteredCube',
-      });
-    }
+    this._ensureSpecularCubeTex(baseSize, mips);   // (re)create if the size/mip layout changed
     for (const b of baked) {
       this.device.queue.writeTexture(
         { texture: this._prefilteredCubeTex!, mipLevel: b.mip, origin: [0, 0, b.face] },
         b.data, { bytesPerRow: b.size * 4, rowsPerImage: b.size }, [b.size, b.size, 1],
       );
     }
-    this._iblData[38] = 1.0;          // iblSpecularEnabled
-    this._iblData[39] = mips - 1;     // specularMaxMip
+    this._markSpecularBaked(mips);
     this._writeIBLBuffer();
-    this._meshBindGroupCubeTex = null;   // force main mesh bind group rebuild with the real cube
-    this._skinnedMeshBG = null;          // and the skinned one (its guard only tracks the instance buffer)
   }
 
   /** Turn off cubemap specular (revert to the soft SH-probe reflection). Keeps the SH diffuse untouched. */
   clearSpecularIBL(): void {
+    if (this._pendingSkyBake) this._pendingSkyBake.specular = false;
     if (this._prefilteredCubeTex) { this._prefilteredCubeTex.destroy(); this._prefilteredCubeTex = null; }
     this._iblData[38] = 0.0;
     this._writeIBLBuffer();
@@ -1299,6 +2252,13 @@ export class Renderer3D {
    * Returns [w, h] when lo-res is active, null when full-res should be used.
    */
   getLoResSize(canvasW: number, canvasH: number): [number, number] | null {
+    const sz = this._loResSizeRaw(canvasW, canvasH);
+    if (!sz) return null;
+    // P2: take the lo-res path only once its blit pipeline compiled — until then render full-res (never a blank frame).
+    this._loFiPass ??= new LoFiPass(this.device, this._swapChainFormat);
+    return this._loFiPass.ready() ? sz : null;
+  }
+  private _loResSizeRaw(canvasW: number, canvasH: number): [number, number] | null {
     const { renderResolution, renderScale } = this._ps1;
     if (renderResolution && renderResolution[0] > 0 && renderResolution[1] > 0) {
       return renderResolution;
@@ -1309,16 +2269,41 @@ export class Renderer3D {
     // DYNAMIC RESOLUTION (piggybacks the PS1 lo-res path, but with a LINEAR upscale so it reads as full-res):
     // while the camera is panning a streamed world, the scene renders at a reduced scale — ~40% less fragment
     // work — and snaps back to native when the view settles. PS1's own lo-res config takes precedence above.
-    if (this._dynResScale < 1) {
-      return [Math.max(1, Math.round(canvasW * this._dynResScale)), Math.max(1, Math.round(canvasH * this._dynResScale))];
+    // RESOLUTION SCALING (setUserResolutionScale, docs/ui/performance.md) rides the same path; the lower of the two wins.
+    // TEMPORAL AA / UPSCALING (temporal-aa.ts) rides the same path, at full size for 'taa' (the scale already folds in
+    // the two scales above).
+    if (this._taaOn) {
+      const s = this._taaScale;
+      return [Math.max(1, Math.round(canvasW * s)), Math.max(1, Math.round(canvasH * s))];
+    }
+    const ds = Math.min(this._dynResScale, this._userResScale);
+    if (ds < 1) {
+      return [Math.max(1, Math.round(canvasW * ds)), Math.max(1, Math.round(canvasH * ds))];
     }
     return null;
+  }
+
+  private _userResScale = 1;
+  /** RESOLUTION SCALING (the host's off / fixed / auto setting, driven by WebGPURenderer's ResolutionScaler): the 3D
+   *  scene renders at this fraction of the canvas (0.25..1) and is upscaled with the sharpened filter. The UI, gizmos
+   *  and text stay full size. Independent of the city's pan-time setDynamicResScale; the lower one applies. */
+  setUserResolutionScale(s: number): void { this._userResScale = Math.min(1, Math.max(0.25, s || 1)); }
+  /** The scale the 3D scene renders at this frame from the dynamic paths (1 = native; PS1 lo-res not counted). */
+  get dynamicResolutionScale(): number { return this._ps1LoResConfigured() ? 1 : this._taaOn ? this._taaScale : Math.min(this._dynResScale, this._userResScale); }
+  /** True when the lo-res path is a perf trick (resolution scaling / pan-time scale), not the PS1 look. That path
+   *  upsamples depth into the main pass, so overlays, FXAA and the focus-background restore run as on the native path. */
+  loResIsDynamic(): boolean { return !this._ps1LoResConfigured() && (this._taaOn || Math.min(this._dynResScale, this._userResScale) < 1); }
+  private _ps1LoResConfigured(): boolean {
+    const { renderResolution, renderScale } = this._ps1;
+    return !!(renderResolution && renderResolution[0] > 0 && renderResolution[1] > 0) || !!(renderScale && renderScale > 0 && renderScale < 1);
   }
 
   private _dynResScale = 1;
   /** Dynamic-resolution scale (0.25–1). <1 routes 3D through the lo-res buffer with a LINEAR (smooth) upscale —
    *  the "drop render scale while the camera moves" trick. 1 restores native rendering. No-op while a PS1 lo-res
    *  config is active (that path already renders lo-res, deliberately chunky). */
+  /** The camera-motion (pan-time) scale in force now (1 = off). */
+  get motionResolutionScale(): number { return this._dynResScale; }
   setDynamicResScale(s: number): void {
     this._dynResScale = Math.min(1, Math.max(0.25, s));
   }
@@ -1347,7 +2332,9 @@ export class Renderer3D {
     const { renderResolution, renderScale } = this._ps1;
     const ps1LoRes = !!(renderResolution && renderResolution[0] > 0 && renderResolution[1] > 0)
       || !!(renderScale && renderScale > 0 && renderScale < 1);
-    this._loFiPass.linearFilter = !ps1LoRes && this._dynResScale < 1;
+    this._loFiPass.linearFilter = !ps1LoRes && (this._taaOn || Math.min(this._dynResScale, this._userResScale) < 1);
+    this._loFiPass.sharpen = this._loFiPass.linearFilter;   // resolution scaling: sharpened bicubic upscale
+    if (this._taaOn) this._taaBeginScene(w, h);   // temporal AA: jitter the camera while the scene records
     return this._loFiPass.beginRenderPass(encoder, w, h, clearColor);
   }
 
@@ -1356,12 +2343,165 @@ export class Renderer3D {
    * Call this after the lo-res pass has ended, while the main pass is active.
    */
   blitLowResToPass(pass: GPURenderPassEncoder): void {
+    if (this._taaOn && this._taa?.blit(pass, this._taaSet.sharpen)) return;   // temporal AA: the resolved frame
     this._loFiPass?.blitToRenderPass(pass);
   }
+  /** Resolution scaling: copy the lo-res scene depth into `pass`'s (full-size) depth attachment. False = not ready
+   *  (the caller then draws the overlays inline in the lo-res pass, the old behaviour). */
+  blitLowResDepthToPass(pass: GPURenderPassEncoder): boolean { return this._loFiPass?.blitDepthToRenderPass(pass) ?? false; }
+  /** Resolution scaling: true when the depth upsample is compiled (decided BEFORE the lo-res pass records). */
+  lowResDepthBlitReady(): boolean { return this._loFiPass?.depthBlitReady() ?? false; }
+
+  // ── Temporal AA / upscaling (engine-roadmap step 6; temporal-aa.ts, docs/ui/performance.md) ──────────────────────
+  /** Per frame, before the 3D pass (WebGPURenderer): the host's setting, whether this frame must render natively
+   *  (`bypass`: captures / exports / snapshot holds) and whether resolution scaling (Fixed / Auto) picks the scale. */
+  setTemporalFrame(s: TemporalAASettings, bypass: boolean, scalerActive: boolean): void {
+    const wasOn = this._taaOn;
+    this._taaSet = s;
+    let reason: TemporalAAReason = 'ok';
+    if (s.mode === 'off') reason = 'off';
+    else if (bypass) reason = 'capture';
+    else if (this._ps1LoResConfigured() || (s.retroOff && this._taaRetroLook())) reason = 'retro';   // the PS1 lo-res look always wins
+    else if (s.inkOff && this.outlineEnabled) reason = 'ink';
+    else {
+      this._loFiPass ??= new LoFiPass(this.device, this._swapChainFormat);
+      this._taa ??= new TemporalAAPass(this.device, this._swapChainFormat, MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE);
+      if (!this._taa.ready() || !this._loFiPass.ready() || !this._loFiPass.depthBlitReady()) reason = 'compiling';
+    }
+    this._taaOn = reason === 'ok';
+    this._taaReason = reason;
+    this._taaBypassFxaa = reason === 'capture';
+    if (!this._taaOn && wasOn) this.resetTemporalHistory();
+    this._taaScale = this._taaOn ? temporalRenderScale(s, this._userResScale, this._dynResScale, scalerActive) : 1;
+  }
+  /** Drop the temporal history (the next TAA frame starts from the spatial reconstruction). */
+  resetTemporalHistory(): void { this._taa?.resetHistory(); this._taaHasPrev = false; }
+  /** True while this frame renders through the TAA path. */
+  get temporalActive(): boolean { return this._taaOn; }
+  /** What the last TAA decision was (getTemporalAA3D). */
+  getTemporalStatus(): { active: boolean; reason: TemporalAAReason; renderScale: number; samples: number; velocityDraws: number } {
+    return { active: this._taaOn, reason: this._taaReason, renderScale: this._taaOn ? this._taaScale : 1, samples: temporalSamples(this._taaSet.mode), velocityDraws: this._taaVelDraws };
+  }
+  /** Retro looks that TAA would wash out (vertex snap, ordered dither, global colour quantisation, UV snap). */
+  private _taaRetroLook(): boolean {
+    const p = this._ps1;
+    return (p.vertexJitter > 0 && p.snapGridSize > 0) || (!!p.dither && (p.ditherStrength ?? 0.5) > 0)
+      || (p.colorDepth > 0 && p.colorScope !== 'optIn') || (!!p.uvQuantize && (p.uvQuantizeSteps ?? 64) > 0);
+  }
+  /** Start the jittered scene (beginLowResRenderPass, TAA frames only). */
+  private _taaBeginScene(w: number, h: number): void {
+    this._taa!.beginFrame();
+    this._taaFrameNo++;
+    temporalJitter(this._taaFrameNo, temporalSamples(this._taaSet.mode), this._taaJit);
+    jitterToNdc(this._taaJit[0], this._taaJit[1], w, h, this._taaJitNdc);
+    this._taaDither = temporalDitherShift(this._taaFrameNo);
+    this.camera.aspect = w / h;
+    this.camera.setProjectionJitter(this._taaJitNdc[0], this._taaJitNdc[1]);
+    this._taaVelOn = true;
+    this._taaMoverN = 0;
+  }
+  /** Transforms fast path (TAA frames): `m`'s slot is about to be rewritten; keep the matrix shown last frame. */
+  private _taaNoteMove(m: Mesh3D, slot: number, offset: number, sub: number): void {
+    if (this._taaMoverN >= 4096) return;
+    let r = this._taaMovers[this._taaMoverN];
+    if (!r) { r = { m, slot, sub, prev: new Float32Array(16) }; this._taaMovers.push(r); }
+    r.m = m; r.slot = slot; r.sub = sub;
+    r.prev.set(this._instanceDataBuf!.subarray(offset, offset + 16));
+    this._taaMoverN++;
+  }
+  /**
+   * End the jittered scene (the host calls this right after the lo-res pass ends, on the same encoder): un-jitter the
+   * camera (the overlays draw crisp), then record the velocity pass and the full-size resolve. No-op off the TAA path.
+   */
+  endLowResScene(enc: GPUCommandEncoder, outW: number, outH: number): void {
+    if (!this._taaOn) return;
+    // The jittered view-projection the scene used (the camera still holds the jitter), then the unjittered one.
+    this._taaJitVP.set(this.camera.getViewProjectionMatrix() as Float32Array);
+    this.camera.setProjectionJitter(0, 0);
+    this._taaVelOn = false;
+    const taa = this._taa, lo = this._loFiPass;
+    const colorTex = lo?.colorTexture, depthTex = lo?.depthTexture;
+    if (!taa || !lo || !colorTex || !depthTex) { this._taaMoverN = 0; return; }
+    unjitterViewProj(this._taaCurVP, this._taaJitVP, this._taaJitNdc[0], this._taaJitNdc[1]);
+    if (!invert4(this._taaInvVP, this._taaCurVP)) { this.resetTemporalHistory(); this._taaMoverN = 0; return; }
+    let valid = this._taaHasPrev;
+    if (valid && isCameraCut(this._taaPrevVP, this._taaInvVP)) valid = false;
+    const prevVP = valid ? this._taaPrevVP : this._taaCurVP;
+    const w = lo.width, h = lo.height, dMin = this.sceneDepthRangeMin();
+    this._taaBuildVelocityDraws();
+    this._taaVelDraws = taa.recordVelocity(enc, lo.depthView!, w, h, dMin, this._taaJitVP, this._taaCurVP, prevVP, this._taaRigid, this._taaSkin);
+    this._taaAfterVelocity();
+    const up = this._taaSet.mode === 'taau' && this._taaScale < 0.999;
+    taa.recordResolve(enc, colorTex, depthTex, {
+      invVP: this._taaInvVP, prevVP, curVP: this._taaCurVP, loW: w, loH: h, outW, outH,
+      jitterX: this._taaJit[0], jitterY: this._taaJit[1], depthMin: dMin, ortho: this.camera.mode === 'orthographic',
+      historyValid: valid, blend: up ? 0.06 : 0.07, motionBlend: 0.2, gamma: 1.25, depthTol: 0.03,
+    });
+    this._taaPrevVP.set(this._taaCurVP);
+    this._taaHasPrev = true;
+    if ((this._taaFrameNo & 63) === 0) taa.pruneSkins();
+  }
+  /** The velocity pass's draw lists: this frame's movers (rigid) and visible skinned parts. */
+  private _taaBuildVelocityDraws(): void {
+    const rigid = this._taaRigid, sk = this._taaSkin;
+    let nr = 0, ns = 0;
+    const data = this._instanceDataBuf, vbPool = this._geomVB, ib = this._geomIB, fpi = MESH_INSTANCE_STRIDE / 4;
+    if (data && vbPool && ib) {
+      for (let i = 0; i < this._taaMoverN; i++) {
+        const r = this._taaMovers[i], m = r.m;
+        if (!m || !m.visible || m.lodHidden || m.material.opacity < 1) continue;
+        const alloc = this._geomAllocs.get(m.id);
+        if (!alloc || alloc.pk) continue;   // (P22: movers are never packed; a packed mesh keeps the camera velocity)
+        const sub = r.sub >= 0 ? m.submeshes[r.sub] : undefined;
+        if (r.sub >= 0 && !sub) continue;
+        const override = this._vertexBufferOverrides.get(m.id);
+        const o = r.slot * fpi;
+        let d = rigid[nr];
+        if (!d) { d = { vb: vbPool, ib, indexCount: 0, firstIndex: 0, baseVertex: 0, cur: data, prev: r.prev }; rigid.push(d); }
+        d.vb = override ?? vbPool; d.ib = ib;
+        d.indexCount = sub ? sub.indexCount : alloc.indexCount;
+        d.firstIndex = alloc.firstIndex + (sub ? sub.indexOffset : 0);
+        d.baseVertex = override ? 0 : alloc.baseVertex;
+        d.cur = data.subarray(o, o + 16); d.prev = r.prev;
+        nr++;
+      }
+    }
+    rigid.length = nr;
+    if (this._taaSkinFrame === this._taaFrameNo && this._skinnedInstData) {
+      const vis = this._skinnedVisibleScratch, flags = this._skinnedFlags, sd = this._skinnedInstData;
+      for (let i = 0; i < vis.length; i++) {
+        const m = vis[i];
+        if (!(flags[i] & 1) || !m.skeleton || m.material.opacity < 1) continue;
+        const vb = this._skinnedVBs.get(m.id), sib = this._skinnedIBs.get(m.id), sb = this._skinMatBufs.get(m.skeleton.id);
+        if (!vb || !sib || !sb) continue;
+        const skin = this._taa!.skinBindGroup(m.skeleton.id, sb.buf, this._skinUploadData(m.skeleton));
+        const o = i * fpi, cur = sd.subarray(o, o + 16);
+        let prev = this._taaSkinPrevModel.get(m.id);
+        if (!prev) { prev = new Float32Array(cur); this._taaSkinPrevModel.set(m.id, prev); }
+        let d = sk[ns];
+        if (!d) { d = { vb, ib: sib, indexCount: 0, skin, cur, prev }; sk.push(d); }
+        d.vb = vb; d.ib = sib; d.indexCount = m.geometry.indices.length; d.skin = skin; d.cur = cur; d.prev = prev;
+        ns++;
+      }
+    }
+    sk.length = ns;
+  }
+  /** After the velocity draws were copied: skinned parts remember this frame's model; drop the mover references. */
+  private _taaAfterVelocity(): void {
+    for (const d of this._taaSkin) (d.prev as Float32Array).set(d.cur);
+    for (let i = 0; i < this._taaMoverN; i++) this._taaMovers[i].m = null;
+    this._taaMoverN = 0;
+    if (this._taaSkinPrevModel.size > 256) this._taaSkinPrevModel.clear();
+  }
+
+  /** Is this array group distance-LOD hidden right now (the per-family LOD stats, world-lod-settings.ts)? */
+  isArrayGroupLodHidden(id: string): boolean { return this._lodHiddenGroups.has(id); }
 
   private _writeIBLBuffer(): void {
     if (this._iblUniformBuffer) {
-      this.device.queue.writeBuffer(this._iblUniformBuffer, 0, this._iblData);
+      // GPU-baked SH (P4.1) lives only in the buffer — write the scalars (floats 36+) and leave floats 0-35 alone.
+      if (this._shGpuOwned) this.device.queue.writeBuffer(this._iblUniformBuffer, 144, this._iblData, 36);
+      else this.device.queue.writeBuffer(this._iblUniformBuffer, 0, this._iblData);
     }
   }
 
@@ -1448,14 +2588,31 @@ export class Renderer3D {
   /** Diagnostic: geometry-pool occupancy. `liveAllocs` = meshes with a live pool slot (should be ~stable per
    *  regen); `vtxUsedMB`/`vtxCapMB` = append-tail vs buffer size (dead space accumulates until a compaction).
    *  `appendsSinceCompact` (dead-string counter) shows how bloated the pool is since the last full rebuild. */
-  getGeomPoolStats(): { liveAllocs: number; appendsSinceCompact: number; vtxUsedMB: number; vtxCapMB: number } {
+  getGeomPoolStats(): { liveAllocs: number; appendsSinceCompact: number; vtxUsedMB: number; vtxCapMB: number; idxUsedMB: number; idxCapMB: number;
+    uploadLastMB: number; uploadMaxMB: number; slicing: number; slicedGeoms: number; maxWriteMB: number; liveMB: number;
+    packMode: boolean; packGate: number; packedKeys: number; packedMB: number; packSkips: number } {
+    let pkN = 0, pkB = 0;
+    for (const a of this._geomKeyAllocs.values()) if (a.pk) { pkN++; pkB += a.vtxBytes + a.idxBytes; }
     return {
+      // P22 packedVertices: the pool's mode, the twin gate (0 / 1 compiling / 2 packing), packed geometries + their MB,
+      // draws skipped while a twin compiled
+      packMode: this._pkMode, packGate: this._pkGate, packedKeys: pkN, packedMB: +(pkB / 1048576).toFixed(1), packSkips: this._pkSkips,
       liveAllocs: this._geomAllocs.size,
       appendsSinceCompact: this._geomPoolIds.length,
       vtxUsedMB: +(this._geomVtxTail / 1048576).toFixed(1),
       vtxCapMB: +(this._geomVBCap / 1048576).toFixed(1),
+      idxUsedMB: +(this._geomIdxTail / 1048576).toFixed(1),
+      idxCapMB: +(this._geomIBCap / 1048576).toFixed(1),
+      // step 3: geometry written in the last frame interval / the most in one interval since resetUploadStats, the
+      // geometries being written in slices now and the count ever sliced
+      uploadLastMB: +this._upLastMB.toFixed(2), uploadMaxMB: +this._upMaxMB.toFixed(2), slicing: this._geomPartial.size, slicedGeoms: this._upSliced,
+      maxWriteMB: +(this._upMaxWrite / 1048576).toFixed(2),
+      // the live geometry (used span minus the free list's dead space), vertex + index MB
+      liveMB: +((this._geomVtxTail + this._geomIdxTail - this._geomFree.reduce((s, f) => s + f.vtxBytes + f.idxBytes, 0)) / 1048576).toFixed(1),
     };
   }
+  /** Step 3 diagnostics: restart the upload maximum (getGeomPoolStats().uploadMaxMB). */
+  resetUploadStats(): void { this._upMaxMB = 0; this._upMaxWrite = 0; }
 
   setAmbientLight(r: number, g: number, b: number, intensity = 1): void {
     this._ambientColor = [r, g, b];
@@ -1463,6 +2620,7 @@ export class Renderer3D {
   }
 
   setDirectionalLight(dx: number, dy: number, dz: number, r = 1, g = 1, b = 1, intensity = 1): void {
+    const prevDir = this._light.direction;
     // Normalize direction
     const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
     this._light = {
@@ -1470,7 +2628,34 @@ export class Renderer3D {
       color: [r, g, b],
       intensity,
     };
+    if (Renderer3D.SUN_SHADOW_STEP_DEG > 0) {
+      // P14: the shadow maps follow the sun in steps (stepSunDirection); a call that leaves the shadow direction where
+      // it is (colour / intensity only, a lightning flash, a sub-step move) leaves the maps valid.
+      if (stepSunDirection(this._shadowDir, this._light.direction, Renderer3D.SUN_SHADOW_STEP_DEG)) { this._shadowLightMoved = true; this._shadowMapStale = true; this._sunPending = false; }
+      else { const d = this._light.direction, c = this._shadowDir; this._sunPending = d[0] !== c[0] || d[1] !== c[1] || d[2] !== c[2]; }
+      this._sunCallFrame = this._shadowFrameNo;
+      return;
+    }
+    const sd = this._shadowDir; sd[0] = this._light.direction[0]; sd[1] = this._light.direction[1]; sd[2] = this._light.direction[2];
+    if (prevDir[0] !== this._light.direction[0] || prevDir[1] !== this._light.direction[1] || prevDir[2] !== this._light.direction[2]) this._shadowLightMoved = true;   // P4.2
     this._shadowMapStale = true;   // the shadow light matrix follows the sun — refresh the throttled map
+  }
+  /** P14 A/B: the shadow maps' light direction follows the sun only once it has turned this many degrees (0 = on every
+   *  setDirectionalLight call, which also marked the maps stale on colour-only calls: the pre-P14 behaviour). */
+  static SUN_SHADOW_STEP_DEG = 0.15;
+  /** P14: once the sun has stopped moving for this many frames, a sub-step remainder snaps the shadow direction onto
+   *  the exact sun (a still scene never keeps a lagging shadow). */
+  static SUN_SETTLE_FRAMES = 8;
+  private _sunPending = false;
+  private _sunCallFrame = 0;
+  /** P14: called per frame (_updateShadowCenter): settle a pending sub-step sun. */
+  private _settleSun(): void {
+    if (!this._sunPending || this._shadowFrameNo - this._sunCallFrame < Renderer3D.SUN_SETTLE_FRAMES) return;
+    this._sunPending = false;
+    const d = this._light.direction, c = this._shadowDir;
+    if (d[0] === c[0] && d[1] === c[1] && d[2] === c[2]) return;
+    c[0] = d[0]; c[1] = d[1]; c[2] = d[2];
+    this._shadowLightMoved = true; this._shadowMapStale = true;
   }
 
   /** Up to 16 POINT LIGHTS (street lamps at night) — additive lambert with a smooth radius falloff, applied
@@ -1486,6 +2671,19 @@ export class Renderer3D {
   setCandidatePointLights(lights: PointLight3D[]): void {
     this._candidateLights = lights;
     this._lightSelKey = [1e9, 1e9, 1e9];               // force a re-select next frame
+  }
+  /** visual-polish #7c: PINNED point lights (the Play player light) — always uploaded, AHEAD of the direct / candidate
+   *  set, which keeps the remaining MAX_POINT_LIGHTS - n slots. [] = none (the original upload, bit-identical). */
+  setPinnedPointLights(lights: PointLight3D[]): void { this._pinnedLights = lights.slice(0, MAX_POINT_LIGHTS); }
+  private _pinnedLights: PointLight3D[] = [];
+  private readonly _uploadLights: PointLight3D[] = [];
+  private _lightsForUpload(): PointLight3D[] {
+    if (!this._pinnedLights.length) return this._pointLights;
+    const out = this._uploadLights;
+    out.length = 0;
+    for (const l of this._pinnedLights) out.push(l);
+    for (const l of this._pointLights) { if (out.length >= MAX_POINT_LIGHTS) break; out.push(l); }
+    return out;
   }
   private _pointLights: PointLight3D[] = [];
   private _candidateLights: PointLight3D[] = [];
@@ -1524,8 +2722,8 @@ export class Renderer3D {
   /** PERF COUNTERS for hitch diagnosis (salsaWorld.perf() prints these): cumulative counts of the heavy
    *  events + the last cost of the two expensive rebuilds. A dip correlates with poolRebuilds/atlasRebuilds
    *  climbing; fullRepacks are the cheap-but-not-free middle tier; fastPaths should dominate. */
-  private _perf = { renders: 0, fullRepacks: 0, fastPaths: 0, poolRebuilds: 0, lastPoolMs: 0, atlasRebuilds: 0, lastAtlasMs: 0, shadowPasses: 0, appends: 0, warms: 0 };
-  getPerfCounters(): { renders: number; fullRepacks: number; fastPaths: number; poolRebuilds: number; lastPoolMs: number; atlasRebuilds: number; lastAtlasMs: number; shadowPasses: number; appends: number; warms: number } {
+  private _perf = { renders: 0, fullRepacks: 0, fastPaths: 0, poolRebuilds: 0, lastPoolMs: 0, atlasRebuilds: 0, lastAtlasMs: 0, shadowPasses: 0, appends: 0, warms: 0, groupPlacements: 0, groupPacks: 0, groupReclaims: 0, poolGrows: 0, instanceGrows: 0, gpuCompactions: 0, poolShrinks: 0, poolReleases: 0 };
+  getPerfCounters(): { renders: number; fullRepacks: number; fastPaths: number; poolRebuilds: number; lastPoolMs: number; atlasRebuilds: number; lastAtlasMs: number; shadowPasses: number; appends: number; warms: number; groupPlacements: number; groupPacks: number; groupReclaims: number; poolGrows: number; instanceGrows: number; gpuCompactions: number; poolShrinks: number; poolReleases: number } {
     return { ...this._perf };
   }
 
@@ -1533,8 +2731,64 @@ export class Renderer3D {
   // count across ALL passes; ms* = CPU submission time per phase (NOT GPU execution). If drawCalls is high + msTotal
   // high → draw-call bound; msUpload high → instance processing; msTotal low but fps low → GPU bound. Read via
   // salsaWorld.frameStats().
-  private _frame = { drawCalls: 0, meshes: 0, arrayGroups: 0, instances: 0, msTotal: 0, msUpload: 0, msShadow: 0 };
-  getFrameStats3D(): { drawCalls: number; meshes: number; arrayGroups: number; instances: number; msTotal: number; msUpload: number; msShadow: number } { return { ...this._frame }; }
+  //
+  // CULLING counters (polish-round-3 Round 5): cheap per-frame sums filled by _buildDrawLists / _drawMesh.
+  //   meshesCulled / groupsCulled / instancesCulled = what the CAMERA frustum rejected (main + screen-space passes);
+  //   trisTotal = every triangle the scene holds this frame (meshes + array instances), trisVisible = what survived
+  //   the camera cull (the main pass's opaque + transparent lists), trisDrawn = triangles actually submitted across
+  //   ALL passes (main + shadow + SSAO/SSR prepasses + outline depth). shadow* = the shadow pass (culled against the
+  //   LIGHT's ortho box + the shadow-reach test, not the camera box — see _buildDrawLists): casters kept / culled /
+  //   off-view, its draw calls + triangles.
+  private _frame = { drawCalls: 0, meshes: 0, arrayGroups: 0, instances: 0, msTotal: 0, msUpload: 0, msShadow: 0,
+    meshesCulled: 0, groupsCulled: 0, instancesCulled: 0, trisTotal: 0, trisVisible: 0, trisDrawn: 0,
+    shadowCasters: 0, shadowCulled: 0, shadowOffView: 0, shadowDrawCalls: 0, shadowTris: 0, msCull: 0,
+    skinnedMeshes: 0, skinnedDrawn: 0, skinnedCulled: 0, skinnedShadow: 0, skinUploads: 0, skinnedFogHidden: 0, skinnedWaiting: 0, skelAnimCulled: 0, skinnedTris: 0, msSkinned: 0,
+    lodHidden: 0, lodTrisHidden: 0, fogHidden: 0, fogTrisHidden: 0, cascadeCasters: 0, cascadeDrawCalls: 0, cascadePasses: 0, cascades: 0,
+    shadowLodFar: 0, shadowLodCascade: 0,
+    passMainDraws: 0, passMainTris: 0, passFarShadowDraws: 0, passFarShadowTris: 0, passCascadeDraws: 0, passCascadeTris: 0,
+    passOutlineDraws: 0, passOutlineTris: 0, passPrepassDraws: 0, passPrepassTris: 0, passPlanarDraws: 0, passPlanarTris: 0,
+    passOtherDraws: 0, passOtherTris: 0,
+    passFarShadowLastDraws: 0, passFarShadowLastTris: 0, passCascadeLastDraws: 0, passCascadeLastTris: 0,
+    occlCulled: 0, occlTrisCulled: 0, msOccl: 0, rangeTrisCulled: 0, rangeTrisCulledCascade: 0, rangeBuilds: 0,
+    rangeTrisCulledShadow: 0, cascadeStaticRenders: 0, cascadeDynPasses: 0, cascadeRecentres: 0,
+    gpuDriven: 0, gpuMainDraws: 0, gpuMainTris: 0, gpuStatsAge: -1, gpuRecords: 0, msGpuSync: 0, gpuOrphanDraws: 0 };
+  getFrameStats3D(): FrameStats3D { return { ...this._frame, cascades: this._cascadeCount }; }
+  /** P11 per-pass accumulators (index = PassBucket), copied into `_frame.pass*` at the end of drawMeshes. */
+  private _passBucket: PassBucket = PassBucket.Other;
+  private readonly _passDraws = new Float64Array(7);
+  private readonly _passTris = new Float64Array(7);
+  private _flushPassStats(): void {
+    const f = this._frame, d = this._passDraws, t = this._passTris;
+    f.passMainDraws = d[0]; f.passMainTris = t[0]; f.passFarShadowDraws = d[1]; f.passFarShadowTris = t[1];
+    f.passCascadeDraws = d[2]; f.passCascadeTris = t[2]; f.passOutlineDraws = d[3]; f.passOutlineTris = t[3];
+    f.passPrepassDraws = d[4]; f.passPrepassTris = t[4]; f.passPlanarDraws = d[5]; f.passPlanarTris = t[5];
+    f.passOtherDraws = d[6]; f.passOtherTris = t[6];
+    const shOn = this._shadowsEnabled && !this._shadowsSuspended;
+    if (d[1] > 0 || !shOn) { f.passFarShadowLastDraws = d[1]; f.passFarShadowLastTris = t[1]; }
+    if (d[2] > 0 || !shOn || this._cascadeCount === 0) { f.passCascadeLastDraws = d[2]; f.passCascadeLastTris = t[2]; }
+  }
+  /** Frame-stats keys that count since start (not per frame): an empty frame keeps them. */
+  private static readonly _FRAME_CUMULATIVE = new Set(['cascadePasses', 'cascadeStaticRenders', 'cascadeDynPasses', 'cascadeRecentres']);
+  /** Stats fix 2026-10-03 (performance-plan §P15): a frame with NO regular (non-skinned) meshes. drawMeshes does not
+   *  run then (the caller skips it, and it returns at once on an empty list), so every per-frame counter kept the LAST
+   *  static frame's values: a cleared city followed by one character read as the city (1.9 M tris, 3 k draws, "over
+   *  budget"), and the GPU scene kept every record (the departed meshes and their CPU geometry alive) with nothing ever
+   *  rebuilding it. This zeroes the frame (drawSkinnedMeshes, if it runs next, fills the skinned part), drops the
+   *  GPU-driven records and drains the deferred evictions. Cheap when there is nothing to drop. */
+  noStaticMeshesThisFrame(): void {
+    const f = this._frame as unknown as Record<string, number>;
+    for (const k in f) if (!Renderer3D._FRAME_CUMULATIVE.has(k)) f[k] = 0;
+    f.gpuStatsAge = -1;
+    this._passDraws.fill(0); this._passTris.fill(0); this._passBucket = PassBucket.Other;
+    this._gdDrew = false;
+    if (this._gd && this._gd.recordCount > 0) this._gd.reset();
+    if (this._evictPending.size) this.drainDeferredEviction(STREAM_HITCH_LIMITS.evictBudgetMs, []);
+  }
+  /** Forget the GPU-driven scene's records (document load): the next GPU-driven frame rebuilds them from the scene. */
+  resetGpuScene(): void { this._gd?.reset(); }
+  /** Skinned parts drawn on the last drawSkinnedMeshes call (the caller runs it once more on an empty roster so the
+   *  departed characters' stats, shadow and replay list clear). */
+  get skinnedLastCount(): number { return this._lastSkinnedCount; }
 
   setCamera(camera: Camera3D): void {
     this.camera = camera;
@@ -1575,38 +2829,402 @@ export class Renderer3D {
     this._shadowTexture = this.device.createTexture({
       size: [mapSize, mapSize, 1],
       format: 'depth32float',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,   // COPY_DST: P4.2 static-cache copy
     });
     this._shadowTextureView = this._shadowTexture.createView();
-    this._shadowBindGroup = this.device.createBindGroup({
-      layout: this.pipeline.shadowBindGroupLayout,
-      entries: [
-        { binding: 0, resource: this._shadowTextureView },
-        { binding: 1, resource: this.pipeline.shadowSampler },
-      ],
-    });
+    this._dropShadowStaticCache();
+    this._cascadeTexKey = '';        // (re)bind the cascade array (or its dummy) with the fresh map
+    this._ensureCascadeTexture(this._csm.cascades > 1 ? this._csm.cascades - 1 : 0);
     this._shadowsEnabled = true;
     this._shadowMapStale = true;
   }
 
+  // ── Cascaded shadows (persona-polish A2) ──
+
+  /** Configure CASCADED shadows (partial OK): `cascades` 1 = the original single map (default), 2 = + a near cascade,
+   *  3 = + near and mid. See shadow-cascades.ts for the fields. Takes effect while shadows are enabled; persists via
+   *  the global scene settings (shadows.cascades). */
+  setShadowCascades(s: Partial<ShadowCascadeSettings>): void {
+    this._csm = sanitizeShadowCascades(s, this._csm);
+    if (this._shadowsEnabled) this._ensureCascadeTexture(this._csm.cascades > 1 ? this._csm.cascades - 1 : 0);
+    this._cascadeStale = true;
+  }
+  get shadowCascades(): ShadowCascadeSettings { return { ...this._csm }; }
+
+  /** The cascade depth array for `n` near cascades (n = 0 → a 1x1 one-layer dummy so the shadow bind group stays
+   *  complete), and the shadow bind group that binds it at 2. Rebuilds only when the shape changes. */
+  private _ensureCascadeTexture(n: number): void {
+    const size = n > 0 ? this._csm.mapSize : 1, layers = Math.max(1, n);
+    const key = `${size}x${layers}`;
+    if (key === this._cascadeTexKey && this._cascadeTex && this._shadowBindGroup) return;
+    this._cascadeTex?.destroy();
+    this._cascadeTex = this.device.createTexture({
+      size: [size, size, layers], format: 'depth32float', label: n > 0 ? 'ShadowCascades' : 'ShadowCascadesDummy',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,   // COPY_SRC: debug readback; COPY_DST: P14 static-layer copy
+    });
+    this._dropCascadeCache();   // P14: the sampled layers are new (the static layers stay valid, but recomposite)
+    this._cascadeLayerViews = [];
+    for (let i = 0; i < layers; i++) this._cascadeLayerViews.push(this._cascadeTex.createView({ dimension: '2d', baseArrayLayer: i, arrayLayerCount: 1 }));
+    this._cascadeTexKey = key;
+    this._cascadeStale = true;
+    if (n === 0) {   // the dummy must read "fully lit" if anything ever sampled it
+      const enc = this.device.createCommandEncoder();
+      enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: this._cascadeLayerViews[0], depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' } }).end();
+      this.device.queue.submit([enc.finish()]);
+    }
+    this._cascadeArrayView = this._cascadeTex.createView({ dimension: '2d-array' });
+    if (this._shadowTextureView) {
+      const mm = this._shadowMM ??= new ShadowMinMax(this.device);
+      mm.ensure(this._shadowMapSize, size, layers);
+      mm.setValid('far', false); mm.setValid('casc', false);   // fresh textures → no shortcut until rebuilt
+      this._shadowMMFarDirty = true; this._shadowMMCascDirty = true;
+      this._shadowBindGroup = this.device.createBindGroup({
+        layout: this.pipeline.shadowBindGroupLayout,
+        entries: [
+          { binding: 0, resource: this._shadowTextureView },
+          { binding: 1, resource: this.pipeline.shadowSampler },
+          { binding: 2, resource: this._cascadeArrayView },
+          { binding: 3, resource: mm.farView },
+          { binding: 4, resource: mm.cascView },
+          { binding: 5, resource: { buffer: mm.params } },
+        ],
+      });
+    }
+  }
+
+  private _shadowMMFarDirty = true;
+  private _shadowMMCascDirty = true;
+  /** P6: after this frame's shadow passes, rebuild the min/max tiles of every map that was written (same encoder, so
+   *  the main pass sees matching tiles). A map whose rebuild can't run (pipeline compiling) has its shortcut turned
+   *  off until one lands; the A/B switch off turns both off. */
+  private _recordShadowMinMax(enc: () => GPUCommandEncoder, farWritten: boolean, cascWritten: boolean): void {
+    const mm = this._shadowMM;
+    if (!mm) return;
+    if (farWritten) this._shadowMMFarDirty = true;
+    if (cascWritten) this._shadowMMCascDirty = true;
+    if (!Renderer3D.shadowMinMax || !this._shadowsEnabled || !this._shadowTextureView) {
+      mm.setValid('far', false); mm.setValid('casc', false); this._shadowMMFarDirty = this._shadowMMCascDirty = true;
+      mm.flush();
+      return;
+    }
+    if (this._shadowMMFarDirty) { if (mm.record(enc(), 'far', this._shadowTextureView, 1)) this._shadowMMFarDirty = false; }
+    const n = this._cascadeCount;
+    if (this._shadowMMCascDirty && n > 0 && this._cascadeArrayView) { if (mm.record(enc(), 'casc', this._cascadeArrayView, n)) this._shadowMMCascDirty = false; }
+    mm.flush();
+  }
+
+  /** Per frame (uploadSceneUniforms, after the far box moved): lay out + snap the near cascades around the camera. */
+  private _updateCascades(): void {
+    const want = this._shadowsEnabled && !this._shadowsSuspended && this._csm.cascades > 1 ? this._csm.cascades - 1 : 0;
+    this._cascadeCount = 0;
+    this._cascadePack.count = 0;
+    if (want === 0) return;
+    this._ensureCascadeTexture(want);
+    const cam = this.camera, p = cam.position, t = cam.target;
+    const dist = Math.hypot(t[0] - p[0], t[1] - p[1], t[2] - p[2]);
+    const hes = cascadeHalfExtents(want, this._effHe, this._csm.nearExtent, dist);
+    const ld = this._shadowDir, ll = Math.hypot(ld[0], ld[1], ld[2]) || 1;   // P14: the stepped shadow direction
+    const dy = ld[1] / ll;
+    const size = this._csm.mapSize, pk = this._cascadePack;
+    const top = this._sceneTopY, floor = this._sceneFloorY;
+    for (let i = 0; i < hes.length; i++) {
+      const he = hes[i];
+      const c = cascadeCentre(p, t, he, this._cascadeCentreScratch);
+      // Depth: reach UP the sun ray far enough to catch the tallest caster (its shadow can land in the box), and down
+      // past the lowest receiver. A low sun (|dy| small) is capped at 8 box-widths so precision stays sane.
+      const slope = Math.min(dy < -0.05 ? 1 / -dy : 8, 8);
+      const back = he + (Number.isFinite(top) ? Math.max(0, top - c[1]) : 4 * he) * slope;
+      const fwd = 2 * he + (Number.isFinite(floor) ? Math.max(0, c[1] - floor) : he) * slope;
+      // P14.2 SLACK: keep the previous box (and with it the cached static layer) while the wanted one stays within
+      // CASCADE_FOLLOW_SLACK_TEXELS of it and inside its depth range; a re-centre pads the depth range (shadow-cache.ts).
+      // Slack 0 = the wanted box every frame, exactly the old matrix.
+      const wb = cascadeLightBox(ld, he, c, back, fwd, size, this._cascadeScratch, this._cascadeWant);
+      const hb = this._cascadeHeld[i], slack = Math.max(0, Renderer3D.CASCADE_FOLLOW_SLACK_TEXELS) * (2 * he) / Math.max(1, size);
+      if (!(this._cascadeHeldOk[i] && cascadeBoxHolds(hb, wb, slack))) {
+        copyCascadeBox(hb, wb);
+        let range = back + fwd;
+        if (slack > 0) { const mg = cascadeDepthMargin(slack, wb.dy); hb.zn -= mg; hb.zf += mg; range += 2 * mg; }
+        this._cascadeHeldRange[i] = range;
+        if (this._cascadeHeldOk[i]) this._frame.cascadeRecentres++;
+        this._cascadeHeldOk[i] = slack > 0;
+      }
+      cascadeMatrixFromBox(hb, this._cascadeScratch, pk.matrices.subarray(i * 16, i * 16 + 16));
+      pk.bias[i] = cascadeBias(he, size, this._cascadeHeldRange[i], this._shadowSoftness);
+      if (i < 2) this._cascadeTexel[i] = shadowTexel(he, size);   // P8 shadow LOD
+    }
+    pk.count = hes.length; pk.mapSize = size; pk.band = this._csm.blend;
+    this._cascadeCount = hes.length;
+    for (let i = 0; i < hes.length; i++) this._cascadeCullers[i].setFromViewProjection(pk.matrices.subarray(i * 16, i * 16 + 16));
+  }
+  private readonly _cascadeScratch = { eye: vec3.create(), up: vec3.create(), view: mat4.create(), proj: mat4.create(), out: mat4.create() };
+
+  /** Clone the mesh / skinned group-0 bind groups with the scene uniform (binding 1) pointed at each cascade's own
+   *  buffer, whose light matrix is that cascade's (the depth VS reads scene.lightSpaceMatrix). */
+  private _ensureCascadeBindGroups(n: number): void {
+    while (this._cascadeSceneBufs.length < n) {
+      this._cascadeSceneBufs.push(this.device.createBuffer({ size: SCENE_UNIFORM_SIZE_PADDED, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: `CascadeScene${this._cascadeSceneBufs.length}` }));
+      this._cascadeMeshBGFor = null; this._cascadeSkinBGFor = null;
+    }
+    const swap = (entries: GPUBindGroupEntry[], buf: GPUBuffer): GPUBindGroupEntry[] =>
+      entries.map((e) => (e.binding === 1 ? { binding: 1, resource: { buffer: buf } } : e));
+    if (this.meshBindGroup && this._meshBGEntries && this._cascadeMeshBGFor !== this.meshBindGroup) {
+      this._cascadeMeshBGs = this._cascadeSceneBufs.map((b) => this.device.createBindGroup({ layout: this.pipeline.meshBindGroupLayout, entries: swap(this._meshBGEntries!, b) }));
+      this._cascadeMeshBGFor = this.meshBindGroup;
+    }
+    if (this._skinnedMeshBG && this._skinnedMeshBGEntries && this._cascadeSkinBGFor !== this._skinnedMeshBG) {
+      this._cascadeSkinBGs = this._cascadeSceneBufs.map((b) => this.device.createBindGroup({ layout: this.pipeline.meshBindGroupLayout, entries: swap(this._skinnedMeshBGEntries!, b) }));
+      this._cascadeSkinBGFor = this._skinnedMeshBG;
+    }
+  }
+
+  private readonly _cascadeSceneScratch = new Float32Array(SCENE_UNIFORM_SIZE_PADDED / 4);
+  /** Record the near-cascade depth passes into the shared pre-pass encoder (after the far map). */
+  private _recordCascadePasses(enc: () => GPUCommandEncoder): void {
+    const n = this._cascadeCount;
+    if (n === 0 || !this._cascadeTex || this._cascadeLayerViews.length < n || !this.meshBindGroup) return;
+    this._cascadeFramesSince++;
+    if (this._cascadeSplitLists) { this._recordCascadeCached(enc, n); return; }
+    // (split off: the static layers are kept — they stay valid for the static set they hold, and an A/B toggle back
+    // composites from them; disableShadows / a size change frees them)
+    const pk = this._cascadePack;
+    let moved = false;
+    for (let k = 0; k < n * 16; k++) if (pk.matrices[k] !== this._cascadePrev[k]) { moved = true; break; }
+    if (!(this._cascadeStale || moved || this._cascadeFramesSince >= this._csm.updateInterval)) return;
+    this._cascadeStale = false; this._cascadeFramesSince = 0;
+    this._cascadePrev.set(pk.matrices);
+    this._ensureCascadeBindGroups(n);
+    const e = enc();
+    const _dc = this._frame.drawCalls;
+    for (let i = 0; i < n; i++) {
+      const sd = this._cascadeSceneScratch;
+      sd.set(this._sceneUniformsData);
+      sd.set(pk.matrices.subarray(i * 16, i * 16 + 16), 40);   // lightSpaceMatrix ← this cascade's
+      this.device.queue.writeBuffer(this._cascadeSceneBufs[i], 0, sd);
+      const pass = e.beginRenderPass({
+        label: `ShadowCascade${i}`, colorAttachments: [],
+        depthStencilAttachment: { view: this._cascadeLayerViews[i], depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
+      });
+      if (!this._setPipe(pass, this.pipeline.shadowPassPipeline)) this._cascadeStale = true;   // P2: pending → cleared (lit) layer, redo next frame
+      pass.setBindGroup(0, this._cascadeMeshBGs[i]);
+      this._gdShadowDraw(pass, 3 + 2 * i, this._cascadeMeshBGs[i], 'c' + i);   // P15 Phase C
+      this._replayRuns(pass, this._cascadeRunsCache[i] ??= this._buildRuns(this._cascadeLists[i]));
+      if (this._cascadeSkinBGs[i]) this._drawSkinnedShadowCasters(pass, this._cascadeSkinBGs[i]);
+      pass.end();
+    }
+    this._frame.cascadeDrawCalls = this._frame.drawCalls - _dc;
+    this._frame.cascadePasses++;
+  }
+
+  /** P14.2 (performance-plan.md): the near cascades with a cached STATIC layer each. Per cascade (cascadeRefresh):
+   *  the static casters are re-rendered into `_cascadeStaticTex` only when the box moved past its slack, the static
+   *  set changed or something structural did; each refresh of the dynamic layer copies the static layer into the
+   *  sampled one and draws the dynamic casters + skinned characters on top (depth load: the same per-texel minimum as
+   *  drawing them all at once, so the map is identical). */
+  private _recordCascadeCached(enc: () => GPUCommandEncoder, n: number): void {
+    this._ensureCascadeStaticTex(n);
+    const pk = this._cascadePack, prev = this._cascadePrev, size = this._csm.mapSize;
+    const dynDue = this._cascadeDynStale || this._cascadeFramesSince >= this._csm.updateInterval;
+    const stale = this._cascadeStale;
+    const skinned = this._skinnedVisibleScratch.length > 0;
+    const pipe = this.pipeline.shadowPassPipeline;
+    let e: GPUCommandEncoder | null = null, wrote = false, dynFailed = false;
+    const _dc = this._frame.drawCalls;
+    for (let i = 0; i < n; i++) {
+      const st = this._cascadeCache[i];
+      let boxChanged = false;
+      for (let k = i * 16; k < i * 16 + 16; k++) if (pk.matrices[k] !== prev[k]) { boxChanged = true; break; }
+      const hasDyn = this._cascadeDynLists[i].length > 0 || skinned || this._gdShThis;   // (Phase C: the GPU's may exist)
+      const sig = this._cascadeSigs[i].value, mem = this._cascadeMembers[i];
+      const r = cascadeRefresh(st, boxChanged, sig, stale, hasDyn, dynDue, this._joinDeferOn && (mem.due(this._shadowFrameNo, Renderer3D.STATIC_JOIN_TRIS, Renderer3D.STATIC_JOIN_FRAMES) || this._gdShDue(1 + i, mem.joinTris)));
+      if (!r.composite) continue;
+      if (!e) { e = enc(); this._ensureCascadeBindGroups(n); }
+      const sd = this._cascadeSceneScratch;
+      sd.set(this._sceneUniformsData);
+      sd.set(pk.matrices.subarray(i * 16, i * 16 + 16), 40);   // lightSpaceMatrix ← this cascade's
+      this.device.queue.writeBuffer(this._cascadeSceneBufs[i], 0, sd);
+      if (r.renderStatic) {
+        const sp = e.beginRenderPass({
+          label: `ShadowCascadeStatic${i}`, colorAttachments: [],
+          depthStencilAttachment: { view: this._cascadeStaticViews[i], depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
+        });
+        const ok = this._setPipe(sp, pipe);   // P2: pending → a cleared (lit) layer, redone next frame
+        sp.setBindGroup(0, this._cascadeMeshBGs[i]);
+        if (ok) { this._gdShadowDraw(sp, 3 + 2 * i, this._cascadeMeshBGs[i], 'c' + i); this._replayRuns(sp, this._cascadeRunsCache[i] ??= this._buildRuns(this._expandRanges(this._cascadeLists[i], true, this._cascadeCullers[i], this._cascExp[i]))); }
+        sp.end();
+        if (ok) this._gdShCommitLayer(e, 1 + i);   // P15 Phase C
+        const why = this._cascadeWhy;
+        if (!st.valid) why.cold++; else if (stale) why.stale++; else if (boxChanged) why.box++; else why.sig++;   // diagnostics
+        st.valid = ok; st.sigDrawn = ok ? (this._joinDeferOn ? this._cascadeSigsAll[i].value : sig) : NaN;
+        if (ok && this._joinDeferOn) mem.drawnWith(this._cascadeStaticKeys[i]); else if (!ok) mem.clear();   // P14: the layer now holds every static caster
+        if (ok) prev.set(pk.matrices.subarray(i * 16, i * 16 + 16), i * 16);
+        this._frame.cascadeStaticRenders++;
+      }
+      e.copyTextureToTexture({ texture: this._cascadeStaticTex!, origin: { x: 0, y: 0, z: i } }, { texture: this._cascadeTex!, origin: { x: 0, y: 0, z: i } }, [size, size, 1]);
+      const pass = e.beginRenderPass({
+        label: `ShadowCascade${i}`, colorAttachments: [],
+        depthStencilAttachment: { view: this._cascadeLayerViews[i], depthLoadOp: 'load', depthStoreOp: 'store' },
+      });
+      if (hasDyn) {
+        const ok = this._setPipe(pass, pipe);
+        if (!ok) dynFailed = true;
+        pass.setBindGroup(0, this._cascadeMeshBGs[i]);
+        if (ok) this._gdShadowDraw(pass, 4 + 2 * i, this._cascadeMeshBGs[i], 'c' + i);   // P15 Phase C
+        if (ok && this._cascadeDynLists[i].length) this._replayRuns(pass, this._cascadeDynRunsCache[i] ??= this._buildRuns(this._expandRanges(this._cascadeDynLists[i], true, this._cascadeCullers[i], this._cascExpDyn[i])));   // (joiners carry ranges)
+        if (this._cascadeSkinBGs[i]) this._drawSkinnedShadowCasters(pass, this._cascadeSkinBGs[i]);
+      }
+      pass.end();
+      st.dynInMap = hasDyn;
+      this._frame.cascadeDynPasses++;
+      wrote = true;
+    }
+    this._cascadeStale = false;   // a failed static render left its layer invalid (cascadeRefresh redoes it)
+    if (dynDue) { this._cascadeDynStale = false; this._cascadeFramesSince = 0; }
+    if (dynFailed) this._cascadeDynStale = true;
+    if (wrote) { this._frame.cascadeDrawCalls = this._frame.drawCalls - _dc; this._frame.cascadePasses++; }
+  }
+
   disableShadows(): void {
+    this._cascadeTex?.destroy(); this._cascadeTex = null; this._cascadeTexKey = ''; this._cascadeLayerViews = []; this._cascadeCount = 0; this._cascadePack.count = 0;
+    this._cascadeArrayView = null;
+    this._dropCascadeStaticTex();   // P14
+    this._shadowMM?.setValid('far', false); this._shadowMM?.setValid('casc', false);
     this._shadowTexture?.destroy();
     this._shadowTexture = null;
     this._shadowTextureView = null;
     this._shadowBindGroup = null;
     this._shadowsEnabled = false;
+    this._dropShadowStaticCache();
+  }
+
+  /** P4.2: free the static far-map cache (re-created on demand at the far map's size). */
+  private _dropShadowStaticCache(): void {
+    this._shadowStaticTex?.destroy(); this._shadowStaticTex = null; this._shadowStaticView = null;
+    this._shadowStaticValid = false; this._shadowSampledStatic = false; this._shadowDynInMap = false;
+    this._farMembers.clear();   // P14
+  }
+
+  /** P4.2 A/B: cache the STATIC far shadow map (default on) or re-render every caster on the throttle (old). */
+  get shadowStaticCache(): boolean { return this._shadowCacheOn; }
+  set shadowStaticCache(v: boolean) { if (this._shadowCacheOn === v) return; this._shadowCacheOn = v; this._dropShadowStaticCache(); this._shadowMapStale = true; }
+  /** P4.2 diagnostics: static re-renders / dynamic-layer passes / direct (old-path) renders since load, and the last
+   *  frame's static + dynamic caster counts. */
+  getShadowCacheStats(): { staticRenders: number; dynPasses: number; directRenders: number; staticCasters: number; dynCasters: number; farTris: number; staticStale: number; staticSig: number; staticCold: number; cached: boolean } {
+    return { ...this._shadowCacheStats, cached: this._shadowCachePath };
+  }
+
+  private _shadowVerify: ((r: { texels: number; diffTexels: number; maxDiff: number; staticCasters: number; dynCasters: number }) => void) | null = null;
+  /** P4.2 verification (headless): on the next cached dynamic-layer refresh, ALSO render static + dynamic casters
+   *  directly into a scratch map in the same encoder, read both back and compare depth. A correct cache is
+   *  bit-identical (diffTexels 0). Resolves null if the cached path doesn't run within ~2 s. */
+  debugVerifyShadowCache(): Promise<{ texels: number; diffTexels: number; maxDiff: number; staticCasters: number; dynCasters: number } | null> {
+    return new Promise((res) => {
+      const t = setTimeout(() => { this._shadowVerify = null; res(null); }, 2000);
+      this._shadowVerify = (r) => { clearTimeout(t); res(r); };
+      this._shadowDynStale = true;
+    });
+  }
+  private _recordShadowCacheVerify(enc: GPUCommandEncoder): void {
+    const done = this._shadowVerify!; this._shadowVerify = null;
+    const sz = this._shadowMapSize, dev = this.device;
+    const ref = dev.createTexture({ size: [sz, sz, 1], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const pass = enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: ref.createView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' } });
+    this._setPipe(pass, this.pipeline.shadowPassPipeline);
+    pass.setBindGroup(0, this.meshBindGroup!);
+    this._gdShadowDraw(pass, 1, this.meshBindGroup, 'far'); this._gdShadowDraw(pass, 2, this.meshBindGroup, 'far');   // P15 Phase C
+    this._replayRuns(pass, this._buildRuns(this._shadowStaticList));
+    if (this._shadowDynList.length) this._replayRuns(pass, this._buildRuns(this._shadowDynList));
+    this._drawSkinnedShadowCasters(pass);
+    pass.end();
+    const bpr = Math.ceil(sz * 4 / 256) * 256;
+    const mk = () => dev.createBuffer({ size: bpr * sz, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const bA = mk(), bB = mk();
+    enc.copyTextureToBuffer({ texture: this._shadowTexture!, aspect: 'depth-only' }, { buffer: bA, bytesPerRow: bpr, rowsPerImage: sz }, [sz, sz, 1]);
+    enc.copyTextureToBuffer({ texture: ref, aspect: 'depth-only' }, { buffer: bB, bytesPerRow: bpr, rowsPerImage: sz }, [sz, sz, 1]);
+    const sc = this._shadowStaticList.length, dc = this._shadowDynList.length;
+    queueMicrotask(() => {   // after this frame's pre-pass submit
+      void Promise.all([bA.mapAsync(GPUMapMode.READ), bB.mapAsync(GPUMapMode.READ)]).then(() => {
+        const a = new Float32Array(bA.getMappedRange()), b = new Float32Array(bB.getMappedRange());
+        let diff = 0, maxD = 0;
+        const row = bpr / 4;
+        for (let y = 0; y < sz; y++) for (let x = 0; x < sz; x++) { const d = Math.abs(a[y * row + x] - b[y * row + x]); if (d > 0) { diff++; if (d > maxD) maxD = d; } }
+        bA.unmap(); bB.unmap(); bA.destroy(); bB.destroy(); ref.destroy();
+        done({ texels: sz * sz, diffTexels: diff, maxDiff: maxD, staticCasters: sc, dynCasters: dc });
+      });
+    });
+  }
+
+  /** Skinned pose / count changed: the cached path refreshes only the dynamic layer, the old path the whole map. */
+  private _skinnedShadowChanged(): void {
+    if (this._shadowCachePath) this._shadowDynStale = true; else this._shadowMapStale = true;
+  }
+
+  /** P4.2: a caster is DYNAMIC when it moved within the last MOVER_HOLD frames (new meshes start on a short
+   *  probation so streaming arrivals / spawned walkers don't churn the static set), sways in the wind, or is a
+   *  view-facing billboard. Also assigns the stable per-mesh uid used by the static-set signature. */
+  private _casterIsDynamic(m: Mesh3D, windOn: boolean): boolean {
+    const until = this._casterUntil(m);
+    if (m.billboard || m.billboardParent) return true;
+    if (m.hlodFade >= 0) return true;   // P17: an HLOD tier dissolving (fs_shadow dithers it): never in the cached static map
+    if (windOn && m.material.windSway) return true;
+    if (this._fhBandOn && (m.fogClass === 2 || (m.fogClass === 1 && this._fhBandAttach)) && !m.material.noFog && this._inFadeBand(m)) return true;   // fog horizon P2
+    return this._shadowFrameNo <= until;
+  }
+  /** The motion part of _casterIsDynamic: the last frame `m` counts as a mover (moved within HOLD frames, or a new
+   *  caster's PROBATION), updating the bookkeeping (and the stable signature uid in `_lastCasterUid`). P15 Phase C
+   *  calls it when a GPU record is written (a matrix change) and keeps the result per record. */
+  private _casterUntil(m: Mesh3D): number {
+    const HOLD = 1800, PROBATION = 90;
+    const fr = this._shadowFrameNo, v = m.localMatrixVersion;
+    let r = this._casterMotion.get(m);
+    if (!r) { r = { v, f: fr - HOLD + PROBATION, uid: ++this._casterUid }; this._casterMotion.set(m, r); }
+    else if (r.v !== v) { r.v = v; r.f = fr; }
+    this._lastCasterUid = r.uid;   // P6: the caller's _sigMix reads this instead of a second map lookup
+    return r.f + HOLD;
+  }
+  /** FOG HORIZON P2: the fade band this frame (on / its inner distance / attachments fade too). */
+  private _fhBandOn = false;
+  private _fhBandIn = 0;
+  private _fhBandAttach = false;
+  /** Whether a mesh's box reaches into the fade band (its farthest corner past the band's inner edge; boxes wholly
+   *  past the fog edge are culled before this is asked). */
+  private _inFadeBand(m: Mesh3D): boolean {
+    const bb = this.getMeshWorldAABB3D(m, this._fhBandScratch);
+    if (!bb) return false;
+    return this._boxFarthest(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ) >= this._fhBandIn;
+  }
+  private readonly _fhBandScratch: AABB3 = { minX: 0, minY: 0, minZ: 0, maxX: 0, maxY: 0, maxZ: 0 };
+  private _boxFarthest(minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): number {
+    const e = this._fogEye;
+    const dx = Math.max(Math.abs(e[0] - minX), Math.abs(e[0] - maxX)), dy = Math.max(Math.abs(e[1] - minY), Math.abs(e[1] - maxY)), dz = Math.max(Math.abs(e[2] - minZ), Math.abs(e[2] - maxZ));
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+  private _lastCasterUid = 0;
+  private _casterUidOf(m: Mesh3D): number {
+    let r = this._casterMotion.get(m);
+    if (!r) { r = { v: m.localMatrixVersion, f: -1e9, uid: ++this._casterUid }; this._casterMotion.set(m, r); }
+    return r.uid;
+  }
+  private _sigMix(a: number, b: number, c: number): void {
+    const k = (Math.imul(a | 0, 0x9E3779B1) ^ Math.imul((b | 0) + 0x7F4A7C15, 0x85EBCA77) ^ Math.imul((c | 0) + 1, 0xC2B2AE3D)) | 0;
+    this._sigSum = (this._sigSum + k) | 0;
+    this._sigXor = (this._sigXor ^ Math.imul(k, 0x27D4EB2F)) | 0;
   }
 
   // ── Outline pass ───────────────────────────────────────────────
 
   get outlineEnabled(): boolean { return !!this._outlinePass; }
 
-  enableOutlines(color?: [number, number, number, number], threshold?: number): void {
+  /** `depthFade` (visual-polish #8): thin + lighten the ink from `near` to `far` world units (null / absent = off, the
+   *  constant ink; every call sets it, so a caller re-enabling without it turns it off). */
+  enableOutlines(color?: [number, number, number, number], threshold?: number, depthFade?: { near: number; far: number; minAlpha?: number } | null, extras?: OutlineExtras): void {
     if (!this._outlinePass) {
       this._outlinePass = new OutlinePass(this.device, this.pipeline.meshBindGroupLayout, this._swapChainFormat);
     }
     if (color)     this._outlinePass.color     = color;
-    if (threshold !== undefined) this._outlinePass.threshold = threshold;
+    if (threshold !== undefined) this._outlinePass.threshold = outlineWidthPx(threshold);
+    const df = depthFade && Number.isFinite(depthFade.near) && Number.isFinite(depthFade.far) && depthFade.far > depthFade.near ? depthFade : null;
+    this._outlinePass.depthFade = df ? { near: Math.max(0, df.near), far: df.far, minAlpha: Math.max(0, Math.min(1, df.minAlpha ?? 0.25)) } : null;
+    this._outlinePass.setExtras(extras);   // visual-polish #3: foliage mode + crease fade (absent = the original ink)
   }
 
   setOutlineColor(r: number, g: number, b: number, a = 1): void {
@@ -1614,12 +3232,20 @@ export class Renderer3D {
   }
 
   setOutlineThreshold(t: number): void {
-    if (this._outlinePass) this._outlinePass.threshold = t;
+    if (this._outlinePass) this._outlinePass.threshold = outlineWidthPx(t);
   }
 
   disableOutlines(): void {
     this._outlinePass?.destroy();
     this._outlinePass = null;
+  }
+  /** The screen-space edge outline's settings, or null when it's off (for persistence). */
+  get outlineConfig(): { color: [number, number, number, number]; threshold: number; depthFade?: { near: number; far: number; minAlpha: number } } | null {
+    const p = this._outlinePass;
+    if (!p) return null;
+    const out: { color: [number, number, number, number]; threshold: number; depthFade?: { near: number; far: number; minAlpha: number } } = { color: [p.color[0], p.color[1], p.color[2], p.color[3]], threshold: p.threshold };
+    if (p.depthFade) out.depthFade = { ...p.depthFade };   // only when on (saves without it stay byte-identical)
+    return out;
   }
 
   // ── Bloom pass ────────────────────────────────────────────────
@@ -1640,6 +3266,11 @@ export class Renderer3D {
     this._bloomCapturePipeline = null;
   }
 
+  /** The particle bloom's settings, or null when it's off (for persistence). */
+  get bloomConfig(): { threshold: number; intensity: number } | null {
+    const b = this._bloomPass;
+    return b ? { threshold: b.threshold, intensity: b.intensity } : null;
+  }
   setBloomThreshold(t: number): void { if (this._bloomPass) this._bloomPass.threshold = t; }
   setBloomIntensity(v: number): void { if (this._bloomPass) this._bloomPass.intensity  = v; }
 
@@ -1794,7 +3425,7 @@ export class Renderer3D {
   // ── Gizmo accessors ────────────────────────────────────────────
 
   /** Call whenever any mesh transform or material changes outside of gpuDirty (e.g. gizmo drag). */
-  markInstancesDirty(): void { this._instancesDirty = true; this._shadowMapStale = true; }
+  markInstancesDirty(): void { this._instancesDirty = true; this._shadowMapStale = true; this._arraySrcCount = null; }
 
   /** PERF: call when ONLY transforms changed (nothing added/removed, no material/geometry edits) — the
    *  city-traffic tick. Takes a fast path in uploadMeshInstances that rewrites just the model/normal
@@ -1804,7 +3435,22 @@ export class Renderer3D {
   /** Render the shadow map every N rendered frames instead of every frame (1 = every frame). Structural
    *  changes (lights, geometry, adds/removes) force an immediate refresh regardless. City mode uses ~3 —
    *  the whole-scene depth pre-pass is the single biggest GPU cost of an animated diorama. */
-  setShadowUpdateInterval(n: number): void { this._shadowUpdateInterval = Math.max(1, n | 0); }
+  setShadowUpdateInterval(n: number): void { this._shadowIntervalBase = Math.max(1, n | 0); this._shadowUpdateInterval = Math.max(1, Math.round(this._shadowIntervalBase * this._shadowIntervalScale)); }
+  private _shadowIntervalBase = 1;
+  private _shadowIntervalScale = 1;
+  /** P14 shadow quality presets (shadow-quality.ts): the far map's refresh interval is the scene's own
+   *  (setShadowUpdateInterval) times this (1 = unchanged). */
+  setShadowIntervalScale(k: number): void { this._shadowIntervalScale = k > 0 && Number.isFinite(k) ? k : 1; this.setShadowUpdateInterval(this._shadowIntervalBase); }
+  get shadowIntervalScale(): number { return this._shadowIntervalScale; }
+  /** P14: change the far map's resolution, keeping its box and bias (recreates the depth texture; no-op when unchanged
+   *  or shadows are off — enableShadows takes the size then). */
+  setShadowMapSize(size: number): void {
+    const s = Math.min(8192, Math.max(256, Math.round(size)));
+    if (!this._shadowsEnabled || s === this._shadowMapSize) return;
+    const he = this._shadowHalfExtent, bias = this._shadowBias, effHe = this._effHe, effBias = this._effBias;
+    this.enableShadows(s, he, bias);
+    this._effHe = effHe; this._effBias = effBias;   // the zoom-adaptive box carries on (_updateShadowCenter re-derives it)
+  }
 
   private _shadowPcfRadius = 0;   // 0 = default (5x5 PCF); 1 = fast 3x3 tier (shadowParams.x)
   /** PCF quality tier: radius 1 = 3x3 (9 taps, ~2.7x cheaper per lit fragment — softer edge, good for city
@@ -1812,6 +3458,8 @@ export class Renderer3D {
   setShadowQuality(radius: number): void {
     this._shadowPcfRadius = radius === 1 ? 1 : 0;
   }
+  /** The PCF tier (1 = 3x3, 0 = 5x5). */
+  get shadowPcfRadius(): number { return this._shadowPcfRadius; }
 
   private _shadowsSuspended = false;
   private _shadowSuspendCleared = false;
@@ -1827,6 +3475,8 @@ export class Renderer3D {
   }
 
   /** Register GPU-instanced array groups — renderer computes instance transforms from params. */
+  /** P15: bumped whenever the array-group SET changes (the GPU-driven records re-derive their order). */
+  private _groupSetGen = 0;
   setArrayGroups(groups: ArrayGroup3D[], localBases?: Map<string, LocalBasis3>): void {
     // Dirty ONLY when the SET changed (add/remove/reorder). The sync callback calls this EVERY FRAME with a freshly
     // collected array, but the ArrayGroup OBJECTS are stable in steady state — unconditionally dirtying here rebuilt
@@ -1837,7 +3487,17 @@ export class Renderer3D {
     const basesChanged = (localBases?.size ?? 0) !== this._arrayGroupLocalBases.size;
     this._arrayGroups = groups;
     this._arrayGroupLocalBases = localBases ?? new Map();
-    if (setChanged || basesChanged) this._instancesDirty = true;
+    // P5: a changed SET (the city zoom tiers show / hide whole groups on a view switch) is placed incrementally — the
+    // next upload allocates the new groups' slot ranges and parks the hidden ones (see _syncArrayGroupSlots). Only a
+    // local-basis change (radial arrays under the local gizmo) still forces the full repack.
+    if (setChanged) { if (this.incrementalArrayGroups) this._groupSetDirty = true; else this._instancesDirty = true; this._arraySrcCount = null; this._groupSetGen++; }
+    // Step 3 (P10.D leftover): the per-group world-box cache was keyed by group id and never pruned (streamed tiles'
+    // groups piled up, ~10 KB a tile). Once it holds twice the live set, keep only the live groups' entries.
+    if (setChanged && Renderer3D.pruneGroupBoxCache && this._agAABBCache.size > 2 * groups.length + 256) {
+      const live = new Set<string>(); for (const g of groups) live.add(g.id);
+      for (const id of this._agAABBCache.keys()) if (!live.has(id)) this._agAABBCache.delete(id);
+    }
+    if (basesChanged) { this._instancesDirty = true; this._arraySrcCount = null; }
   }
 
   /**
@@ -1997,13 +3657,19 @@ export class Renderer3D {
     if (this._meshEditBgActive) {
       const mode = this._meshEditBgOpts.mode;
       if (mode !== 'dim' && mode !== 'none') {
-        this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH);
+        this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH, mode === 'sky' ? this._skyDomeView(canvasW, canvasH) : null);
       }
       return;
     }
     if (this._sceneBgOpts.mode !== 'none') {
-      this._sceneBgPass?.draw(pass, this._sceneBgOpts, canvasW, canvasH);
+      this._sceneBgPass?.draw(pass, this._sceneBgOpts, canvasW, canvasH, this._sceneBgOpts.mode === 'sky' ? this._skyDomeView(canvasW, canvasH) : null);
     }
+  }
+  /** visual-polish #9: the camera basis the SKY DOME backdrop (focus-bg mode 'sky') turns pixels into directions with.
+   *  Orthographic views use a nominal 50 deg FOV (parallel rays would paint one flat colour). */
+  private _skyDomeView(w: number, h: number): SkyDomeView {
+    const c = this.camera;
+    return skyDomeView(c.position, c.target, c.up, c.mode === 'perspective' ? c.fov : 50 * Math.PI / 180, w / Math.max(1, h));
   }
 
   /** Activate or deactivate the armature focus background, independent of skeleton state. */
@@ -2027,6 +3693,17 @@ export class Renderer3D {
   meshEditHidesContent(): boolean {
     const m = this._meshEditBgOpts.mode;
     return this._meshEditBgActive && m !== 'none' && m !== 'dim';
+  }
+
+  /** P4.4 (docs/specs/performance-plan.md): true when drawArmatureBg will paint an OPAQUE full-canvas background over
+   *  everything drawn before it this frame — the 3D workspace backdrop (free3D, or a 2D mode on the scene target).
+   *  The host then skips compositing + drawing the 2D raster layers underneath (they could not be seen). Conservative:
+   *  not in armature mode (its own bg may be 'dim'), and only when the backdrop colours it uses are fully opaque. */
+  focusBgCoversCanvas(): boolean {
+    if (this._armatureModeActive || !this.meshEditHidesContent() || !this._armatureBgPass) return false;
+    const o = this._meshEditBgOpts;
+    const a1 = o.color1 ? o.color1[3] : 1, a2 = o.color2 ? o.color2[3] : 1;
+    return a1 >= 1 && a2 >= 1;
   }
 
   /** Draw the mesh-edit 'dim' overlay AFTER meshes (parity with the armature dim mode,
@@ -2217,11 +3894,17 @@ export class Renderer3D {
    * Call this from the main renderer's render loop at the 3D draw point.
    */
   drawMeshes(pass: GPURenderPassEncoder, meshes: Mesh3D[], canvasWidth: number, canvasHeight: number, uploadUniforms = true): void {
-    if (meshes.length === 0) return;
+    if (meshes.length === 0) { this.noStaticMeshesThisFrame(); return; }
+    this._prewarmForScene(meshes, false);   // P2.2: queue the variants this document uses (only when the roster changes)
+    this._drew3DThisFrame = true;   // AA gate (runPostProcess)
     this._perf.renders++;   // diagnostic: total mesh renders (delta while moving the mouse = renders/move)
     const _ft0 = performance.now();   // per-frame profile (salsaWorld.frameStats())
     this._frame.drawCalls = 0; this._frame.msShadow = 0; this._frame.msUpload = 0;
+    if (this._lastSkinnedCount === 0) { this._frame.skinnedMeshes = 0; this._frame.skinnedDrawn = 0; this._frame.skinnedTris = 0; this._frame.skinnedWaiting = 0; }
+    this._frame.trisDrawn = 0; this._frame.shadowDrawCalls = 0; this._frame.shadowTris = 0;
+    this._passDraws.fill(0); this._passTris.fill(0); this._passBucket = PassBucket.Other;   // P11 per-pass counters
     this._frame.meshes = meshes.length;
+    this._gdBegin();   // P15: GPU-driven main pass on this frame? (before the instance upload: it captures material-dirty meshes)
     this._frame.arrayGroups = this._arrayGroups.length;
     this._frame.instances = this._arrayGroups.reduce((n, g) => n + getArrayInstanceCount(g.arrayParams), 0);
 
@@ -2253,7 +3936,7 @@ export class Renderer3D {
     // Must run before _ensureGeomPool because that call clears gpuDirty as a side effect.
     // Reused Set (was new Set(filter().map()) = 2 arrays + a Set every frame; empty for the city).
     const vcDirtyIds = this._vcDirtyIds; vcDirtyIds.clear();
-    for (const m of meshes) if (m.gpuDirty && m.vertexColors) vcDirtyIds.add(m.id);
+    for (let _km = 0; _km < meshes.length; _km++) { const m = meshes[_km]; if (m.gpuDirty && m.vertexColors) vcDirtyIds.add(m.id); }
 
     // Rebuild shared geometry pool if mesh list or any geometry changed.
     // Clears gpuDirty on uploaded meshes as a side effect.
@@ -2261,7 +3944,7 @@ export class Renderer3D {
 
     // Re-upload standalone VB overrides + color VBs for dirty EditMesh meshes.
     // Also create on first encounter (no entry yet in _vcColorBuffers).
-    for (const m of meshes) {
+    for (let _km = 0; _km < meshes.length; _km++) { const m = meshes[_km];
       if (m.vertexColors && (vcDirtyIds.has(m.id) || !this._vcColorBuffers.has(m.id))) {
         this._uploadVCBuffers(m);
       }
@@ -2273,11 +3956,21 @@ export class Renderer3D {
     // frame-fresh (reset here, derived lazily from the lists `_buildDrawLists` just filled). ──
     this._ensureMeshBindGroups(canvasWidth, canvasHeight);
     this._buildDrawLists(meshes);
-    this._passRunsCache = null;
+    if (this._gdOn) this._gdFinish(meshes);   // P15: record sync + uploads + the cull dispatch (submitted before the main pass)
+    this._passRunsCache = null; this._gdRestRuns = null;
+    this._shadowRunsCache = null;
+    this._shadowStaticRunsCache = null; this._shadowDynRunsCache = null;
+    this._cascadeRunsCache[0] = null; this._cascadeRunsCache[1] = null;
+    this._cascadeDynRunsCache[0] = null; this._cascadeDynRunsCache[1] = null;   // P14
     this._recordPrePasses(canvasWidth, canvasHeight);
+    this._passBucket = PassBucket.Planar;
     this._drawPlanarReflectionPass(meshes, canvasWidth, canvasHeight);
+    this._passBucket = PassBucket.Main;
     this._drawMainPass(pass, meshes);
+    if (this._gdDrew) this._gdAddStats();
+    this._passBucket = PassBucket.Other;
     this._drawMainOverlays(pass, canvasWidth, canvasHeight);
+    this._flushPassStats();
 
 
     this._frame.msTotal = performance.now() - _ft0;
@@ -2315,14 +4008,15 @@ export class Renderer3D {
         { binding: 9, resource: this._brdfLutTex!.createView() },
       ];
       const hfDummyView = this._ensureDummyHalfFloat().createView();
-      this.meshBindGroup = this.device.createBindGroup({
-        layout: this.pipeline.meshBindGroupLayout,
-        entries: [...baseEntries,
+      this._meshBGEntries = [...baseEntries,
           { binding: 10, resource: worldPosTex.createView() },
           { binding: 11, resource: worldPosBackTex.createView() },
           { binding: 12, resource: normalTex.createView() },
           { binding: 13, resource: reflectionTex.createView() },
-          { binding: 14, resource: planarTexBind.createView() }],
+          { binding: 14, resource: planarTexBind.createView() }];
+      this.meshBindGroup = this.device.createBindGroup({
+        layout: this.pipeline.meshBindGroupLayout,
+        entries: this._meshBGEntries,
       });
       // The world-pos PREPASS writes worldPosTex AND the normal target, so it must NOT bind them (read/write
       // alias in one pass) — dummies at 10/11/12/13. (Only the non-skinned opaque prepass uses it.)
@@ -2382,16 +4076,355 @@ export class Renderer3D {
     const opaque = this._opaque; opaque.length = 0;
     const transparent = this._transparent; transparent.length = 0;
 
+    const _tc0 = performance.now();
+    const fs = this._frame;
+    fs.meshesCulled = 0; fs.groupsCulled = 0; fs.instancesCulled = 0; fs.trisTotal = 0; fs.trisVisible = 0;
+    fs.shadowCasters = 0; fs.shadowCulled = 0; fs.shadowOffView = 0; fs.shadowLodFar = 0; fs.shadowLodCascade = 0;
     const culler = this._frustumCulling
       ? this._culler.setFromViewProjection(this.camera.getViewProjectionMatrix())
       : null;
+    // SHADOW list (see _shadowList): built only while a shadow map is live. The light matrix was computed this frame
+    // by uploadSceneUniforms (packSceneUniforms -> computeLightSpaceMatrix -> _lsmMatrix). The 6-plane test against it
+    // is EXACTLY the hardware clip of the shadow pass (no unclippedDepth), so dropping those casters is invisible.
+    const buildShadow = this._shadowLightCull && this._shadowsEnabled && !this._shadowsSuspended;
+    const lightCuller = buildShadow && this._frustumCulling ? this._lightCuller.setFromViewProjection(this._lsmMatrix) : null;
+    const shadowList = this._shadowList; shadowList.length = 0;
+    const shadowSeen = this._shadowSeen; shadowSeen.clear();
+    // P4.2 static/dynamic caster split (see _shadowCacheOn).
+    this._shadowFrameNo++;
+    const cacheLists = buildShadow && this._shadowCacheOn;
+    this._shadowCacheListsBuilt = cacheLists;
+    const staticList = this._shadowStaticList; staticList.length = 0;
+    const dynList = this._shadowDynList; dynList.length = 0;
+    this._sigSum = 0; this._sigXor = 0;
+    const windOn = this._wind.strength > 0 && this._wind.speed > 0;
+    // SHADOW REACH: additionally drop casters whose shadow volume (box swept along the sun down to the scene floor)
+    // misses the CAMERA frustum — their shadow cannot land on anything visible. A superset of the old camera-culled
+    // shadow list (so no pop the old list did not have) and a subset of the light box (a tiled world's box spans the
+    // whole world). Off with a planar mirror live (it shows receivers outside the view).
+    const reach = lightCuller && culler && !this._planarActive ? culler : null;
+    const ld = this._shadowDir, ll = Math.hypot(ld[0], ld[1], ld[2]) || 1, lightDir = this._lightDirN;   // P14: the stepped shadow direction
+    lightDir[0] = ld[0] / ll; lightDir[1] = ld[1] / ll; lightDir[2] = ld[2] / ll;
+    const floorY = this._sceneFloorY;
+    let nextFloor = Infinity;
+    let nextTop = -Infinity;   // persona-polish A2: highest box top (how far the near cascades reach toward the sun)
+    // Near CASCADE caster lists (persona-polish A2): every kept shadow caster that also touches cascade i's box.
+    const nC = buildShadow ? this._cascadeCount : 0;
+    const cLists = this._cascadeLists; cLists[0].length = 0; cLists[1].length = 0;
+    const cCull = this._cascadeCullers;
+    // P8 SHADOW LOD: a caster whose shadowFeatureSize is below SHADOW_LOD_TEXELS texels of a map is left out of it.
+    // Both the map texel AND the screen guard (the feature's size in pixels at the camera's distance to the city
+    // volume — 0 at street / roof level) must call the caster too small (shadow-lod.ts).
+    const lodPxAng = this.camera.mode === 'orthographic' || !(this._viewH > 0) ? 0 : 2 * Math.tan(this.camera.fov / 2) / this._viewH;
+    const lodScreen = shadowLodScreenThreshold(Renderer3D.SHADOW_LOD_SCREEN_PX, this.distanceLodBias, lodPxAng);
+    const lodTexFar = Math.min(lodScreen, shadowLodThreshold(Renderer3D.shadowSizeLod, Renderer3D.SHADOW_LOD_TEXELS, shadowTexel(this._effHe, this._shadowMapSize)));
+    const lodTexC = this._cascadeLodTex;
+    for (let ci = 0; ci < 2; ci++) lodTexC[ci] = Math.min(lodScreen, shadowLodThreshold(Renderer3D.shadowSizeLod, Renderer3D.SHADOW_LOD_TEXELS, this._cascadeTexel[ci]));
+    // R6.1 DISTANCE LOD: meshes with a drawDistance drop out (every pass) once the camera is that far from their box.
+    // P1.2: an ortho camera's position says nothing about how big things are on screen, its ZOOM does — so under ortho
+    // every mesh is "at" orthoLodDistance(orthoSize) (uniform across the view; size x zoom) instead of LOD turning off.
+    const lodCam = this.camera;
+    const lodOrtho = lodCam.mode === 'orthographic';
+    const lodOn = this.distanceLod && (!lodOrtho || this.orthoScreenLod);
+    const lodScale = lodOn ? (lodOrtho ? 1 : fovDistanceScale(lodCam.fov)) * this.distanceLodScale * this.lodResolutionScale : 1;
+    const lodBias = this.distanceLodBias;
+    const cpx = lodCam.position[0], cpy = lodCam.position[1], cpz = lodCam.position[2];
+    const orthoD = lodOrtho ? orthoLodDistance(lodCam.orthoSize) : 0, orthoD2 = orthoD * orthoD;
+    fs.lodHidden = 0; fs.lodTrisHidden = 0;
+    // FOG HORIZON CULL (fog-horizon.ts; Buildings only in fog): a mesh / group whose fog class is not part of the
+    // silhouette stops drawing (every pass, its shadow too) once its whole box lies past the fog edge, measured from
+    // the fog eye with the true distance (no lens / aerial / resolution scaling: the fog line is a real distance).
+    // Its pixels there were the flat fog colour anyway. +1 % keeps vertex sway inside the box. Off while a planar
+    // mirror is live (the mirror sees objects the eye's fog hides).
+    fs.fogHidden = 0; fs.fogTrisHidden = 0;
+    const fhS = this._fogHorizon;
+    const fhOn = fhS.buildingsOnly && this.fogHorizonActive && !this._planarActive && Renderer3D.fogHorizonCpuCull;
+    const fhCullOther = fhOn, fhCullAttach = fhOn && !fhS.includeAttachments;
+    { const c = fhOn ? fogHorizonEdge(this._fog) * 1.01 : Infinity; this._fhCull2 = c * c; }
+    // P2 FADE BAND: casters straddling [edge - band, edge] dissolve with the camera distance, so they cannot sit in the
+    // cached static shadow map (it is not re-rendered when only the camera moves): they go to the dynamic list.
+    { const band = fhOn ? fhS.fadeM * this.fogHorizonUnitsPerMetre : 0, edge = fhOn ? fogHorizonEdge(this._fog) : 0;
+      this._fhBandOn = band > 0; this._fhBandIn = Math.max(0, edge - band); this._fhBandAttach = fhCullAttach; }
+    // P9 HIERARCHICAL CULL (cull-clusters.ts): static meshes sit in spatial clusters; a cluster outside the view whose
+    // shadow cannot reach it rejects its members in a few reads each (visited in order, so the lists are unchanged).
+    const hcFrame = this._shadowFrameNo, fastLoop = this.drawListFastPaths;
+    // Step 3: with sliced uploads a streamed tile's geometry lands over ~40 frames instead of ~8, so "an append is
+    // deferred" is the normal state while streaming — the clusters stay on through it (a member that is not resident
+    // yet was never clustered and takes the per-mesh path, as before) and are only REBUILT once the appends caught up.
+    const hcOn = this.hierarchicalCull && !!culler && (!this._geomAppendDeferred || Renderer3D.slicedUploads);
+    if (hcOn && this._hcRebuild && !this._geomAppendDeferred) { this._hcRebuild = false; this._buildCullClusters(meshes); }
+    const hcT = this._hcTests;
+    hcT.inView = this._hcInView; hcT.shadows = buildShadow;
+    hcT.inLight = lightCuller ? this._hcInLight : null; hcT.reaches = reach ? this._hcReaches : null;
+    this._hcFloorY = floorY;
+    let hcMiss = 0, hcSkipped = 0, hcFogSkipped = 0;
+    const hcFog = hcOn && fhOn && Renderer3D.hcFogReject;
+    // P11 OCCLUSION CULL (occlusion-culler.ts; Renderer3D.occlusionCulling, default off): this frame's building walls
+    // rasterised into a small CPU depth buffer; a main-pass mesh / group wholly behind them is not drawn (camera passes
+    // only: the shadow lists above are built before this test). Same frame + conservative: nothing can pop.
+    const occ = culler ? this._beginOcclusion(meshes) : null;
+    if (this.occlusionDebugList) this.occlusionDebugList.length = 0;
+    fs.occlCulled = 0; fs.occlTrisCulled = 0;
+    // P11 CULL RANGES (cull-ranges.ts): a heavy mesh partly in the view / a cascade draws only its runs that are in it.
+    fs.rangeTrisCulled = 0; fs.rangeTrisCulledCascade = 0; fs.rangeBuilds = 0; fs.rangeTrisCulledShadow = 0;
+    this._rangePoolN = 0; this._rangeBuildBudget = Renderer3D.CULL_RANGE_BUILD_TRIS;
+    const rangeOn = Renderer3D.rangeCulling && !this._planarActive && !(this._ps1.vertexJitter > 0);
+    // P14.1 FAR-MAP RANGES (shadow-cache.ts ShadowRunTester): a heavy caster partly outside the light box / the shadow
+    // reach submits only its runs inside: the direct list against light box ∩ reach, the static list against the light
+    // box alone (it must stay valid while only the camera moves). Exact: a run is dropped only when it is clipped
+    // anyway (light box) or cannot shadow a visible receiver (reach, the rule the whole-mesh list already uses).
+    const farRangeOn = Renderer3D.shadowRangeCulling && !!lightCuller && !this._planarActive && !(this._ps1.vertexJitter > 0);
+    const runT = farRangeOn ? this._shadowRunTester.set(lightCuller, reach, lightDir, floorY) : null;
+    // P14.2 NEAR-CASCADE STATIC / DYNAMIC SPLIT: cLists[ci] = the cascade's STATIC casters (light box ∩ cascade box, no
+    // camera reach test, so turning the camera keeps the cached layer valid), cDyn[ci] = its dynamic ones (reach-culled,
+    // redrawn on every refresh on top of a copy of the static layer). Off = the single reach-culled list per cascade.
+    const cSplit = nC > 0 && Renderer3D.cascadeStaticCache;
+    this._cascadeSplitLists = cSplit;
+    const cDyn = this._cascadeDynLists; cDyn[0].length = 0; cDyn[1].length = 0;
+    const cSig = this._cascadeSigs; cSig[0].reset(); cSig[1].reset();
+    // P14 joiners (StaticLayerMembers): signatures of all static casters / of those already in each cached layer
+    this._joinDeferOn = Renderer3D.staticJoinDefer;
+    this._farSigAll.reset(); this._farSigKept.reset(); this._farStaticKeys.length = 0; this._farMembers.beginFrame();
+    for (let ci = 0; ci < 2; ci++) { this._cascadeSigsAll[ci].reset(); this._cascadeStaticKeys[ci].length = 0; this._cascadeMembers[ci].beginFrame(); }
+    // P15 GPU-DRIVEN main pass: this frame's cull inputs for the compute pass (the same locals the rules below use);
+    // every mesh / group the loop visits is stamped, forced records get the CPU verdict, and in LEAN mode the camera
+    // tail of a GPU-culled record is skipped (the GPU tests it).
+    const gd = this._gdOn ? this._gd : null, gdStamp = this._gdStamp, gdLean = gd !== null && this._gdLean;
+    if (gd !== null) {
+      const F = this._gdF;
+      F.planes = culler ? culler.writePlanes(this._gdPlanes) : null;
+      this._gdCam[0] = cpx; this._gdCam[1] = cpy; this._gdCam[2] = cpz;
+      F.lodOn = lodOn; F.lodOrtho = lodOrtho; F.orthoD2 = orthoD2; F.lodScale = lodScale; F.lodBias = lodBias;
+      F.fogEye = this._fogEye; F.fogCull2 = this._fhCull2; F.fogCullOther = fhCullOther; F.fogCullAttach = fhCullAttach;
+      F.hcOn = hcOn; F.groupTwins = Renderer3D.groupTwins;   // Phase B: the twin re-seed rule + the group-twin switch
+      F.ranges = rangeOn; F.mergeGap = Renderer3D.CULL_RANGE_MERGE_GAP;   // Phase B: P11 cull ranges (range jobs)
+      F.cpuState = GpuDrivenMain.cpuState;   // the LOD / twin hysteresis state is the loop's (GD_CTL_CPU_*)
+    }
+    // P15 PHASE C: the GPU decides the records' shadow casters this frame (the loop skips their shadow section)
+    const gdSh = gd !== null && !this._gdWarm && GpuDrivenMain.shadows && buildShadow && gd.shadowReady;
+    this._gdShThis = gdSh;
+    if (gd !== null) {
+      const S = this._gdS;
+      S.on = gdSh;
+      if (gdSh) {
+        S.light = lightCuller ? lightCuller.writePlanes(this._gdShL) : null;
+        S.cascades = nC;
+        for (let ci = 0; ci < 2; ci++) S.casc[ci] = ci < nC ? cCull[ci].writePlanes(this._gdShC[ci]) : null;
+        S.ldir = lightDir; S.floorY = floorY; S.reach = !!reach;
+        S.lodFar = lodTexFar; S.lodC0 = lodTexC[0]; S.lodC1 = lodTexC[1];
+        S.cache = cacheLists; S.split = cSplit; S.wind = windOn; S.join = this._joinDeferOn;
+        S.band = this._fhBandOn; S.bandAttach = this._fhBandAttach; S.bandIn = this._fhBandIn;
+      }
+    }
 
     for (let i = 0; i < meshes.length; i++) {
       const m = meshes[i];
-      if (culler) {
-        const bb = this.getMeshWorldAABB3D(m, this._aabbScratch);
-        if (bb && !culler.testAABB(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ)) continue;
+      if (m.arraySourceOnly) continue;   // P12: an instanced-crowd group SOURCE (never drawn itself; its copies are)
+      const gdRec = gd !== null ? gd.seeMesh(m) : -1;   // P15: stamped (its record index, or -1)
+      if (hcOn) {
+        const hc = m._hcC;
+        if (hc !== null && hc.owner === this && m._hcVer === m.localMatrixVersion && !m.gpuDirty) {
+          if (hc.frame !== hcFrame) {
+            hc.frame = hcFrame; hc.verdict = clusterVerdict(hc, hcT);
+            // FOG HORIZON cluster reject (2026-10-01): the cluster's whole union box past the fog edge x 1.01 -> every
+            // member's box is too (a member keeps its build-time box while its matrix version holds, checked below).
+            hc.fogPast = hcFog && this._fogBoxPast(hc.box[0], hc.box[1], hc.box[2], hc.box[3], hc.box[4], hc.box[5]);
+          }
+          const e = m._r3Aabb as MeshAABBEntry | null;
+          if (hc.verdict !== HC_PASS && e !== null && e.owner === this && !e.dead && e.ref === m && e.matVersion === m.localMatrixVersion) {
+            fs.trisTotal += m._hcTris | 0; fs.meshesCulled++; hcSkipped++;
+            if (e.wMinY < nextFloor) nextFloor = e.wMinY;
+            if (e.wMaxY > nextTop) nextTop = e.wMaxY;
+            // Off view and its shadow misses the view: only the P4.2 static shadow cache still wants it (as the full
+            // path below would add it: drawn by its LOD / twin state, opaque, fine enough for the far map, static).
+            if (hc.verdict === HC_NOREACH && gdSh && gdRec >= 0 && !m._gdKF) gd!.markNoReach(gdRec);   // P15 Phase C: the GPU's static push
+            else if (hc.verdict === HC_NOREACH && cacheLists && m.material.opacity >= 1 && !m.lodHidden
+                && !((m.fogClass === 2 ? fhCullOther : m.fogClass === 1 && fhCullAttach) && !m.material.noFog && this._fogBoxPast(e.wMinX, e.wMinY, e.wMinZ, e.wMaxX, e.wMaxY, e.wMaxZ))
+                && (m.lodTwinRole === 0 || twinDraws(m.lodTwinRole, m.lodTwinNear, m.lodTwinNear2))
+                && !(m.shadowFeatureSize > 0 && m.shadowFeatureSize < lodTexFar) && !this._casterIsDynamic(m, windOn)) {
+              const slot = this._meshInstanceSlots.get(m.id) ?? i;
+              this._pushDraw(staticList, m, slot);
+              this._farStatic(m, this._lastCasterUid, slot, 1, m._hcTris | 0, null);
+            }
+            continue;
+          }
+        } else if (m._hcB !== this._hcSerial || (hc !== null && m._hcVer !== m.localMatrixVersion)) hcMiss++;   // new since the build, or a member that moved
+        // A twin that sat in a rejected cluster re-seeds its swap state (its pair partner does the same), so two
+        // twins of one chunk never come back with different hysteresis histories.
+        if (m.lodTwinRole !== 0 && !m.lodTwinExternal && m._hcSeen !== hcFrame - 1) { m.lodTwinNear = false; m.lodTwinNear2 = true; }
+        m._hcSeen = hcFrame;
+        if (gd !== null) gd.markVisited(m, gdRec);   // P15 Phase B: past the hierarchical cull (GD_CTL_VISITED)
+        // FOG HORIZON cluster reject: a member of a cluster wholly past the fog edge whose own class is culled ends
+        // exactly where the fog test below would end it (that test runs before the distance LOD / twin updates, so
+        // they are skipped either way): the same lists and state, without the box fetch and the per-mesh test.
+        // Members of a cullable class only; a building member (class 0) or a no-fog one falls through.
+        if (hc !== null && hc.fogPast && hc.frame === hcFrame && hc.owner === this && m._hcVer === m.localMatrixVersion && !m.gpuDirty
+            && (m.fogClass === 2 ? fhCullOther : m.fogClass === 1 && fhCullAttach) && !m.material.noFog) {
+          const e = m._r3Aabb as MeshAABBEntry | null;
+          if (e !== null && e.owner === this && !e.dead && e.ref === m && e.matVersion === m.localMatrixVersion) {
+            const t = m._hcTris | 0;
+            fs.trisTotal += t; fs.fogHidden++; fs.fogTrisHidden += t; hcFogSkipped++;
+            if (e.wMinY < nextFloor) nextFloor = e.wMinY;
+            if (e.wMaxY > nextTop) nextTop = e.wMaxY;
+            m.fogHidden = true;
+            continue;
+          }
+        }
       }
+      if (m._r3o !== this || m._r3g !== this._r3Gen || !fastLoop) {
+        m._r3o = this; m._r3g = this._r3Gen;
+        const mid = m.id;
+        m._r3GA = this._geomAllocs.get(mid); m._r3Slot = this._meshInstanceSlots.get(mid) ?? -1;
+      }
+      const gdCull = gdRec >= 0 && gd!.syncMesh(m, gdRec, i);   // P15: record re-checked; true = the GPU culls it
+      const alloc = m._r3GA as GeomAlloc | undefined;
+      // P5: geometry still queued by the time-sliced append → not drawable yet. Keep it out of every list (and so out
+      // of the P4.2 static-shadow signature, which then changes when it lands and refreshes the cached map).
+      if (!alloc && this._geomAppendDeferred && m.geometry && m.geometry.vertices.length > 0) continue;
+      const tris = alloc ? (alloc.indexCount / 3) | 0 : 0;   // P9: an int (a double here was boxed per mesh below TurboFan)
+      fs.trisTotal += tris;
+      let bb: AABB3 | null = null;
+      const lodMesh = lodOn && m.drawDistance > 0;
+      if (culler || lightCuller || lodMesh) {
+        // P9: inline cache hit (the common case: a static mesh whose entry is current) — getMeshWorldAABB3D's
+        // getters + call were ~15 % of the draw-list build in a tiled city.
+        const e = m._r3Aabb as MeshAABBEntry | null;
+        if (fastLoop && e !== null && e.owner === this && !e.dead && e.ref === m && e.matVersion === m.localMatrixVersion && !m.gpuDirty) {
+          const s = this._aabbScratch;
+          s.minX = e.wMinX; s.minY = e.wMinY; s.minZ = e.wMinZ; s.maxX = e.wMaxX; s.maxY = e.wMaxY; s.maxZ = e.wMaxZ;
+          bb = s;
+        } else bb = this.getMeshWorldAABB3D(m, this._aabbScratch);
+      }
+      if (bb && bb.minY < nextFloor) nextFloor = bb.minY;
+      if (bb && bb.maxY > nextTop) nextTop = bb.maxY;
+      // FOG HORIZON CULL (see above). Since 2026-10-01 BEFORE the distance LOD / twin updates: a fog-culled mesh's
+      // hysteresis state (lodHidden, the twin choice) is held while it is past the fog and picked up where it was when
+      // it comes back (both twins of a pair share one box and class, so they are culled together and stay in step).
+      // This makes the cluster-level reject above exact (it skips the same updates) and fog-culled meshes cheaper.
+      if ((m.fogClass === 2 ? fhCullOther : m.fogClass === 1 && fhCullAttach) && !m.material.noFog) {   // noFog: never fog-culled
+        if (!bb) bb = this.getMeshWorldAABB3D(m, this._aabbScratch);
+        if (bb && this._fogBoxPast(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ)) { m.fogHidden = true; fs.fogHidden++; fs.fogTrisHidden += tris; continue; }
+      }
+      if (m.fogHidden) m.fogHidden = false;
+      let camD2 = -1;   // P9: camera → box squared distance, computed inline once (aabbDistanceSq / distanceLodHidden, unrolled)
+      if (lodMesh && bb) {
+        if (lodOrtho) camD2 = orthoD2;
+        else {
+          const dx = cpx < bb.minX ? bb.minX - cpx : cpx > bb.maxX ? cpx - bb.maxX : 0;
+          const dy = cpy < bb.minY ? bb.minY - cpy : cpy > bb.maxY ? cpy - bb.maxY : 0;
+          const dz = cpz < bb.minZ ? bb.minZ - cpz : cpz > bb.maxZ ? cpz - bb.maxZ : 0;
+          camD2 = dx * dx + dy * dy + dz * dz;
+        }
+        const far = (m.drawDistance + lodBias * m.drawDistanceBias) * lodScale;
+        if (m.lodHidden) { const sh = far * DISTANCE_LOD_SHOW; m.lodHidden = camD2 >= sh * sh; } else m.lodHidden = camD2 > far * far;
+        if (m.lodHidden) { fs.lodHidden++; fs.lodTrisHidden += tris; if (gdRec >= 0) gd!.cpuMesh(gdRec, m); continue; }
+      } else if (m.lodHidden) m.lodHidden = false;
+      // E2 NEAR/FAR TWIN (chipped edges near only): both twins of a chunk share its box, threshold and hysteresis
+      // rule (same starting state), so exactly one of them draws. No aerial bias — chips are invisible from the air.
+      if (m.lodTwinRole !== 0) {
+        if (!bb) bb = this.getMeshWorldAABB3D(m, this._aabbScratch);
+        const tb = bb, role = m.lodTwinRole;
+        // P9: roles 3 / 4 (mid / xfar of a three-tier family) also track the second threshold; a degraded prop far
+        // twin (lodTwinOffNear) yields to its near twin whenever the distance cannot decide (LOD off).
+        // P8: the A/B switch Renderer3D.groupTwins = false also keeps the instanced tree crowns' instance 0 (this mesh) near.
+        if (m.lodTwinExternal) { /* P12: the owner (world-crowd.ts) set the state */ }
+        else if (!lodOn || !tb || (m.lodTwinInstanced && !Renderer3D.groupTwins)) { m.lodTwinNear = m.lodTwinOffNear; m.lodTwinNear2 = true; }
+        else {
+          const td2 = camD2 >= 0 ? camD2 : lodOrtho ? orthoD2 : aabbDistanceSq(cpx, cpy, cpz, tb.minX, tb.minY, tb.minZ, tb.maxX, tb.maxY, tb.maxZ);
+          if (role !== 4) m.lodTwinNear = m.lodTwinDist > 0 ? !distanceLodHidden(td2, m.lodTwinDist * lodScale, !m.lodTwinNear) : m.lodTwinOffNear;
+          if (role >= 3) m.lodTwinNear2 = m.lodTwinDist2 > 0 ? !distanceLodHidden(td2, m.lodTwinDist2 * lodScale, !m.lodTwinNear2) : true;
+        }
+        if (!twinDraws(role, m.lodTwinNear, m.lodTwinNear2)) { fs.lodHidden++; fs.lodTrisHidden += tris; if (gdRec >= 0) gd!.cpuMesh(gdRec, m); continue; }
+      }
+      if (gdRec >= 0) gd!.cpuMesh(gdRec, m);   // P15: the loop's LOD / twin state for the cull (GD_CTL_CPU_*)
+      // Shadow caster (light box) — independent of the camera test. Opaque only; a multi-material mesh is ONE full-
+      // geometry entry (the opaqueForPasses dedup rule: first opaque submesh's slot, no submesh).
+      let singleSlot = -1;   // P6: the single-material slot, looked up once for both lists
+      if (buildShadow && !(gdSh && gdRec >= 0 && !m._gdKF)) {   // P15 Phase C: a GPU record's casters are the GPU's
+        if (bb && lightCuller && !(fastLoop ? lightCuller.testBox(bb) : lightCuller.testAABB(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ))) fs.shadowCulled++;
+        else {
+          const reachOk = !(bb && reach && !(fastLoop ? shadowReachesViewBox(reach, lightDir, floorY, bb) : shadowReachesView(reach, lightDir, floorY, bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ)));
+          if (!reachOk) fs.shadowOffView++;
+          // The one opaque slot this mesh casts from (multi-material: the first opaque submesh's slot).
+          let slot = -1;
+          if (m.submeshes.length > 0) {
+            const slots = this._meshSubmeshSlots.get(m.id);
+            for (let si = 0; si < m.submeshes.length; si++) {
+              if (m.submeshes[si].material.opacity < 1) continue;
+              if (!shadowSeen.has(m.id)) { shadowSeen.add(m.id); slot = slots?.[si] ?? 0; }
+              break;
+            }
+          } else if (m.material.opacity >= 1) slot = singleSlot = m._r3Slot >= 0 ? m._r3Slot : i;
+          const fsz = m.shadowFeatureSize;
+          // P8 SHADOW LOD: the far map's texel is too coarse for this caster — it stays out of the far map (and its
+          // P4.2 static set / signature) but may still cast into a near cascade fine enough for it.
+          const farSkip = slot >= 0 && fsz > 0 && fsz < lodTexFar;
+          // One static / dynamic verdict for the P4.2 far cache and the P14 cascade split (_casterIsDynamic also
+          // looks up the caster uid of the signatures). Without the split it is asked exactly where P4.2 asked it.
+          const isDyn = slot >= 0 && ((cacheLists && !farSkip) || cSplit) ? this._casterIsDynamic(m, windOn) : false;
+          const cUid = this._lastCasterUid;
+          let whole: RendererDrawEntry | null = null;   // this caster's full-geometry entry (shared by the lists)
+          if (farSkip) {
+            fs.shadowLodFar++;
+            if (reachOk && !cSplit) {
+              let ce: RendererDrawEntry | null = null;
+              for (let ci = 0; ci < nC; ci++) {
+                if (fsz < lodTexC[ci]) { fs.shadowLodCascade++; continue; }
+                if (bb && !(fastLoop ? cCull[ci].testBox(bb) : cCull[ci].testAABB(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ))) continue;
+                if (ce) cLists[ci].push(ce); else { this._pushDraw(cLists[ci], m, slot); ce = cLists[ci][cLists[ci].length - 1]; }
+              }
+            }
+          } else if (slot >= 0) {
+            const rgF = runT !== null && bb && tris >= Renderer3D.CULL_RANGE_MIN_TRIS ? this._rangesFor(m, alloc) : null;
+            // (P14.1: a ranged caster carries its run table; the far map's lists are expanded only when it renders)
+            if (reachOk) { this._pushDraw(shadowList, m, slot); whole = shadowList[shadowList.length - 1]; if (rgF !== null) whole.frg = rgF; }
+            if (cacheLists) {
+              if (isDyn) { if (whole !== null) dynList.push(whole); }
+              else {
+                if (whole !== null) staticList.push(whole);
+                else { this._pushDraw(staticList, m, slot); whole = staticList[staticList.length - 1]; if (rgF !== null) whole.frg = rgF; }
+                this._farStatic(m, cUid, slot, 1, tris, reachOk ? whole : null);   // cUid == _casterUidOf(m): _casterIsDynamic just looked it up
+              }
+            }
+          }
+          // NEAR CASCADES: every caster the far map kept (reach-culled; split: the static ones without the reach test,
+          // so the cached static layer does not depend on where the camera looks) that touches the cascade's box.
+          if (nC > 0 && slot >= 0 && (cSplit || (reachOk && !farSkip))) {
+            for (let ci = 0; ci < nC; ci++) {
+              if (fsz > 0 && fsz < lodTexC[ci]) { fs.shadowLodCascade++; continue; }   // P8: too small for this cascade
+              if (bb && !(fastLoop ? cCull[ci].testBox(bb) : cCull[ci].testAABB(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ))) continue;
+              if (cSplit && isDyn && !reachOk) continue;   // a dynamic caster is redrawn every refresh: reach-culled
+              const list = cSplit && isDyn ? cDyn[ci] : cLists[ci];
+              const rg = rangeOn && bb && tris >= Renderer3D.CULL_RANGE_MIN_TRIS && !cCull[ci].containsBox(bb) ? this._rangesFor(m, alloc) : null;
+              if (cSplit && !isDyn) {
+                // a cached static layer: ranges are expanded only when it re-renders (_expandRanges, crg)
+                if (whole !== null) list.push(whole); else { this._pushDraw(list, m, slot); whole = list[list.length - 1]; }
+                if (rg) whole.crg = rg;
+                this._cascStatic(ci, m, cUid, slot, ci + 1, tris, reachOk ? whole : null);
+              }
+              else if (rg) fs.rangeTrisCulledCascade += tris - this._rangedPush(list, m, slot, rg, cCull[ci]);
+              else if (whole !== null) list.push(whole);
+              else { this._pushDraw(list, m, slot); whole = list[list.length - 1]; }
+            }
+          }
+        }
+      }
+      // P15 Phase B: a heavy record's run table (the range job draws only its runs in the view)
+      if (gdRec >= 0 && rangeOn && tris >= Renderer3D.CULL_RANGE_MIN_TRIS) gd!.syncRanges(gdRec, this._gdRangeTable(m, alloc, bb, culler));
+      if (gdLean && gdCull) continue;   // P15: the GPU culls + draws it
+      if (culler && bb && !(fastLoop ? culler.testBox(bb) : culler.testAABB(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ))) { fs.meshesCulled++; continue; }
+      if (occ !== null && bb && !occ.testBox(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ) && !this._occlExempt(m)) { fs.occlCulled++; fs.occlTrisCulled += tris; if (this.occlusionDebugList) this.occlusionDebugList.push(m); continue; }
+      if (rangeOn && culler && bb && tris >= Renderer3D.CULL_RANGE_MIN_TRIS && m.submeshes.length === 0 && m.material.opacity >= 1 && !culler.containsBox(bb)) {
+        const rg = this._rangesFor(m, alloc);
+        if (rg) {
+          const kept = this._rangedPush(opaque, m, singleSlot >= 0 ? singleSlot : (m._r3Slot >= 0 ? m._r3Slot : i), rg, culler);
+          fs.rangeTrisCulled += tris - kept;
+          if (kept === 0) fs.meshesCulled++; else { fs.trisVisible += kept; if (gd !== null) { m._gdVis = gdStamp; if (gdRec >= 0) gd.markVis(gdRec); } }
+          continue;
+        }
+      }
+      if (gd !== null) { m._gdVis = gdStamp; if (gdRec >= 0) gd.markVis(gdRec); }   // P15: the CPU path draws it this frame
+      fs.trisVisible += tris;
       if (m.submeshes.length > 0) {
         // Multi-material: one draw entry per submesh.
         const slots = this._meshSubmeshSlots.get(m.id);
@@ -2403,7 +4436,7 @@ export class Renderer3D {
         }
       } else {
         // Single-material: idx = slot in the geometryKey-sorted instance buffer.
-        const idx = this._meshInstanceSlots.get(m.id) ?? i;
+        const idx = singleSlot >= 0 ? singleSlot : (m._r3Slot >= 0 ? m._r3Slot : i);
         if (m.material.opacity < 1) this._pushDraw(transparent, m, idx);
         else this._pushDraw(opaque, m, idx);
       }
@@ -2411,19 +4444,114 @@ export class Renderer3D {
 
     // Add GPU-instanced array group draw entries (no Mesh3D copies — instances computed from params).
     // Each instance uses the source mesh's geometry; slots are contiguous immediately after source slot.
-    for (const group of this._arrayGroups) {
+    for (let _kgroup = 0; _kgroup < this._arrayGroups.length; _kgroup++) { const group = this._arrayGroups[_kgroup];
       const firstSlot = this._arrayGroupFirstSlot.get(group.id);
       if (firstSlot === undefined) continue;
       const sourceMesh = this._meshById.get(group.sourceId);   // O(1) (map built in uploadMeshInstances, which ran earlier this frame)
       if (!sourceMesh || sourceMesh.submeshes.length > 0) continue;
-      // Whole-group frustum cull (per-cell chunked groups off-screen skip all instances; city-wide groups span
-      // everything → never culls = no-op).
-      if (culler) {
-        const gb = this._arrayGroupWorldAABB(group, sourceMesh);
-        if (gb && !culler.testAABB(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5])) continue;
-      }
       const N = getArrayInstanceCount(group.arrayParams);
       if (N <= 0) continue;
+      const gdGRec = gd !== null ? gd.seeGroup(group, firstSlot, sourceMesh, N) : -1;   // P15: stamped + re-checked
+      // P8 INSTANCED NEAR/FAR TWINS (the far tree crowns; Renderer3D.groupTwins): a near group draws only while the
+      // camera is within lodTwinDist of its instances' ORIGIN box, the far group otherwise. The two groups of a twin
+      // pair hold the identical transforms (chunkCityLayers splits them on one grid), so they test the identical box
+      // with the same hysteresis history and exactly one of them draws. Evaluated before every other skip so both
+      // stay in lockstep. The far crown is a degraded copy: twins off / distance LOD off / no box → the near group.
+      const twinRole = sourceMesh.lodTwinRole;
+      if (twinRole !== 0 && sourceMesh.lodTwinExternal) {
+        // P12 EXTERNALLY DRIVEN group twin (the instanced crowd's xfar cells, world-crowd.ts): the owner decided.
+        if (!twinDraws(twinRole, sourceMesh.lodTwinNear, sourceMesh.lodTwinNear2)) { const ta = this._geomAllocs.get(sourceMesh.id); fs.lodHidden++; fs.lodTrisHidden += ta ? (ta.indexCount / 3) * N : 0; continue; }
+      } else if (twinRole === 1 || twinRole === 2) {
+        let near = true;
+        if (Renderer3D.groupTwins && lodOn && sourceMesh.lodTwinDist > 0) {
+          const tbx = this._arrayGroupWorldAABB(group, sourceMesh);
+          if (gdGRec >= 0) gd!.groupBox(gdGRec, tbx);   // P15 Phase B: the record's origin box follows the cache
+          const ob = this._agAABBCache.get(group.id)?.org;
+          if (ob) {
+            const was = this._lodTwinNearGroups.has(group.id);
+            near = !distanceLodHidden(lodOrtho ? orthoD2 : aabbDistanceSq(cpx, cpy, cpz, ob[0], ob[1], ob[2], ob[3], ob[4], ob[5]), sourceMesh.lodTwinDist * lodScale, !was);
+            if (near !== was) { if (near) this._lodTwinNearGroups.add(group.id); else this._lodTwinNearGroups.delete(group.id); }
+          }
+        }
+        if (gdGRec >= 0) gd!.cpuGroupNear(gdGRec, near);   // P15: the loop's twin state for the cull
+        if ((twinRole === 1) !== near) { const ta = this._geomAllocs.get(sourceMesh.id); fs.lodHidden++; fs.lodTrisHidden += ta ? (ta.indexCount / 3) * N : 0; continue; }
+      }
+      const aAlloc = this._geomAllocs.get(sourceMesh.id);
+      if (!aAlloc && this._geomAppendDeferred) continue;   // P5: source geometry not resident yet (time-sliced append)
+      const gTris = aAlloc ? (aAlloc.indexCount / 3) * N : 0;
+      fs.trisTotal += gTris;
+      // Whole-group frustum cull (per-cell chunked groups off-screen skip all instances; a city-wide group spans
+      // everything → never culls). Also the shadow test, against the light box.
+      const lodGroup = lodOn && sourceMesh.drawDistance > 0;
+      const gb = culler || lightCuller || lodGroup ? this._arrayGroupWorldAABB(group, sourceMesh) : null;
+      if (gdGRec >= 0 && gb !== null) gd!.groupBox(gdGRec, gb);   // P15: the record follows the group's box
+      if (lodGroup && gb) {
+        const was = this._lodHiddenGroups.has(group.id);
+        const hid = distanceLodHidden(lodOrtho ? orthoD2 : aabbDistanceSq(cpx, cpy, cpz, gb[0], gb[1], gb[2], gb[3], gb[4], gb[5]), (sourceMesh.drawDistance + lodBias * sourceMesh.drawDistanceBias) * lodScale, was);
+        if (hid !== was) { if (hid) this._lodHiddenGroups.add(group.id); else this._lodHiddenGroups.delete(group.id); }
+        if (gdGRec >= 0) gd!.cpuGroupLod(gdGRec, hid);   // P15: the loop's LOD state for the cull
+        if (hid) { if (gb[1] < nextFloor) nextFloor = gb[1]; fs.lodHidden++; fs.lodTrisHidden += gTris; continue; }
+      } else {
+        if (this._lodHiddenGroups.size > 0 && this._lodHiddenGroups.has(group.id)) this._lodHiddenGroups.delete(group.id);
+        if (gdGRec >= 0) gd!.cpuGroupLod(gdGRec, false);
+      }
+      // FOG HORIZON CULL (see the mesh loop): the group's whole box past the fog edge.
+      if ((sourceMesh.fogClass === 2 ? fhCullOther : sourceMesh.fogClass === 1 && fhCullAttach) && !sourceMesh.material.noFog) {
+        const fb = gb ?? this._arrayGroupWorldAABB(group, sourceMesh);
+        if (gdGRec >= 0 && gb === null) gd!.groupBox(gdGRec, fb);
+        if (fb && this._fogBoxPast(fb[0], fb[1], fb[2], fb[3], fb[4], fb[5])) { if (fb[1] < nextFloor) nextFloor = fb[1]; fs.fogHidden++; fs.fogTrisHidden += gTris; continue; }
+      }
+      // Shadow: an opted-in (castsInstancedShadow) opaque group is one instanced-range caster, light-box culled.
+      if (gb && gb[1] < nextFloor) nextFloor = gb[1];
+      if (gb && gb[4] > nextTop) nextTop = gb[4];
+      if (buildShadow && sourceMesh.castsInstancedShadow && sourceMesh.material.opacity >= 1 && !(gdSh && gdGRec >= 0 && !gd!.isForced(gdGRec))) {
+        const gfs = sourceMesh.shadowFeatureSize;
+        if (gb && lightCuller && !lightCuller.testAABB(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5])) fs.shadowCulled++;
+        else if (gfs > 0 && gfs < lodTexFar) {
+          // P8 SHADOW LOD (see the mesh loop): out of the far map; the near cascades that can resolve it keep it.
+          fs.shadowLodFar++;
+          const gReach = !(gb && reach && !shadowReachesView(reach, lightDir, floorY, gb[0], gb[1], gb[2], gb[3], gb[4], gb[5]));
+          if (cSplit) this._groupCascades(group, sourceMesh, firstSlot, N, gb, null, gReach, windOn, gfs, gTris);
+          else if (gReach) {
+            let ce: RendererDrawEntry | null = null;
+            for (let ci = 0; ci < nC; ci++) {
+              if (gfs < lodTexC[ci]) { fs.shadowLodCascade++; continue; }
+              if (gb && !cCull[ci].testAABB(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5])) continue;
+              if (ce) cLists[ci].push(ce); else { this._pushDraw(cLists[ci], sourceMesh, firstSlot, undefined, N); ce = cLists[ci][cLists[ci].length - 1]; }
+            }
+          }
+        } else {
+          const reachOk = !(gb && reach && !shadowReachesView(reach, lightDir, floorY, gb[0], gb[1], gb[2], gb[3], gb[4], gb[5]));
+          let se: RendererDrawEntry | null = null;
+          if (!reachOk) fs.shadowOffView++;
+          else {
+            this._pushDraw(shadowList, sourceMesh, firstSlot, undefined, N);
+            se = shadowList[shadowList.length - 1];
+            if (!cSplit) {
+              for (let ci = 0; ci < nC; ci++) {
+                if (gfs > 0 && gfs < lodTexC[ci]) { fs.shadowLodCascade++; continue; }
+                if (!gb || cCull[ci].testAABB(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5])) cLists[ci].push(se);
+              }
+            }
+          }
+          if (cacheLists) {   // P4.2: wind-swayed groups (trees) are dynamic; the rest join the static set
+            if (this._groupCasterDynamic(sourceMesh, gb, windOn)) { if (se) dynList.push(se); }
+            else {
+              if (se) staticList.push(se); else this._pushDraw(staticList, sourceMesh, firstSlot, undefined, N);
+              this._farStatic(group, this._casterUidOf(sourceMesh) ^ 0x5bd1e995, firstSlot * 65599 + N, sourceMesh.localMatrixVersion, gTris, se);
+            }
+          }
+          if (cSplit) this._groupCascades(group, sourceMesh, firstSlot, N, gb, se, reachOk, windOn, gfs, gTris);
+        }
+      }
+      // P22 propCull: an instanced prop group's runs of copies (CPU: spans below; GPU: a range job in instance mode)
+      const propTab = P22_RENDER.propCull && group.instanceXf && N >= Renderer3D.PROP_CULL_MIN && sourceMesh.material.opacity >= 1 ? this._propCullTable(group, sourceMesh, N) : null;
+      if (gdGRec >= 0) gd!.syncRanges(gdGRec, propTab);
+      if (gdLean && gd!.gpuCulls(gdGRec)) continue;   // P15: the GPU culls + draws it
+      if (culler && gb && !culler.testAABB(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5])) { fs.groupsCulled++; fs.instancesCulled += N; continue; }
+      if (occ !== null && gb && !occ.testBox(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5]) && !this._occlExempt(sourceMesh)) { fs.occlCulled++; fs.occlTrisCulled += gTris; if (this.occlusionDebugList) this.occlusionDebugList.push(group); continue; }
+      if (gd !== null) { group._gdVis = gdStamp; if (gdGRec >= 0) gd.markVis(gdGRec); }   // P15: the CPU path draws it
+      fs.trisVisible += gTris;
       if (sourceMesh.material.opacity < 1) {
         // Transparent instances need per-instance back-to-front ordering — keep one entry each.
         for (let i = 0; i < N; i++) this._pushDraw(transparent, sourceMesh, firstSlot + i);
@@ -2432,7 +4560,17 @@ export class Renderer3D {
         // per-frame draw pipeline (filter/sort/shadow-dedup/batch) ran O(total instances); with the city greenery
         // visible that's ~18K entries EVERY frame = the 60→33fps zoom-in cliff. Depth-test orders opaque, so the
         // slots are already contiguous — one drawMesh(firstSlot, N) draws them all.
-        this._pushDraw(opaque, sourceMesh, firstSlot, undefined, N);
+        // P22 propCull: an instanced prop group partly in the view draws only its runs of copies whose box passes
+        // (whole runs outside a plane are clipped anyway: the same pixels), as one entry per kept span
+        const pt = propTab !== null && culler && gb && !culler.containsAABB(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5]) ? propTab : null;
+        if (pt) {
+          const sp = this._propSpans, kept = Math.round(selectRanges(pt, culler!, sp, Renderer3D.PROP_CULL_GAP) * 3);   // (its count / 3 → copies)
+          for (let s = 0; s < sp.length; s += 2) { this._pushDraw(opaque, sourceMesh, firstSlot + sp[s], undefined, sp[s + 1]); if (gd !== null) opaque[opaque.length - 1].gdObj = group; }
+          if (aAlloc) { const cut = (aAlloc.indexCount / 3) * (N - kept); fs.trisVisible -= cut; this._propCulledTris += cut; }
+        } else {
+          this._pushDraw(opaque, sourceMesh, firstSlot, undefined, N);
+          if (gd !== null) opaque[opaque.length - 1].gdObj = group;
+        }
       }
     }
 
@@ -2441,7 +4579,7 @@ export class Renderer3D {
     const opaqueForPasses = this._opaqueForPasses; opaqueForPasses.length = 0;
     {
       const seen = this._opaqueSeen; seen.clear();
-      for (const e of opaque) {
+      for (let _ke = 0; _ke < opaque.length; _ke++) { const e = opaque[_ke];
         // Instanced detail (greenery / juliet / window-trim — the count>1 array-group ranges) does NOT cast
         // shadows or feed the outline depth pass: at city scale those shadows/edges are invisible, but
         // redrawing ~18K instances into the shadow map (every 3rd frame) is a big GPU cost. The MAIN pass
@@ -2461,22 +4599,195 @@ export class Renderer3D {
         }
       }
     }
+    // Pre-Round-5 behaviour (toggle off / shadows suspended): the shadow pass replays the camera-culled pass list.
+    if (!buildShadow) for (let _ke = 0; _ke < opaqueForPasses.length; _ke++) shadowList.push(opaqueForPasses[_ke]);
+    if (!buildShadow) for (let ci = 0; ci < this._cascadeCount; ci++) for (let _ke = 0; _ke < shadowList.length; _ke++) cLists[ci].push(shadowList[_ke]);
+    fs.shadowCasters = shadowList.length;
+    fs.cascadeCasters = cLists[0].length + cLists[1].length;
+    if (gdSh) this._gdShEpochMix();   // P15 Phase C: the GPU casters' leavers / joiners into the static-layer signatures
+    if (cacheLists) {
+      this._shadowStaticSig = (this._sigSum ^ Math.imul(this._sigXor, 31) ^ Math.imul(staticList.length, 0x01000193)) | 0;
+      if (this._joinDeferOn) { this._shadowStaticSig = this._farSigKept.value; this._shadowStaticSigAll = this._farSigAll.value; }   // P14 joiners
+    }
+    {
+      this._farMembers.endFrame(); this._cascadeMembers[0].endFrame(); this._cascadeMembers[1].endFrame();
+      this._shadowCacheStats.staticCasters = staticList.length; this._shadowCacheStats.dynCasters = dynList.length;
+    }
+    this._sceneTopY = nextTop;
+    this._sceneFloorY = nextFloor;
+   // next frame's shadow-reach floor (Infinity when nothing had bounds → reach test off)
+    // P9: rebuild the clusters once enough of the roster is unclustered (new / moved meshes) for 30 frames running.
+    this._hcStats.skipped = hcSkipped; this._hcStats.fogSkipped = hcFogSkipped;
+    if (hcOn && hcMiss > Math.max(48, meshes.length * 0.03)) { if (++this._hcMissFrames >= 30) { this._hcMissFrames = 0; this._hcRebuild = true; } }
+    else this._hcMissFrames = 0;
+    fs.msCull = performance.now() - _tc0;
     // Last pool push happened above (opaqueForPasses). Trim the pool to this frame's high-water so stale
     // entries don't PIN removed meshes (holding their geometry) after the scene shrinks. Stable city =
     // length === _drawPoolN → no-op; only a genuine shrink drops (and later regrows) the tail.
     if (this._drawPool.length > this._drawPoolN) this._drawPool.length = this._drawPoolN;
   }
 
+  /** P2 (docs/specs/performance-plan.md): set `p` on the pass, or — when it is still compiling asynchronously —
+   *  flag the following _drawMesh / _replayRuns calls as SKIPPED until the next _setPipe. Every setPipeline that
+   *  precedes _drawMesh goes through here, so the flag is always re-armed per run. Returns false when pending. */
+  private _skipDraws = false;
+  private _pipeSkips = 0;
+  private _setPipe(pass: GPURenderPassEncoder, p: GPURenderPipeline | null, fallback: GPURenderPipeline | null = null): boolean {
+    if (!p) { this._skipDraws = true; this._pipeSkips++; return false; }
+    pass.setPipeline(p);
+    this._skipDraws = false;
+    // P22: the full-format pipeline is bound (a new encoder: nothing else of it is known). `fallback` = a pipeline with
+    // the same output whose twin a packed draw may use while `p`'s compiles (a shader variant's base pipeline).
+    if (pass !== this._pkEnc) { this._pkEnc = pass; this._pkIbKnown = false; this._pkTanEnc = null; }
+    this._pkBase = p; this._pkFb = fallback !== p ? fallback : null; this._pkTwin = false;
+    return true;
+  }
+  // P22 packed draws (CPU path): the pipeline the caller bound with _setPipe (`_pkBase`) and what _drawMesh switched on
+  // `_pkEnc` since — its packed twin (`_pkTwin`), the index format (`_pkIb16`, valid while `_pkIbKnown`), the
+  // constant-tangent buffer in slot 1 (`_pkTanEnc`). Code that rebinds the pool's buffers itself, or executes a render
+  // bundle (which clears the pass state), calls `_pkLost(pass)`; the next draw then binds the format explicitly.
+  private _pkEnc: GPURenderPassEncoder | null = null;
+  private _pkBase: GPURenderPipeline | null = null;
+  private _pkFb: GPURenderPipeline | null = null;
+  private _pkTwin = false;
+  private _pkIb16 = false;
+  private _pkIbKnown = false;
+  private _pkTanEnc: GPURenderPassEncoder | null = null;
+  /** Draws skipped because a packed twin was still compiling (diagnostics). */
+  private _pkSkips = 0;
+  /** `pass`'s buffers were rebound / its state cleared by other code: forget what is bound. */
+  private _pkLost(pass: GPURenderPassEncoder): void { if (pass === this._pkEnc) { this._pkIbKnown = false; this._pkTanEnc = null; } }
+  /** Bind the format of `pk` on `enc` before a pooled draw. False = skip this draw (the twin is compiling). */
+  private _pkPrepare(enc: GPURenderPassEncoder, pk: boolean): boolean {
+    if (enc !== this._pkEnc) {
+      if (!pk) return true;   // an encoder no _setPipe ran on draws as it always did
+      this._pkEnc = enc; this._pkBase = null; this._pkFb = null; this._pkTwin = false; this._pkIbKnown = false; this._pkTanEnc = null;
+    }
+    if (pk !== this._pkTwin) {
+      if (pk) {
+        const tw = packedTwin(this.device, this._pkBase) ?? (this._pkFb ? packedTwin(this.device, this._pkFb) : null);
+        if (!tw) { this._pkSkips++; this.onDeferredWork?.(); return false; }
+        enc.setPipeline(tw);
+      } else if (this._pkBase) enc.setPipeline(this._pkBase);
+      this._pkTwin = pk;
+    }
+    if (pk && this._pkTanEnc !== enc) { enc.setVertexBuffer(1, constTangentBuffer(this.device)); this._pkTanEnc = enc; }
+    if (!this._pkIbKnown || this._pkIb16 !== pk) {
+      enc.setIndexBuffer(this._geomIB!, pk ? 'uint16' : 'uint32');
+      this._pkIb16 = pk; this._pkIbKnown = true;
+    }
+    return true;
+  }
+  /** P2.2 — document-driven warm-up: when the mesh roster changes, queue (DOCUMENT priority, ahead of the generic
+   *  common set) every pipeline variant these meshes route to — textured/untextured × plain/patterned × cull ×
+   *  shadow-receiving, transparent, skinned, and the shadow casters. Visible meshes already requested theirs at top
+   *  priority via the draw itself; this catches the off-screen rest (a character behind the camera, a mirror). */
+  private _prewarmSeen = { opaque: -1, skinned: -1, shadows: false };
+  /** Step 2: classify each mesh into a 5-bit variant code (no per-mesh string building) and queue only the pipeline
+   *  names not already queued for this Pipeline3D. `false` = the old per-mesh name Set (A/B reference). */
+  prewarmNewOnly = true;
+  private readonly _prewarmQueued = new Set<string>();
+  private _prewarmGen = 0;
+  private _prewarmFds = false;
+  private _prewarmSh = false;
+  private static _prewarmGenSeq = 0;
+  private _prewarmPipe: unknown = null;
+  private readonly _prewarmCodes = new Uint8Array(32);
+  /** Diagnostics: how many names the last roster change actually queued. */
+  private _prewarmLastQueued = 0;
+  private _prewarmForScene(meshes: readonly Mesh3D[], skinned: boolean): void {
+    const k = skinned ? 'skinned' : 'opaque';
+    if (this._prewarmSeen[k] === meshes.length && this._prewarmSeen.shadows === this._shadowsEnabled) return;
+    this._prewarmSeen[k] = meshes.length; this._prewarmSeen.shadows = this._shadowsEnabled;
+    if (this.prewarmNewOnly) { this._prewarmCoded(meshes, skinned); return; }
+    const names = new Set<string>();
+    const sh = this._shadowsEnabled ? 'Shadow' : '';
+    for (const m of meshes) {
+      const T = (m.material.hasTexture || m.material.hasNormalMap) ? 'Textured' : 'Untextured';
+      const plain = this._usesPatterns(m) ? '' : 'Plain';
+      if (skinned) { names.add(`skinnedOpaque${T}${plain}Pipeline`); continue; }
+      const noCull = (this.forceDoubleSided || !!m.material.doubleSided) ? 'NoCull' : '';
+      if (m.material.opacity < 1) { names.add(`transparent${T}${noCull}Pipeline`); continue; }
+      names.add(`opaque${T}${noCull}${plain}${sh}Pipeline`);
+      if (m.submeshes.length > 0) names.add(`opaque${T}${noCull}${sh}Pipeline`);   // multi-material → full variant
+    }
+    if (sh) names.add(skinned ? 'skinnedShadowPipeline' : 'shadowPassPipeline');
+    this.pipeline.warmPipelines([...names], PIPELINE_PRIORITY.DOCUMENT);
+  }
+  /** The same name set as the loop above, from per-mesh variant bits: 1 textured · 2 plain (no patterns) ·
+   *  4 noCull · 8 transparent · 16 has submeshes. Only names not queued before (for this Pipeline3D) are warmed —
+   *  warming an already queued / compiled name at the same priority is a no-op. */
+  private _prewarmCoded(meshes: readonly Mesh3D[], skinned: boolean): void {
+    // The classification generation: a mesh already classified in this generation was queued already, so only the
+    // NEW meshes (and ones whose material was set since: setMaterial resets their stamp) are classified. A new
+    // Pipeline3D, a shadows toggle or a force-double-sided change starts a new generation (full re-classify).
+    const fds = this.forceDoubleSided, sh0 = this._shadowsEnabled;
+    if (this._prewarmPipe !== this.pipeline || this._prewarmFds !== fds || this._prewarmSh !== sh0) {
+      this._prewarmPipe = this.pipeline; this._prewarmFds = fds; this._prewarmSh = sh0;
+      this._prewarmQueued.clear(); this._prewarmGen = ++Renderer3D._prewarmGenSeq;
+    }
+    const gen = this._prewarmGen;
+    const seen = this._prewarmCodes; seen.fill(0);
+    let any = false;
+    for (let i = 0; i < meshes.length; i++) {
+      const m = meshes[i];
+      if (m._pwGen === gen) continue;
+      const mat = m.material;
+      // 1 textured · 2 plain · 4 double-sided (material) · 8 transparent · 16 submeshes
+      const c = ((mat.hasTexture || mat.hasNormalMap) ? 1 : 0) | (this._usesPatterns(m) ? 0 : 2)
+        | (mat.doubleSided ? 4 : 0) | (mat.opacity < 1 ? 8 : 0) | (m.submeshes.length > 0 ? 16 : 0);
+      m._pwGen = gen; m._pwCode = c;
+      seen[skinned ? (c & 3) : (fds ? (c | 4) : c)] = 1;
+      any = true;
+    }
+    if (!any && this._prewarmQueued.size) { this._prewarmLastQueued = 0; return; }
+    const sh = this._shadowsEnabled ? 'Shadow' : '';
+    const names: string[] = [];
+    const add = (n: string) => { if (!this._prewarmQueued.has(n)) { this._prewarmQueued.add(n); names.push(n); } };
+    for (let c = 0; c < 32; c++) {
+      if (!seen[c]) continue;
+      const T = (c & 1) ? 'Textured' : 'Untextured', plain = (c & 2) ? 'Plain' : '';
+      if (skinned) { add(`skinnedOpaque${T}${plain}Pipeline`); continue; }
+      const noCull = (c & 4) ? 'NoCull' : '';
+      if (c & 8) { add(`transparent${T}${noCull}Pipeline`); continue; }
+      add(`opaque${T}${noCull}${plain}${sh}Pipeline`);
+      if (c & 16) add(`opaque${T}${noCull}${sh}Pipeline`);
+    }
+    if (sh) add(skinned ? 'skinnedShadowPipeline' : 'shadowPassPipeline');
+    this._prewarmLastQueued = names.length;
+    if (names.length) this.pipeline.warmPipelines(names, PIPELINE_PRIORITY.DOCUMENT);
+  }
+  /** Step 2 A/B: incremental draw rank + coded prewarm (both default on). */
+  setStructureOptions(o: { incrementalDrawOrder?: boolean; prewarmNewOnly?: boolean }): { incrementalDrawOrder: boolean; prewarmNewOnly: boolean } {
+    if (o.incrementalDrawOrder !== undefined) { this._drawOrder.incremental = !!o.incrementalDrawOrder; this._drawOrderDirty = true; }
+    if (o.prewarmNewOnly !== undefined) { this.prewarmNewOnly = !!o.prewarmNewOnly; this._prewarmQueued.clear(); this._prewarmPipe = null; this._prewarmSeen.opaque = -1; this._prewarmSeen.skinned = -1; }
+    return { incrementalDrawOrder: this._drawOrder.incremental, prewarmNewOnly: this.prewarmNewOnly };
+  }
+  /** Diagnostics for the structure-change work (draw rank + prewarm). */
+  getStructureStats(): { drawRank: { updates: number; merged: number; fullSorts: number; legacy: number; lastAdded: number; lastRemoved: number; size: number; keyCodes: number }; prewarmLastQueued: number; prewarmQueued: number } {
+    return { drawRank: { ...this._drawOrder.stats, size: this._drawOrder.size, keyCodes: this._drawOrder.codes.size }, prewarmLastQueued: this._prewarmLastQueued, prewarmQueued: this._prewarmQueued.size };
+  }
+
+  /** Draws skipped so far because their pipeline was still compiling (diagnostics). */
+  get pipelineSkips(): number { return this._pipeSkips; }
+
   /** Draw one mesh (or an instanced range) from the shared geometry pool — the former drawMeshes
    *  closure. instanceCount > 1 requires contiguous slots (guaranteed by the geometryKey sort in
    *  uploadMeshInstances). `vbRef` tracks the encoder's bound VB so overrides switch minimally. */
   private _drawMesh(enc: GPURenderPassEncoder, mesh: Mesh3D, firstInstance: number,
                     activeVBRef: { vb: GPUBuffer }, instanceCount = 1,
-                    submesh?: import('../../scene-graph/shapes/mesh-3d').Submesh3D): void {
+                    submesh?: { indexOffset: number; indexCount: number }): void {
+    if (this._skipDraws) return;      // P2: this run's pipeline is still compiling (async) → skip, never block
     if (instanceCount <= 0) return;   // empty batch run → skip; Dawn warns on a 0-instance draw (and it's a no-op)
     const alloc = this._geomAllocs.get(mesh.id);
     if (!alloc) return;
+    // P22: the allocation's format (packed = the twin pipeline + slot-1 tangent + 16-bit indices). Packable geometry is
+    // world geometry, which never has a vertex-buffer override.
+    if (!this._pkPrepare(enc, alloc.pk === true)) return;
     this._frame.drawCalls++;
+    const _dt = ((submesh ? submesh.indexCount : alloc.indexCount) / 3) * instanceCount;
+    this._frame.trisDrawn += _dt;
+    this._passDraws[this._passBucket]++; this._passTris[this._passBucket] += _dt;   // P11 per-pass counters
     const override = this._vertexBufferOverrides.get(mesh.id);
     const targetVB = override ?? this._geomVB!;
     if (targetVB !== activeVBRef.vb) {
@@ -2497,10 +4808,40 @@ export class Renderer3D {
    *  the planar pass — geometry-key + contiguous-instance-slot runs over opaqueForPasses. Cached per
    *  frame (drawMeshes resets `_passRunsCache` right after `_buildDrawLists`). */
   private _passRunsCache: { mesh: Mesh3D; idx: number; count: number }[] | null = null;
+  private _shadowRunsCache: { mesh: Mesh3D; idx: number; count: number }[] | null = null;
   private _passRuns(): { mesh: Mesh3D; idx: number; count: number }[] {
-    if (this._passRunsCache) return this._passRunsCache;
-    const opaqueForPasses = this._opaqueForPasses;
-    const runs: { mesh: Mesh3D; idx: number; count: number }[] = [];
+    return this._passRunsCache ??= this._buildRuns(this._opaqueForPasses);
+  }
+  /** The shadow pass's batched runs — over the LIGHT-culled caster list (see _shadowList). */
+  private _shadowRuns(): { mesh: Mesh3D; idx: number; count: number }[] {
+    return this._shadowRunsCache ??= this._buildRuns(this._expandRanges(this._shadowList, false, this._shadowRunTester, this._farExpDirect));
+  }
+  private readonly _farExpDirect: RendererDrawEntry[] = [];
+  private readonly _farExpStatic: RendererDrawEntry[] = [];
+  private readonly _farExpDyn: RendererDrawEntry[] = [];
+  private readonly _cascExp: RendererDrawEntry[][] = [[], []];
+  private readonly _cascExpDyn: RendererDrawEntry[][] = [[], []];
+  /** P14 LAZY RANGES: `list` with every entry that carries a run table (frg = far map, crg = cascade: `cascade`)
+   *  replaced by its index sub-ranges that pass `t`, in order (into `out`); `list` itself when nothing is ranged.
+   *  Runs only on the frames the far map / a cached static cascade layer actually renders. */
+  private _expandRanges(list: RendererDrawEntry[], cascade: boolean, t: BoxTester, out: RendererDrawEntry[]): RendererDrawEntry[] {
+    let k = 0;
+    for (; k < list.length; k++) if (cascade ? list[k].crg : list[k].frg) break;
+    if (k === list.length) return list;
+    out.length = 0;
+    for (let i = 0; i < k; i++) out.push(list[i]);
+    let culled = 0;
+    for (let i = k; i < list.length; i++) {
+      const e = list[i], rg = cascade ? e.crg : e.frg;
+      if (!rg || e.range || e.submesh || (e.count ?? 1) !== 1) { out.push(e); continue; }
+      const kept = this._rangedPush(out, e.mesh, e.idx, rg, t);
+      culled += (rg.first[rg.n - 1] + rg.count[rg.n - 1]) / 3 - kept;
+    }
+    if (cascade) this._frame.rangeTrisCulledCascade += culled; else this._frame.rangeTrisCulledShadow += culled;
+    return out;
+  }
+  private _buildRuns(opaqueForPasses: RendererDrawEntry[]): PassRun[] {
+    const runs: PassRun[] = [];
     let ri = 0;
     while (ri < opaqueForPasses.length) {
       const geoKey = opaqueForPasses[ri].mesh.geometryKey;
@@ -2512,10 +4853,11 @@ export class Renderer3D {
         const subStart = ri + rk;
         const lead = opaqueForPasses[subStart];
         if ((lead.count ?? 1) > 1) { runs.push({ mesh: lead.mesh, idx: lead.idx, count: lead.count! }); rk++; continue; }   // instanced-range entry (array group)
+        if (lead.range) { runs.push({ mesh: lead.mesh, idx: lead.idx, count: 1, range: lead.range }); rk++; continue; }   // P11 index sub-range
         const firstSlot = lead.idx;
         let subLen = 1;
         while (rk + subLen < groupLen &&
-               (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
+               (opaqueForPasses[subStart + subLen].count ?? 1) === 1 && !opaqueForPasses[subStart + subLen].range &&
                opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
           subLen++;
         }
@@ -2524,15 +4866,36 @@ export class Renderer3D {
       }
       ri = rj;
     }
-    return this._passRunsCache = runs;
+    return runs;
+  }
+  /** P15 Phase B: a depth-style camera prepass (outline depth + normal, SSAO / SSR G-buffer, SSR peel). With the GPU
+   *  main pass drawing this frame, the GPU-culled records come from a render bundle (gpu-scene.ts drawPrepass) and the
+   *  CPU replays only the pass entries the bundle does not cover; otherwise the shared CPU runs, as before. The caller
+   *  has set `pipe` (or found it pending: `_skipDraws`) and `bg0`. */
+  private _gdReplay(pass: GPURenderPassEncoder, kind: string, pipe: GPURenderPipeline | null, bg0: GPUBindGroup, colorFormats: GPUTextureFormat[], depthFormat: GPUTextureFormat): void {
+    const gd = this._gdOn && Renderer3D.gpuDrivenPrepasses && !!this._gd && this._gd.dispatched ? this._gd : null;
+    if (gd === null || !gd.drawPrepass(pass, kind, pipe, bg0, colorFormats, depthFormat)) { this._replayRuns(pass); return; }
+    // executeBundles cleared the pass state: the CPU remainder re-binds it
+    this._pkLost(pass);
+    if (pipe) { this._setPipe(pass, pipe); pass.setBindGroup(0, bg0); }
+    this._replayRuns(pass, this._gdRestRuns ??= this._buildRuns(this._gdRestList(gd)));
+  }
+  private _gdRestRuns: PassRun[] | null = null;
+  private readonly _gdRest: RendererDrawEntry[] = [];
+  private _gdRestList(gd: GpuDrivenMain): RendererDrawEntry[] {
+    const out = this._gdRest; out.length = 0;
+    const src = this._opaqueForPasses;
+    for (let i = 0; i < src.length; i++) { const e = src[i]; if (e.submesh || !gd.prepassDraws((e.gdObj ?? e.mesh) as Mesh3D)) out.push(e); }
+    return out;
   }
   /** Replay the shared batched runs into a depth-style pass (shadow / SSAO prepass / outline depth). */
-  private _replayRuns(pass: GPURenderPassEncoder): void {
+  private _replayRuns(pass: GPURenderPassEncoder, runs: PassRun[] = this._passRuns()): void {
     const sharedVB = this._geomVB!;
     pass.setVertexBuffer(0, sharedVB);
     pass.setIndexBuffer(this._geomIB!, 'uint32');
+    this._pkLost(pass);   // P22: the index buffer was rebound
     const vbRef = { vb: sharedVB };
-    for (const r of this._passRuns()) this._drawMesh(pass, r.mesh, r.idx, vbRef, r.count);
+    for (const r of runs) this._drawMesh(pass, r.mesh, r.idx, vbRef, r.count, r.range);
   }
 
   /** drawMeshes stage 3 — the outline-depth / shadow / SSAO+SSR pre-passes, coalesced into one
@@ -2547,8 +4910,17 @@ export class Renderer3D {
 
     // Outline depth pre-pass: camera-view depth into outline texture, then Sobel.
     // Recorded into the shared pre-pass encoder (submitted below, before the main pass).
-    if (this._outlinePass) {
+    this._skipDraws = false;
+    if (this._outlinePass && this._outlinePass.ready()) {   // P2: skipped (no outline) while its pipelines compile
       this._outlinePass.ensureTextures(canvasWidth, canvasHeight);
+      // FOG HORIZON: Silhouette outlines off = no ink past the fog edge (the Sobel pass reads world distance from depth).
+      // visual-polish #8: the DEPTH FADE (thinner / lighter ink with distance) reads the same world-from-depth inverse.
+      const olFade = this._outlinePass.needsFadeView, olFogCut = !this._fogHorizon.silhouetteOutlines && this.fogHorizonActive;
+      const olVP = (olFogCut || olFade) && !!mat4.invert(this._outlineInvVP, this.camera.getViewProjectionMatrix() as unknown as mat4);
+      if (olFogCut && olVP) {
+        this._outlinePass.fogCut = { eye: this._fogEye, edge: fogHorizonEdge(this._fog), invViewProj: this._outlineInvVP as unknown as Float32Array };
+      } else this._outlinePass.fogCut = null;
+      this._outlinePass.fadeView = olFade && olVP ? { eye: this.camera.position as unknown as Float32Array, invViewProj: this._outlineInvVP as unknown as Float32Array } : null;
       this._outlinePass.updateParams();
 
       const outlineEncoder = prePassEnc();
@@ -2567,9 +4939,10 @@ export class Renderer3D {
           depthStoreOp: 'store',
         },
       });
-      depthPrePass.setPipeline(this._outlinePass.depthNormalPipeline);
+      this._passBucket = PassBucket.Outline;
+      this._setPipe(depthPrePass, this._outlinePass.depthNormalPipeline);
       depthPrePass.setBindGroup(0, this.meshBindGroup!);
-      this._replayRuns(depthPrePass);                       // batched opaque walk (E2 — was per-entry draws)
+      this._gdReplay(depthPrePass, 'outline', this._outlinePass.depthNormalPipeline, this.meshBindGroup!, ['rgba8unorm'], 'depth32float');   // batched opaque walk (E2) / P15 GPU set
       const outlineVBRef = { vb: sharedVB };
       for (const e of transparent) this._drawMesh(depthPrePass, e.mesh, e.idx, outlineVBRef);
       depthPrePass.end();
@@ -2583,7 +4956,13 @@ export class Renderer3D {
     // shadows lag a frame or two (invisible) while the whole-scene depth render stops eating every frame.
     // Structural changes (_shadowMapStale: lights/geometry/adds) always refresh immediately.
     this._shadowFramesSince++;
+    this._passBucket = PassBucket.FarShadow;
+    if (this._shadowMapStale) this._cascadeStale = true;   // structural change → the near cascades refresh too
+    this._frame.cascadeDrawCalls = 0;
     const _ts = performance.now();
+    // P6: did this frame write the far map / the cascades? (→ rebuild their min/max tiles below)
+    const _scs = this._shadowCacheStats;
+    const _farW0 = _scs.staticRenders + _scs.dynPasses + _scs.directRenders, _susp0 = this._shadowSuspendCleared, _casc0 = this._frame.cascadePasses;
     if (this._shadowsSuspended && this._shadowTextureView) {
       // Suspended (extreme zoom-out): clear the map ONCE to depth=1 (no occluders → fully lit), then skip the
       // whole-scene depth pass every frame until resume.
@@ -2596,11 +4975,15 @@ export class Renderer3D {
         }).end();
         this.device.queue.submit([clearEnc.finish()]);
       }
+    } else if (this._shadowsEnabled && this._shadowTextureView && this._shadowBindGroup && this._recordCachedFarShadow(prePassEnc)) {
+      // P4.2: handled by the static-cache path (static re-render only on change + a dynamic-caster layer)
     } else if (this._shadowsEnabled && this._shadowTextureView && this._shadowBindGroup
         && (this._shadowMapStale || this._shadowFramesSince >= this._shadowUpdateInterval)) {
       this._shadowFramesSince = 0;
       this._shadowMapStale = false;
       this._perf.shadowPasses++;
+      this._shadowCacheStats.directRenders++;
+      this._shadowDynInMap = true; this._shadowSampledStatic = false;   // the map now holds everything (old path)
       const shadowEncoder = prePassEnc();
       const shadowPass = shadowEncoder.beginRenderPass({
         colorAttachments: [],
@@ -2611,10 +4994,17 @@ export class Renderer3D {
           depthStoreOp: 'store',
         },
       });
-      shadowPass.setPipeline(this.pipeline.shadowPassPipeline);
+      // P2: pipeline still compiling → the pass only CLEARS the map (depth 1 = fully lit, never garbage) and the
+      // map stays stale so it renders for real the frame the pipeline lands.
+      if (!this._setPipe(shadowPass, this.pipeline.shadowPassPipeline)) this._shadowMapStale = true;
       shadowPass.setBindGroup(0, this.meshBindGroup!);
-      // Shadow pass uses one pipeline (no texture grouping needed) — the shared batched runs (E2).
-      this._replayRuns(shadowPass);
+      // Shadow pass uses one pipeline (no texture grouping needed) — batched runs (E2) over the LIGHT-culled
+      // caster list (Round 5; `shadowLightCulling = false` -> the camera-culled pass list, the old behaviour).
+      const _sdc = this._frame.drawCalls, _stri = this._frame.trisDrawn;
+      this._gdShadowDraw(shadowPass, 0, this.meshBindGroup, 'far');   // P15 Phase C: the GPU's direct casters
+      this._replayRuns(shadowPass, this._shadowRuns());
+      this._frame.shadowDrawCalls = this._frame.drawCalls - _sdc; this._frame.shadowTris = this._frame.trisDrawn - _stri;
+      this._shadowCacheStats.farTris += this._frame.shadowTris;
       // E1 tail (c): CHARACTERS cast shadows too — skinned parts replay into the same depth map with
       // the skin-deformed depth pipeline. Uses the LAST drawSkinnedMeshes frame's list/buffers (this
       // pass records before this frame's skinned upload — a 1-frame pose lag, the same tolerance the
@@ -2622,6 +5012,9 @@ export class Renderer3D {
       this._drawSkinnedShadowCasters(shadowPass);
       shadowPass.end();
     }
+    this._passBucket = PassBucket.Cascade;
+    this._recordCascadePasses(prePassEnc);   // persona-polish A2: the near cascades (own throttle, own caster lists)
+    this._recordShadowMinMax(prePassEnc, _farW0 !== _scs.staticRenders + _scs.dynPasses + _scs.directRenders || (!_susp0 && this._shadowSuspendCleared), _casc0 !== this._frame.cascadePasses);
     this._frame.msShadow = performance.now() - _ts;
 
     // ── SSAO geometry prepass + AO estimate (own encoder, mirrors the shadow pass) ──────────────────────
@@ -2630,6 +5023,7 @@ export class Renderer3D {
     // (drawn at the end of drawMeshes) is how the AO buffer is verified before it touches the ambient term.
     if ((this._ssaoEnabled || this._ssrEnabled) && this._ssao) {
       this._ssao.ensureTextures(canvasWidth, canvasHeight);
+      this._passBucket = PassBucket.Prepass;
       const aoEnc = prePassEnc();
       const prepass = aoEnc.beginRenderPass({
         label: 'SSAOPrepass',
@@ -2640,9 +5034,9 @@ export class Renderer3D {
         depthStencilAttachment: { view: this._ssao.prepassDepthView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
       });
       // The same shared batched runs drive BOTH the front prepass and the depth-peel pass (E2).
-      prepass.setPipeline(this.pipeline.ssaoPrepassPipeline);
+      this._setPipe(prepass, this.pipeline.ssaoPrepassPipeline);   // P2: pending → cleared G-buffer (no AO / no SSR hits)
       prepass.setBindGroup(0, this._prepassMeshBG ?? this.meshBindGroup!);   // dummies at 10/11 (avoids write/read alias)
-      this._replayRuns(prepass);
+      this._gdReplay(prepass, 'ssao', this.pipeline.ssaoPrepassPipeline, this._prepassMeshBG ?? this.meshBindGroup!, ['rgba32float', 'rgba16float'], 'depth24plus');
       prepass.end();
 
       // ── Depth-peel pass (SSR backface-fill): SECOND-nearest surface ──
@@ -2656,9 +5050,9 @@ export class Renderer3D {
           colorAttachments: [{ view: this._ssao.worldPosBackTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
           depthStencilAttachment: { view: this._ssao.peelDepthView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
         });
-        peelPass.setPipeline(this.pipeline.ssaoPeelPrepassPipeline);
+        this._setPipe(peelPass, this.pipeline.ssaoPeelPrepassPipeline);
         peelPass.setBindGroup(0, this._peelMeshBG);
-        this._replayRuns(peelPass);
+        this._gdReplay(peelPass, 'peel', this.pipeline.ssaoPeelPrepassPipeline, this._peelMeshBG, ['rgba32float'], 'depth24plus');
         peelPass.end();
       }
 
@@ -2671,20 +5065,24 @@ export class Renderer3D {
           label: 'SSRResolve',
           colorAttachments: [{ view: this._ssao.reflectionTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
         });
-        resolvePass.setPipeline(this.pipeline.ssrResolvePipeline);
-        resolvePass.setBindGroup(0, this._resolveMeshBG);
-        resolvePass.draw(3);
+        const ssrResolvePipe = this.pipeline.ssrResolvePipeline;   // P2: pending → reflection texture stays cleared (no reflections)
+        if (ssrResolvePipe) {
+          resolvePass.setPipeline(ssrResolvePipe);
+          resolvePass.setBindGroup(0, this._resolveMeshBG);
+          resolvePass.draw(3);
+        }
         resolvePass.end();
 
         // ── Phase B post: HEAL (A→B, majority-gated hole/serration fill) then FEATHER (B→A, perimeter
         // blur at ssrEdgeFeather texels; radius 0 = plain copy so the result always lands back in A). ──
         // meshBindGroup binds texture A at 13 (heal input); _reflectionPingBG binds B (feather input).
-        if (this.meshBindGroup && this._reflectionPingBG) {
+        const ssrHealPipe = this.pipeline.ssrHealPipeline, ssrFeatherPipe = this.pipeline.ssrFeatherPipeline;
+        if (this.meshBindGroup && this._reflectionPingBG && ssrHealPipe && ssrFeatherPipe) {
           const healPass = aoEnc.beginRenderPass({
             label: 'SSRHeal',
             colorAttachments: [{ view: this._ssao.reflectionPingTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
           });
-          healPass.setPipeline(this.pipeline.ssrHealPipeline);
+          healPass.setPipeline(ssrHealPipe);
           healPass.setBindGroup(0, this.meshBindGroup);
           healPass.draw(3);
           healPass.end();
@@ -2692,7 +5090,7 @@ export class Renderer3D {
             label: 'SSRFeather',
             colorAttachments: [{ view: this._ssao.reflectionTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
           });
-          featherPass.setPipeline(this.pipeline.ssrFeatherPipeline);
+          featherPass.setPipeline(ssrFeatherPipe);
           featherPass.setBindGroup(0, this._reflectionPingBG);
           featherPass.draw(3);
           featherPass.end();
@@ -2713,33 +5111,137 @@ export class Renderer3D {
     if (_prePassPending) this.device.queue.submit([_prePassPending.finish()]);
   }
 
+  /**
+   * P4.2 static far-map cache. Returns false when the cache can't run this frame (toggle off, lists not built,
+   * or the light box / sun is moving) → the caller falls through to the old direct path. Otherwise records:
+   *   - a STATIC re-render into `_shadowStaticTex` when the static set signature changed (throttled like the old
+   *     refresh), the map went stale (structural / light settings), or the cache is cold;
+   *   - a DYNAMIC layer: copy static → sampled map, then draw the dynamic casters (+ skinned) with depth LOAD,
+   *     every `_shadowUpdateInterval` frames (immediately on a skinned pose change) — the old mover cadence.
+   * With no dynamic casters at all, the static set renders straight into the sampled map (no copy, no 2nd texture).
+   */
+  private _recordCachedFarShadow(prePassEnc: () => GPUCommandEncoder): boolean {
+    const volatile = this._shadowLightMoved;
+    this._shadowLightMoved = false;
+    this._shadowQuietFrames = volatile ? 0 : this._shadowQuietFrames + 1;
+    this._shadowStaticFramesSince++;
+    const interval = this._shadowUpdateInterval;
+    if (!this._shadowCacheOn || !this._shadowCacheListsBuilt || volatile
+        || (!this._shadowStaticValid && !this._shadowSampledStatic && this._shadowQuietFrames < interval)) {
+      // Moving light box (pan / zoom / sun sweep) or just settled: the old direct path (reach-culled, all casters).
+      this._shadowStaticValid = false; this._shadowSampledStatic = false;
+      this._shadowCachePath = false;
+      return false;
+    }
+    this._shadowCachePath = true;
+    const sigChanged = this._shadowStaticSig !== this._shadowStaticSigDrawn || (this._joinDeferOn && (this._farMembers.due(this._shadowFrameNo, Renderer3D.STATIC_JOIN_TRIS, Renderer3D.STATIC_JOIN_FRAMES) || this._gdShDue(0, this._farMembers.joinTris)));
+    const stale = this._shadowMapStale;
+    const hasDyn = this._shadowDynList.length > 0 || this._skinnedVisibleScratch.length > 0 || this._gdShThis;   // (Phase C: the GPU's may exist)
+    const sizeOk = this._shadowStaticTex && this._shadowStaticTex.width === this._shadowMapSize;
+    const throttledSig = sigChanged && this._shadowStaticFramesSince >= interval;
+    const pipe = this.pipeline.shadowPassPipeline;
+
+    const renderStatic = (view: GPUTextureView): void => {
+      const pass = prePassEnc().beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view, depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' } });
+      const ok = this._setPipe(pass, pipe);
+      pass.setBindGroup(0, this.meshBindGroup!);
+      const _sdc = this._frame.drawCalls, _stri = this._frame.trisDrawn;
+      if (ok) { this._gdShadowDraw(pass, 1, this.meshBindGroup, 'far'); this._replayRuns(pass, this._shadowStaticRunsCache ??= this._buildRuns(this._expandRanges(this._shadowStaticList, false, this._lightCuller, this._farExpStatic))); }
+      this._frame.shadowDrawCalls = this._frame.drawCalls - _sdc; this._frame.shadowTris = this._frame.trisDrawn - _stri;
+      this._shadowCacheStats.farTris += this._frame.shadowTris;
+      pass.end();
+      if (ok) this._gdShCommitLayer(prePassEnc(), 0);   // P15 Phase C: the GPU casters drawn into it are its set now
+      this._shadowStaticSigDrawn = ok ? (this._joinDeferOn ? this._shadowStaticSigAll : this._shadowStaticSig) : NaN;   // P2 pending → cleared map, retry next frame
+      if (ok && this._joinDeferOn) this._farMembers.drawnWith(this._farStaticKeys); else if (!ok) this._farMembers.clear();   // P14: the layer now holds every static caster
+      this._shadowMapStale = !ok;
+      this._shadowStaticFramesSince = 0;
+      this._perf.shadowPasses++;
+      this._shadowCacheStats.staticRenders++;
+      if (stale) this._shadowCacheStats.staticStale++; else if (sigChanged) this._shadowCacheStats.staticSig++; else this._shadowCacheStats.staticCold++;   // P14 diagnostics: why
+    };
+
+    if (!hasDyn) {
+      // No movers: the static set IS the map — render it straight into the sampled texture when it changes.
+      if (!this._shadowSampledStatic || this._shadowDynInMap || stale || throttledSig) {
+        renderStatic(this._shadowTextureView!);
+        this._shadowSampledStatic = true; this._shadowDynInMap = false;
+        this._shadowStaticValid = false;   // the cache texture (if any) is now behind
+        this._shadowFramesSince = 0;
+      }
+      this._shadowDynStale = false;
+      return true;
+    }
+
+    let staticDrawn = false;
+    if (!sizeOk) {
+      this._shadowStaticTex?.destroy();
+      this._shadowStaticTex = this.device.createTexture({
+        size: [this._shadowMapSize, this._shadowMapSize, 1], format: 'depth32float', label: 'ShadowStaticCache',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
+      this._shadowStaticView = this._shadowStaticTex.createView();
+      this._shadowStaticValid = false;
+    }
+    if (!this._shadowStaticValid || stale || throttledSig) {
+      renderStatic(this._shadowStaticView!);
+      this._shadowStaticValid = true;
+      staticDrawn = true;
+    }
+    this._shadowSampledStatic = false;
+    if (staticDrawn || this._shadowDynStale || this._shadowFramesSince >= interval) {
+      const enc = prePassEnc();
+      const sz = this._shadowMapSize;
+      enc.copyTextureToTexture({ texture: this._shadowStaticTex! }, { texture: this._shadowTexture! }, [sz, sz, 1]);
+      const pass = enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: this._shadowTextureView!, depthLoadOp: 'load', depthStoreOp: 'store' } });
+      const ok = this._setPipe(pass, pipe);   // P2 pending → retry the layer next frame
+      pass.setBindGroup(0, this.meshBindGroup!);
+      const _dtri = this._frame.trisDrawn;
+      if (ok) this._gdShadowDraw(pass, 2, this.meshBindGroup, 'far');   // P15 Phase C: the GPU's dynamic casters + joiners
+      if (ok && this._shadowDynList.length) this._replayRuns(pass, this._shadowDynRunsCache ??= this._buildRuns(this._expandRanges(this._shadowDynList, false, this._shadowRunTester, this._farExpDyn)));
+      this._shadowCacheStats.farTris += this._frame.trisDrawn - _dtri;
+      this._drawSkinnedShadowCasters(pass);
+      pass.end();
+      this._shadowDynInMap = true;
+      this._shadowFramesSince = 0;
+      this._shadowDynStale = !ok;
+      if (this._shadowVerify && ok) this._recordShadowCacheVerify(enc);
+      this._shadowCacheStats.dynPasses++;
+    }
+    return true;
+  }
+
   /** E1 tail (c): replay the skinned character parts into the open SHADOW depth pass with the
    *  skin-deformed depth-only pipeline, so characters cast shadows like everything else. Reads the
    *  LAST drawSkinnedMeshes frame's visible list + instance slots (`firstInstance = i` matches that
    *  upload's order) — the pre-passes record before this frame's skinned upload, so poses lag one
    *  frame (invisible; the mover-shadow throttle already accepts more). Every part is re-guarded:
    *  eviction, rebinding, or a deleted skeleton since last frame just skips the part. */
-  private _drawSkinnedShadowCasters(pass: GPURenderPassEncoder): void {
+  private _drawSkinnedShadowCasters(pass: GPURenderPassEncoder, meshBG: GPUBindGroup | null = this._skinnedMeshBG): void {
     const list = this._skinnedVisibleScratch;
-    if (list.length === 0 || !this._skinnedMeshBG) return;
+    if (list.length === 0 || !meshBG) return;
+    const flags = this._skinnedFlags;
     let began = false;
     let curSkinBG: GPUBindGroup | null = null;
     for (let i = 0; i < list.length; i++) {
       const mesh = list[i];
-      if (!mesh.skeleton || mesh.vertexColors) continue;   // weight-paint previews don't cast
+      if (!mesh.skeleton || mesh.vertexColors || mesh.isFaceFeatures) continue;   // weight-paint previews + face-kit overlays don't cast
+      if (!(flags[i] & 2)) continue;                       // R6.1: in view but its shadow can't matter (or shadows were off)
       const vb = this._skinnedVBs.get(mesh.id);
       const ib = this._skinnedIBs.get(mesh.id);
       const skinBG = this._skinBGs.get(mesh.skeleton.id);
       if (!vb || !ib || !skinBG) continue;
       if (!began) {
-        pass.setPipeline(this.pipeline.skinnedShadowPipeline);
-        pass.setBindGroup(0, this._skinnedMeshBG);
+        const skShadowPipe = this.pipeline.skinnedShadowPipeline;
+        if (!skShadowPipe) return;   // P2: still compiling → characters cast no shadow for a frame or two
+        pass.setPipeline(skShadowPipe);
+        pass.setBindGroup(0, meshBG);
         began = true;
       }
       if (skinBG !== curSkinBG) { pass.setBindGroup(1, skinBG); curSkinBG = skinBG; }
       pass.setVertexBuffer(0, vb);
       pass.setIndexBuffer(ib, 'uint32');
       pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
+      this._passDraws[this._passBucket]++; this._passTris[this._passBucket] += mesh.geometry.indices.length / 3;   // P11
     }
   }
 
@@ -2785,6 +5287,8 @@ export class Renderer3D {
           pd.set(this._sceneUniformsData);
           pd.set(vpm as unknown as Float32Array, 0);                          // viewProjection ← mirrored + oblique
           pd[16] = camM[0]; pd[17] = camM[1]; pd[18] = camM[2];               // cameraPosition ← mirrored (.w kept)
+          const fe = this._fogEye, feM = transformPoint4(refl, [fe[0], fe[1], fe[2]]);
+          pd[268] = feM[0]; pd[269] = feM[1]; pd[270] = feM[2];               // fog eye ← mirrored (fog horizon)
           this.device.queue.writeBuffer(this._planarSceneBuf!, 0, pd);
 
           const pEnc = this.device.createCommandEncoder();
@@ -2797,13 +5301,13 @@ export class Renderer3D {
           pPass.setIndexBuffer(sharedIB, 'uint32');
           const pRef = { vb: sharedVB };
           const PP = this.pipeline;
-          for (const e of opaqueForPasses) {
+          for (let _ke = 0; _ke < opaqueForPasses.length; _ke++) { const e = opaqueForPasses[_ke];
             if (e.mesh === planarReflector) continue;   // the mirror does not reflect itself
             const em = e.mesh.material;
             const useTexture = !!(em.hasTexture || em.hasNormalMap);
             const patterned = this._usesPatterns(e.mesh);
             if (useTexture) {
-              pPass.setPipeline(this._shadowsEnabled
+              this._setPipe(pPass, this._shadowsEnabled
                 ? (patterned ? PP.opaqueTexturedNoCullShadowPipeline : PP.opaqueTexturedNoCullPlainShadowPipeline)
                 : (patterned ? PP.opaqueTexturedNoCullPipeline : PP.opaqueTexturedNoCullPlainPipeline));
               pPass.setBindGroup(0, this._planarMeshBG);
@@ -2811,7 +5315,7 @@ export class Renderer3D {
               pPass.setBindGroup(1, (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(e.mesh));
               if (this._shadowsEnabled) pPass.setBindGroup(2, this._shadowBindGroup!);
             } else {
-              pPass.setPipeline(this._shadowsEnabled
+              this._setPipe(pPass, this._shadowsEnabled
                 ? (patterned ? PP.opaqueUntexturedNoCullShadowPipeline : PP.opaqueUntexturedNoCullPlainShadowPipeline)
                 : (patterned ? PP.opaqueUntexturedNoCullPipeline : PP.opaqueUntexturedNoCullPlainPipeline));
               pPass.setBindGroup(0, this._planarMeshBG);
@@ -2823,17 +5327,17 @@ export class Renderer3D {
           // variants (winding flip), reusing the main pass's back-to-front order (sorted for the MAIN camera —
           // an approximation for the mirrored view; subtle blend-order errors accepted v1). Caveat: characters
           // (drawn into the mirror in a later sub-pass) can overdraw glass in front of them.
-          for (const e of transparent) {
+          for (let _ke = 0; _ke < transparent.length; _ke++) { const e = transparent[_ke];
             if (e.mesh === planarReflector) continue;
             const tm = e.submesh ? e.submesh.material : e.mesh.material;
             const useTexture = !!(tm.hasTexture || tm.hasNormalMap);
             if (useTexture) {
-              pPass.setPipeline(PP.transparentTexturedNoCullPipeline);
+              this._setPipe(pPass, PP.transparentTexturedNoCullPipeline);
               pPass.setBindGroup(0, this._planarMeshBG);
               const isAtlas = !!e.mesh.textureLibraryId && this._atlasLayerMap.has(e.mesh.textureLibraryId);
               pPass.setBindGroup(1, (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(e.mesh));
             } else {
-              pPass.setPipeline(PP.transparentUntexturedNoCullPipeline);
+              this._setPipe(pPass, PP.transparentUntexturedNoCullPipeline);
               pPass.setBindGroup(0, this._planarMeshBG);
             }
             this._drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1, e.submesh);
@@ -2848,6 +5352,151 @@ export class Renderer3D {
   /** drawMeshes stage 5 — the MAIN colour pass: partition opaque into VC/simple/multi, the cached
    *  draw-rank sort, the batched opaque walk (pipeline/texture grouping + contiguous-slot sub-runs),
    *  then multi-submesh, vertex-colored, and back-to-front transparent draws. Verbatim. */
+  /** The batched opaque walk of the main pass (pipeline / texture grouping + contiguous-slot sub-runs) over `opaqueSimple`
+   *  (rank-sorted). Verbatim from _drawMainPass (P15: also draws the GPU scene's not-yet-placed meshes). */
+  private _drawBatched(pass: GPURenderPassEncoder, opaqueSimple: RendererDrawEntry[], mainVBRef: { vb: GPUBuffer }): void {
+    // Group consecutive entries sharing the same geometry + pipeline + texture into one
+    // instanced drawIndexed call. Falls back to individual draws when frustum culling
+    // breaks slot contiguity within a group.
+    let oi = 0;
+    while (oi < opaqueSimple.length) {
+      const lead = opaqueSimple[oi].mesh;
+      const geoKey     = lead.geometryKey;
+      const useTexture = lead.material.hasTexture || lead.material.hasNormalMap;
+      const noCull     = this.forceDoubleSided || !!lead.material.doubleSided;
+      const patterned  = this._usesPatterns(lead);   // §3.1: full-shader vs plain (pattern-stripped) pipeline
+      const leadDiff   = lead.diffuseTexture;
+      const leadNorm   = lead.normalMapTexture;
+      // A mesh is "atlas mode" when its texture is packed into the shared atlas
+      // (identified by textureLibraryId). Atlas meshes all share one bind group
+      // and can batch across different textures — textureIndex selects the layer.
+      const leadIsAtlas = useTexture && !!lead.textureLibraryId && this._atlasLayerMap.has(lead.textureLibraryId);
+      const sv = Renderer3D.shaderVariants;
+      const vk = sv ? lead._r3VF : -1;   // step 8: the shader-variant key (the exact instance flags, or -1)
+
+      // Scan forward while same group (geometry + pipeline + texture mode all match)
+      let oj = oi + 1;
+      while (oj < opaqueSimple.length) {
+        const m = opaqueSimple[oj].mesh;
+        if (m.geometryKey !== geoKey) break;
+        if ((m.material.hasTexture || m.material.hasNormalMap) !== useTexture) break;
+        if ((this.forceDoubleSided || !!m.material.doubleSided) !== noCull) break;
+        if (this._usesPatterns(m) !== patterned) break;   // §3.1: don't batch plain + patterned into one pipeline
+        if (sv && m._r3VF !== vk) break;   // step 8: one variant (= one exact flags value) per group
+        if (useTexture) {
+          const mIsAtlas = !!m.textureLibraryId && this._atlasLayerMap.has(m.textureLibraryId);
+          if (mIsAtlas !== leadIsAtlas) break; // can't mix atlas and standalone in one group
+          if (!mIsAtlas && (m.diffuseTexture !== leadDiff || m.normalMapTexture !== leadNorm)) break;
+          // atlas meshes: no texture-based break — they all share the atlas bind group
+        }
+        oj++;
+      }
+
+      // Set pipeline + bind groups once for the whole group. Double-sided (noCull) meshes — the whole
+      // world city — now RECEIVE shadows too via the NoCull-shadow pipeline variants.
+      const P = this.pipeline;
+      const vPipe = this._variantPipe(vk, !!useTexture, noCull, patterned);   // step 8: null = the base pipeline below
+      if (useTexture) {
+        const bp = this._shadowsEnabled
+          ? (noCull ? (patterned ? P.opaqueTexturedNoCullShadowPipeline : P.opaqueTexturedNoCullPlainShadowPipeline)
+                    : (patterned ? P.opaqueTexturedShadowPipeline       : P.opaqueTexturedPlainShadowPipeline))
+          : (noCull ? (patterned ? P.opaqueTexturedNoCullPipeline       : P.opaqueTexturedNoCullPlainPipeline)
+                    : (patterned ? P.opaqueTexturedPipeline             : P.opaqueTexturedPlainPipeline));
+        this._setPipe(pass, vPipe ?? bp, bp);   // (P22: a packed run falls back to the base pipeline's twin)
+        pass.setBindGroup(0, this.meshBindGroup);
+        // Atlas meshes share one bind group; standalone meshes get per-mesh bind group
+        const texBG = (leadIsAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(lead);
+        pass.setBindGroup(1, texBG);
+        if (this._shadowsEnabled) pass.setBindGroup(2, this._shadowBindGroup!);
+      } else {
+        const bp = this._shadowsEnabled
+          ? (noCull ? (patterned ? P.opaqueUntexturedNoCullShadowPipeline : P.opaqueUntexturedNoCullPlainShadowPipeline)
+                    : (patterned ? P.opaqueUntexturedShadowPipeline       : P.opaqueUntexturedPlainShadowPipeline))
+          : (noCull ? (patterned ? P.opaqueUntexturedNoCullPipeline       : P.opaqueUntexturedNoCullPlainPipeline)
+                    : (patterned ? P.opaqueUntexturedPipeline             : P.opaqueUntexturedPlainPipeline));
+        this._setPipe(pass, vPipe ?? bp, bp);   // (P22: a packed run falls back to the base pipeline's twin)
+        pass.setBindGroup(0, this.meshBindGroup);
+        if (this._shadowsEnabled) pass.setBindGroup(1, this._shadowBindGroup!);
+      }
+
+      // Split the group into maximal contiguous sub-runs of instance slots.
+      // Frustum culling may remove members mid-group, creating gaps in the slot sequence.
+      let k = 0;
+      const groupLen = oj - oi;
+      while (k < groupLen) {
+        const subStart  = oi + k;
+        const lead = opaqueSimple[subStart];
+        if ((lead.count ?? 1) > 1) { this._drawMesh(pass, lead.mesh, lead.idx, mainVBRef, lead.count); k++; continue; }   // instanced-range entry (array group)
+        if (lead.range) { this._drawMesh(pass, lead.mesh, lead.idx, mainVBRef, 1, lead.range); k++; continue; }   // P11 index sub-range
+        const firstSlot = lead.idx;
+        let subLen = 1;
+        while (k + subLen < groupLen &&
+               (opaqueSimple[subStart + subLen].count ?? 1) === 1 && !opaqueSimple[subStart + subLen].range &&
+               opaqueSimple[subStart + subLen].idx === firstSlot + subLen) {
+          subLen++;
+        }
+        this._drawMesh(pass, lead.mesh, firstSlot, mainVBRef, subLen);
+        k += subLen;
+      }
+
+      oi = oj;
+    }
+  }
+  private readonly _gdOrphanEntries: RendererDrawEntry[] = [];
+
+  /** P15 SPATIAL DRAW RANK: the rank's second key is a square XZ cell of this many metres (× fogHorizonUnitsPerMetre,
+   *  the city's scale; 1 unit = 1 m outside a city) around the mesh's box centre, so one cell's records are contiguous
+   *  in every pipeline class. The GPU path records one sub-bundle per run of a cell and leaves out the ones that draw
+   *  nothing (GpuDrivenMain.subBundles). Both paths read the same rank, so they stay pixel-identical; among the city's
+   *  unique geometry keys (`custom:<uuid>`) the old order was arbitrary anyway. Same-geometry meshes still sit
+   *  together inside a cell (the CPU path's instanced batches). 0 = the old rank (pipeline class, geometry key). */
+  static rankCellM = 80;   // ON by default since 2026-10-03: the spatially coherent order alone cut the CPU path's main pass by 0.5 ms (1300x850) / 0.9-1.1 ms (2500x1390) in the tiled city, same draws (performance-plan §P15 cause runs); sub-bundles stay off
+  private _drawOrderCell = -1;
+  /** P15: the rank's pipeline class includes the §3.1 plain / full (patterned) shader choice, so plain and patterned
+   *  meshes no longer alternate in draw order. Both paths read the rank (ON = OFF by construction). The GPU path then
+   *  keeps the cheap plain pipeline for plain meshes without a pipeline switch per alternation: the merged full-shader
+   *  bucket (GpuDrivenMain.mergePatterned) cost +5-7 ms of main-pass GPU time in the tiled city (performance-plan §P15
+   *  2026-10-03 cause runs). The CPU path's own pipeline switches drop too. false = the old rank. */
+  static rankPatterned = true;
+  private _drawOrderPat = false;
+  /** The rank cell of `m` (1..2^28; 0 = no box or no cell). Read when the rank is rebuilt; stored on the mesh. */
+  private _rankCellOf(m: Mesh3D, cs: number): number {
+    if (!(cs > 0)) return 0;
+    const b = this.getMeshWorldAABB3D(m, this._aabbScratch);
+    if (!b) return 0;
+    const cx = (b.minX + b.maxX) * 0.5, cz = (b.minZ + b.maxZ) * 0.5;
+    if (!Number.isFinite(cx) || !Number.isFinite(cz)) return 0;
+    const gx = Math.max(-8191, Math.min(8191, Math.floor(cx / cs))) + 8192, gz = Math.max(-8191, Math.min(8191, Math.floor(cz / cs))) + 8192;
+    // Z-order (Morton) code of the 14-bit cell coordinates: consecutive cells form compact blocks, so the sub-bundle
+    // groups (GpuDrivenMain.SUB_GROUP consecutive cells) are squares, not strips, and a view keeps or drops them whole
+    let code = 0;
+    for (let b = 13; b >= 0; b--) code = code * 4 + (((gx >> b) & 1) << 1) + ((gz >> b) & 1);
+    return code + 1;
+  }
+  /** The cached draw rank (pipeline class, rank cell, geometry-key code, input position), re-ranked on a structural change. */
+  private _ensureDrawOrder(meshes: Mesh3D[]): void {
+    const cs = Renderer3D.rankCellM > 0 ? Renderer3D.rankCellM * this.fogHorizonUnitsPerMetre : 0;
+    const rp = Renderer3D.rankPatterned;
+    // step 8: the shader-variant id joins the pipeline class (rankVariants), whether the variants are on or not, so the
+    // A/B switch never changes the draw order (coplanar decals / kerb paint resolve by order: ON = OFF by construction)
+    const sv = Renderer3D.rankVariants, svGen = sv ? this._svKeyGen : -1;
+    if (this._drawOrderDirty || this._drawOrderDS !== this.forceDoubleSided || this._drawOrderCell !== cs || this._drawOrderPat !== rp || this._drawOrderSv !== svGen) {
+      this._drawOrderDirty = false;
+      this._drawOrderDS = this.forceDoubleSided;
+      this._drawOrderCell = cs;
+      this._drawOrderPat = rp;
+      this._drawOrderSv = svGen;
+      const fds = this.forceDoubleSided;
+      const ids = this._svIds;
+      const pipeOf = (m: Mesh3D): number => {
+        const cell = cs > 0 ? (m._r3RankCell = this._rankCellOf(m, cs)) : (m._r3RankCell = 0);
+        return ((((m.material.hasTexture || m.material.hasNormalMap) ? 1 : 0) | ((fds || !!m.material.doubleSided) ? 2 : 0)
+          | ((rp && this._usesPatterns(m)) ? 4 : 0) | (sv ? ids.idOf(m._r3VF) * 8 : 0)) * 268435456) + cell;
+      };
+      this._drawOrder.update(meshes, pipeOf);
+    }
+  }
+
   private _drawMainPass(pass: GPURenderPassEncoder, meshes: Mesh3D[]): void {
     const sharedVB = this._geomVB!;
     const sharedIB = this._geomIB!;
@@ -2866,7 +5515,7 @@ export class Renderer3D {
     const opaqueVC     = this._opaqueVC;     opaqueVC.length = 0;
     const opaqueSimple = this._opaqueSimple; opaqueSimple.length = 0;
     const opaqueMulti  = this._opaqueMulti;  opaqueMulti.length = 0;
-    for (const e of opaque) {
+    for (let _ke = 0; _ke < opaque.length; _ke++) { const e = opaque[_ke];
       if ((e.count ?? 1) > 1) opaqueSimple.push(e);   // instanced-range entry (array group) → the count-aware batch path
       else if (e.submesh) opaqueMulti.push(e);
       else if (e.mesh.vertexColors && !showsTexture(e)) opaqueVC.push(e);
@@ -2879,117 +5528,46 @@ export class Renderer3D {
     //   3. Same-texture instances within a geometry group are adjacent → single bind group per group
     // Plain < > compare (NOT localeCompare — 10-100× slower, and this sort runs on EVERY frame over the
     // whole city; a consistent total order is all the grouping needs).
-    if (opaqueSimple.length > 1) {
+    // P15: the GPU scene draws the whole batched segment (its records are this list's superset, in this sort's order)
+    const gdDraw = this._gdOn && !!this._gd && this._gd.dispatched;
+    if (opaqueSimple.length > 1 && !gdDraw) {
       // CACHED DRAW RANK: the old inline sort allocated the pipelineKeyOf closure PER COMPARISON and did ~40k
       // geometryKey STRING compares over the whole city EVERY frame (steady GC + CPU). The (pipelineKey,
       // geometryKey) order is stable per mesh — build a rank map once per STRUCTURAL change, then per frame do
       // one Map.get per mesh + a pure numeric sort. Meshes streamed in since the last rebuild rank at the tail
       // (worst case a few extra draw calls until the next structural rebuild — never incorrect).
-      if (this._drawOrderDirty || this._drawOrderDS !== this.forceDoubleSided) {
-        this._drawOrderDirty = false;
-        this._drawOrderDS = this.forceDoubleSided;
-        const pipeOf = (m: Mesh3D): number =>
-          ((m.material.hasTexture || m.material.hasNormalMap) ? 1 : 0) |
-          ((this.forceDoubleSided || !!m.material.doubleSided) ? 2 : 0);
-        const tmp = meshes.slice().sort((a, b) => {
-          const p = pipeOf(a) - pipeOf(b);
-          if (p !== 0) return p;
-          const ak = a.geometryKey, bk = b.geometryKey;
-          return ak < bk ? -1 : ak > bk ? 1 : 0;
-        });
-        this._drawOrder.clear();
-        for (let i = 0; i < tmp.length; i++) this._drawOrder.set(tmp[i].id, i);
-      }
+      this._ensureDrawOrder(meshes);
       const ord = this._drawOrder;
-      for (const e of opaqueSimple) e.ord = ord.get(e.mesh.id) ?? 0x7fffffff;
+      for (let _ke = 0; _ke < opaqueSimple.length; _ke++) { const e = opaqueSimple[_ke]; e.ord = ord.get(e.mesh.id) ?? 0x7fffffff; }
       opaqueSimple.sort((a, b) => a.ord! - b.ord!);
     }
 
     // Set shared VB/IB once for the main pass — only VB slot 0 switches for overrides.
     pass.setVertexBuffer(0, sharedVB);
     pass.setIndexBuffer(sharedIB, 'uint32');
+    this._pkLost(pass);
     const mainVBRef = { vb: sharedVB };
 
-    if (opaqueSimple.length > 0) {
-      // Group consecutive entries sharing the same geometry + pipeline + texture into one
-      // instanced drawIndexed call. Falls back to individual draws when frustum culling
-      // breaks slot contiguity within a group.
-      let oi = 0;
-      while (oi < opaqueSimple.length) {
-        const lead = opaqueSimple[oi].mesh;
-        const geoKey     = lead.geometryKey;
-        const useTexture = lead.material.hasTexture || lead.material.hasNormalMap;
-        const noCull     = this.forceDoubleSided || !!lead.material.doubleSided;
-        const patterned  = this._usesPatterns(lead);   // §3.1: full-shader vs plain (pattern-stripped) pipeline
-        const leadDiff   = lead.diffuseTexture;
-        const leadNorm   = lead.normalMapTexture;
-        // A mesh is "atlas mode" when its texture is packed into the shared atlas
-        // (identified by textureLibraryId). Atlas meshes all share one bind group
-        // and can batch across different textures — textureIndex selects the layer.
-        const leadIsAtlas = useTexture && !!lead.textureLibraryId && this._atlasLayerMap.has(lead.textureLibraryId);
-
-        // Scan forward while same group (geometry + pipeline + texture mode all match)
-        let oj = oi + 1;
-        while (oj < opaqueSimple.length) {
-          const m = opaqueSimple[oj].mesh;
-          if (m.geometryKey !== geoKey) break;
-          if ((m.material.hasTexture || m.material.hasNormalMap) !== useTexture) break;
-          if ((this.forceDoubleSided || !!m.material.doubleSided) !== noCull) break;
-          if (this._usesPatterns(m) !== patterned) break;   // §3.1: don't batch plain + patterned into one pipeline
-          if (useTexture) {
-            const mIsAtlas = !!m.textureLibraryId && this._atlasLayerMap.has(m.textureLibraryId);
-            if (mIsAtlas !== leadIsAtlas) break; // can't mix atlas and standalone in one group
-            if (!mIsAtlas && (m.diffuseTexture !== leadDiff || m.normalMapTexture !== leadNorm)) break;
-            // atlas meshes: no texture-based break — they all share the atlas bind group
-          }
-          oj++;
-        }
-
-        // Set pipeline + bind groups once for the whole group. Double-sided (noCull) meshes — the whole
-        // world city — now RECEIVE shadows too via the NoCull-shadow pipeline variants.
-        const P = this.pipeline;
-        if (useTexture) {
-          pass.setPipeline(this._shadowsEnabled
-            ? (noCull ? (patterned ? P.opaqueTexturedNoCullShadowPipeline : P.opaqueTexturedNoCullPlainShadowPipeline)
-                      : (patterned ? P.opaqueTexturedShadowPipeline       : P.opaqueTexturedPlainShadowPipeline))
-            : (noCull ? (patterned ? P.opaqueTexturedNoCullPipeline       : P.opaqueTexturedNoCullPlainPipeline)
-                      : (patterned ? P.opaqueTexturedPipeline             : P.opaqueTexturedPlainPipeline)));
-          pass.setBindGroup(0, this.meshBindGroup);
-          // Atlas meshes share one bind group; standalone meshes get per-mesh bind group
-          const texBG = (leadIsAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(lead);
-          pass.setBindGroup(1, texBG);
-          if (this._shadowsEnabled) pass.setBindGroup(2, this._shadowBindGroup!);
-        } else {
-          pass.setPipeline(this._shadowsEnabled
-            ? (noCull ? (patterned ? P.opaqueUntexturedNoCullShadowPipeline : P.opaqueUntexturedNoCullPlainShadowPipeline)
-                      : (patterned ? P.opaqueUntexturedShadowPipeline       : P.opaqueUntexturedPlainShadowPipeline))
-            : (noCull ? (patterned ? P.opaqueUntexturedNoCullPipeline       : P.opaqueUntexturedNoCullPlainPipeline)
-                      : (patterned ? P.opaqueUntexturedPipeline             : P.opaqueUntexturedPlainPipeline)));
-          pass.setBindGroup(0, this.meshBindGroup);
-          if (this._shadowsEnabled) pass.setBindGroup(1, this._shadowBindGroup!);
-        }
-
-        // Split the group into maximal contiguous sub-runs of instance slots.
-        // Frustum culling may remove members mid-group, creating gaps in the slot sequence.
-        let k = 0;
-        const groupLen = oj - oi;
-        while (k < groupLen) {
-          const subStart  = oi + k;
-          const lead = opaqueSimple[subStart];
-          if ((lead.count ?? 1) > 1) { this._drawMesh(pass, lead.mesh, lead.idx, mainVBRef, lead.count); k++; continue; }   // instanced-range entry (array group)
-          const firstSlot = lead.idx;
-          let subLen = 1;
-          while (k + subLen < groupLen &&
-                 (opaqueSimple[subStart + subLen].count ?? 1) === 1 &&
-                 opaqueSimple[subStart + subLen].idx === firstSlot + subLen) {
-            subLen++;
-          }
-          this._drawMesh(pass, lead.mesh, firstSlot, mainVBRef, subLen);
-          k += subLen;
-        }
-
-        oi = oj;
+    if (gdDraw && this._gd!.draw(pass)) {
+      // P15: one indirect draw per record (bundle) or per bucket (multi-draw); executeBundles cleared the pass state
+      this._gdDrew = true;
+      pass.setVertexBuffer(0, sharedVB);
+      pass.setIndexBuffer(sharedIB, 'uint32');
+      this._pkLost(pass);   // (P22)
+      // meshes / groups met this frame but not placed in the bundle yet (a throttled full rebuild): the CPU draws them,
+      // in rank order, right after the bundle (only their order relative to the bundle differs, for a few frames)
+      const orph = this._gdOrphanEntries; orph.length = 0;
+      const gd = this._gd!;
+      for (let _ke = 0; _ke < opaqueSimple.length; _ke++) { const e = opaqueSimple[_ke]; if (!gd.drawsObject((e.gdObj ?? e.mesh) as Mesh3D)) orph.push(e); }
+      if (orph.length > 0) {
+        const ord = this._drawOrder;
+        for (let _ke = 0; _ke < orph.length; _ke++) { const e = orph[_ke]; e.ord = ord.get(e.mesh.id) ?? 0x7fffffff; }
+        orph.sort((a, b) => a.ord! - b.ord!);
+        this._drawBatched(pass, orph, mainVBRef);
+        this._frame.gpuOrphanDraws = orph.length;
       }
+    } else if (opaqueSimple.length > 0) {
+      this._drawBatched(pass, opaqueSimple, mainVBRef);
     }
 
     // Draw multi-material opaque submesh entries (one draw call per submesh, no batching).
@@ -3000,7 +5578,7 @@ export class Renderer3D {
       if (useTexture) {
         const texId = submesh!.textureLibraryId ?? '';
         const isAtlas = !!texId && this._atlasLayerMap.has(texId);
-        pass.setPipeline(this._shadowsEnabled
+        this._setPipe(pass, this._shadowsEnabled
           ? (noCull ? this.pipeline.opaqueTexturedNoCullShadowPipeline : this.pipeline.opaqueTexturedShadowPipeline)
           : (noCull ? this.pipeline.opaqueTexturedNoCullPipeline : this.pipeline.opaqueTexturedPipeline));
         pass.setBindGroup(0, this.meshBindGroup);
@@ -3008,7 +5586,7 @@ export class Renderer3D {
         pass.setBindGroup(1, texBG);
         if (this._shadowsEnabled) pass.setBindGroup(2, this._shadowBindGroup!);
       } else {
-        pass.setPipeline(this._shadowsEnabled
+        this._setPipe(pass, this._shadowsEnabled
           ? (noCull ? this.pipeline.opaqueUntexturedNoCullShadowPipeline : this.pipeline.opaqueUntexturedShadowPipeline)
           : (noCull ? this.pipeline.opaqueUntexturedNoCullPipeline : this.pipeline.opaqueUntexturedPipeline));
         pass.setBindGroup(0, this.meshBindGroup);
@@ -3021,7 +5599,7 @@ export class Renderer3D {
     // Uses a two-slot vertex layout: slot 0 = standard geometry (standalone VB override,
     // baseVertex=0), slot 1 = per-vertex rgba float32x4 color buffer.
     if (opaqueVC.length > 0) {
-      pass.setPipeline(this.pipeline.opaqueVertexColorPipeline);
+      this._setPipe(pass, this.pipeline.opaqueVertexColorPipeline);
       pass.setBindGroup(0, this.meshBindGroup!);
       for (const { mesh, idx } of opaqueVC) {
         const colorBuf = this._vcColorBuffers.get(mesh.id);
@@ -3041,14 +5619,14 @@ export class Renderer3D {
         const useTexture = mat.hasTexture || mat.hasNormalMap;
         const noCull = this.forceDoubleSided || !!mat.doubleSided;   // both faces for a doubleSided transparent mesh
         if (useTexture) {
-          pass.setPipeline(noCull ? this.pipeline.transparentTexturedNoCullPipeline : this.pipeline.transparentTexturedPipeline);
+          this._setPipe(pass, noCull ? this.pipeline.transparentTexturedNoCullPipeline : this.pipeline.transparentTexturedPipeline);
           pass.setBindGroup(0, this.meshBindGroup);
           const texId = submesh?.textureLibraryId ?? mesh.textureLibraryId ?? '';
           const isAtlas = !!texId && this._atlasLayerMap.has(texId);
           const texBG   = (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(mesh);
           pass.setBindGroup(1, texBG);
         } else {
-          pass.setPipeline(noCull ? this.pipeline.transparentUntexturedNoCullPipeline : this.pipeline.transparentUntexturedPipeline);
+          this._setPipe(pass, noCull ? this.pipeline.transparentUntexturedNoCullPipeline : this.pipeline.transparentUntexturedPipeline);
           pass.setBindGroup(0, this.meshBindGroup);
         }
 
@@ -3066,7 +5644,7 @@ export class Renderer3D {
     const opaqueVC = this._opaqueVC;
     const transparent = this._transparent;
     // Composite outline edges on top of all meshes (before gizmo)
-    if (this._outlinePass) {
+    if (this._outlinePass && this._outlinePass.ready()) {
       this._outlinePass.drawComposite(pass);
     }
 
@@ -3103,6 +5681,7 @@ export class Renderer3D {
           firstIndex:  alloc.firstIndex,
           baseVertex:  hasOverride ? 0 : alloc.baseVertex,
           instanceIdx: pair.idx,
+          pk:          alloc.pk === true,   // P22
         }));
       });
 
@@ -3125,6 +5704,7 @@ export class Renderer3D {
             firstIndex:  alloc.firstIndex + r.indexStart,
             baseVertex:  hasOverride ? 0 : alloc.baseVertex,
             instanceIdx: slot,
+            pk:          alloc.pk === true,   // P22
           });
         }
       }
@@ -3159,6 +5739,7 @@ export class Renderer3D {
                 firstIndex:  alloc.firstIndex,
                 baseVertex:  hasOverride ? 0 : alloc.baseVertex,
                 instanceIdx: first + i,
+                pk:          alloc.pk === true,   // P22
               });
             }
           }
@@ -3174,7 +5755,9 @@ export class Renderer3D {
       // overwrite each other within a submit. Regular meshes only in v1 (skinned characters render on a separate
       // path — a skinned outline shader is the follow-up).
       if (this._meshOutlines.size > 0) {
-        const outlineDraws: { entry: HighlightMeshEntry; paramIndex: number; onTop?: boolean }[] = [];
+        const outlineDraws: { entry: HighlightMeshEntry; paramIndices: number[]; onTop?: boolean }[] = [];
+        const spriteDraws: SpriteOutlineDraw[] = [];
+        let spritePending = false;
         let opi = 0;
         const seenOutline = new Set<string>();
         // Draw from the SMOOTHED-normal shell (gap-free on hard edges), keeping the mesh's live instance slot for
@@ -3185,14 +5768,38 @@ export class Renderer3D {
             const style = this._meshOutlines.get(p.mesh.id);
             if (!style || seenOutline.has(p.mesh.id)) continue;
             seenOutline.add(p.mesh.id);
+            // SPRITE outlines (sprite-alpha-outlines.md): a textured sprite whose spriteShape is 'card', or 'image' with its
+            // distance field READY, takes the separate sprite pass. Anything else — including an 'image' sprite while
+            // its field is still building, or whose image turned out fully opaque — falls through to the hull below.
+            const sm = p.mesh as Mesh3D;
+            const spMode = this._spriteOutlinePass && sm.diffuseTexture ? spriteOutlineMode(sm, style) : null;
+            const size = sm.spriteSize;
+            if (spMode && size && sm.diffuseTexture) {
+              const base = { instanceIdx: p.idx, width: size[0], height: size[1], onTop: !!style.merge,
+                             layers: outlineLayers(style, this._meshOutlineRings.get(p.mesh.id)) };
+              if (spMode === 'card') {
+                const tt = sm.material.textureTiling, to = sm.material.textureOffset;
+                spriteDraws.push({ ...base, mode: 'card', texture: sm.diffuseTexture,
+                                   uvTransform: [tt?.[0] ?? 1, tt?.[1] ?? 1, to?.[0] ?? 0, to?.[1] ?? 0] });
+                continue;
+              }
+              const field = this._spriteSDF?.get(sm.diffuseTexture);
+              if (field === undefined) spritePending = true;
+              if (field) { spriteDraws.push({ ...base, mode: 'image', field }); continue; }
+            }
             const og = this._ensureOutlineGeom(p.mesh as Mesh3D);
             if (!og) continue;
-            this._highlightPass.writeCustomParams(opi, style, canvasWidth, canvasHeight, style.speed !== 0 ? _hlTime : 0);
-            outlineDraws.push({ entry: { vertex: og.vb, index: og.ib, indexCount: og.count, firstIndex: 0, baseVertex: 0, instanceIdx: p.idx }, paramIndex: opi, onTop: !!style.merge });
-            opi++;
+            const paramIndices: number[] = [];
+            for (const layer of outlineLayers(style, this._meshOutlineRings.get(p.mesh.id))) {
+              this._highlightPass.writeCustomParams(opi, layer, canvasWidth, canvasHeight, outlineAnimates(layer) ? _hlTime : 0);
+              paramIndices.push(opi++);
+            }
+            outlineDraws.push({ entry: { vertex: og.vb, index: og.ib, indexCount: og.count, firstIndex: 0, baseVertex: 0, instanceIdx: p.idx }, paramIndices, onTop: !!style.merge });
           }
         }
         if (outlineDraws.length > 0) this._highlightPass.drawCustom(pass, this.meshBindGroup, outlineDraws);
+        if (spriteDraws.length > 0) this._spriteOutlinePass!.draw(pass, this.meshBindGroup, spriteDraws, canvasWidth, canvasHeight, _hlTime);
+        this._spriteSDFPending = spritePending;
       }
     }
 
@@ -3308,21 +5915,22 @@ export class Renderer3D {
       });
     }
 
+    // P2: particle pipeline still compiling → no particles this frame (they appear when it lands).
+    const particlePipe = this._particlePipeline!.get();
+    if (!particlePipe) return;
     // ── Bloom capture + blur (before main pass draws) ──────────────
-    if (this._bloomPass) {
+    this._bloomCapturePipeline ??= createBloomCapturePipeline(this.device, this._particleBGL0!, this._particleBGL1!);
+    const bloomCapturePipe = this._bloomPass ? this._bloomCapturePipeline.get() : null;
+    const bloomReady = !!(this._bloomPass && bloomCapturePipe && this._bloomPass.ready());   // P2: whole bloom skipped while compiling
+    if (this._bloomPass && bloomReady) {
       this._bloomPass.ensureTextures(canvasWidth, canvasHeight);
-      if (!this._bloomCapturePipeline) {
-        this._bloomCapturePipeline = createBloomCapturePipeline(
-          this.device, this._particleBGL0!, this._particleBGL1!,
-        );
-      }
       const atlasTex = this._atlasTexture ?? this.getDefaultWhiteTex();
       this._bloomPass.captureAndBlur(
         this._particleInstBuf!,
         this._particleSceneUniBuf!,
         this._particleBGL0!,
         this._particleBGL1!,
-        this._bloomCapturePipeline,
+        bloomCapturePipe!,
         active,
         firstInstances,
         this.pipeline.activeSampler,
@@ -3331,7 +5939,7 @@ export class Renderer3D {
     }
 
     // ── Main pass draw ─────────────────────────────────────────────
-    pass.setPipeline(this._particlePipeline!);
+    pass.setPipeline(particlePipe);
     pass.setBindGroup(0, this._particleBindGroup0!);
     pass.setBindGroup(1, this._getParticleTexBindGroup());
 
@@ -3341,9 +5949,58 @@ export class Renderer3D {
     }
 
     // ── Bloom composite (additive, drawn after particles) ──────────
-    if (this._bloomPass) {
+    if (this._bloomPass && bloomReady) {
       this._bloomPass.drawComposite(pass, this.pipeline.activeSampler);
     }
+  }
+
+  // ── Transient particles (Play landing dust, 2026-10-04) ───────────────
+  // Runtime-only particle sources that are NOT scene-graph nodes (never saved, no outliner row, no emitter icon):
+  // the Play landing dust (game/landing-dust.ts). Drawn with the billboard particle pipeline right after the
+  // scene's emitters, from their own instance buffer, never into the particle bloom. The Play loop registers a
+  // source only while it has live particles, so an idle scene pays one empty-array check per pass.
+  private readonly _transientParticles: TransientParticleSource[] = [];
+  private _transientInstBuf: GPUBuffer | null = null;
+  private _transientInstCap = 0;
+  private _transientBG0: GPUBindGroup | null = null;
+  addTransientParticles(src: TransientParticleSource): void { if (!this._transientParticles.includes(src)) this._transientParticles.push(src); }
+  removeTransientParticles(src: TransientParticleSource): void { const i = this._transientParticles.indexOf(src); if (i >= 0) this._transientParticles.splice(i, 1); }
+  get hasTransientParticles(): boolean { return this._transientParticles.length > 0; }
+  /** Draw every registered transient source (call once per scene pass, after drawParticles). */
+  drawTransientParticles(pass: GPURenderPassEncoder): void {
+    const srcs = this._transientParticles;
+    let total = 0;
+    for (const s of srcs) if (s.gpuData && s.activeCount > 0) total += s.activeCount;
+    if (total === 0) return;
+    if (!this._particlePipeline) this._initParticlePipeline();
+    const pipe = this._particlePipeline!.get();
+    if (!pipe) return;
+    const bytes = total * PARTICLE_INSTANCE_STRIDE;
+    if (!this._transientInstBuf || this._transientInstCap < bytes) {
+      this._transientInstBuf?.destroy();
+      this._transientInstCap = Math.max(4096, Math.ceil(bytes * 1.5));
+      this._transientInstBuf = this.device.createBuffer({ size: this._transientInstCap, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, label: 'TransientParticleInstBuf' });
+      this._transientBG0 = null;
+    }
+    let off = 0;
+    for (const s of srcs) {
+      if (!s.gpuData || s.activeCount <= 0) continue;
+      const n = s.activeCount * PARTICLE_INSTANCE_STRIDE;
+      this.device.queue.writeBuffer(this._transientInstBuf, off, s.gpuData.buffer, s.gpuData.byteOffset, n);
+      off += n;
+    }
+    this._writeParticleSceneUniforms();
+    this._transientBG0 ??= this.device.createBindGroup({
+      layout: this._particleBGL0!,
+      entries: [
+        { binding: 0, resource: { buffer: this._transientInstBuf } },
+        { binding: 1, resource: { buffer: this._particleSceneUniBuf! } },
+      ],
+    });
+    pass.setPipeline(pipe);
+    pass.setBindGroup(0, this._transientBG0);
+    pass.setBindGroup(1, this._getParticleTexBindGroup());
+    pass.draw(6, total, 0, 0);
   }
 
   private _initParticlePipeline(): void {
@@ -3365,7 +6022,8 @@ export class Renderer3D {
       ],
     });
 
-    this._particlePipeline = device.createRenderPipeline({
+    this._particlePipeline = GPUPipelineCache.for(device).render({
+      label: 'Particles',
       layout: device.createPipelineLayout({ bindGroupLayouts: [this._particleBGL0, this._particleBGL1] }),
       vertex: {
         module:     device.createShaderModule({ code: PARTICLE_VERTEX_SHADER }),
@@ -3431,6 +6089,7 @@ export class Renderer3D {
    */
   private _updateShadowCenter(): void {
     if (!this._shadowsEnabled) return;
+    this._settleSun();   // P14
 
     // ── Zoom-adaptive box size ────────────────────────────────────────────────────────────────────────────────
     // Tune these two in-browser: HE_PER_DIST too small → shadows cut off at the screen edges when zoomed in;
@@ -3444,12 +6103,14 @@ export class Renderer3D {
       const dist = Math.hypot(p[0] - t[0], p[1] - t[1], p[2] - t[2]);
       he = Math.min(this._shadowHalfExtent, Math.max(MIN_HE, dist * HE_PER_DIST));
     }
-    if (he !== this._effHe) {
+    const heChanged = he !== this._effHe;
+    if (heChanged) {
       this._effHe = he;
       // Bias scales with the effective texel size (∝ he): a small sharp box needs far less bias, which also cuts
       // the peter-panning (detached shadows) that a fixed large bias causes when zoomed in.
       this._effBias = this._shadowBias * (he / this._shadowHalfExtent);
       this._shadowMapStale = true;                 // box resized → the map must re-render at the new scale
+      this._shadowLightMoved = true;               // P4.2: volatile light box → direct path, cache invalid
     }
 
     if (!this._shadowFollowCamera) return;         // origin-locked: centre stays at 0 (set by setShadowFollowCamera)
@@ -3466,11 +6127,319 @@ export class Renderer3D {
     // centre at y=0 puts the column through the ground at the focus, so coverage stays put at every azimuth.
     const cy = 0;
     const cz = Math.round(t[2] / texel) * texel;
+    // P6 (performance-plan.md): re-centre only once the focus has drifted more than SHADOW_FOLLOW_SLACK_TEXELS from
+    // the box centre. Every re-centre re-renders the whole far map AND voids the P4.2 static cache, and at street
+    // level a texel is ~0.1 m, so walking / flying re-rendered it every 1-4 frames. The centre stays on the same texel
+    // lattice (cx/cz are still texel multiples), so every shadow texel lands where it did before; only the box's
+    // coverage edge, 100+ m away, trails the focus by at most the slack.
+    const slack = texel * Math.max(0, Renderer3D.SHADOW_FOLLOW_SLACK_TEXELS);
+    if (slack > 0 && !heChanged && this._lsmCenter[1] === cy && Math.abs(cx - this._lsmCenter[0]) <= slack && Math.abs(cz - this._lsmCenter[2]) <= slack) return;
     if (cx !== this._lsmCenter[0] || cy !== this._lsmCenter[1] || cz !== this._lsmCenter[2]) {
       vec3.set(this._lsmCenter, cx, cy, cz);
       this._shadowMapStale = true;                 // centre moved a texel → refresh the throttled map this frame
+      this._shadowLightMoved = true;               // P4.2: panning → direct path, cache invalid
     }
   }
+
+  /** P6: how far (in far-map texels) the camera focus may drift from the far shadow box centre before the box is
+   *  re-centred (and the map re-rendered). 0 = re-centre on every texel (the pre-P6 behaviour). */
+  static SHADOW_FOLLOW_SLACK_TEXELS = 16;
+
+  /** P8 SHADOW LOD (performance-plan.md P8): leave a caster out of a shadow map (the far map, or one near cascade)
+   *  when its `Mesh3D.shadowFeatureSize` is below SHADOW_LOD_TEXELS of that map's texels — the map cannot resolve its
+   *  shadow. Only meshes with a feature size (the city's sub-metre classes) are affected. false = every caster in
+   *  every map (the pre-P8 behaviour, A/B). */
+  static shadowSizeLod = true;
+  static SHADOW_LOD_TEXELS = 1;
+  /** P8 shadow LOD screen guard: a caster also has to be under this many pixels at the camera's distance to the city
+   *  volume (`distanceLodBias`; 0 at street / roof level → nothing is skipped there). */
+  static SHADOW_LOD_SCREEN_PX = 2;
+  /** P8 SHADER FAST PATHS (scene.cascadeBias.z): bit-identical shortcuts in the main fragment shaders — a facade's
+   *  wall pixels skip the interior-mapped window trace, windowsPattern evaluates only the facade's own material and
+   *  returns the footprint alone to non-facade patterned meshes. false = the original code paths (A/B). */
+  static shaderFastPaths = true;
+  /** STEP 8 SPECIALISED SHADER VARIANTS (shader-variants.ts; performance-plan §P21): a batched opaque mesh whose
+   *  material flags are in a listed feature family draws with a variant of its fragment shader compiled with those
+   *  flags as constants (same pixels; compiled in the background, the uber-shader until ready). false = every mesh
+   *  on the uber-shader (A/B). Through setShaderVariants / sm.setShaderVariants3D. */
+  static shaderVariants = true;
+  /** Step 8: dense ids of the variant keys in use (the draw rank and the GPU-driven state codes carry them). */
+  private readonly _svIds = new ShaderVariantIds();
+  /** Step 8: bumped when a mesh's variant key changes on a slot write (a look switch): the draw rank re-ranks. */
+  private _svKeyGen = 0;
+  private _drawOrderSv = -2;
+  /** Step 8: the draw rank's pipeline class includes the shader-variant id (same-variant meshes form one run, so the
+   *  variants add no pipeline switches by alternation). Independent of shaderVariants (the A/B keeps the order). */
+  static rankVariants = true;
+  private _svU32: Uint32Array | null = null;
+  /** Step 8: the specialised pipeline for a batched opaque draw with variant key `vk` (-1 = none), or null (the
+   *  caller uses the base pipeline: no variant, variants off, or still compiling). */
+  private _variantPipe(vk: number, tex: boolean, noCull: boolean, pat: boolean): GPURenderPipeline | null {
+    if (vk < 0 || !Renderer3D.shaderVariants) return null;
+    return this.pipeline.variantPipeline((tex ? VB_TEXTURED : 0) | (noCull ? VB_NOCULL : 0) | (pat ? VB_PATTERNED : 0) | (this._shadowsEnabled ? VB_SHADOW : 0), vk, Renderer3D.shaderFastPaths);
+  }
+  /** Step 8: switch the shader variants (A/B) and read their state: keys in use, compiled pipelines, compile times. */
+  setShaderVariants(o: { enabled?: boolean; max?: number } = {}): { enabled: boolean; keys: number; max: number; registered: number; ready: number; pending: number; failed: number; list: { key: number; base: number; fast: boolean; ready: boolean; ms: number }[] } {
+    if (o.max !== undefined && Number.isFinite(o.max)) this._svIds.max = Math.max(0, Math.floor(o.max));
+    if (o.enabled !== undefined && !!o.enabled !== Renderer3D.shaderVariants) {
+      Renderer3D.shaderVariants = !!o.enabled;
+      this._gd?.recode();   // the GPU-driven state codes carry the variant id
+    }
+    return { enabled: Renderer3D.shaderVariants, keys: this._svIds.size, max: this._svIds.max, ...this.pipeline.variantStats() };
+  }
+  /** FOG HORIZON silhouette fast path (fog-horizon.ts FOG_HORIZON_FAST): fogged pixels return the fog colour early
+   *  while Hard edge + linear fog are on. Pixel-identical; false = the full shading path (A/B). */
+  static fogHorizonFastPath = true;
+  /** FOG HORIZON CPU cull (Buildings only in fog: non-silhouette families past the fog edge are not drawn). false =
+   *  draw them (the shaders still fog / dissolve them) - the A/B that proves the cull itself is invisible. */
+  static fogHorizonCpuCull = true;
+  /** A/B: the P9 cluster-level fog reject (a cluster wholly past the fog edge skips its culled-class members without
+   *  the per-mesh box fetch + fog test). The draw lists are identical either way (cull-clusters-fog.test.ts). */
+  static hcFogReject = true;
+  /** P11 OCCLUSION CULL (occlusion-culler.ts). Default OFF (opt-in): main-pass meshes / groups wholly behind this
+   *  frame's building walls are not drawn. Conservative + same-frame (unit-tested against a dense ray reference). */
+  static occlusionCulling = false;
+  /** Occlusion buffer width in pixels (height from the aspect). 256 ≈ 6 screen px per buffer pixel at 1540 wide. */
+  static OCCLUSION_WIDTH = 256;
+  /** Which meshes act as occluders (by name). They must be opaque, untextured and never dissolved. */
+  static OCCLUDER_NAMES: RegExp = DEFAULT_OCCLUDER_NAMES;
+  private readonly _occl = new OcclusionCuller();
+  private readonly _occlCache = new OccluderCache(12);
+  /** P11 diagnostics of the last frame's occlusion pass (occluder polygons, pixels covered, boxes tested / culled). */
+  get occlusionStats(): OcclusionCuller['stats'] { return this._occl.stats; }
+  /** Verification hook (headless drivers): when an array, each frame it is refilled with the meshes and instanced
+   *  groups the occlusion cull dropped. null = off (no cost). */
+  occlusionDebugList: Array<Mesh3D | ArrayGroup3D> | null = null;
+  /** Build this frame's occlusion buffer, or null when the cull is off / cannot run (ortho, planar mirror live). */
+  private _beginOcclusion(meshes: Mesh3D[]): OcclusionCuller | null {
+    this._frame.msOccl = 0;
+    if (!Renderer3D.occlusionCulling || this.camera.mode === 'orthographic' || this._planarActive) return null;
+    const t0 = performance.now();
+    const oc = this._occl, re = Renderer3D.OCCLUDER_NAMES;
+    oc.width = Renderer3D.OCCLUSION_WIDTH;
+    oc.begin(this.camera.getViewProjectionMatrix() as unknown as Float32Array, Math.max(1e-3, this.camera.aspect) * 1000, 1000);
+    for (let i = 0; i < meshes.length; i++) {
+      const m = meshes[i];
+      // occluder: name-matched, drawn this frame (visible, resident, not LOD / fog hidden), opaque, untextured, no
+      // dissolve (fog class 0), a static current geometry
+      if (m._r3Occl !== re) { m._r3Occl = re; m._r3IsOccl = re.test(m.name ?? ''); }
+      if (!m._r3IsOccl || !m.visible || m.gpuDirty || m.lodHidden || m.fogHidden || m.fogClass !== 0 || m.lodTwinRole !== 0
+          || m.material.opacity < 1 || m.material.hasTexture || m.alwaysOnTop || m.submeshes.length > 0 || !this._geomAllocs.has(m.id)) continue;
+      const g = this._occlCache.get(m as unknown as import('./occlusion-culler').OccluderSource);
+      if (g) oc.addOccluder(g);
+    }
+    oc.finish();
+    this._frame.msOccl = performance.now() - t0;
+    return oc.stats.pixelsCovered > 0 ? oc : null;
+  }
+  /** Meshes the occlusion cull must keep: drawn on top / outlined / selected / hovered (their highlight shows through). */
+  private _occlExempt(m: Mesh3D): boolean {
+    return m.alwaysOnTop || this._meshOutlines.has(m.id) || this._selectedMeshIds.has(m.id) || this._hoveredMeshIds.has(m.id);
+  }
+  /** P11 CULL RANGES (cull-ranges.ts). A/B: false = every mesh draws whole (the old lists). Bit-identical either way:
+   *  a run is dropped only when its box is wholly outside a clip plane of the pass it was dropped from. */
+  static rangeCulling = true;
+  /** Triangles per run (the cull granularity; adjacent kept runs merge into one draw). */
+  static CULL_RANGE_TRIS = 256;
+  /** Meshes under this many triangles draw whole. */
+  static CULL_RANGE_MIN_TRIS = 2048;
+  /** Kept runs separated by at most this many dropped runs draw as one span (fewer draw calls; the gap is clipped). */
+  static CULL_RANGE_MERGE_GAP = 2;
+  /** Triangles of run boxes built per frame at most (a first street-level frame in a tiled world would otherwise
+   *  scan millions of indices at once); a mesh over budget draws whole until a later frame builds it. */
+  static CULL_RANGE_BUILD_TRIS = 400_000;
+  private _rangeBuildBudget = 0;
+  private readonly _rangePool: IndexRange[] = [];
+  private _rangePoolN = 0;
+  private readonly _rangeSpans: number[] = [];
+  /** The run boxes of `m`, or null (not eligible / moving / over this frame's build budget). Cached on the mesh per
+   *  geometry + matrix version; a mesh whose matrix changed in the last 120 frames counts as moving (no ranges). */
+  private _rangesFor(m: Mesh3D, alloc: GeomAlloc | undefined): CullRanges | null {
+    const geo = m.geometry;
+    if (!geo || !alloc || m.gpuDirty || m.submeshes.length > 0 || m.vertexColors || m.alwaysOnTop || m.billboard || m.billboardParent || m.material.windSway
+        || alloc.indexCount !== geo.indices.length || this._vertexBufferOverrides.has(m.id)) return null;
+    const fr = this._shadowFrameNo, v = m.localMatrixVersion, run = Renderer3D.CULL_RANGE_TRIS;
+    const c = m._r3Ranges as { owner: Renderer3D; geo: object; ver: number; frame: number; run: number; r: CullRanges | null } | null;
+    if (c && c.owner === this && c.geo === geo && c.run === run) {
+      if (c.ver === v) { if (c.r) return c.r; if (fr - c.frame < 120) return null; }
+      else { c.ver = v; c.frame = fr; c.r = null; return null; }
+    }
+    const tris = alloc.indexCount / 3;
+    if (tris > this._rangeBuildBudget) return null;
+    this._rangeBuildBudget -= tris;
+    this._frame.rangeBuilds++;
+    const r = buildCullRanges(geo.vertices, geo.indices, 12, m.localMatrix as unknown as Float32Array, run);
+    m._r3Ranges = { owner: this, geo, ver: v, frame: fr, run, r };
+    return r;
+  }
+  /** P15 Phase C: draw shadow layer `layer` (gpu-driven.ts GdShLayer) of the GPU casters into a depth pass whose pipeline
+   *  (the shadow pipeline, or pending: `_skipDraws`) and bind group 0 (`bg0`) the caller set; re-binds them after. */
+  private _gdShadowDraw(pass: GPURenderPassEncoder, layer: number, bg0: GPUBindGroup | null | undefined, bgKey: string): void {
+    if (!this._gdShThis || !bg0 || this._skipDraws || !this._gd) return;
+    const pipe = this.pipeline.shadowPassPipeline;
+    if (!pipe) return;
+    if (this._gd.drawShadow(pass, layer, pipe, bg0, bgKey)) { this._pkLost(pass); this._setPipe(pass, pipe); pass.setBindGroup(0, bg0); }   // (P22: the bundle cleared the pass state)
+  }
+  /** P15 Phase C: static layer `k` (0 far, 1 / 2 cascades) re-rendered with this frame's GPU members: commit them. */
+  private _gdShCommitLayer(enc: GPUCommandEncoder, k: number): void {
+    if (!this._gdShThis || !this._gd || !this._gd.encodeShadowCommit(enc, k)) return;
+    this._gdShCommit[k] = this._gd.frame; this._gdShJoinSince[k] = -1; this._gdShJoiners[k] = 0; this._gdShJoinTris[k] = 0;
+  }
+  /** P15 Phase C: the GPU's joiners of static layer `k` are due (with the CPU's `cpuTris`): the StaticLayerMembers rule. */
+  private _gdShDue(k: number, cpuTris: number): boolean {
+    if (!this._gdShThis || this._gdShJoiners[k] === 0) return false;
+    return this._gdShJoinTris[k] + cpuTris >= Renderer3D.STATIC_JOIN_TRIS || this._shadowFrameNo - this._gdShJoinSince[k] >= Renderer3D.STATIC_JOIN_FRAMES;
+  }
+  /** P15 Phase C, per frame: the last read-back leaver / joiner counters (frames after each layer's last commit) bump
+   *  that layer's epoch (a leaver: the layer must re-render, like a drawn member leaving the CPU's signature), and the
+   *  epochs are mixed into the three static-layer signatures (kept and all alike). Freed records bump every layer. */
+  private _gdShEpochMix(): void {
+    const gd = this._gd!, st = gd.readStats(), ep = this._gdShEpoch;
+    if (gd.takeFreed() > 0) { ep[0]++; ep[1]++; ep[2]++; }
+    for (let k = 0; k < 3; k++) {
+      if (st.shFrame > this._gdShCommit[k]) {
+        if (st.shLeave[k] > 0 || (!this._joinDeferOn && st.shJoin[k] > 0)) ep[k]++;
+        this._gdShJoiners[k] = st.shJoin[k]; this._gdShJoinTris[k] = st.shJoinTris[k];
+        if (st.shJoin[k] > 0) { if (this._gdShJoinSince[k] < 0) this._gdShJoinSince[k] = this._shadowFrameNo; }
+        else this._gdShJoinSince[k] = -1;
+      } else { this._gdShJoiners[k] = 0; this._gdShJoinTris[k] = 0; }
+    }
+    this._farSigKept.mix(0x5a17, ep[0], 7); this._farSigAll.mix(0x5a17, ep[0], 7); this._sigMix(0x5a17, ep[0], 7);
+    for (let ci = 0; ci < 2; ci++) { this._cascadeSigs[ci].mix(0x5a17, ep[1 + ci], 8 + ci); this._cascadeSigsAll[ci].mix(0x5a17, ep[1 + ci], 8 + ci); }
+  }
+  /** P15 Phase B: the run table a GPU range job uses for `m`: its current cached table (the same object the CPU's
+   *  camera / shadow lists use), else one built now when the mesh is partly in the view (the CPU path's rule, so the
+   *  per-frame build budget goes where the CPU path would spend it), else null (draws whole). */
+  private _gdRangeTable(m: Mesh3D, alloc: GeomAlloc | undefined, bb: AABB3 | null, culler: FrustumCuller | null): CullRanges | null {
+    const c = m._r3Ranges as { owner: Renderer3D; geo: object; ver: number; run: number; r: CullRanges | null } | null;
+    if (c && c.owner === this && c.geo === m.geometry && c.ver === m.localMatrixVersion && c.run === Renderer3D.CULL_RANGE_TRIS && c.r && !m.gpuDirty) return c.r;
+    if (culler && bb && culler.testBox(bb) && !culler.containsBox(bb)) return this._rangesFor(m, alloc);
+    return null;
+  }
+  /** Push `m`'s runs that pass `t` into `list` as index-range entries (adjacent runs merged). Returns the triangles kept. */
+  /** P4.2 / P14: an instanced caster group is dynamic when it sways in the wind or straddles the fog fade band. */
+  private _groupCasterDynamic(src: Mesh3D, gb: ArrayLike<number> | null, windOn: boolean): boolean {
+    if (windOn && src.material.windSway) return true;
+    return this._fhBandOn && !!gb && (src.fogClass === 2 || (src.fogClass === 1 && this._fhBandAttach)) && !src.material.noFog && this._boxFarthest(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5]) >= this._fhBandIn;   // fog horizon P2
+  }
+  /** P14 cascade split for an instanced caster group: static groups join every cascade they touch (no reach test) and
+   *  its signature; dynamic ones join the dynamic list when their shadow reaches the view. `se` = the group's far-map
+   *  entry when it has one (shared). */
+  private _groupCascades(key: object, src: Mesh3D, firstSlot: number, N: number, gb: ArrayLike<number> | null, se: RendererDrawEntry | null, reachOk: boolean, windOn: boolean, gfs: number, gTris: number): void {
+    const dyn = this._groupCasterDynamic(src, gb, windOn);
+    if (dyn && !reachOk) return;
+    const n = this._cascadeCount, cCull = this._cascadeCullers, lodTexC = this._cascadeLodTex, fs = this._frame;
+    let e = se;
+    for (let ci = 0; ci < n; ci++) {
+      if (gfs > 0 && gfs < lodTexC[ci]) { fs.shadowLodCascade++; continue; }
+      if (gb && !cCull[ci].testAABB(gb[0], gb[1], gb[2], gb[3], gb[4], gb[5])) continue;
+      const list = dyn ? this._cascadeDynLists[ci] : this._cascadeLists[ci];
+      if (e) list.push(e); else { this._pushDraw(list, src, firstSlot, undefined, N); e = list[list.length - 1]; }
+      if (!dyn) this._cascStatic(ci, key, this._casterUidOf(src) ^ 0x5bd1e995, firstSlot * 65599 + N, src.localMatrixVersion + ci * 7919, gTris, reachOk ? e : null);
+    }
+  }
+
+  /** P14: one static far-map caster (`key` = the mesh or the instanced group): the P4.2 signature, and with joiner
+   *  deferral (StaticLayerMembers) the kept signature, or — not in the cached layer yet — a joiner drawn with the
+   *  dynamic casters (`dynE` = its reach-culled entry; null when its shadow cannot reach the view). */
+  private _farStatic(key: object, a: number, b: number, c: number, tris: number, dynE: RendererDrawEntry | null): void {
+    this._sigMix(a, b, c);
+    if (!this._joinDeferOn) return;
+    this._farSigAll.mix(a, b, c);
+    this._farStaticKeys.push(key);
+    if (this._farMembers.has(key)) this._farSigKept.mix(a, b, c);
+    else { this._farMembers.join(tris, this._shadowFrameNo); if (dynE) this._shadowDynList.push(dynE); }
+  }
+  /** P14: the same for a static caster of near cascade `ci` (its static list already holds the entry). */
+  private _cascStatic(ci: number, key: object, a: number, b: number, c: number, tris: number, dynE: RendererDrawEntry | null): void {
+    this._cascadeSigsAll[ci].mix(a, b, c);
+    if (!this._joinDeferOn) { this._cascadeSigs[ci].mix(a, b, c); return; }
+    this._cascadeStaticKeys[ci].push(key);
+    if (this._cascadeMembers[ci].has(key)) this._cascadeSigs[ci].mix(a, b, c);
+    else { this._cascadeMembers[ci].join(tris, this._shadowFrameNo); if (dynE) this._cascadeDynLists[ci].push(dynE); }
+  }
+  /** P14 A/B (tile attach): a static caster that is not in a cached static layer yet (a streamed tile's mesh after its
+   *  probation, a crowd cell, a parked car) is drawn with the dynamic casters until the joiners pass STATIC_JOIN_TRIS
+   *  or the first has waited STATIC_JOIN_FRAMES, then the static layer re-renders with them all. The map is the same
+   *  either way. false = every static-set change re-renders the static layer (the P4.2 behaviour). */
+  static staticJoinDefer = true;
+  static STATIC_JOIN_TRIS = 200_000;
+  static STATIC_JOIN_FRAMES = 120;
+  private _joinDeferOn = true;
+  private readonly _farMembers = new StaticLayerMembers();
+  private readonly _farSigAll = new CasterSig();
+  private readonly _farSigKept = new CasterSig();
+  private _shadowStaticSigAll = 0;
+  private readonly _farStaticKeys: object[] = [];
+  private readonly _cascadeMembers = [new StaticLayerMembers(), new StaticLayerMembers()];
+  private readonly _cascadeSigsAll = [new CasterSig(), new CasterSig()];
+  private readonly _cascadeStaticKeys: object[][] = [[], []];
+
+  // ── P14 (performance-plan.md): far-map ranges + near-cascade static cache ──
+  /** P14.1 A/B: range-cull the far shadow map's casters (sub-mesh runs) against the light box / shadow reach. */
+  static shadowRangeCulling = true;
+  /** P14.2 A/B: near cascades keep a cached STATIC layer and redraw only the dynamic casters on top each refresh.
+   *  false = every refresh re-renders every caster (the pre-P14 path). */
+  static cascadeStaticCache = true;
+  /** P14.2: how far (in cascade texels) the wanted cascade centre may drift before the box re-centres (0 = re-centre
+   *  every texel, the pre-P14 behaviour). The coverage edge trails the camera by at most this much. */
+  static CASCADE_FOLLOW_SLACK_TEXELS = 64;
+  private readonly _shadowRunTester = new ShadowRunTester();
+  private _cascadeSplitLists = false;                 // this frame's cascade lists are the split ones
+  private readonly _cascadeDynLists: RendererDrawEntry[][] = [[], []];
+  private _cascadeDynRunsCache: (PassRun[] | null)[] = [null, null];
+  private readonly _cascadeSigs = [new CasterSig(), new CasterSig()];
+  private readonly _cascadeCache: CascadeCacheState[] = [newCascadeCacheState(), newCascadeCacheState()];
+  private _cascadeDynStale = false;                   // a skinned pose changed: the dynamic layer is due now
+  private readonly _cascadeWhy = { cold: 0, stale: 0, box: 0, sig: 0 };   // why the static layers re-rendered (diagnostics)
+  private _cascadeStaticTex: GPUTexture | null = null;
+  private _cascadeStaticViews: GPUTextureView[] = [];
+  private _cascadeStaticKey = '';
+  private readonly _cascadeHeld: CascadeLightBox[] = [0, 1].map(() => ({ dx: 0, dy: -1, dz: 0, he: 0, size: 0, sx: 0, sy: 0, zn: 0, zf: 0 }));
+  private readonly _cascadeHeldRange = [0, 0];
+  private readonly _cascadeHeldOk = [false, false];
+  private readonly _cascadeWant: CascadeLightBox = { dx: 0, dy: -1, dz: 0, he: 0, size: 0, sx: 0, sy: 0, zn: 0, zf: 0 };
+  /** P14 diagnostics: far-map + cascade cache counters (since load) and this frame's cascade list sizes. */
+  getShadowCacheStatsP14(): { far: ReturnType<Renderer3D['getShadowCacheStats']>; farJoiners: number; cascade: { split: boolean; joiners: number[]; staticRenders: number; dynPasses: number; recentres: number; why: { cold: number; stale: number; box: number; sig: number }; staticCasters: number[]; dynCasters: number[]; held: boolean[] } } {
+    const f = this._frame, n = this._cascadeCount;
+    return { far: this.getShadowCacheStats(), farJoiners: this._farMembers.joiners, cascade: { split: this._cascadeSplitLists, joiners: this._cascadeMembers.slice(0, n).map((m) => m.joiners), staticRenders: f.cascadeStaticRenders, dynPasses: f.cascadeDynPasses, recentres: f.cascadeRecentres, why: { ...this._cascadeWhy },
+      staticCasters: this._cascadeLists.slice(0, n).map((l) => l.length), dynCasters: this._cascadeDynLists.slice(0, n).map((l) => l.length), held: this._cascadeHeldOk.slice(0, n) } };
+  }
+  /** The cascade static-layer array (same size / layers as the cascade array); a rebuild drops every cached layer. */
+  private _ensureCascadeStaticTex(n: number): void {
+    const size = this._csm.mapSize, key = `${size}x${n}`;
+    if (key === this._cascadeStaticKey && this._cascadeStaticTex) return;
+    this._cascadeStaticTex?.destroy();
+    this._cascadeStaticTex = this.device.createTexture({ size: [size, size, n], format: 'depth32float', label: 'ShadowCascadeStatic', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    this._cascadeStaticViews = [];
+    for (let i = 0; i < n; i++) this._cascadeStaticViews.push(this._cascadeStaticTex.createView({ dimension: '2d', baseArrayLayer: i, arrayLayerCount: 1 }));
+    this._cascadeStaticKey = key;
+    this._dropCascadeCache();
+  }
+  private _dropCascadeCache(): void { for (const c of this._cascadeCache) { c.valid = false; c.sigDrawn = NaN; c.dynInMap = false; } for (const m of this._cascadeMembers) m.clear(); }
+  private _dropCascadeStaticTex(): void {
+    this._cascadeStaticTex?.destroy(); this._cascadeStaticTex = null; this._cascadeStaticViews = []; this._cascadeStaticKey = '';
+    this._dropCascadeCache();
+  }
+
+  private _rangedPush(list: RendererDrawEntry[], m: Mesh3D, slot: number, rg: CullRanges, t: BoxTester): number {
+    const sp = this._rangeSpans;
+    const kept = selectRanges(rg, t, sp, Renderer3D.CULL_RANGE_MERGE_GAP);
+    for (let k = 0; k < sp.length; k += 2) {
+      this._pushDraw(list, m, slot);
+      let r = this._rangePool[this._rangePoolN];
+      if (r === undefined) { r = { indexOffset: 0, indexCount: 0 }; this._rangePool[this._rangePoolN] = r; }
+      this._rangePoolN++;
+      r.indexOffset = sp[k]; r.indexCount = sp[k + 1];
+      list[list.length - 1].range = r;
+    }
+    return kept;
+  }
+  /** A/B: _ensureGeomPool skips resident, clean meshes whose P9 slot cache is current (2026-10-01; identical result). */
+  static geomPoolFastSkip = true;
+  /** P8 GROUND RELIEF LOD (scene.cascadeBias.w): fade the procedural ground's relief normal out between a 4 and an
+   *  8 cm pixel footprint and skip its four height samples beyond (not bit-identical: sub-pixel relief noise goes). */
+  static groundReliefLod = false;
 
   /** Lock the shadow box at origin (box already spans the scene) or let it follow the camera focus. */
   setShadowFollowCamera(on: boolean): void {
@@ -3482,7 +6451,7 @@ export class Renderer3D {
 
   private computeLightSpaceMatrix(): Float32Array {
     // Pure math in scene-uniforms.ts (C1 Part 2); the renderer owns the persistent scratch + inputs.
-    return computeLSM(this._light.direction, this._effHe, this._lsmCenter, this._lsmScratch);
+    return computeLSM(this._shadowDir, this._effHe, this._lsmCenter, this._lsmScratch);   // P14: the stepped shadow direction
   }
 
   getMeshWorldAABB3D(mesh: Mesh3D, out?: AABB3): AABB3 | null {
@@ -3490,7 +6459,11 @@ export class Renderer3D {
     if (!geom || geom.vertices.length === 0) return null;
 
     const matVersion = mesh.localMatrixVersion;
-    const cached     = this._meshAABBCache.get(mesh.id);
+    let cached = mesh._r3Aabb as MeshAABBEntry | null;
+    if (!cached || cached.owner !== this || cached.dead || cached.ref !== mesh) {
+      cached = this._meshAABBCache.get(mesh.id) ?? null;
+      if (cached) mesh._r3Aabb = cached;
+    }
 
     // Full cache hit: geometry unchanged (gpuDirty = false) and matrix unchanged.
     if (!mesh.gpuDirty && cached && cached.matVersion === matVersion) {
@@ -3505,6 +6478,11 @@ export class Renderer3D {
       // Geometry stable — reuse cached local AABB, only redo the 8-corner world transform.
       ox0 = cached.lMinX; oy0 = cached.lMinY; oz0 = cached.lMinZ;
       ox1 = cached.lMaxX; oy1 = cached.lMaxY; oz1 = cached.lMaxZ;
+    } else if (this.useGeometryBounds && (geom as { bounds?: ArrayLike<number> }).bounds?.length === 6) {
+      // P9: PRECOMPUTED bounds (world builds attach them after the drape; near/far twins of one chunk share one
+      // union box so their swap decisions agree exactly) — the same box Mesh3D.calculateBoundingBox uses.
+      const pre = (geom as { bounds?: ArrayLike<number> }).bounds!;
+      ox0 = pre[0]; oy0 = pre[1]; oz0 = pre[2]; ox1 = pre[3]; oy1 = pre[4]; oz1 = pre[5];
     } else {
       ox0 = Infinity;  oy0 = Infinity;  oz0 = Infinity;
       ox1 = -Infinity; oy1 = -Infinity; oz1 = -Infinity;
@@ -3534,13 +6512,21 @@ export class Renderer3D {
 
     // Cache only when geometry is stable; skip caching for dynamic meshes (cloth etc.)
     if (!mesh.gpuDirty) {
-      this._meshAABBCache.set(mesh.id, {
-        lMinX: ox0, lMinY: oy0, lMinZ: oz0,
-        lMaxX: ox1, lMaxY: oy1, lMaxZ: oz1,
-        wMinX: wx0, wMinY: wy0, wMinZ: wz0,
-        wMaxX: wx1, wMaxY: wy1, wMaxZ: wz1,
-        matVersion,
-      });
+      if (cached) {
+        cached.lMinX = ox0; cached.lMinY = oy0; cached.lMinZ = oz0; cached.lMaxX = ox1; cached.lMaxY = oy1; cached.lMaxZ = oz1;
+        cached.wMinX = wx0; cached.wMinY = wy0; cached.wMinZ = wz0; cached.wMaxX = wx1; cached.wMaxY = wy1; cached.wMaxZ = wz1;
+        cached.matVersion = matVersion;
+      } else {
+        const e: MeshAABBEntry = {
+          lMinX: ox0, lMinY: oy0, lMinZ: oz0,
+          lMaxX: ox1, lMaxY: oy1, lMaxZ: oz1,
+          wMinX: wx0, wMinY: wy0, wMinZ: wz0,
+          wMaxX: wx1, wMaxY: wy1, wMaxZ: wz1,
+          matVersion, owner: this, dead: false, ref: mesh,
+        };
+        this._meshAABBCache.set(mesh.id, e);
+        mesh._r3Aabb = e;
+      }
     }
 
     return this._writeAABB(out, wx0, wy0, wz0, wx1, wy1, wz1);
@@ -3557,15 +6543,20 @@ export class Renderer3D {
   // ── GPU upload helpers ─────────────────────────────────────────
 
   private uploadSceneUniforms(w: number, h: number): void {
+    this._viewH = h;                    // P8 shadow LOD: the screen-size guard's pixel angle
     this._selectNearestPointLights();   // camera-follow point lights: pick the nearest-N candidates before writing the uniform
     // Re-centre the shadow box on the camera focus BEFORE the light matrix is computed below, so the map the
     // shadow pass renders this frame and the matrix the main pass samples with agree. Marks the map stale when
     // the (texel-snapped) centre actually moves, so throttled shadows refresh on pan without per-frame cost.
     this._updateShadowCenter();
+    this._updateCascades();   // persona-polish A2: near cascades around the camera (after the far box settled)
 
     // The struct LAYOUT (all float offsets) lives in scene-uniforms.ts packSceneUniforms (C1 Part 2,
     // unit-tested there); this method gathers the live inputs and uploads the packed buffer.
     const data = this._sceneUniformsData;
+    computeFogEye(this.camera, this._fogEye);   // fog horizon: the point fog is measured from (perspective = the camera)
+    const fhActive = this.fogHorizonActive;
+    const fhFade = fhActive && this._fogHorizon.buildingsOnly ? this._fogHorizon.fadeM * this.fogHorizonUnitsPerMetre : 0;
     packSceneUniforms(data, {
       vp: this.camera.getViewProjectionMatrix() as Float32Array,
       camPos: this.camera.position,
@@ -3576,8 +6567,8 @@ export class Renderer3D {
       lightSpaceMatrix: this._shadowsEnabled ? this.computeLightSpaceMatrix() : null,
       shadowPcfRadius: this._shadowPcfRadius, effBias: this._effBias,
       shadowMapSize: this._shadowMapSize, shadowSoftness: this._shadowSoftness,
-      fog: this._fog, aerialFog: this._aerialFog,
-      pointLights: this._pointLights, wind: this._wind,
+      fog: this._fog, aerialFog: this.fogHardEdge ? 0 : this._aerialFog,
+      pointLights: this._lightsForUpload(), wind: this._wind,
       glassQuality: this._glassQuality,
       timeSec: this._worldTimeSec() % 3600,
       softLightStrength: this._softLightStrength,
@@ -3585,12 +6576,31 @@ export class Renderer3D {
         bands: this._skinRamp.bands, softness: this._skinRamp.softness,
         shadowFloor: this._skinRamp.shadowFloor, tintPacked: packRGB8(this._skinRamp.shadowTint),
       },
+      sketchPaper: this._sketchPaper,
+      shadowTintPacked: this._shadowTint ? packRGB8(this._shadowTint) : 0,
+      heightFog: this.fogHardEdge ? [0, 0, 1, 0.05] : this._heightFog,
+      toon: {
+        bands: this._toon.bands, softness: this._toon.softness, shadowValue: this._toon.shadowValue,
+        tintPacked: packRGB8(this._toon.shadowTint), saturation: this._toon.saturation,
+      },
+      rim: { strength: this._rim.strength, width: this._rim.width, hardness: this._rim.hardness, colorPacked: packRGB8(this._rim.color) },
+      cascades: this._cascadePack,   // count 0 = off (the shaders sample only the original map)
+      aerialHaze: this.fogHardEdge ? [0, 20, 0.6, 0.5] : this._aerialHaze,
+      shaderFastPaths: Renderer3D.shaderFastPaths ? 1 : 0,   // P8 (cascadeBias.z)
+      groundReliefLod: Renderer3D.groundReliefLod ? 1 : 0,   // P8 (cascadeBias.w)
+      fogEye: this._fogEye,                                     // fog horizon (fogEye.xyz)
+      fogFade: fhFade,                                          // fog horizon fade band (fogEye.w, world units)
+      fogHorizonFlags: fogHorizonFlags(fhActive, this._fogHorizon, fhFade, this.fogHardEdge) & (Renderer3D.fogHorizonFastPath ? ~0 : ~1),   // toonParams.w (0 = inert; HARD alone = noFog 'hardEdge' meshes skip the fog)
+      taaDitherShift: this._taaOn ? this._taaDither : 0,     // temporal AA: the dither fades move every frame (cascadeParams.w)
     });
     this.device.queue.writeBuffer(this.sceneUniformBuffer, 0, data);
   }
 
   private ensureInstanceBuffer(count: number): void {
     if (this.instanceCapacity >= count && this.instanceStorageBuffer) return;
+    // P5: when the GPU buffer is CONSISTENT (no full repack pending) grow it by a GPU-side copy and keep every slot —
+    // the first view that reveals the city's instanced detail used to pay a growth → full repack here.
+    if (this.instanceStorageBuffer && this._instanceDataBuf && !this._instancesDirty && this.incrementalArrayGroups) { this._growInstanceBuffer(count); return; }
 
     if (this.instanceStorageBuffer) this.instanceStorageBuffer.destroy();
 
@@ -3600,13 +6610,47 @@ export class Renderer3D {
     this.instanceCapacity = Math.max(Math.ceil(count * 1.5), INITIAL_INSTANCE_CAPACITY);
     this.instanceStorageBuffer = this.device.createBuffer({
       size: this.instanceCapacity * MESH_INSTANCE_STRIDE,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,   // COPY_SRC: P5 preserving growth
     });
     // Buffer reference changed — bind group, instance data, and texture atlas must be rebuilt.
     this._instancesDirty = true;
     this._atlasDirty = true;
     this._meshBindGroupBuffer = null;
   }
+
+  /** P5: grow the instance buffer to hold `count` slots (+50%) WITHOUT a repack: copy the old buffer on the GPU, grow
+   *  the CPU mirror, rebind (the mesh bind group follows the buffer reference). Slot maps, the allocator's ranges and
+   *  the atlas indices all stay valid. The old buffer is destroyed once this frame's work was submitted. */
+  private _growInstanceBuffer(count: number): void {
+    const old = this.instanceStorageBuffer!, oldCap = this.instanceCapacity;
+    this.instanceCapacity = Math.max(Math.ceil(count * 1.5), INITIAL_INSTANCE_CAPACITY);
+    this.instanceStorageBuffer = this.device.createBuffer({
+      size: this.instanceCapacity * MESH_INSTANCE_STRIDE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const enc = this.device.createCommandEncoder({ label: 'instance grow' });
+    enc.copyBufferToBuffer(old, 0, this.instanceStorageBuffer, 0, oldCap * MESH_INSTANCE_STRIDE);
+    this.device.queue.submit([enc.finish()]);
+    this._retireBuffer(old);
+    const fpi = MESH_INSTANCE_STRIDE / 4, cur = this._instanceDataBuf!;
+    if (cur.length < this.instanceCapacity * fpi) { const bigger = new Float32Array(this.instanceCapacity * fpi); bigger.set(cur); this._instanceDataBuf = bigger; }
+    this._slotAlloc.setCapacity(this.instanceCapacity);
+    this._meshBindGroupBuffer = null;
+    this._perf.instanceGrows++;
+  }
+
+  /** Destroy a replaced GPU buffer only after the work already recorded against it (this frame's encoder) was
+   *  submitted and finished — a destroyed buffer in a pending submit is a validation error. */
+  private _retireBuffer(b: GPUBuffer): void {
+    const q = this.device.queue as GPUQueue & { onSubmittedWorkDone?: () => Promise<void> };
+    const kill = (): void => { try { b.destroy(); } catch { /* already gone */ } };
+    if (typeof q.onSubmittedWorkDone === 'function') q.onSubmittedWorkDone().then(() => setTimeout(kill, 0), kill);
+    else setTimeout(kill, 1000);
+  }
+
+  /** P5 A/B switch: false restores the pre-P5 behaviour (a changed array-group SET forces the full repack, buffer
+   *  growth re-packs, geometry-pool overflow compacts). `renderer3D.incrementalArrayGroups = false`. */
+  incrementalArrayGroups = true;
 
   /** The cached DataView over the instance staging buffer — the SINGLE source of truth, recreated whenever the
    *  backing Float32Array was reallocated (identity check on `.buffer`). The P8 cache (`_instanceDataView`) went
@@ -3624,11 +6668,58 @@ export class Renderer3D {
   /** World AABB over a group's instance positions (source + explicit offsets, transformed by the source's parent
    *  chain), expanded by the canonical extent — for whole-group frustum culling. Cached per source-matrix version.
    *  Non-explicit modes (array tool) return null → never group-culled. */
+  // ── P22 propCull (tile-landing.ts P22_RENDER.propCull) ──────────────────────────────────────────────────────────────
+  /** Prop groups with at least this many copies cull per run of copies. */
+  static PROP_CULL_MIN = 24;
+  /** Copies per run (one box each; consecutive copies are spatially close: the builders emit prop by prop). */
+  static PROP_CULL_RUN = 4;   // street pose, CPU path: 8 → 7.16 M main tris / 5,770 draws, 4 → 7.00 M / 5,944, 2 → 6.82 M / 6,331
+  /** Kept runs separated by at most this many dropped ones merge into one draw (a draw costs more than a few props). */
+  static PROP_CULL_GAP = 1;
+  private readonly _propSpans: number[] = [];
+  private _propCulledTris = 0;
+  private readonly _propTabs = new Map<string, { ver: number; n: number; xf: Float32Array; tab: CullRanges | null }>();
+  /** The run table of an instanced prop group: runs of PROP_CULL_RUN copies (first / count in COPIES), each box = its
+   *  copies' origins (the group's explicit offsets through the parent chain, as _arrayGroupWorldAABB) ± the same
+   *  geometry margin as the group box; blocks of 16 runs. Cached per group (source matrix version, count, transforms). */
+  private _propCullTable(group: ArrayGroup3D, source: Mesh3D, N: number): CullRanges | null {
+    const xf = group.instanceXf!, ver = source.localMatrixVersion;
+    const c = this._propTabs.get(group.id);
+    if (c && c.ver === ver && c.n === N && c.xf === xf) return c.tab;
+    let tab: CullRanges | null = null;
+    const p = group.arrayParams;
+    if (p.mode === 'explicit' && p.offsets.length >= N) {
+      const m = source.parentChainMatrix as unknown as Float32Array;
+      const sb = this.getMeshWorldAABB3D(source, this._aabbScratch);
+      const mg = sb ? Math.max(sb.maxX - sb.minX, sb.maxY - sb.minY, sb.maxZ - sb.minZ) : 0;
+      const run = Math.max(1, Renderer3D.PROP_CULL_RUN | 0), n = Math.ceil(N / run), br = 16, nb = Math.ceil(n / br);
+      const first = new Int32Array(n), count = new Int32Array(n), box = new Float64Array(n * 6), blockBox = new Float64Array(nb * 6);
+      for (let b = 0; b < nb; b++) { blockBox[b * 6] = blockBox[b * 6 + 1] = blockBox[b * 6 + 2] = Infinity; blockBox[b * 6 + 3] = blockBox[b * 6 + 4] = blockBox[b * 6 + 5] = -Infinity; }
+      for (let r = 0; r < n; r++) {
+        const i0 = r * run, i1 = Math.min(N, i0 + run);
+        first[r] = i0; count[r] = i1 - i0;
+        let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+        for (let i = i0; i < i1; i++) {
+          const o = p.offsets[i];
+          const wx = m[0] * o[0] + m[4] * o[1] + m[8] * o[2] + m[12], wy = m[1] * o[0] + m[5] * o[1] + m[9] * o[2] + m[13], wz = m[2] * o[0] + m[6] * o[1] + m[10] * o[2] + m[14];
+          if (wx < x0) x0 = wx; if (wx > x1) x1 = wx; if (wy < y0) y0 = wy; if (wy > y1) y1 = wy; if (wz < z0) z0 = wz; if (wz > z1) z1 = wz;
+        }
+        const q = r * 6;
+        box[q] = x0 - mg; box[q + 1] = y0 - mg; box[q + 2] = z0 - mg; box[q + 3] = x1 + mg; box[q + 4] = y1 + mg; box[q + 5] = z1 + mg;
+        const o = Math.floor(r / br) * 6;
+        for (let k = 0; k < 3; k++) { if (box[q + k] < blockBox[o + k]) blockBox[o + k] = box[q + k]; if (box[q + 3 + k] > blockBox[o + 3 + k]) blockBox[o + 3 + k] = box[q + 3 + k]; }
+      }
+      tab = { n, first, count, box, blockRuns: br, blockBox, inst: true };
+    }
+    if (this._propTabs.size > 8192) this._propTabs.clear();
+    this._propTabs.set(group.id, { ver, n: N, xf, tab });
+    return tab;
+  }
   private _arrayGroupWorldAABB(group: ArrayGroup3D, source: Mesh3D): [number, number, number, number, number, number] | null {
     const ver = source.localMatrixVersion;
     const cached = this._agAABBCache.get(group.id);
     if (cached && cached.ver === ver) return cached.box;
     let box: [number, number, number, number, number, number] | null = null;
+    let org: [number, number, number, number, number, number] | null = null;   // P8: instance ORIGINS only (no geometry margin)
     const p = group.arrayParams;
     if (p.mode === 'explicit') {
       let lx0 = source.x, lx1 = source.x, ly0 = source.y, ly1 = source.y, lz0 = source.z, lz1 = source.z;
@@ -3651,8 +6742,9 @@ export class Renderer3D {
       const sb = this.getMeshWorldAABB3D(source, this._aabbScratch);
       const mg = sb ? Math.max(sb.maxX - sb.minX, sb.maxY - sb.minY, sb.maxZ - sb.minZ) : 0;
       box = [wx0 - mg, wy0 - mg, wz0 - mg, wx1 + mg, wy1 + mg, wz1 + mg];
+      org = [wx0, wy0, wz0, wx1, wy1, wz1];
     }
-    this._agAABBCache.set(group.id, { ver, box });
+    this._agAABBCache.set(group.id, { ver, box, org });
     return box;
   }
 
@@ -3669,6 +6761,38 @@ export class Renderer3D {
     this._writePatternSlots(data, offset, mm);
   }
 
+  // ── Procedural-ground uv scale (ground-uv-scale.ts) ─────────────────────────────────────────────────────────────
+  /** Per mesh: the geometry + 3×3 model part the cached scale was computed for. */
+  private _groundUvScaleCache = new Map<string, { geo: unknown; m: number[]; s: [number, number] | null }>();
+
+  /** For an UNTEXTURED procedural-ground mesh, write its world-units-per-uv (computed once from the geometry + the
+   *  model matrix already in the slot) into uvTransform (floats 56-59) with the marker, so the shader stops deriving
+   *  it per pixel (the noisy / shimmering grout). Call AFTER the slot's model matrix + material floats are written.
+   *  Every other mesh returns immediately. Cached per mesh by geometry identity + the 3×3 matrix values. */
+  private _writeGroundUvScale(data: Float32Array, offset: number, mesh: Mesh3D): void {
+    // FLAGS2 (material-3d.ts: normalMatrix column 3 .x, an integer-valued float the normal transform multiplies by 0).
+    // Here because every slot writer calls this after the matrices (and the material-only rewrites too).
+    data[offset + FLAGS2_FLOAT_OFFSET] = encodeMeshFlags2(mesh);
+    data[offset + FLAGS2_FLOAT_OFFSET + 1] = mesh.hlodFade >= 0 ? mesh.hlodFade : 0;   // P17 HLOD fade coverage (column 3 .y, x 0 like .x)
+    // STEP 8: the shader-variant key = the flags exactly as just written to this slot (floats 43, a u32), so a variant
+    // pipeline is only ever chosen for a mesh whose instance flags equal its constant. Multi-material meshes: none.
+    if (this._svU32 === null || this._svU32.buffer !== data.buffer) this._svU32 = new Uint32Array(data.buffer);
+    const svk = mesh.submeshes.length === 0 ? variantKeyOfFlags(this._svU32[(data.byteOffset >> 2) + offset + 43]) : -1;
+    if (svk !== mesh._r3VF) { this._svKeyGen++; mesh._r3VF = svk; }
+    const mm = mesh.material;
+    if (!mm.groundShade || mm.hasTexture || mm.hasNormalMap || mm.garpTex) return;
+    const geo = mesh.groundUvSample ?? mesh.geometry;   // chunked city ground: the unsplit layer's sample (no seams)
+    if (!geo?.vertices?.length || !geo.indices?.length) return;
+    const m9 = [data[offset], data[offset + 1], data[offset + 2], data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 8], data[offset + 9], data[offset + 10]];
+    let c = this._groundUvScaleCache.get(mesh.id);
+    if (!c || c.geo !== geo || c.m.some((x, i) => x !== m9[i])) {
+      c = { geo, m: m9, s: groundUvWorldScale(geo, data.subarray(offset, offset + 16)) };
+      this._groundUvScaleCache.set(mesh.id, c);
+    }
+    if (!c.s) return;   // degenerate uv → the shader keeps its per-pixel estimate
+    data[offset + 56] = c.s[0]; data[offset + 57] = c.s[1]; data[offset + 58] = GROUND_UV_SCALE_MARKER; data[offset + 59] = 0;
+  }
+
   /** Write the pattern instance slots (floats 48–55). Several features REPURPOSE them, which is why they are
    *  mutually exclusive with patternMode (and each other) per mesh: boardShade (bit 16, packaging paperboard)
    *  → (rimU, rimV, rimStrength, grainAmp) + the panel's dieline-UV rect; groundShade (bit 18) → seam/tile/
@@ -3680,6 +6804,14 @@ export class Renderer3D {
     const tt = mm.textureTiling, to = mm.textureOffset;
     data[offset + 56] = tt?.[0] ?? 1; data[offset + 57] = tt?.[1] ?? 1;
     data[offset + 58] = to?.[0] ?? 0; data[offset + 59] = to?.[1] ?? 0;
+    if (mm.crowdPalette) {
+      // CROWD PALETTE (performance-plan P12, crowd-palette.ts): patternColor.xyz = the packed per-instance palette slots
+      // (array copies take their own from InstanceOverride.crowdSlots). The crowd draws no pattern (plain shader).
+      const cs = mm.crowdSlots;
+      data[offset + 48] = cs?.[0] ?? 0; data[offset + 49] = cs?.[1] ?? 0; data[offset + 50] = cs?.[2] ?? 0; data[offset + 51] = 0;
+      data[offset + 52] = 8; data[offset + 53] = 0; data[offset + 54] = 0.5; data[offset + 55] = 0;
+      return;
+    }
     if (mm.windSway || mm.foliageShade) {
       // FOLIAGE (foliage-quality S1/S2, flag bits 19/20) repurposes the slots — see Material3D.windSway:
       //   patternColor  = (translucency, groundBlend, baseAO, packedGroundTint)
@@ -3768,17 +6900,15 @@ export class Renderer3D {
       return;
     }
     const pc = mm.patternColor;
-    data[offset + 48] = pc?.r ?? 0; data[offset + 49] = pc?.g ?? 0; data[offset + 50] = pc?.b ?? 0; data[offset + 51] = 0;
+    // .a = the 'windows' lit-glow multiplier (visual-polish #8, opt-in: absent -> 0 -> the shader's 1x)
+    data[offset + 48] = pc?.r ?? 0; data[offset + 49] = pc?.g ?? 0; data[offset + 50] = pc?.b ?? 0; data[offset + 51] = mm.patternMode === 'windows' ? (mm.windowGlow ?? 0) : 0;
     data[offset + 52] = mm.patternFreq ?? 8; data[offset + 53] = mm.patternAngle ?? 0; data[offset + 54] = mm.patternScale ?? 0.5; data[offset + 55] = mm.patternSpacing ?? 0;
   }
 
   /** Take an instance slot: reuse a freed one, else grow the high-water. Returns -1 if the buffer is full (caller
    *  bails to a full repack, which compacts + grows). */
   private _takeInstanceSlot(): number {
-    const f = this._instanceFreeSlots.pop();
-    if (f !== undefined) return f;
-    if (this._instanceHigh < this.instanceCapacity) return this._instanceHigh++;
-    return -1;
+    return this._slotAlloc.alloc(1);
   }
 
   /** Write a NON-billboard mesh's instance slot: model matrix + inverse-transpose normal matrix + material block
@@ -3794,6 +6924,7 @@ export class Renderer3D {
     }
     data.set(nc.floats, offset + 16);
     this._writeSlotMaterial(data, dataView, offset, mat3d);
+    this._writeGroundUvScale(data, offset, m);   // P5: as the full writer does (slotcheck found appended ground slots at the default uv scale)
     this._slotMatVer.set(m.id, m.localMatrixVersion);
   }
 
@@ -3812,6 +6943,7 @@ export class Renderer3D {
       nc.floats.set(normalMat as Float32Array); nc.matVersion = m.localMatrixVersion;
     }
     data.set(nc.floats, offset + 16);
+    this._writeGroundUvScale(data, offset, m);   // P5: the ground uv scale depends on the matrix
   }
 
   /** INCREMENTAL instance update (the streaming-pan smoothness fix): append newly-added meshes into freed/high-water
@@ -3819,15 +6951,20 @@ export class Renderer3D {
    *  Removed meshes already freed their slots in evictMeshCaches. Only valid when nothing needs the sort's contiguity
    *  or the atlas (no array groups / billboards / textures) — the caller gates on that; this bails (→ full repack) on
    *  anything it can't handle, so correctness is always preserved. */
-  private _tryIncrementalInstances(meshes: Mesh3D[], anyMatDirty: boolean): boolean {
+  private _tryIncrementalInstances(meshes: Mesh3D[], anyMatDirty: boolean, arraySlots = 0): boolean {
     const data = this._instanceDataBuf;
     if (!data || !this.instanceStorageBuffer) return false;
+    // A NEW array-group source needs its instances contiguous after its own slot → only the full repack can do that.
+    const arraySources = this._arrayGroups.length ? this._arraySourceCounts() : null;   // sourceId → instance count
+    const incDirtySources = this._fpDirtySources; incDirtySources.clear();
+    let incMat = 0, incDeferred = false, incAdded = false;
     const fpi = MESH_INSTANCE_STRIDE / 4;
     // The CPU shadow must span the whole buffer capacity (the free list can place slots past the last full repack's tail).
     if (data.length < this.instanceCapacity * fpi) {
       const bigger = new Float32Array(this.instanceCapacity * fpi); bigger.set(data); this._instanceDataBuf = bigger;
     }
     const buf = this._instanceDataBuf!;
+    this._slotAlloc.setCapacity(this.instanceCapacity);
     const dataView = this._instanceView();   // always synced to buf's current buffer (see _instanceView) — the "add primitive → drag → mouseup → RangeError" fix
     const normalMat = mat4.create();
     const touched: number[] = [];
@@ -3850,11 +6987,20 @@ export class Renderer3D {
             for (const s of hadMulti) { this._writeIncSlotMatrices(buf, normalMat, s, m); touched.push(s); }
             this._slotMatVer.set(m.id, m.localMatrixVersion);
           }
-          if (m.gpuDirty || m.materialDirty) {
+          const deferM = !m.gpuDirty && m.materialDirty && incMat >= Renderer3D.MATERIAL_SLOT_BUDGET;   // P4.3 budget
+          if (deferM) incDeferred = true;
+          if ((m.gpuDirty || m.materialDirty) && !deferM) {
+            incMat += hadMulti.length;
             for (let si = 0; si < hadMulti.length; si++) {
-              const sm = m.submeshes[si].material;
-              if (sm.hasTexture || sm.hasNormalMap) return false;        // atlas index lives in the slot → full repack
-              this._writeSlotMaterial(buf, dataView, hadMulti[si] * fpi, sm); touched.push(hadMulti[si]);
+              const sub = m.submeshes[si], sm = sub.material;
+              if (sm.hasTexture || sm.hasNormalMap) {
+                // P4.3: textured → full write of this one slot (atlas indices from the last atlas build) unless the
+                // atlas itself is dirty (then only the full repack can rebuild it).
+                if (this._atlasDirty) { this._incBailWhy = 'texturedAtlasDirty'; return false; }
+                this._writeInstanceSlot(hadMulti[si], m, sm, sub.textureLibraryId ?? '', sub.normalMapLibraryId ?? ''); touched.push(hadMulti[si]);
+                continue;
+              }
+              this._writeSlotMaterial(buf, dataView, hadMulti[si] * fpi, sm); this._writeGroundUvScale(buf, hadMulti[si] * fpi, m); touched.push(hadMulti[si]);
             }
             m.materialDirty = false;
           }
@@ -3864,59 +7010,86 @@ export class Renderer3D {
         if (hadMulti) return false;                                     // multi→single flip → full repack
         if (hadSingle) {                                                // resident, unchanged shape
           if (this._slotMatVer.get(m.id) !== m.localMatrixVersion) {    // …but MOVED → rewrite matrices
+            if (arraySources && arraySources.has(m.id)) { this._incBailWhy = 'movedArraySource'; return false; }   // a moved array source → full repack (instances follow it)
             this._writeIncSlotMatrices(buf, normalMat, hadSingleSlot!, m); touched.push(hadSingleSlot!);
             this._slotMatVer.set(m.id, m.localMatrixVersion);
           }
+          const deferS = !m.gpuDirty && m.materialDirty && incMat >= Renderer3D.MATERIAL_SLOT_BUDGET;   // P4.3 budget
+          if (deferS) incDeferred = true;
+          if ((m.gpuDirty || m.materialDirty) && !deferS && arraySources && arraySources.has(m.id)) { incDirtySources.add(m.id); incMat += Math.ceil(arraySources.get(m.id)! / 4); }   // P4.3: its instances copy its material (weighted into the budget)
           // ★ MATERIAL change on a RESIDENT mesh (the "Apply Ground does nothing" bug). This path used to
           // `continue` on any unmoved resident, so a mesh whose MATERIAL changed never had its slot's material
           // floats (+ the repurposed ground/board/foliage pattern slots) rewritten — and because `gpuDirty` is
           // cleared by the geometry-pool pass later the SAME frame, the change was lost for good, until some
           // unrelated structural edit (adding the scatter group) forced a full repack and it "appeared".
-          if (m.gpuDirty || m.materialDirty) {
-            if (m.material.hasTexture || m.material.hasNormalMap) return false;   // textured → atlas → full repack
-            this._writeSlotMaterial(buf, dataView, hadSingleSlot! * fpi, m.material); touched.push(hadSingleSlot!);
+          if ((m.gpuDirty || m.materialDirty) && !deferS) {
+            incMat++;
+            if (m.material.hasTexture || m.material.hasNormalMap) {   // textured → full write of this slot (P4.3), see above
+              if (this._atlasDirty) { this._incBailWhy = 'texturedAtlasDirty'; return false; }
+              this._writeInstanceSlot(hadSingleSlot!, m, m.material, m.textureLibraryId ?? '', m.normalMapLibraryId ?? '');
+            } else { this._writeSlotMaterial(buf, dataView, hadSingleSlot! * fpi, m.material); this._writeGroundUvScale(buf, hadSingleSlot! * fpi, m); }
+            touched.push(hadSingleSlot!);
             m.materialDirty = false;
+            this._clearPendingGpuDirty(m);
           }
           continue;
         }
       }
-      if (m.billboard) return false;   // needs per-frame reorient → full/fast path
+      if (m.billboard) { this._incBailWhy = 'newBillboard'; return false; }   // needs per-frame reorient → full/fast path
+      // P5: a NEW array source no longer bails — its groups get their own contiguous ranges (_syncArrayGroupSlots,
+      // after this loop wrote the source slot their material is copied from). Source + instances never had to be
+      // adjacent: every group is its own instanced-range draw entry (firstSlot, N).
+      if (!this.incrementalArrayGroups && arraySources && arraySources.has(m.id)) { this._incBailWhy = 'newArraySource'; return false; }   // A/B: old rule
       if (multi) {
-        for (const s of m.submeshes) if (s.textureLibraryId || s.normalMapLibraryId) return false;   // textured → atlas changes → full repack
+        for (const s of m.submeshes) if (s.textureLibraryId || s.normalMapLibraryId) { this._incBailWhy = 'newTextured'; return false; }   // textured → atlas changes → full repack
         const slots: number[] = [];
         for (let si = 0; si < m.submeshes.length; si++) { const slot = this._takeInstanceSlot(); if (slot < 0) return false; slots.push(slot); }
+        incAdded = true; this._meshById.set(m.id, m);   // P5: a new array source is visible to _syncArrayGroupSlots this frame
         this._meshSubmeshSlots.set(m.id, slots);
         for (let si = 0; si < slots.length; si++) { this._writeIncSlot(buf, dataView, normalMat, slots[si], m, m.submeshes[si].material); touched.push(slots[si]); }
       } else {
-        if (m.textureLibraryId || m.normalMapLibraryId) return false;
-        const slot = this._takeInstanceSlot(); if (slot < 0) return false;
-        this._meshInstanceSlots.set(m.id, slot);
+        if (m.textureLibraryId || m.normalMapLibraryId) { this._incBailWhy = 'newTextured'; return false; }
+        const slot = this._takeInstanceSlot(); if (slot < 0) { this._incBailWhy = 'capacity'; return false; }
+        incAdded = true; this._meshById.set(m.id, m);   // P5: a new array source is visible to _syncArrayGroupSlots this frame
+        this._r3Gen++; this._meshInstanceSlots.set(m.id, slot);
         this._writeIncSlot(buf, dataView, normalMat, slot, m, m.material); touched.push(slot);
       }
       m.materialDirty = false;
+      this._clearPendingGpuDirty(m);
     }
     if (anyMatDirty) {   // rewrite material-dirty EXISTING meshes at their current slot(s)
       for (const m of meshes) {
         if (!m.materialDirty) continue;
-        if (m.submeshes.length > 0) { const ss = this._meshSubmeshSlots.get(m.id); if (ss) for (let si = 0; si < ss.length; si++) { this._writeSlotMaterial(buf, dataView, ss[si] * fpi, m.submeshes[si].material); touched.push(ss[si]); } }
-        else { const s = this._meshInstanceSlots.get(m.id); if (s !== undefined) { this._writeSlotMaterial(buf, dataView, s * fpi, m.material); touched.push(s); } }
+        if (incMat >= Renderer3D.MATERIAL_SLOT_BUDGET && !m.gpuDirty) { incDeferred = true; continue; }   // P4.3 budget
+        incMat += Math.max(1, m.submeshes.length);
+        if (m.submeshes.length > 0) { const ss = this._meshSubmeshSlots.get(m.id); if (ss) for (let si = 0; si < ss.length; si++) { this._writeSlotMaterial(buf, dataView, ss[si] * fpi, m.submeshes[si].material); this._writeGroundUvScale(buf, ss[si] * fpi, m); touched.push(ss[si]); } }
+        else { const s = this._meshInstanceSlots.get(m.id); if (s !== undefined) { this._writeSlotMaterial(buf, dataView, s * fpi, m.material); this._writeGroundUvScale(buf, s * fpi, m); touched.push(s); } }
+        if (arraySources && arraySources.has(m.id)) { incDirtySources.add(m.id); incMat += Math.ceil(arraySources.get(m.id)! / 4); }
         m.materialDirty = false;
       }
     }
+    // P5: place newly shown array groups / park hidden ones (contiguous slot ranges), BEFORE the re-dress re-pack so
+    // a re-shown group of a re-dressed source is packed once, by _repackGroupsOf.
+    if (!this._syncArrayGroupSlots(incDirtySources)) { this._incBailWhy = 'groupCapacity'; return false; }
+    if (incDirtySources.size) this._repackGroupsOf(incDirtySources);   // P4.3: instanced copies of a re-dressed source
+    if (incDeferred) this.onDeferredWork?.();
     // Upload only the touched slots as coalesced runs (same trick as the transforms fast path).
     if (touched.length) {
       touched.sort((a, b) => a - b);
       let runLo = touched[0], prev = touched[0];
       for (let i = 1; i < touched.length; i++) {
         const s = touched[i];
-        if (s > prev + 256) { this.device.queue.writeBuffer(this.instanceStorageBuffer, runLo * MESH_INSTANCE_STRIDE, buf, runLo * fpi, (prev - runLo + 1) * fpi); runLo = s; }
+        if (s > prev + 256) { this.device.queue.writeBuffer(this.instanceStorageBuffer, runLo * MESH_INSTANCE_STRIDE, buf, runLo * fpi, (prev - runLo + 1) * fpi); this._noteInstBytes((prev - runLo + 1) * MESH_INSTANCE_STRIDE); runLo = s; }
         prev = s;
       }
       this.device.queue.writeBuffer(this.instanceStorageBuffer, runLo * MESH_INSTANCE_STRIDE, buf, runLo * fpi, (prev - runLo + 1) * fpi);
+      this._noteInstBytes((prev - runLo + 1) * MESH_INSTANCE_STRIDE);
     }
-    let live = 0; for (const m of meshes) live += Math.max(1, m.submeshes.length);
-    this._instanceCount = live;                 // structural-change check next frame compares totalSlots to this
-    this._drawOrderDirty = true;                // mesh set changed (adds/removals) → rebuild the cached draw rank
+    let live = arraySlots, anyGeo = false; for (const m of meshes) { live += Math.max(1, m.submeshes.length); if (m.gpuDirty) anyGeo = true; }
+    // P4.3: re-rank only when the mesh SET / geometry changed — this path now also serves the material-only re-dress
+    // frames (city day cycle), where re-sorting ~5k draw entries every frame was pure waste.
+    if (incAdded || anyGeo || live !== this._instanceCount) this._drawOrderDirty = true;   // mesh set changed (adds/removals) → rebuild the cached draw rank
+    this._instanceCount = live;                 // structural-change check next frame compares totalSlots (incl. array slots) to this
     this._perf.fastPaths++;                     // a cheap path, NOT a full repack
     this._transformsDirty = false;              // every moved resident was rewritten above (no array groups /
                                                 // billboards here — caller gate), so the pending fast-path work is done
@@ -3927,6 +7100,7 @@ export class Renderer3D {
   }
 
   private uploadMeshInstances(meshes: Mesh3D[]): void {
+    if (this._evictPending.size) this.drainDeferredEviction(STREAM_HITCH_LIMITS.evictBudgetMs, meshes);   // P16
     // id→mesh for this frame — array-group source lookups (here + the draw loop, which runs after) were meshes.find
     // per group = O(groups×meshes); with ~100+ instanced-detail groups that's a real per-frame cost.
     // ONE pass over meshes: build the id→mesh map AND all the per-frame scans (dirty flags + slot count + billboards).
@@ -3937,20 +7111,24 @@ export class Renderer3D {
     // rank dirty) — 3500 Map.set every frame just to service source lookups was pure steady-state waste. A stale
     // entry is benign: lookups miss (next structural frame rebuilds) or hit a dead mesh whose version reads are
     // harmless.
-    const rebuildMap = this._meshById.size !== meshes.length || this._drawOrderDirty;
+    const rebuildMap = this._meshById.size !== meshes.length || this._drawOrderDirty || this._groupSetDirty;   // P5: group placement reads source presence
     if (rebuildMap) this._meshById.clear();
     let anyGpuDirty = false, anyMatDirty = false, hasBillboards = false, regularSlots = 0;
-    for (const m of meshes) {
+    const gdMat = this._gdOn && this._gd ? this._gd : null;   // P15: re-read these records' state code / fog flags
+    for (let _km = 0; _km < meshes.length; _km++) { const m = meshes[_km];
       if (rebuildMap) this._meshById.set(m.id, m);
       if (m.gpuDirty) anyGpuDirty = true;
-      if (m.materialDirty) anyMatDirty = true;
+      if (m.materialDirty) { anyMatDirty = true; if (gdMat !== null) gdMat.noteMatDirty(m); }
       if (m.billboard || m.billboardParent) hasBillboards = true;   // children ride a billboard → also view-dependent
       regularSlots += Math.max(1, m.submeshes.length);
     }
     const arraySlots = this._arrayGroups.reduce((n, g) => n + getArrayInstanceCount(g.arrayParams), 0);
     const totalSlots = regularSlots + arraySlots;
     // Also check if any array source or object-offset mesh moved since last upload.
+    // P5: only PLACED groups — a group being shown this frame (no range yet) is packed fresh by _syncArrayGroupSlots,
+    // and a parked one is version-checked there; their stale/absent recorded versions must not force a full repack.
     const anyArrayMoved = this._arrayGroups.some(g => {
+      if (!this._arrayGroupFirstSlot.has(g.id)) return false;
       const src = this._meshById.get(g.sourceId);
       if (src && src.localMatrixVersion !== (this._arrayGroupSourceVers.get(g.id) ?? -1)) return true;
       if (g.arrayParams.mode === 'linear' && g.arrayParams.objectOffsetId) {
@@ -3974,7 +7152,7 @@ export class Renderer3D {
         this._billboardViewDirty = false;
       }
     }
-    if (!this._instancesDirty && !anyGpuDirty && !anyArrayMoved && totalSlots === this._instanceCount && !billboardViewChanged) {
+    if (!this._instancesDirty && !this._groupSetDirty && !this._groupsPending && !anyGpuDirty && !anyArrayMoved && totalSlots === this._instanceCount && !billboardViewChanged) {
       if (!this._transformsDirty && !anyMatDirty) return;
       // FAST PATH (transforms and/or MATERIAL only): the slot maps, atlas and array-instance POSITIONS are all still
       // valid. Rewrite only the moved slots' matrices + the material-dirty slots' material floats, then upload just
@@ -3990,12 +7168,24 @@ export class Renderer3D {
     // NO array groups / billboards / atlas change / buffer resize can append the new meshes' slots + upload just those
     // — no re-sort, no whole-buffer re-upload. This is the common tiled-streaming case (flat-color tiles, arrays
     // LOD-hidden, traffic off). Bails to the full repack below on anything it can't handle.
-    if (this._arrayGroups.length === 0 && !this._instancesDirty && !anyArrayMoved && !this._atlasDirty && !hasBillboards
-        && this._tryIncrementalInstances(meshes, anyMatDirty)) {
+    // P4.3: array groups no longer force the full repack — their instance ranges sit untouched in [0, high-water)
+    // (the GROUP SET / params changing sets _instancesDirty → full repack, and a new mesh that is an array SOURCE
+    // bails inside). This was the city's periodic 30-100 ms spike: every live-crowd promotion / demotion and every
+    // streamed add re-sorted + re-wrote ~all instance slots because the city always has instanced greenery.
+    if (!this._instancesDirty && !anyArrayMoved && !this._atlasDirty && !hasBillboards
+        && this._tryIncrementalInstances(meshes, anyMatDirty, arraySlots)) {
       return;
     }
 
     this._perf.fullRepacks++;
+    this._arraySrcCount = null;   // P4.3: re-derive the source → instance-count map after any full repack
+    {   // P4.3 diagnostics: WHY this frame paid a full repack (getRepackReasons)
+      const why = this._instancesDirty ? 'instancesDirty' : anyArrayMoved ? 'arrayMoved' : billboardViewChanged ? 'billboardView'
+        : this._atlasDirty ? 'atlas' : this._fpBailWhy ? 'fastBail:' + this._fpBailWhy : hasBillboards ? 'structural+billboards' : 'incBail:' + (anyGpuDirty ? 'gpuDirty' : '') + (totalSlots !== this._instanceCount ? 'count' : '') + (this._incBailWhy || '?');
+      this._incBailWhy = '';
+      this._fpBailWhy = '';
+      this._repackWhy[why] = (this._repackWhy[why] ?? 0) + 1;
+    }
     // Sort single-material meshes by geometryKey (contiguous same-geometry slots enable
     // batched instanced draws). Multi-submesh meshes sort last — they can't be instanced.
     // Plain < > compare (NOT localeCompare — 10-100× slower, and this sort runs on every full repack).
@@ -4010,23 +7200,33 @@ export class Renderer3D {
     // Rebuild slot maps. Single-material meshes: one slot each; multi-submesh: one slot per submesh.
     // Array instance slots are assigned immediately after their source mesh's slot so the
     // source + all its instances are contiguous → one batched drawIndexed call.
-    this._meshInstanceSlots.clear();
+    this._r3Gen++; this._meshInstanceSlots.clear();
     this._meshSubmeshSlots.clear();
     this._arrayGroupFirstSlot.clear();
+    this._arrayGroupSlotCount.clear();
+    this._placedGroupObj.clear(); this._placedGroupSrc.clear();
     let slotIdx = 0;
+    // sourceId → its groups (in _arrayGroups order). Was a scan of EVERY group per mesh = O(meshes × groups) per full
+    // repack — which chunking (Round 5: per-cell instanced groups) would have multiplied.
+    const groupsBySource = new Map<string, ArrayGroup3D[]>();
+    for (const group of this._arrayGroups) {
+      const arr = groupsBySource.get(group.sourceId);
+      if (arr) arr.push(group); else groupsBySource.set(group.sourceId, [group]);
+    }
     for (const m of sorted) {
       if (m.submeshes.length > 0) {
         const slots: number[] = [];
         for (let si = 0; si < m.submeshes.length; si++) slots.push(slotIdx++);
         this._meshSubmeshSlots.set(m.id, slots);
       } else {
-        this._meshInstanceSlots.set(m.id, slotIdx++);
+        this._r3Gen++; this._meshInstanceSlots.set(m.id, slotIdx++);
         // Assign array instance slots immediately after source — keeps them contiguous for batching.
-        for (const group of this._arrayGroups) {
-          if (group.sourceId !== m.id) continue;
+        for (const group of groupsBySource.get(m.id) ?? []) {
           const N = getArrayInstanceCount(group.arrayParams);
           if (N > 0) {
             this._arrayGroupFirstSlot.set(group.id, slotIdx);
+            this._arrayGroupSlotCount.set(group.id, N);
+            this._placedGroupObj.set(group.id, group); this._placedGroupSrc.set(group.id, m);   // P5 placement record
             slotIdx += N;
           }
         }
@@ -4075,8 +7275,10 @@ export class Renderer3D {
     this._instancesDirty = false;
     this._transformsDirty = false;   // a full repack supersedes any pending fast-path work
     this._instanceCount = totalSlots;
-    this._instanceFreeSlots.length = 0;   // repack packed everything contiguous [0, totalSlots) — no holes, no free slots
-    this._instanceHigh = totalSlots;      // the incremental append path continues from here
+    this._slotAlloc.reset(totalSlots, this.instanceCapacity);   // packed contiguous [0, totalSlots) — no holes, nothing parked
+    this._parkedGroups.clear();
+    this._groupSetDirty = false;
+    this._groupsPending = false;          // P16: the full repack placed every group
     this._drawOrderDirty = true;          // slot layout changed → rebuild the cached draw rank
   }
 
@@ -4084,6 +7286,199 @@ export class Renderer3D {
    *  border-glow/frost/wet walks): rewrite only the moved slots' matrices + material-dirty slots'
    *  floats, upload just the touched runs. Returns false on bail (structural / textured / billboard /
    *  array-source change) → caller falls through to the full repack. Verbatim body (C1 Part 2). */
+  private readonly _repackWhy: Record<string, number> = {};
+  private _fpBailWhy = '';
+  private _arraySrcCount: Map<string, number> | null = null;
+  /** sourceId → total instances of its array groups (cached; dropped when the group set / params change). */
+  private _arraySourceCounts(): Map<string, number> {
+    if (!this._arraySrcCount) {
+      const m = new Map<string, number>();
+      for (const g of this._arrayGroups) m.set(g.sourceId, (m.get(g.sourceId) ?? 0) + getArrayInstanceCount(g.arrayParams));
+      this._arraySrcCount = m;
+    }
+    return this._arraySrcCount;
+  }
+  /** P4.3 frame budget for MATERIAL-ONLY slot rewrites (the day-cycle / weather re-dress marks ~every city material
+   *  dirty at once): past it the rest stay materialDirty and are written over the next frames (~1-3 frames for a
+   *  whole city) instead of one 10-20 ms frame. Moved / geometry-dirty meshes are never deferred. */
+  static MATERIAL_SLOT_BUDGET = 1500;
+  /** Called when work was deferred to a later frame (budgeted re-dress) so an on-demand host renders again. */
+  onDeferredWork: (() => void) | null = null;
+  private _incBailWhy = '';
+  private readonly _packedRanges: number[] = [];   // [firstSlot, count, ...] from a partial _packArrayGroupInstances
+  private readonly _fpDirtySources = new Set<string>();
+  /** P5: bring the array-group slot PLACEMENT in line with the current group set, incrementally (no re-sort):
+   *  - a placed group that left the set (or lost its source / changed its count) releases its range. It is PARKED
+   *    (owned, data kept) when its source slot still exists, so a later re-show costs nothing;
+   *  - a group in the set without a range claims its parked range back when nothing it depends on changed (same group
+   *    and source objects, source + object-offset matrix versions, source-slot material floats), else allocates a
+   *    fresh contiguous range and is packed + uploaded (only its N slots).
+   *  Returns false when a range can't be allocated (buffer full / too fragmented) → the caller's full repack compacts.
+   *  `skipPack`: sources re-packed right after anyway (re-dress) — their newly placed groups aren't packed twice. */
+  private _syncArrayGroupSlots(skipPack: Set<string>): boolean {
+    const first = this._arrayGroupFirstSlot, counts = this._arrayGroupSlotCount;
+    if (!this._groupSetDirty && first.size === 0 && this._arrayGroups.length === 0) return true;
+    const want = this._gsWant; want.clear();
+    const fpi = MESH_INSTANCE_STRIDE / 4;
+    // Pass 1: groups that should be placed = in the set, single-material source present this frame with a slot, N > 0
+    // (exactly the full repack's rule).
+    const byId = this._gsById; byId.clear();
+    for (const g of this._arrayGroups) {
+      const src = this._meshById.get(g.sourceId);
+      if (!src || src.submeshes.length > 0 || !this._meshInstanceSlots.has(src.id)) continue;
+      if (getArrayInstanceCount(g.arrayParams) <= 0) continue;
+      want.add(g.id); byId.set(g.id, g);
+    }
+    // Pass 2: release placed groups that are no longer wanted, were replaced by another object, or changed count.
+    let changed = false;
+    for (const [gid, start] of first) {
+      const n = counts.get(gid) ?? 0;
+      const g = byId.get(gid);
+      const placed = this._placedGroupObj.get(gid);
+      if (g && g === placed && getArrayInstanceCount(g.arrayParams) === n) continue;
+      const src = this._placedGroupSrc.get(gid);   // the source usually hides WITH its group → not in this frame's map
+      first.delete(gid); counts.delete(gid); this._placedGroupObj.delete(gid); this._placedGroupSrc.delete(gid); changed = true;
+      const srcSlot = src && src.submeshes.length === 0 ? this._meshInstanceSlots.get(src.id) : undefined;   // resident (not evicted)
+      if (!g && placed && src && srcSlot !== undefined && n > 0) {   // hidden, data intact → PARK it
+        const o = srcSlot * fpi, data = this._instanceDataBuf!;
+        const offId = placed.arrayParams.mode === 'linear' ? placed.arrayParams.objectOffsetId : undefined;
+        this._parkedGroups.set(gid, {
+          group: placed, src, srcVer: this._arrayGroupSourceVers.get(gid) ?? -1,
+          offVer: offId ? (this._arrayGroupOffsetVers.get(gid) ?? -1) : -1,
+          mat: data.slice(o + 32, o + 60),
+        });
+        this._slotAlloc.free(start, n, gid);
+      } else {
+        this._parkedGroups.delete(gid);
+        this._slotAlloc.disown(gid);
+        this._slotAlloc.free(start, n);
+      }
+    }
+    // Pass 3: place wanted groups that have no range.
+    const pack = this._gsPack; pack.clear();
+    // P16 slicedGroupPacks: a group that needs a FRESH pack (not a parked reclaim) waits when this frame's packs are past
+    // STREAM_HITCH_LIMITS.groupPackInstances, nearest in-view first. A waiting group has no range, so it is not drawn
+    // (never with stale slots) and _groupSetDirty keeps the next frames on this path until it is placed.
+    const defer = STREAM_HITCH.slicedGroupPacks && this.incrementalArrayGroups ? this._groupPackDeferrals(want, byId, skipPack) : null;
+    for (const g of this._arrayGroups) {
+      if (!want.has(g.id) || first.has(g.id) || byId.get(g.id) !== g) continue;
+      if (defer !== null && defer.has(g.id)) continue;   // P16: packed on a later frame
+      const N = getArrayInstanceCount(g.arrayParams);
+      const src = this._meshById.get(g.sourceId)!;
+      let start = -1;
+      const pk = this._parkedGroups.get(g.id);
+      if (pk && this._parkedStillValid(pk, g, src, N)) { start = this._slotAlloc.claimOwned(g.id, N); if (start >= 0) this._perf.groupReclaims++; }
+      this._parkedGroups.delete(g.id);
+      if (start < 0) {
+        this._slotAlloc.disown(g.id);
+        start = this._slotAlloc.alloc(N);
+        if (start < 0 && this.incrementalArrayGroups) {   // full / fragmented → grow (GPU copy, no repack) and retry
+          this._growInstanceBuffer(Math.max(this.instanceCapacity, this._slotAlloc.high + N));
+          start = this._slotAlloc.alloc(N);
+        }
+        if (start < 0) return false;
+        if (!skipPack.has(g.sourceId)) pack.add(g.id);
+      }
+      first.set(g.id, start); counts.set(g.id, N); this._placedGroupObj.set(g.id, g); this._placedGroupSrc.set(g.id, src); changed = true;
+    }
+    this._groupSetDirty = false;
+    this._groupsPending = defer !== null && defer.size > 0;   // P16: groups still waiting → this path again next frame
+    if (this._groupsPending) { streamHitchStats.groupPacksDeferred += defer!.size; streamHitchStats.groupPackFramesDeferred++; this.onDeferredWork?.(); }
+    if (pack.size) {
+      this._packArrayGroupInstances(undefined, pack);
+      this._perf.groupPacks += pack.size;
+      const r = this._packedRanges, data = this._instanceDataBuf!;
+      for (let i = 0; i < r.length; i += 2) if (r[i + 1] > 0) { this.device.queue.writeBuffer(this.instanceStorageBuffer!, r[i] * MESH_INSTANCE_STRIDE, data, r[i] * fpi, r[i + 1] * fpi); this._noteInstBytes(r[i + 1] * MESH_INSTANCE_STRIDE); }
+    }
+    if (changed) this._perf.groupPlacements++;
+    return true;
+  }
+  /** P16 slicedGroupPacks: the wanted, unplaced groups that would need a fresh pack this frame past the instance budget
+   *  (null = everything fits). Parked groups that reclaim their range cost nothing and are never deferred; the first
+   *  group always goes (a single huge group is never starved). Order: in view first, then by camera distance. */
+  private _groupPackDeferrals(want: Set<string>, byId: Map<string, ArrayGroup3D>, skipPack: Set<string>): Set<string> | null {
+    const first = this._arrayGroupFirstSlot;
+    const budget = STREAM_HITCH_LIMITS.groupPackInstances;
+    let need = 0;
+    const cands = this._gsCands; cands.length = 0;
+    for (const g of this._arrayGroups) {
+      if (!want.has(g.id) || first.has(g.id) || byId.get(g.id) !== g) continue;
+      const N = getArrayInstanceCount(g.arrayParams);
+      const pk = this._parkedGroups.get(g.id);
+      if (pk && this._parkedStillValid(pk, g, this._meshById.get(g.sourceId)!, N)) continue;   // a reclaim: no pack
+      cands.push(g); need += skipPack.has(g.sourceId) ? 0 : N;
+    }
+    if (need <= budget) return null;
+    const pr = this._gsPrio; pr.clear();
+    for (const g of cands) pr.set(g, this._groupUploadPriority(g, this._meshById.get(g.sourceId)!));
+    cands.sort((a, b) => pr.get(a)! - pr.get(b)!);
+    const out = new Set<string>();
+    let used = 0;
+    for (const g of cands) {
+      const N = skipPack.has(g.sourceId) ? 0 : getArrayInstanceCount(g.arrayParams);
+      if (used > 0 && used + N > budget) out.add(g.id); else used += N;
+    }
+    cands.length = 0; pr.clear();
+    return out.size ? out : null;
+  }
+  private readonly _gsCands: ArrayGroup3D[] = [];
+  /** P16: wanted array groups still waiting for their pack (keeps the frames on the incremental path, not the fast one). */
+  private _groupsPending = false;
+  private readonly _gsPrio = new Map<ArrayGroup3D, number>();
+  /** Lower = sooner: an array group's instance box (explicit offsets) or else its source's, as _uploadPriority. */
+  private _groupUploadPriority(g: ArrayGroup3D, src: Mesh3D): number {
+    const b = g.arrayParams.mode === 'explicit' ? this._arrayGroupWorldAABB(g, src) : null;
+    if (!b) return this._uploadPriority(src);
+    const e = this.camera?.position;
+    const dist = e ? Math.hypot(Math.max(b[0] - e[0], 0, e[0] - b[3]), Math.max(b[1] - e[1], 0, e[1] - b[4]), Math.max(b[2] - e[2], 0, e[2] - b[5])) : 0;
+    return this._culler.testAABB(b[0], b[1], b[2], b[3], b[4], b[5]) ? dist : dist + 1e6;
+  }
+  /** P16 uploadLedger: instance / group-pack bytes written since the last frame's geometry append (they come off the
+   *  frame's upload budget before geometry: what is already resident draws first). */
+  private _upInst = 0;
+  private _noteInstBytes(bytes: number): void { this._upInst += bytes; }
+  /** P16: the largest geometry write (the ledger's cap, else the step-3 slice). */
+  private _geomSlice(): number { return STREAM_HITCH.uploadLedger ? STREAM_HITCH_LIMITS.writeSliceBytes : Renderer3D.UPLOAD_GEOM_SLICE; }
+  /** P16: geometry bytes still allowed this frame interval (sliced uploads on). Ledger: the frame total minus the
+   *  instance bytes, never under the geometry floor, minus the geometry already written; else the step-3 budget. */
+  private _geomBudgetLeft(): number {
+    if (!STREAM_HITCH.uploadLedger) return Math.max(0, Renderer3D.UPLOAD_FRAME_BUDGET - this._upBytes);
+    const L = STREAM_HITCH_LIMITS;
+    const frame = TILE_LANDING.active ? Math.max(L.frameWriteBytes, TILE_LANDING.writeBytes) : L.frameWriteBytes;   // P22 landingLedger
+    return Math.max(0, Math.max(L.geomFloorBytes, frame - this._upInst) - this._upBytes);
+  }
+  /** groupId → the ArrayGroup3D object its range was placed for (parks it after it leaves the set). */
+  private readonly _placedGroupObj = new Map<string, ArrayGroup3D>();
+  private readonly _placedGroupSrc = new Map<string, Mesh3D>();
+  private readonly _gsById = new Map<string, ArrayGroup3D>();
+  /** A parked group's range still equals what a fresh pack would write. */
+  private _parkedStillValid(pk: { group: ArrayGroup3D; src: Mesh3D; srcVer: number; offVer: number; mat: Float32Array }, g: ArrayGroup3D, src: Mesh3D, N: number): boolean {
+    if (pk.group !== g || pk.src !== src || src.localMatrixVersion !== pk.srcVer) return false;
+    if (!this._slotAlloc.hasOwned(g.id, N)) return false;
+    const p = g.arrayParams;
+    if ((p.mode === 'linear' || p.mode === 'grid') && p.spacingMode === 'relative') return false;   // depends on the source AABB
+    if (this._arrayGroupLocalBases.has(g.id)) return false;                                           // radial local basis (per frame)
+    const offId = p.mode === 'linear' ? p.objectOffsetId : undefined;
+    if (offId) { const off = this._meshById.get(offId); if (!off || off.localMatrixVersion !== pk.offVer) return false; }
+    const srcSlot = this._meshInstanceSlots.get(src.id);
+    if (srcSlot === undefined) return false;
+    const data = this._instanceDataBuf!, o = srcSlot * (MESH_INSTANCE_STRIDE / 4) + 32, m = pk.mat;
+    for (let k = 0; k < 28; k++) { const a = data[o + k], b = m[k]; if (a !== b && !(a !== a && b !== b)) return false; }   // material stamp (NaN-safe)
+    return true;
+  }
+
+  /** Re-pack the array groups of `sources` (material change on their source) and upload just their slot ranges. */
+  private _repackGroupsOf(sources: Set<string>): void {
+    if (!sources.size) return;
+    this._packArrayGroupInstances(sources);
+    const fpi = MESH_INSTANCE_STRIDE / 4, r = this._packedRanges, data = this._instanceDataBuf!;
+    for (let i = 0; i < r.length; i += 2) if (r[i + 1] > 0) { this.device.queue.writeBuffer(this.instanceStorageBuffer!, r[i] * MESH_INSTANCE_STRIDE, data, r[i] * fpi, r[i + 1] * fpi); this._noteInstBytes(r[i + 1] * MESH_INSTANCE_STRIDE); }
+  }
+  /** P4.3 diagnostics: full instance repacks since load, by trigger. */
+  getRepackReasons(): Record<string, number> { return { ...this._repackWhy }; }
+
+  /** Transforms fast path: touched slots closer than this many slots are uploaded as one run (see the upload loop). */
+  static FASTPATH_MERGE_GAP = 256;
   private _fastPathInstances(meshes: Mesh3D[], anyMatDirty: boolean): boolean {
     if (!this._instanceDataBuf) return false;
     const fpi = MESH_INSTANCE_STRIDE / 4;
@@ -4092,18 +7487,37 @@ export class Renderer3D {
     const dv = anyMatDirty ? new DataView(data.buffer, data.byteOffset, data.byteLength) : null;
     const touched = this._fpTouched; touched.length = 0;   // slots written this frame → coalesced into upload runs below
     let bail = false;
-    for (const m of meshes) {
+    // P4.3: a material change on an array-group SOURCE re-packs just that source's groups (was: bail → full repack of
+    // every slot — the day-cycle glow walk marks ~every city material dirty, so each re-dress paid a 20-100 ms repack).
+    const sources = this._arrayGroups.length ? this._arraySourceCounts() : null;   // sourceId → instance count
+    const dirtySources = this._fpDirtySources; dirtySources.clear();
+    let matSlots = 0, deferredMat = false;
+    for (let _km = 0; _km < meshes.length; _km++) { const m = meshes[_km];
       const ver = m.localMatrixVersion;
       const moved = this._slotMatVer.get(m.id) !== ver;
       const matD = m.materialDirty;
       if (!moved && !matD) continue;
-      if (m.billboard || m.billboardParent) { bail = true; break; }   // view-dependent → needs the full writeSlot
-      // Textured, or an array-group SOURCE (its material feeds all its instances) → full path. Material-dirty
-      // meshes are FEW (the border-glow pulse), so the per-mesh `.some` over groups is cheaper than a per-frame Set.
-      if (matD && (m.material.hasTexture || m.material.hasNormalMap || this._arrayGroups.some(g => g.sourceId === m.id))) { bail = true; break; }
+      if (m.billboard || m.billboardParent) { bail = true; this._fpBailWhy = 'billboard'; break; }   // view-dependent → needs the full writeSlot
+      if (matD && !moved) {   // P4.3: material-only rewrite → budgeted (the rest stay dirty for the next frame)
+        if (matSlots >= Renderer3D.MATERIAL_SLOT_BUDGET) { deferredMat = true; continue; }
+        matSlots += Math.max(1, m.submeshes.length);
+      }
+      if (matD && sources && sources.has(m.id)) { dirtySources.add(m.id); matSlots += Math.ceil(sources.get(m.id)! / 4); }   // its group re-pack counts toward the budget
       const slots = m.submeshes.length > 0 ? this._meshSubmeshSlots.get(m.id) : undefined;
       const single = slots ? undefined : this._meshInstanceSlots.get(m.id);
-      if (!slots && single === undefined) { bail = true; break; }   // unknown mesh → structural change
+      if (!slots && single === undefined) { bail = true; this._fpBailWhy = 'unknownMesh'; break; }   // unknown mesh → structural change
+      // P4.3: TEXTURED material change → a full write of just this mesh's slot(s) (atlas indices come from the last
+      // atlas build, still valid unless the atlas itself is dirty) instead of bailing to the full repack.
+      const textured = matD && (slots ? m.submeshes.some((sm) => sm.material.hasTexture || sm.material.hasNormalMap || !!sm.textureLibraryId || !!sm.normalMapLibraryId)
+        : (m.material.hasTexture || m.material.hasNormalMap || !!m.textureLibraryId || !!m.normalMapLibraryId));
+      if (textured) {
+        if (this._atlasDirty) { bail = true; this._fpBailWhy = 'texturedAtlasDirty'; break; }
+        if (slots) for (let si = 0; si < slots.length; si++) { const sub = m.submeshes[si]; this._writeInstanceSlot(slots[si], m, sub.material, sub.textureLibraryId ?? '', sub.normalMapLibraryId ?? ''); touched.push(slots[si]); }
+        else { this._writeInstanceSlot(single!, m, m.material, m.textureLibraryId ?? '', m.normalMapLibraryId ?? ''); touched.push(single!); }
+        this._slotMatVer.set(m.id, ver);
+        m.materialDirty = false;
+        continue;
+      }
       let nc = this._normalMatCache.get(m.id);
       if (moved) {
         if (!nc) { nc = { matVersion: -1, floats: new Float32Array(16) }; this._normalMatCache.set(m.id, nc); }
@@ -4117,21 +7531,28 @@ export class Renderer3D {
       // Inline the single-slot vs multi-slot write (no per-mesh closure/array alloc — ~200 movers × 60fps).
       const mlm = m.localMatrix as Float32Array;
       if (slots) {
-        for (const slot of slots) {
+        for (let si = 0; si < slots.length; si++) {
+          const slot = slots[si];
           const offset = slot * fpi;
+          if (moved && this._taaVelOn) this._taaNoteMove(m, slot, offset, si);   // temporal AA: last frame's matrix
           if (moved) { data.set(mlm, offset); data.set(nc!.floats, offset + 16); }
-          if (matD) this._writeSlotMaterial(data, dv!, offset, m.material);
+          if (matD) this._writeSlotMaterial(data, dv!, offset, m.submeshes[si]?.material ?? m.material);   // per-submesh, as the full repack writes it
+          if (moved || matD) this._writeGroundUvScale(data, offset, m as Mesh3D);
           touched.push(slot);
         }
       } else {
         const offset = single! * fpi;
+        if (moved && this._taaVelOn) this._taaNoteMove(m, single!, offset, -1);   // temporal AA: last frame's matrix
         if (moved) { data.set(mlm, offset); data.set(nc!.floats, offset + 16); }
         if (matD) this._writeSlotMaterial(data, dv!, offset, m.material);
+        if (moved || matD) this._writeGroundUvScale(data, offset, m as Mesh3D);
         touched.push(single!);
       }
       if (moved) this._slotMatVer.set(m.id, ver);
       if (matD) m.materialDirty = false;
     }
+    if (!bail && dirtySources.size) this._repackGroupsOf(dirtySources);   // P4.3 (after the source slots were rewritten)
+    if (!bail && deferredMat) this.onDeferredWork?.();
     if (!bail) {
       // Upload only the RUNS of touched slots — NOT one [lo,hi] span. The moved meshes (traffic movers) are
       // scattered across the geometryKey-sorted buffer, so a single span re-uploads the whole ~190k-instance
@@ -4141,7 +7562,7 @@ export class Renderer3D {
       // detail between them.
       if (touched.length) {
         touched.sort((a, b) => a - b);
-        const GAP = 256;
+        const GAP = Renderer3D.FASTPATH_MERGE_GAP;
         let runLo = touched[0], prev = touched[0];
         for (let i = 1; i < touched.length; i++) {
           const s = touched[i];
@@ -4312,20 +7733,29 @@ export class Renderer3D {
 
     // patternColor (floats 48-51) + patternParams (52-55) — boardShade repurposes both (see helper)
     this._writePatternSlots(data, offset, mat3d);
+    this._writeGroundUvScale(data, offset, m);   // procedural ground: the per-mesh uv scale (floats 56-59)
   }
 
   /** Write the GPU-instanced array-group slots (source R+S with per-copy translation/overrides/GARP
    *  skins) — the former uploadMeshInstances tail loop, verbatim (C1 Part 2). */
-  private _packArrayGroupInstances(): void {
+  /** `onlySources` (P4.3): re-pack just the groups of these source meshes (a material change on an array SOURCE in
+   *  the fast / incremental paths) and record their slot ranges in `_packedRanges` for a partial upload, instead of
+   *  bailing to the full repack. Omitted = every group (the full repack). */
+  private _packArrayGroupInstances(onlySources?: Set<string>, onlyGroups?: Set<string>): void {
     const floatsPerInstance = MESH_INSTANCE_STRIDE / 4;
     const data = this._instanceDataBuf!;
     const dataView = this._instanceView();
+    const partial = !!(onlySources || onlyGroups);   // P5: `onlyGroups` = just these (newly placed) groups
+    if (partial) this._packedRanges.length = 0;
     // Write GPU-instanced array group data.
     // Each instance reuses source R+S from source's localMatrix with modified translation.
     // Normal matrix is the same as source (translation doesn't affect inverse-transpose).
     for (const group of this._arrayGroups) {
+      if (onlySources && !onlySources.has(group.sourceId)) continue;
+      if (onlyGroups && !onlyGroups.has(group.id)) continue;
       const firstSlot = this._arrayGroupFirstSlot.get(group.id);
       if (firstSlot === undefined) continue;
+      if (partial) this._packedRanges.push(firstSlot, getArrayInstanceCount(group.arrayParams));
       const srcM = this._meshById.get(group.sourceId);   // O(1) — was an O(meshes) find PER GROUP on every repack
       const source = srcM && srcM.submeshes.length === 0 ? srcM : undefined;
       if (!source) continue;
@@ -4439,6 +7869,46 @@ export class Renderer3D {
           }
         }
 
+        // P20 instanced props: a full 3×3 (+ optionally its own normal matrix), post-multiplied onto the source's —
+        // from the group's typed instanceXf (21 floats a copy: t3 · model 3×3 · normal 3×3) or a per-copy override.
+        const gxf = group.instanceXf;
+        if (gxf || (ov && ov.affine)) {
+          const A: ArrayLike<number> = gxf ?? ov!.affine!, ao = gxf ? i * 21 + 3 : 0;
+          const a00=data[offset+0], a10=data[offset+1], a20=data[offset+2];
+          const a01=data[offset+4], a11=data[offset+5], a21=data[offset+6];
+          const a02=data[offset+8], a12=data[offset+9], a22=data[offset+10];
+          const m0 = A[ao], m1 = A[ao + 1], m2 = A[ao + 2], m3 = A[ao + 3], m4 = A[ao + 4], m5 = A[ao + 5], m6 = A[ao + 6], m7 = A[ao + 7], m8 = A[ao + 8];
+          data[offset+0]  = a00*m0 + a01*m1 + a02*m2;
+          data[offset+1]  = a10*m0 + a11*m1 + a12*m2;
+          data[offset+2]  = a20*m0 + a21*m1 + a22*m2;
+          data[offset+4]  = a00*m3 + a01*m4 + a02*m5;
+          data[offset+5]  = a10*m3 + a11*m4 + a12*m5;
+          data[offset+6]  = a20*m3 + a21*m4 + a22*m5;
+          data[offset+8]  = a00*m6 + a01*m7 + a02*m8;
+          data[offset+9]  = a10*m6 + a11*m7 + a12*m8;
+          data[offset+10] = a20*m6 + a21*m7 + a22*m8;
+          const nm = this._overrideScratch;
+          const N: ArrayLike<number> | undefined = gxf ?? ov!.normal3, no = gxf ? i * 21 + 12 : 0;
+          if (N) {
+            const s = nc ? nc.floats : null;
+            const s00 = s ? s[0] : 1, s10 = s ? s[1] : 0, s20 = s ? s[2] : 0;
+            const s01 = s ? s[4] : 0, s11 = s ? s[5] : 1, s21 = s ? s[6] : 0;
+            const s02 = s ? s[8] : 0, s12 = s ? s[9] : 0, s22 = s ? s[10] : 1;
+            nm.fill(0); nm[15] = 1;
+            for (let c = 0; c < 3; c++) {
+              const b0 = N[no + c * 3], b1 = N[no + c * 3 + 1], b2 = N[no + c * 3 + 2];
+              nm[c * 4]     = s00 * b0 + s01 * b1 + s02 * b2;
+              nm[c * 4 + 1] = s10 * b0 + s11 * b1 + s12 * b2;
+              nm[c * 4 + 2] = s20 * b0 + s21 * b1 + s22 * b2;
+            }
+          } else {
+            nm.set(data.subarray(offset, offset + 16));
+            nm[3] = 0; nm[7] = 0; nm[11] = 0; nm[12] = 0; nm[13] = 0; nm[14] = 0; nm[15] = 1;
+            mat4.invert(nm as any, nm as any);
+            mat4.transpose(nm as any, nm as any);
+          }
+          data.set(nm, offset + 16);
+        } else
         // Per-instance rotation / scale override: post-multiply upper-left 3×3 by override matrix.
         if (ov && (ov.rotationEulerDeg || ov.scale)) {
           const om = this._overrideScratch;
@@ -4497,11 +7967,18 @@ export class Renderer3D {
         // the shader believed wind and translucency were enabled and then read zeros — meaning only the
         // SOURCE mesh of each ArrayGroup swayed and transmitted light, and every other instance stood dead
         // still. That is why some city trees moved in the wind and most did not.
-        data.copyWithin(offset + 32, srcOffset + 32, srcOffset + 56);
+        // ★ …and through 59: the uvTransform (tiling + offset, floats 56-59) was never written for array copies, so
+        // they sampled with whatever STALE floats the reused staging buffer held at that slot (often 0 → uv × 0 = one
+        // texel → a GARP-skinned vending body rendered as a flat colour, and which one depended on slot layout —
+        // found by the Round-5 chunking A/B, where re-laid-out slots flipped the look). Copies share the source's.
+        data.copyWithin(offset + 32, srcOffset + 32, srcOffset + 60);
+        data[offset + FLAGS2_FLOAT_OFFSET] = data[srcOffset + FLAGS2_FLOAT_OFFSET];   // flags2: copies share the source's (fog-horizon fade bits)
         // ★ GARP per-instance SKIN: override the copied textureIndex (float 44, a u32) with THIS instance's
         // atlas layer, so one instanced arrayGroup draw can show a different texture per copy. Scoped here —
         // the rest of the instance record still comes from the source; only the diffuse layer index differs.
         if (ov && ov.textureIndex !== undefined) dataView.setUint32((offset + 44) * 4, ov.textureIndex >>> 0, true);
+        // CROWD PALETTE (performance-plan P12): this copy's own palette slots (patternColor.xyz).
+        if (ov && ov.crowdSlots) { const cs = ov.crowdSlots; data[offset + 48] = cs[0]; data[offset + 49] = cs[1]; data[offset + 50] = cs[2]; }
       }
 
       this._arrayGroupSourceVers.set(group.id, source.localMatrixVersion);
@@ -4667,24 +8144,48 @@ export class Renderer3D {
     // uploading" — the append path handles that (and clears the flag), so it must NOT force a rebuild.
     let dirtyResident = false;
     let fresh: Mesh3D[] | null = null;
+    const gen = this._r3Gen, fastSkip = Renderer3D.geomPoolFastSkip;
     for (const m of meshes) {
+      // 2026-10-01: a resident, clean mesh whose P9 slot cache is current (invalidated by every _geomAllocs /
+      // _meshInstanceSlots change via _r3Gen) needs nothing here: the slow test below would find it resident and not
+      // dirty too. Skips the geometry getter + id getter + Map lookup for ~13 k meshes a frame in a tiled city. The slow
+      // test fills the cache (as the draw-list build does), so meshes the hierarchical cull skips get it too.
+      if (fastSkip && m._r3o === this && m._r3g === gen && m._r3GA !== undefined && !m.gpuDirty) continue;
       if (!m.geometry || m.geometry.vertices.length === 0) continue;
-      if (this._geomAllocs.has(m.id)) { if (m.gpuDirty) { dirtyResident = true; break; } }
-      else (fresh ??= []).push(m);
+      const mid = m.id, ga = this._geomAllocs.get(mid);
+      if (ga !== undefined) {
+        if (m.gpuDirty) { dirtyResident = true; break; }
+        if (fastSkip) { m._r3o = this; m._r3g = gen; m._r3GA = ga; m._r3Slot = this._meshInstanceSlots.get(mid) ?? -1; }
+      } else (fresh ??= []).push(m);
     }
     // A forced compaction (requested when the camera goes idle after streaming) reclaims the dead space that
     // disposed tiles leave behind — BUT only when there's actually fresh geometry to place or real dead space to
     // reclaim, and never mid-motion (the caller only requests it on idle). This keeps the ~68 ms full re-upload OFF
     // the pan path: it happens once you stop, not while you're moving.
-    if (dirtyResident || !this._geomVB || (this._forceCompact && this._compactionWorthwhile())) {
+    if (dirtyResident || !this._geomVB || this._pkRepack) {   // (P22: a packedVertices flip re-places everything)
       this._forceCompact = false;
       return this._fullRebuildGeomPool(meshes);
+    }
+    if (this._forceCompact && this._compactionWorthwhile()) {
+      this._forceCompact = false;
+      return this._compactGeomPoolGpu(meshes) ?? this._fullRebuildGeomPool(meshes);   // P10.B6: GPU-side moves first
     }
     this._forceCompact = false;
     // The only change is meshes the pool hasn't seen (a regen / async reveal / newly added group). APPEND their
     // geometry at the tail instead of re-uploading the whole pool; compact only if they won't fit. Removed
     // meshes leave their alloc parked (dead space) until the next compaction.
-    if (fresh && !this._appendGeometry(fresh)) return this._fullRebuildGeomPool(meshes);   // overflow → compact
+    // P5: TIME-SLICED — at most GEOM_APPEND_BUDGET bytes of new geometry per frame (the first view that reveals the
+    // city's never-drawn detail appended ~145 MB in one frame: ~50 ms of writeBuffer alone). Meshes whose geometry
+    // isn't resident yet are left out of the draw lists (see _buildDrawLists) and land over the next frames.
+    if (!fresh) this._geomAppendDeferred = false;
+    // Step 3 slicedUploads: the frame's upload budget is shared with the warm calls made since the last frame
+    // (UPLOAD_FRAME_BUDGET in all), and a geometry bigger than what is left is written in slices over several frames.
+    const sliced = Renderer3D.slicedUploads && this.incrementalArrayGroups;
+    const budget = sliced ? this._geomBudgetLeft()   // P16: the shared write ledger (or the step-3 geometry budget)
+      : this.incrementalArrayGroups ? Renderer3D.GEOM_APPEND_BUDGET : Infinity;
+    if (fresh && !this._appendGeometry(fresh, budget)) { this._upEndFrame(); return this._compactGeomPoolGpu(meshes) ?? this._fullRebuildGeomPool(meshes); }   // overflow → compact (P10.B6: on the GPU when it fits)
+    this._upEndFrame();
+    if (this._geomAppendDeferred || this._geomPartial.size) this.onDeferredWork?.();
     return this._geomAllocs.size > 0;
   }
 
@@ -4697,58 +8198,331 @@ export class Renderer3D {
    *  hitch on the pause (the "small back-and-forth pans lag" report). */
   requestGeomCompaction(): void { this._forceCompact = true; }
 
+  /** PARTIAL INDEX UPLOAD: re-send `mesh.geometry.indices[start, start + count)` (already edited IN PLACE by the
+   *  caller) to the mesh's pooled index range — a few KB, no pool rebuild (gpuDirty on a resident mesh rebuilds the
+   *  whole pool). The live crowd (world-live-crowd.ts) degenerates / restores one person's triangles inside a merged
+   *  crowd layer with this. A mesh not resident yet needs nothing (its append uploads the current CPU indices, as does
+   *  every later compaction). Also patches the mesh's persistent-outline shell IB when one is cached. Returns whether
+   *  anything was written. */
+  patchMeshIndices(mesh: Mesh3D, start: number, count: number): boolean {
+    const g = mesh.geometry, alloc = this._geomAllocs.get(mesh.id);
+    if (!g || count <= 0 || start < 0 || start + count > g.indices.length) return false;
+    const idx = g.indices as Uint32Array;
+    let wrote = false;
+    if (alloc && this._geomIB && alloc.indexCount === idx.length) {
+      if (alloc.pk) {
+        // P22: a packed allocation holds 16-bit indices — re-pack the (4-byte aligned) covering range and write it
+        const s0 = start & ~1, e0 = Math.min(alloc.idxBytes >> 1, (start + count + 1) & ~1), u = new Uint16Array(e0 - s0);
+        for (let i = s0; i < e0; i++) u[i - s0] = i < idx.length ? idx[i] : 0;
+        this.device.queue.writeBuffer(this._geomIB, (alloc.firstIndex + s0) * 2, u.buffer, 0, u.byteLength);
+      } else this.device.queue.writeBuffer(this._geomIB, (alloc.firstIndex + start) * 4, idx.buffer, idx.byteOffset + start * 4, count * 4);
+      wrote = true;
+    }
+    const og = this._outlineGeom.get(mesh.id);
+    if (og && og.count === idx.length) { this.device.queue.writeBuffer(og.ib, start * 4, idx.buffer, idx.byteOffset + start * 4, count * 4); wrote = true; }
+    return wrote;   // (no shadow refresh: callers swap in geometry that coincides with what they hid)
+  }
+
+  /** PARTIAL VERTEX UPLOAD (visual-polish #16): re-send vertices [start, start + count) of `mesh.geometry.vertices`
+   *  (edited IN PLACE by the caller, same layout + length) to the mesh's pooled vertex range, without the full pool
+   *  rebuild gpuDirty costs. The moving contact blobs (world-mover-shadows.ts) rewrite their quads this way each frame.
+   *  The mesh's bounds are NOT refreshed (the caller keeps them fixed, e.g. with unreferenced anchor vertices) and its
+   *  geometry key must be its own (not shared). A mesh not resident yet needs nothing (its append uploads the current
+   *  CPU vertices, as does every later compaction). Returns whether anything was written. */
+  patchMeshVertices(mesh: Mesh3D, start: number, count: number): boolean {
+    const g = mesh.geometry, alloc = this._geomAllocs.get(mesh.id);
+    if (!g || !alloc || !this._geomVB || count <= 0 || start < 0) return false;
+    const v = g.vertices as Float32Array, fpv = MESH3D_VERTEX_STRIDE / 4, st = strideOf(alloc.pk);
+    // (P22: the span is padded in pack mode — it must hold the whole vertex array at the allocation's stride)
+    if (alloc.vtxBytes < (v.length / fpv) * st || alloc.vtxBytes >= (v.length / fpv) * st + 96 || (start + count) * fpv > v.length || this._geomPartial.has(mesh.geometryKey)) return false;
+    if (alloc.pk) {   // P22: re-pack the range (position, normal, uv) into the 32-byte layout
+      const pv = packVertices(v.subarray(start * fpv, (start + count) * fpv));
+      if (!pv) return false;
+      this.device.queue.writeBuffer(this._geomVB, (alloc.baseVertex + start) * st, pv.buffer, 0, pv.byteLength);
+      return true;
+    }
+    this.device.queue.writeBuffer(this._geomVB, alloc.baseVertex * MESH3D_VERTEX_STRIDE + start * MESH3D_VERTEX_STRIDE,
+      v.buffer, v.byteOffset + start * MESH3D_VERTEX_STRIDE, count * MESH3D_VERTEX_STRIDE);
+    return true;
+  }
+
   /** Compaction is only worth its ~68 ms full re-upload when the free list holds a LOT of fragmented dead space.
    *  With region reuse + coalescing, disposed tiles' space normally gets recycled by the next tiles instead. */
   private _compactionWorthwhile(): boolean {
     let freeVtx = 0;
     for (const f of this._geomFree) freeVtx += f.vtxBytes;
-    return freeVtx > Math.max(64 << 20, this._geomVtxTail * 0.25);   // >64 MB or >25% of the used span
+    if (freeVtx > Math.max(64 << 20, this._geomVtxTail * 0.25)) return true;   // >64 MB or >25% of the used span
+    // P10.D4: or the buffers are far bigger than the live geometry (streamed tiles left) → compact + shrink.
+    return Renderer3D.geomPoolShrink && planPoolShrink(this._geomVBCap, this._geomVtxTail - freeVtx) !== null;
   }
+  /** P10.D4 A/B: release geometry-pool CAPACITY (bug-hunt D-R1). A compaction / rebuild reallocates smaller buffers
+   *  once they are > 3× the live geometry, and an EMPTY pool frees its buffers. false = the old never-shrink pool. */
+  static geomPoolShrink = true;
+  /** P10.D4 A/B: an append that overflows while the free list holds a lot of dead space COMPACTS (GPU moves) instead of
+   *  growing the buffers ×1.5 — streaming in a straight line otherwise grew the pool by fragmentation alone. */
+  static compactBeforeGrow = true;
 
   /** Append geometry for meshes the pool hasn't seen — uploading ONLY the new unique geometries, REUSING a freed
    *  region when one fits (else at the tail). Ref-counts each geometryKey across its meshes. Returns false if a new
    *  geometry needs the tail but would overflow (caller compacts via a full rebuild). */
-  private _appendGeometry(fresh: Mesh3D[]): boolean {
+  /** P5: per-frame byte budget for appending new geometry (see _ensureGeomPool). ~5 ms of writeBuffer. */
+  static GEOM_APPEND_BUDGET = 16 << 20;
+  /** The last append stopped at the budget — meshes are still waiting for their geometry. */
+  private _geomAppendDeferred = false;
+  private _appendGeometry(fresh: Mesh3D[], budget = Infinity): boolean {
+    this._geomAppendDeferred = false;
+    const sliced = Renderer3D.slicedUploads && this.incrementalArrayGroups && budget !== Infinity;
     // Unique geometryKeys among the fresh meshes that aren't already resident (dedupe within + against pool).
-    const newKeys = new Map<string, import('./mesh-generators').MeshGeometry>();
+    let newKeys = new Map<string, import('./mesh-generators').MeshGeometry>();
     for (const m of fresh) {
       const key = m.geometryKey;
-      if (!this._geomKeyAllocs.has(key) && !newKeys.has(key)) newKeys.set(key, m.geometry!);
+      if (!this._geomKeyAllocs.has(key) && !newKeys.has(key)) {
+        newKeys.set(key, m.geometry!);
+        if (sliced && !this._upPrio.has(key)) this._upPrio.set(key, this._uploadPriority(m));
+      }
+    }
+    // Step 3: a geometry already being written in slices continues first; then the rest nearest-in-view first.
+    if (sliced && newKeys.size > 1) {
+      const P = this._upPrio, G = this._geomPartial;
+      const keys = [...newKeys.keys()].sort((a, b) => (G.has(b) ? 1 : 0) - (G.has(a) ? 1 : 0) || (P.get(a) ?? 0) - (P.get(b) ?? 0));
+      const ordered = new Map<string, import('./mesh-generators').MeshGeometry>();
+      for (const k of keys) ordered.set(k, newKeys.get(k)!);
+      newKeys = ordered;
     }
     // Pre-check tail overflow for the SUBSET of new geometry that won't find a free region — but the free-list
     // check is per-key, so do it inline and bail (return false → compact) the moment a key needs the tail and
     // won't fit. Anything uploaded before the bail stays valid; the compaction reuploads everything anyway.
+    // P5: bytes of the keys not placed yet — an overflow GROWS the pool once by all of them (GPU copy) instead of
+    // compacting (the full rebuild re-uploads every geometry: ~110-170 ms the first time a view reveals new detail).
+    let restVtx = 0, restIdx = 0;
+    // (P22: the UNPACKED spans — an upper bound, used only to size growth; packing every waiting key here up front was a
+    // 30 ms task in a landing)
+    for (const g of newKeys.values()) { restVtx += this._pkMode ? alignVtx(g.vertices.byteLength) : g.vertices.byteLength; restIdx += g.indices.byteLength; }
+    let uploaded = 0;
     for (const [key, g] of newKeys) {
-      const needVtx = g.vertices.byteLength, needIdx = g.indices.byteLength;
+      const pv = this._poolView(g);   // P22: the bytes the pool stores (packed or not) and their padded spans
+      const needVtx = pv.vtxBytes, needIdx = pv.idxBytes;
+      // Step 3: continue (or finish) a geometry that is being written in slices — one slice a frame per geometry.
+      const part = sliced ? this._geomPartial.get(key) : undefined;
+      if (part) {
+        if (part.g !== g || part.v.pk !== pv.pk || part.vtxBytes !== needVtx || part.idxBytes !== needIdx) this._abandonPartial(key);   // replaced meanwhile: start over
+        else {
+          if (part.lastFrame === this._upFrameNo) { this._geomAppendDeferred = true; continue; }   // its slice for this frame is in
+          if (budget - uploaded < Renderer3D.UPLOAD_SLICE_MIN) { this._geomAppendDeferred = true; break; }
+          uploaded += this._writePartial(part, Math.min(this._geomSlice(), budget - uploaded));
+          if (part.vDone < pv.vb.byteLength || part.iDone < pv.ib.byteLength) { this._geomAppendDeferred = true; continue; }
+          this._geomPartial.delete(key);
+          this._geomKeyAllocs.set(key, this._poolAlloc(part.vtxOff, part.idxOff, g, pv));
+          this._geomKeySrc.set(key, g);
+          if (pv.pk) dropPoolView(g);
+          restVtx -= needVtx; restIdx -= needIdx;
+          continue;
+        }
+      }
+      // Step 3: a geometry over UPLOAD_GEOM_SLICE never goes in one write — it reserves its region now and takes one
+      // ≤ UPLOAD_GEOM_SLICE slice a frame (its meshes draw once the last slice is in); smaller ones go whole while the
+      // frame's budget lasts.
+      const slicing = sliced && needVtx + needIdx > this._geomSlice();
+      if (slicing) { if (budget - uploaded < Renderer3D.UPLOAD_SLICE_MIN) { this._geomAppendDeferred = true; break; } }
+      else if (sliced ? uploaded + needVtx + needIdx > budget : uploaded > 0 && uploaded + needVtx + needIdx > budget) { this._geomAppendDeferred = true; break; }   // P5: rest next frame
+      if (!slicing) uploaded += needVtx + needIdx;
       const free = this._takeFreeRegion(needVtx, needIdx);
       let vtxOff: number, idxOff: number;
       if (free) {
         vtxOff = free.vtxOff; idxOff = free.idxOff;
       } else {
-        if (this._geomVtxTail + needVtx > this._geomVBCap || this._geomIdxTail + needIdx > this._geomIBCap) return false;
+        if (this._geomVtxTail + needVtx > this._geomVBCap || this._geomIdxTail + needIdx > this._geomIBCap) {
+          // P10.D4: dead space would absorb the rest → compact (the caller's GPU compaction fits) rather than grow.
+          if (Renderer3D.compactBeforeGrow && this._compactionWorthwhile()) {
+            let fv = 0, fi = 0;
+            for (const f of this._geomFree) { fv += f.vtxBytes; fi += f.idxBytes; }
+            if (this._geomVtxTail - fv + restVtx <= this._geomVBCap && this._geomIdxTail - fi + restIdx <= this._geomIBCap) return false;
+          }
+          if (!this._growGeomPool(this._geomVtxTail + restVtx, this._geomIdxTail + restIdx)) return false;
+        }
         vtxOff = this._geomVtxTail; idxOff = this._geomIdxTail;
         this._geomVtxTail += needVtx; this._geomIdxTail += needIdx;
       }
-      this.device.queue.writeBuffer(this._geomVB!, vtxOff, g.vertices.buffer, g.vertices.byteOffset, needVtx);
-      this.device.queue.writeBuffer(this._geomIB!, idxOff, g.indices.buffer, g.indices.byteOffset, needIdx);
-      this._geomKeyAllocs.set(key, { baseVertex: vtxOff / MESH3D_VERTEX_STRIDE, firstIndex: idxOff / 4, indexCount: g.indices.length, vtxBytes: needVtx, idxBytes: needIdx });
+      if (slicing) {   // Step 3: the region is reserved; its bytes go in UPLOAD_GEOM_SLICE pieces, one a frame
+        const pt = { g, v: pv, vtxOff, idxOff, vtxBytes: needVtx, idxBytes: needIdx, vDone: 0, iDone: 0, lastFrame: -1 };
+        this._geomPartial.set(key, pt);
+        this._upSliced++;
+        uploaded += this._writePartial(pt, Math.min(this._geomSlice(), budget - uploaded));
+        this._geomAppendDeferred = true;
+        continue;
+      }
+      if (needVtx + needIdx > this._upMaxWrite) this._upMaxWrite = needVtx + needIdx;
+      this._writePoolView(vtxOff, idxOff, pv);
+      this._geomKeyAllocs.set(key, this._poolAlloc(vtxOff, idxOff, g, pv));
+      this._geomKeySrc.set(key, g);
+      if (pv.pk) dropPoolView(g);
+      restVtx -= needVtx; restIdx -= needIdx;
     }
     for (const m of fresh) {
       const alloc = this._geomKeyAllocs.get(m.geometryKey);
       if (!alloc) continue;
-      this._geomAllocs.set(m.id, alloc);
+      this._r3Gen++; this._geomAllocs.set(m.id, alloc);
       this._geomPoolIds.push(m.id);
       this._geomMeshKey.set(m.id, m.geometryKey);
       this._geomKeyRefs.set(m.geometryKey, (this._geomKeyRefs.get(m.geometryKey) ?? 0) + 1);
       m.gpuDirty = false;
     }
     this._perf.appends++;
+    this._upBytes += uploaded;
     // NO _shadowMapStale here — appends happen on EVERY streamed-tile arrival, and force-refreshing the shadow map
     // each time bypassed the throttle (a full-scene depth pass every few frames mid-pan). The interval pass picks
     // the new geometry up within `_shadowUpdateInterval` frames (≤3 in city mode).
     return true;
   }
 
+  /** Step 3 (slicedUploads): a mesh whose instance slot is written but whose GEOMETRY is still waiting for the upload
+   *  budget kept `gpuDirty` until the append — and every frame with any gpuDirty mesh took the O(all meshes) incremental
+   *  instance path, re-wrote those slots and re-ranked the draw order. With sliced uploads a tile's geometry takes ~40
+   *  frames to land, so that cost ran ~5x longer. The slot is final, and the pool finds the mesh by its missing
+   *  allocation (not by gpuDirty), so the flag is cleared here. Kept for meshes whose vertex colours / modifiers read it. */
+  private _clearPendingGpuDirty(m: Mesh3D): void {
+    if (!Renderer3D.slicedUploads || !m.gpuDirty || this._geomAllocs.has(m.id) || m.vertexColors || m.modifiers.length) return;
+    m.gpuDirty = false;
+  }
+  /** Step 3 A/B: prune the array-group world-box cache when the group set changes (false = never pruned, as before). */
+  static pruneGroupBoxCache = true;
+  // ── Step 3 sliced uploads (performance-plan §P13 "Step 3"; Renderer3D.slicedUploads) ──────────────────────────────
+  /** A/B: no geometry is written in one piece over UPLOAD_GEOM_SLICE (4 MB): a bigger one reserves its region and
+   *  takes one slice a frame (its meshes draw once the last slice is in); the frame's total (render-time appends + the
+   *  warm calls since the last frame, together) stays within UPLOAD_FRAME_BUDGET; nearest-in-view geometry goes first.
+   *  false = the P5 / P10.D8 path (one writeBuffer per geometry: an 18 MB layer was one 60-180 ms frame). */
+  static slicedUploads = true;
+  /** The largest single geometry write (bytes): bigger geometry is sliced across frames. */
+  static UPLOAD_GEOM_SLICE = 4 << 20;
+  /** Bytes of geometry written per frame interval, all geometries together (the P5 append budget). A 4 MB total was
+   *  measured too: streaming then ran at its limit in a street-level fly (tiles waited ~5x longer for their geometry)
+   *  and the per-frame cost of meshes waiting outweighed the smaller writes (17-42 long tasks vs 6). */
+  static UPLOAD_FRAME_BUDGET = 16 << 20;
+  /** A slice is only started with at least this much budget left. */
+  static UPLOAD_SLICE_MIN = 256 << 10;
+  /** Bytes written since the last render-time append (warm calls between frames count toward the next frame). */
+  private _upBytes = 0;
+  private _upFrameNo = 0;
+  private _upLastMB = 0;
+  private _upMaxMB = 0;
+  private _upSliced = 0;
+  private _upMaxWrite = 0;
+  /** Geometry keys being written in slices: the reserved region and how much of each span is in. */
+  private readonly _geomPartial = new Map<string, GeomPartial>();
+  /** Upload priority per geometry key (computed when first seen): in view first, then by camera distance. */
+  private readonly _upPrio = new Map<string, number>();
+  /** End of a render-time append: record the interval's bytes, reset the shared budget, drop stalled slices. */
+  private _upEndFrame(): void {
+    const mb = this._upBytes / 1048576;
+    this._upLastMB = mb; if (mb > this._upMaxMB) this._upMaxMB = mb;
+    { const S = streamHitchStats, tot = this._upBytes + this._upInst;   // P16 ledger diagnostics
+      S.instBytesLast = this._upInst; if (this._upInst > S.instBytesMax) S.instBytesMax = this._upInst; if (tot > S.frameBytesMax) S.frameBytesMax = tot; }
+    this._upBytes = 0; this._upInst = 0;
+    this._upFrameNo++;
+    if (this._upPrio.size > 4096 && !this._geomAppendDeferred) this._upPrio.clear();
+    // a sliced geometry nobody asked for in 120 frames (its meshes left before it finished) gives its region back
+    if (this._geomPartial.size) for (const [k, pt] of this._geomPartial) if (this._upFrameNo - pt.lastFrame > 120) this._abandonPartial(k);
+  }
+  /** Write up to `budget` bytes of a sliced geometry (vertices first, then indices). Returns the bytes written. */
+  private _writePartial(pt: GeomPartial, budget: number): number {
+    pt.lastFrame = this._upFrameNo;
+    let left = Math.max(0, Math.floor(budget / 4) * 4), wrote = 0;
+    const vb = pt.v.vb, ib = pt.v.ib;   // P22: the stored bytes (packed or not); the spans past them are padding
+    if (pt.vDone < vb.byteLength && left > 0) {
+      const n = Math.min(left, vb.byteLength - pt.vDone);
+      this.device.queue.writeBuffer(this._geomVB!, pt.vtxOff + pt.vDone, vb.buffer, vb.byteOffset + pt.vDone, n);
+      pt.vDone += n; left -= n; wrote += n;
+      if (n > this._upMaxWrite) this._upMaxWrite = n;
+    }
+    if (pt.vDone >= vb.byteLength && pt.iDone < ib.byteLength && left > 0) {
+      const n = Math.min(left, ib.byteLength - pt.iDone);
+      this.device.queue.writeBuffer(this._geomIB!, pt.idxOff + pt.iDone, ib.buffer, ib.byteOffset + pt.iDone, n);
+      pt.iDone += n; wrote += n;
+      if (n > this._upMaxWrite) this._upMaxWrite = n;
+    }
+    return wrote;
+  }
+  // ── P22 packed vertices (tile-landing.ts P22_RENDER.packedVertices; vertex-pack.ts) ─────────────────────────────────
+  /** The pool's packing mode: P22_RENDER.packedVertices when the pool was (re)built. With it on every span is padded
+   *  to 96 bytes and packable geometry is stored packed; a switch flip re-places the pool (repackGeometryPool). */
+  private _pkMode = P22_RENDER.packedVertices;
+  private _pkRepack = false;
+  /** 0 = the twin pipelines were never requested, 1 = compiling, 2 = ready: geometry is packed only from then on, so
+   *  a packed mesh never waits for its pipeline. */
+  private _pkGate: 0 | 1 | 2 = 0;
+  /** Re-place every pooled geometry under the current packedVertices switch (the next frame rebuilds the pool). */
+  repackGeometryPool(): void { this._pkRepack = true; this.onDeferredWork?.(); }
+  private _pkPackOk(): boolean {
+    if (!this._pkMode) return false;
+    if (this._pkGate === 2) return true;
+    if (this._pkGate === 0) {
+      this._pkGate = 1;
+      setTwinReadyCallback(() => { this._gd?.invalidateBundle(); this.onDeferredWork?.(); });   // a landed twin: redraw (+ re-record the GPU bundles)
+      this.pipeline.requestPackedTwins(); this._outlinePass?.requestPackedTwins();
+    }
+    if (twinsPending() === 0) this._pkGate = 2;
+    return this._pkGate === 2;
+  }
+  private _poolView(g: import('./mesh-generators').MeshGeometry): PoolView {
+    return poolViewOf(g, this._pkMode, this._pkMode && (g as { packable?: boolean }).packable === true && this._pkPackOk());
+  }
+  private _poolAlloc(vtxOff: number, idxOff: number, g: import('./mesh-generators').MeshGeometry, v: PoolView): GeomAlloc {
+    return { baseVertex: vtxOff / strideOf(v.pk), firstIndex: idxOff / indexSizeOf(v.pk), indexCount: g.indices.length, vtxBytes: v.vtxBytes, idxBytes: v.idxBytes, pk: v.pk };
+  }
+  private _writePoolView(vtxOff: number, idxOff: number, v: PoolView): void {
+    this.device.queue.writeBuffer(this._geomVB!, vtxOff, v.vb.buffer, v.vb.byteOffset, v.vb.byteLength);
+    this.device.queue.writeBuffer(this._geomIB!, idxOff, v.ib.buffer, v.ib.byteOffset, v.ib.byteLength);
+  }
+  /** Byte offsets of an allocation in the pool's buffers. */
+  private static _vOff(a: GeomAlloc): number { return a.baseVertex * strideOf(a.pk); }
+  private static _iOff(a: GeomAlloc): number { return a.firstIndex * indexSizeOf(a.pk); }
+  /** A NEW alloc object for `a` moved to byte offsets (nv, ni) — same format and spans (the GPU compaction). */
+  private static _movedAlloc(a: GeomAlloc, nv: number, ni: number): GeomAlloc {
+    return { baseVertex: nv / strideOf(a.pk), firstIndex: ni / indexSizeOf(a.pk), indexCount: a.indexCount, vtxBytes: a.vtxBytes, idxBytes: a.idxBytes, pk: !!a.pk };
+  }
+  private _abandonPartial(key: string): void {
+    const pt = this._geomPartial.get(key);
+    if (!pt) return;
+    this._geomPartial.delete(key);
+    this._pushFreeRegion(pt.vtxOff, pt.vtxBytes, pt.idxOff, pt.idxBytes);
+  }
+  /** Lower = sooner: in view (last frame's frustum) by distance, then out of view by distance + 1e6. */
+  private _uploadPriority(m: Mesh3D): number {
+    const c = m.obbCorners;
+    if (!c || !c.length) return 1e9;
+    let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+    for (const q of c) { if (q[0] < x0) x0 = q[0]; if (q[0] > x1) x1 = q[0]; if (q[1] < y0) y0 = q[1]; if (q[1] > y1) y1 = q[1]; if (q[2] < z0) z0 = q[2]; if (q[2] > z1) z1 = q[2]; }
+    const e = this.camera?.position;
+    const dist = e ? Math.hypot(Math.max(x0 - e[0], 0, e[0] - x1), Math.max(y0 - e[1], 0, e[1] - y1), Math.max(z0 - e[2], 0, e[2] - z1)) : 0;
+    return this._culler.testAABB(x0, y0, z0, x1, y1, z1) ? dist : dist + 1e6;
+  }
+
+  /** P5: grow the geometry pool so its tails can reach `vtxEnd` / `idxEnd` bytes, keeping every resident allocation:
+   *  new buffers, one GPU copy of the used spans, old buffers retired after this frame's submit. Every draw reads
+   *  `_geomVB` / `_geomIB` fresh, so nothing else needs rebinding. False (→ the caller compacts) when growth is off,
+   *  the pool isn't growable, or the device's max buffer size can't hold it. */
+  private _growGeomPool(vtxEnd: number, idxEnd: number): boolean {
+    if (!this.incrementalArrayGroups || !this._geomVB || !this._geomIB) return false;
+    const maxBuf = this.device.limits.maxBufferSize || 0x10000000;
+    const grow = (cap: number, end: number): number => end <= cap ? cap : Math.min(Math.ceil(Math.max(end, cap) * 1.5 / 4) * 4, maxBuf);
+    const vCap = grow(this._geomVBCap, vtxEnd), iCap = grow(this._geomIBCap, idxEnd);
+    if (vCap < vtxEnd || iCap < idxEnd) return false;
+    const enc = this.device.createCommandEncoder({ label: 'geom pool grow' });
+    if (vCap !== this._geomVBCap) {
+      const nb = this.device.createBuffer({ size: vCap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label: 'GeomPool VB' });
+      if (this._geomVtxTail > 0) enc.copyBufferToBuffer(this._geomVB, 0, nb, 0, Math.ceil(this._geomVtxTail / 4) * 4);
+      this._retireBuffer(this._geomVB); this._geomVB = nb; this._geomVBCap = vCap;
+    }
+    if (iCap !== this._geomIBCap) {
+      const nb = this.device.createBuffer({ size: iCap, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label: 'GeomPool IB' });
+      if (this._geomIdxTail > 0) enc.copyBufferToBuffer(this._geomIB, 0, nb, 0, Math.ceil(this._geomIdxTail / 4) * 4);
+      this._retireBuffer(this._geomIB); this._geomIB = nb; this._geomIBCap = iCap;
+    }
+    this.device.queue.submit([enc.finish()]);
+    this._perf.poolGrows++;
+    this._shadowMapStale = true;
+    return true;
+  }
   /** Best-fit a freed region for `needVtx`/`needIdx` bytes; split the remainder back onto the free list. Returns
    *  the region's offsets, or null if none fits (caller uses the tail). */
   private _takeFreeRegion(needVtx: number, needIdx: number): { vtxOff: number; idxOff: number } | null {
@@ -4804,9 +8578,10 @@ export class Renderer3D {
     if (n > 0) { this._geomKeyRefs.set(key, n); return; }
     this._geomKeyRefs.delete(key);
     const a = this._geomKeyAllocs.get(key);
+    this._geomKeySrc.delete(key);
     if (a) {
       this._geomKeyAllocs.delete(key);
-      this._pushFreeRegion(a.baseVertex * MESH3D_VERTEX_STRIDE, a.vtxBytes, a.firstIndex * 4, a.idxBytes);
+      this._pushFreeRegion(Renderer3D._vOff(a), a.vtxBytes, Renderer3D._iOff(a), a.idxBytes);
     }
   }
 
@@ -4814,34 +8589,46 @@ export class Renderer3D {
    *  leaked hundreds of Map entries (`_geomAllocs`/`_normalMatCache`/`_slotMatVer`/slot maps) — unbounded
    *  growth → GC pressure → periodic frame dips. The buffer's dead space is reclaimed by the next compacting
    *  pool rebuild; this just frees the CPU side + forces a clean repack. */
-  evictMeshCaches(ids: Iterable<string>): void {
+  evictMeshCaches(ids: Iterable<string>, detachedOnly = false): void {
     let any = false;
+    const gone = this._parkedGroups.size ? new Set<string>() : null;   // P5 (see the parked-group release below)
+    // P16: `detachedOnly` = the deferred drain (evictMeshCachesDeferred): every id belongs to a mesh no longer in the
+    // scene whose own P9 cache was cleared, so no live mesh's cached allocation / slot can change: no generation bump
+    // (a bump per drained frame re-resolved ~13 k meshes' caches in the draw-list build).
+    const bump = detachedOnly ? 0 : 1;
     for (const id of ids) {
       any = true;
+      gone?.add(id);
+      if (this._gd) { const gm = this._meshById.get(id); if (gm) this._gd.noteRemoved(gm); }   // P17: its GPU-driven record is dead
       const gk = this._geomMeshKey.get(id);   // free-list: drop this mesh's ref on its geometry; last one frees the region
       if (gk !== undefined) { this._geomMeshKey.delete(id); this._releaseGeomKey(gk); }
-      this._geomAllocs.delete(id);
+      this._r3Gen += bump; this._geomAllocs.delete(id);
       this._normalMatCache.delete(id);
       this._slotMatVer.delete(id);
       this._meshOutlines.delete(id);   // drop any persistent outline for a removed mesh
       this._dropOutlineGeom(id);       // + free its smoothed outline VB/IB
       // FREE this mesh's instance slot(s) back to the pool so the incremental add path reuses them (no full repack).
       const isl = this._meshInstanceSlots.get(id);
-      if (isl !== undefined) this._instanceFreeSlots.push(isl);
+      if (isl !== undefined) this._slotAlloc.free(isl, 1);
       const ssl = this._meshSubmeshSlots.get(id);
-      if (ssl) for (const s of ssl) this._instanceFreeSlots.push(s);
-      this._meshInstanceSlots.delete(id);
+      if (ssl) for (const s of ssl) this._slotAlloc.free(s, 1);
+      this._r3Gen += bump; this._meshInstanceSlots.delete(id);
       this._meshSubmeshSlots.delete(id);
       this._drawOrder.delete(id);
-      this._drawOrderDirty = true;   // mesh set changed → rebuild the cached draw rank
+      // mesh set changed → rebuild the cached draw rank. P16: not for a deferred drain — the frame the meshes left the
+      // list already re-ranked without them (a re-rank per drained batch was an O(all meshes) update each frame).
+      if (!detachedOnly) this._drawOrderDirty = true;
       // Also the world-AABB (frustum culling populates one PER mesh) and the texture bind group — without
       // these, every city regen leaked ~700 stale AABB entries that were never freed, growing the JS heap
       // over a session → slower + more frequent major GCs (the periodic frame-drops that worsen over time).
+      { const e = this._meshAABBCache.get(id); if (e) e.dead = true; }   // P6: the copy held on the mesh dies too
       this._meshAABBCache.delete(id);
       this._texBindGroupCache.delete(id);
+      this._groundUvScaleCache.delete(id);   // P10.D: held the GEOMETRY of every removed ground mesh (streamed tiles leaked ~2 MB each)
       // Skinned-mesh GPU buffers (VRAM). Renderer-owned → destroy. Previously freed ONLY on whole-renderer
       // dispose, so every character/skinned-mesh create→delete cycle leaked its VB/IB/skin-matrix buffers.
       this._skinnedVBs.get(id)?.destroy();       this._skinnedVBs.delete(id);
+      this._skCull.delete(id);                   // R6.1 skinned cull radii + box
       this._skinnedIBs.get(id)?.destroy();       this._skinnedIBs.delete(id);
       // Skin-matrix buffer + bind group are SHARED per skeleton (refcounted): release this mesh's
       // ref; the last mesh out destroys them. The _meshSkelRef guard makes a double-evict of the
@@ -4853,42 +8640,337 @@ export class Renderer3D {
       this._vcColorBuffers.get(id)?.destroy();   this._vcColorBuffers.delete(id);
       this._vertexBufferOverrides.delete(id);    // buffer owned by ClothSimulator — release ref, don't destroy
     }
+    // P5: a parked array group whose SOURCE was just evicted can never be reclaimed (the source identity check fails)
+    // — release its range now instead of holding the slots (and the dead Mesh3D) until the allocator steals it.
+    if (any && gone) {
+      for (const [gid, pk] of this._parkedGroups) if (gone.has(pk.src.id)) { this._parkedGroups.delete(gid); this._slotAlloc.disown(gid); }
+    }
+    // P10.D4 (bug-hunt D-R1): the last pooled geometry left (world cleared / every tile streamed out) → free the pool's
+    // buffers instead of keeping their peak capacity; the next mesh rebuilds a pool sized to it.
+    if (any && Renderer3D.geomPoolShrink && this._geomVB && this._geomAllocs.size === 0 && this._geomKeyAllocs.size === 0) this._releaseGeomPool();
     // NO _instancesDirty here: setting it forced a FULL repack on every eviction frame — which is every few frames
-    // while panning a streamed world — and the repack zeroes `_instanceFreeSlots`, so the freed slots pushed above
+    // while panning a streamed world — and the repack resets the slot allocator, so the freed slots pushed above
     // were never actually reused (the incremental path was dead on exactly the frames it was built for). Removal
     // needs no repack at all: the freed slots are holes the per-mesh draw loop never reads, `totalSlots !==
     // _instanceCount` routes the next upload through `_tryIncrementalInstances` (which refreshes the count), and
     // anything the incremental path can't represent (arrays/billboards/atlas) still bails to the full repack.
   }
 
+  // ── P16 deferred eviction (STREAM_HITCH.deferredEviction; performance-plan §P16) ────────────────────────────────────
+  /** Meshes removed from the scene whose renderer cleanup is still queued (insertion order = the drain order). */
+  private readonly _evictPending = new Set<Mesh3D>();
+  /** P16: queue the per-mesh cleanup of meshes that were just DETACHED from the scene (a streamed tile leaving). They
+   *  are not in any later frame's mesh list, so until the drain reaches them their slots / geometry refs only sit
+   *  unused (holes the draw loop never reads); `drainDeferredEviction` frees them under a time budget each frame. A
+   *  mesh that comes back first (re-attach) is flushed at once (`flushDeferredEviction`), so a resident mesh never
+   *  carries a pending eviction. Switch off = evict now (the old path). */
+  evictMeshCachesDeferred(meshes: readonly Mesh3D[]): void {
+    if (!STREAM_HITCH.deferredEviction) { this.evictMeshCaches(meshes.map((m) => m.id)); return; }
+    for (const m of meshes) { m._r3o = null; this._evictPending.add(m); this._gd?.noteRemoved(m); }   // P17: + its GPU-driven record is dead
+    if (this._evictPending.size > streamHitchStats.evictQueueMax) streamHitchStats.evictQueueMax = this._evictPending.size;
+    this.onDeferredWork?.();
+  }
+  /** P16: evict these meshes now if they are queued (they are about to re-enter the scene). Returns how many were. */
+  flushDeferredEviction(meshes: Iterable<Mesh3D>): number {
+    if (!this._evictPending.size) return 0;
+    const ids: string[] = [];
+    for (const m of meshes) if (this._evictPending.delete(m)) { m._r3o = null; ids.push(m.id); }
+    if (ids.length) { this.evictMeshCaches(ids, true); streamHitchStats.evictFlushed += ids.length; }
+    return ids.length;
+  }
+  /** P16: run queued evictions for up to `budgetMs` (Infinity = all). `live` (this frame's mesh list): any queued mesh
+   *  that is back in it without a re-attach is flushed first, whatever the budget. Returns the meshes still queued. */
+  drainDeferredEviction(budgetMs = STREAM_HITCH_LIMITS.evictBudgetMs, live?: readonly Mesh3D[]): number {
+    const q = this._evictPending;
+    if (!q.size) return 0;
+    if (live) { let back: Mesh3D[] | null = null; for (const m of live) if (q.has(m)) (back ??= []).push(m); if (back) this.flushDeferredEviction(back); }
+    const t0 = performance.now();
+    const ids: string[] = [];
+    let n = 0;
+    for (const m of q) {
+      q.delete(m); ids.push(m.id); n++;
+      if ((n & 63) === 0) {   // evict in batches of 64, checking the clock between them
+        this.evictMeshCaches(ids, true); ids.length = 0;
+        if (performance.now() - t0 > budgetMs) { streamHitchStats.evictBudgetHits++; break; }
+      }
+    }
+    if (ids.length) this.evictMeshCaches(ids, true);
+    streamHitchStats.evictDeferred += n;
+    if (q.size) this.onDeferredWork?.();
+    return q.size;
+  }
+  /** P16 diagnostics: meshes waiting for their deferred eviction. */
+  get pendingEvictions(): number { return this._evictPending.size; }
+
   /** PRE-UPLOAD geometry for meshes that are about to become visible (async city staging). Spreads the GPU
    *  upload across the staging frames so the reveal SWAP is a cheap visibility flip (no big upload, no rebuild).
    *  Returns false if the pool would overflow (caller lets the eventual reveal compact). */
-  warmGeometry(meshes: Mesh3D[]): boolean {
-    if (!this._geomVB) return false;   // no pool yet — the first build will upload everything anyway
+  /** P12: whether `m`'s geometry is resident in the pool (drawable). The instanced crowd swaps a cell to a lazily
+   *  built tier only once it is (no frame where neither tier draws). */
+  hasMeshGeometry(m: Mesh3D): boolean { return this._geomAllocs.has(m.id); }
+
+  /** P12: re-pack the instance slots of these ArrayGroups after their `instanceOverrides` changed (the instanced crowd
+   *  hides / shows single people: a cell's tier swap, a live-crowd promotion) and upload just their ranges. A group
+   *  that is not placed right now is packed fresh when it is (its parked copy is dropped, so it cannot come back
+   *  stale). No full repack. Returns the number of groups re-packed. */
+  repackArrayGroups(groups: Iterable<ArrayGroup3D>): number {
+    const ids = new Set<string>();
+    for (const g of groups) {
+      this._parkedGroups.delete(g.id);
+      if (this._arrayGroupFirstSlot.has(g.id) && this._placedGroupObj.get(g.id) === g && this._meshInstanceSlots.has(g.sourceId) && this._meshById.has(g.sourceId)) ids.add(g.id);
+    }
+    if (!ids.size || !this._instanceDataBuf || !this.instanceStorageBuffer || this._instancesDirty) return 0;
+    this._packArrayGroupInstances(undefined, ids);
+    const fpi = MESH_INSTANCE_STRIDE / 4, r = this._packedRanges, data = this._instanceDataBuf;
+    for (let i = 0; i < r.length; i += 2) if (r[i + 1] > 0) { this.device.queue.writeBuffer(this.instanceStorageBuffer, r[i] * MESH_INSTANCE_STRIDE, data, r[i] * fpi, r[i + 1] * fpi); this._noteInstBytes(r[i + 1] * MESH_INSTANCE_STRIDE); }
+    return ids.size;
+  }
+
+  warmGeometry(meshes: Mesh3D[], budgetBytes = Infinity): boolean {
+    // P10.D8: `budgetBytes` caps this call's upload (the first geometry always goes); the rest is appended by the
+    // render-time path (GEOM_APPEND_BUDGET per frame) or by a later warm call. Returns false while anything is left.
     let fresh: Mesh3D[] | null = null;
     for (const m of meshes) {
       if (m.geometry && m.geometry.vertices.length > 0 && !this._geomAllocs.has(m.id)) (fresh ??= []).push(m);
     }
     if (!fresh) return true;
-    const ok = this._appendGeometry(fresh);
+    // performance-plan P5.W1: no pool yet (the FIRST city in an empty scene) — seed it with this group instead of
+    // bailing, so the rest of the staging appends (and grows) as usual. Bailing left the whole city's geometry to
+    // ONE full rebuild in the reveal frame (0.3-2 s of writeBuffer measured in the harness).
+    if (!this._geomVB) { const ok = this._fullRebuildGeomPool(fresh); if (ok) this._perf.warms++; return ok; }
+    // Step 3: a warm between frames spends the NEXT frame's upload budget (render-time appends + warms ≤ the budget).
+    if (Renderer3D.slicedUploads && this.incrementalArrayGroups) {
+      const left = this._geomBudgetLeft();   // P16: the shared write ledger (or the step-3 geometry budget)
+      if (left <= 0) { this._geomAppendDeferred = true; this.onDeferredWork?.(); return false; }
+      budgetBytes = Math.min(budgetBytes, left);
+    }
+    const ok = this._appendGeometry(fresh, budgetBytes);
     if (ok) this._perf.warms++;
-    return ok;
+    return ok && !(budgetBytes !== Infinity && this._geomAppendDeferred);
+  }
+
+  /** P10.D4: drop the (empty) geometry pool's buffers — retired after this frame's work — and reset its bookkeeping, so
+   *  the next `_ensureGeomPool` takes the `!_geomVB` full-rebuild path sized to the geometry that exists then. */
+  private _releaseGeomPool(): void {
+    if (this._geomVB) this._retireBuffer(this._geomVB);
+    if (this._geomIB) this._retireBuffer(this._geomIB);
+    this._geomVB = null; this._geomIB = null;
+    this._geomVBCap = 0; this._geomIBCap = 0;
+    this._geomVtxTail = 0; this._geomIdxTail = 0;
+    this._pkMode = P22_RENDER.packedVertices;   // P22: an empty pool takes the current packing mode
+    this._geomFree = [];
+    this._geomPoolIds = [];
+    this._geomKeySrc.clear(); this._geomKeyRefs.clear(); this._geomMeshKey.clear();
+    this._geomPartial.clear();   // step 3: the sliced regions went with the buffers
+    this._r3Gen++;
+    this._perf.poolReleases++;
+  }
+
+  /** P10.B6 A/B: compact the geometry pool with GPU buffer copies (no CPU re-upload). false = the full rebuild,
+   *  which re-sends every live geometry with writeBuffer — ~1 s of main thread for the ~1.1-1.9 GB pool of a streamed
+   *  tiled world (it ran 350 ms after every pan stopped: the idle compaction). */
+  static gpuGeomCompaction = true;
+  /** Bytes moved per scratch round trip (a pool buffer cannot be both source and destination of one copy). */
+  static GEOM_COMPACT_SCRATCH = 64 << 20;
+  private _geomScratch: GPUBuffer | null = null;
+  /**
+   * COMPACT the pool IN PLACE on the GPU: every live geometry (a key some mesh in `meshes` still uses) slides down to
+   * a dense prefix through a small scratch buffer — copies in ascending OLD offset order, so a destination never
+   * overlaps data not yet moved (each new offset is the sum of the sizes before it, ≤ its old offset). Vertex and
+   * index spans compact independently (indices are geometry-local; draws pass baseVertex). Geometry the pool has not
+   * seen yet is then appended at the new tail with writeBuffer. The bookkeeping ends exactly as a full rebuild's
+   * would (allocs, key refs, mesh keys, pool ids, empty free list, tails). Returns null when it cannot (no pool, the
+   * live + new geometry would not fit the current buffers): the caller then takes the full rebuild, which grows them.
+   */
+  private _compactGeomPoolGpu(meshes: Mesh3D[]): boolean | null {
+    if (!Renderer3D.gpuGeomCompaction || !this._geomVB || !this._geomIB) return null;
+    const t0 = performance.now();
+    const live = new Map<string, GeomAlloc>();
+    const fresh = new Map<string, import('./mesh-generators').MeshGeometry>();
+    for (const m of meshes) {
+      const g = m.geometry;
+      if (!g || g.vertices.length === 0) continue;
+      const key = m.geometryKey;
+      if (live.has(key) || fresh.has(key)) continue;
+      const a = this._geomKeyAllocs.get(key);
+      if (a && this._geomKeySrc.get(key) === g) live.set(key, a); else fresh.set(key, g);   // collided / stale → re-upload
+    }
+    if (!live.size && !fresh.size) return null;
+    let needV = 0, needI = 0;
+    for (const a of live.values()) { needV += a.vtxBytes; needI += a.idxBytes; }
+    for (const g of fresh.values()) { needV += this._pkMode ? alignVtx(g.vertices.byteLength) : g.vertices.byteLength; needI += g.indices.byteLength; }   // (P22: unpacked = an upper bound)
+    if (needV > this._geomVBCap || needI > this._geomIBCap) return null;
+    type E = { key: string; a: GeomAlloc; ov: number; oi: number; nv: number; ni: number };
+    const ents: E[] = [];
+    for (const [key, a] of live) ents.push({ key, a, ov: Renderer3D._vOff(a), oi: Renderer3D._iOff(a), nv: 0, ni: 0 });   // P22: per-format offsets
+    const SCR = Renderer3D.GEOM_COMPACT_SCRATCH;
+    if (!this._geomScratch) this._geomScratch = this.device.createBuffer({ size: SCR, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, label: 'GeomPool compaction scratch' });
+    const scratch = this._geomScratch;
+    const enc = this.device.createCommandEncoder({ label: 'geom pool compaction' });
+    let moves = 0;
+    const slide = (buf: GPUBuffer, spans: { off: number; size: number }[]): { newOff: number[]; tail: number } => {
+      const plan = planSpanCompaction(spans, SCR, STREAM_HITCH.coalescedCompaction);   // P16: adjacent spans move as one run
+      for (const [src, dst, size] of plan.moves) {
+        enc.copyBufferToBuffer(buf, src, scratch, 0, size);
+        enc.copyBufferToBuffer(scratch, 0, buf, dst, size);
+      }
+      moves += plan.moves.length;
+      return plan;
+    };
+    const vp = slide(this._geomVB, ents.map(e => ({ off: e.ov, size: e.a.vtxBytes })));
+    const ip = slide(this._geomIB, ents.map(e => ({ off: e.oi, size: e.a.idxBytes })));
+    ents.forEach((e, k) => { e.nv = vp.newOff[k]; e.ni = ip.newOff[k]; });
+    let vTail = vp.tail, iTail = ip.tail;
+    // P10.D4 SHRINK: the live (+ fresh) geometry is now a dense prefix — when the buffers are > 3× what it needs,
+    // move the prefix into smaller buffers (one more GPU copy) and retire the big ones. Streaming then really frees VRAM.
+    if (Renderer3D.geomPoolShrink) {
+      const sv = planPoolShrink(this._geomVBCap, needV), si = planPoolShrink(this._geomIBCap, needI);
+      if (sv !== null) {
+        const nb = this.device.createBuffer({ size: sv, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label: 'GeomPool VB' });
+        if (vTail > 0) enc.copyBufferToBuffer(this._geomVB, 0, nb, 0, Math.ceil(vTail / 4) * 4);
+        this._retireBuffer(this._geomVB); this._geomVB = nb; this._geomVBCap = sv;
+      }
+      if (si !== null) {
+        const nb = this.device.createBuffer({ size: si, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, label: 'GeomPool IB' });
+        if (iTail > 0) enc.copyBufferToBuffer(this._geomIB, 0, nb, 0, Math.ceil(iTail / 4) * 4);
+        this._retireBuffer(this._geomIB); this._geomIB = nb; this._geomIBCap = si;
+      }
+      if (sv !== null || si !== null) this._perf.poolShrinks++;
+    }
+    this.device.queue.submit([enc.finish()]);   // queued BEFORE the fresh writeBuffers below (queue order)
+    if (P20_RENDER.cheapCompaction) return this._compactBookkeepingP20(meshes, ents, fresh, vTail, iTail, t0, moves);
+    // Bookkeeping — the same end state as _fullRebuildGeomPool.
+    const srcOf = new Map(this._geomKeySrc);
+    this._geomKeyAllocs.clear();
+    this._geomPartial.clear();   // step 3: every geometry is re-placed (sliced regions are not live allocations)
+    this._geomKeySrc.clear();
+    this._r3Gen++; this._geomAllocs.clear();
+    this._geomKeyRefs.clear();
+    this._geomMeshKey.clear();
+    this._geomFree = [];
+    this._geomPoolIds = [];
+    for (const e of ents) {
+      this._geomKeyAllocs.set(e.key, Renderer3D._movedAlloc(e.a, e.nv, e.ni));
+      this._geomKeySrc.set(e.key, srcOf.get(e.key)!);
+    }
+    // P16 uploadLedger: geometry the pool has not seen yet is NOT written here in whole pieces (one compaction frame
+    // wrote every fresh geometry at once: up to tens of MB); its meshes stay unallocated and the sliced append places
+    // them over the next frames under the write ledger (they are held out of the draw lists until then).
+    const holdFresh = STREAM_HITCH.uploadLedger && Renderer3D.slicedUploads && this.incrementalArrayGroups && fresh.size > 0;
+    if (!holdFresh) for (const [key, g] of fresh) {
+      this._geomKeySrc.set(key, g);
+      const pv = this._poolView(g);
+      this._writePoolView(vTail, iTail, pv);
+      this._geomKeyAllocs.set(key, this._poolAlloc(vTail, iTail, g, pv));
+      if (pv.pk) dropPoolView(g);
+      vTail += pv.vtxBytes; iTail += pv.idxBytes;
+    }
+    for (const m of meshes) {
+      const g = m.geometry;
+      if (!g || g.vertices.length === 0) continue;
+      const key = m.geometryKey, alloc = this._geomKeyAllocs.get(key);
+      if (!alloc) continue;   // P16: a held fresh geometry (appended later)
+      this._r3Gen++; this._geomAllocs.set(m.id, alloc);
+      this._geomPoolIds.push(m.id);
+      this._geomMeshKey.set(m.id, key);
+      this._geomKeyRefs.set(key, (this._geomKeyRefs.get(key) ?? 0) + 1);
+      m.gpuDirty = false;
+    }
+    this._geomVtxTail = vTail;
+    this._geomIdxTail = iTail;
+    this._geomAppendDeferred = holdFresh;   // P16: held fresh meshes stay out of the draw lists until appended
+    if (holdFresh) this.onDeferredWork?.();
+    this._shadowMapStale = true;
+    this._perf.poolRebuilds++;
+    this._perf.gpuCompactions++;
+    this._perf.lastPoolMs = performance.now() - t0;
+    this._lastGpuCompaction = { ms: this._perf.lastPoolMs, moves, liveMB: Math.round((vTail + iTail) / 1048576), fresh: fresh.size };
+    return this._geomAllocs.size > 0;
+  }
+  /** The last GPU compaction (diagnostics): CPU ms, copy rounds, live MB after, fresh keys appended. */
+  _lastGpuCompaction: { ms: number; moves: number; liveMB: number; fresh: number } | null = null;
+
+  /**
+   * P20 cheapCompaction: the GPU compaction's bookkeeping WITHOUT rebuilding the per-mesh maps from scratch. The moved
+   * keys get NEW alloc objects (the GPU-driven scene re-reads a record whose alloc object changed — an in-place edit
+   * would leave it drawing the old offsets), every mesh already mapped to a live key is re-pointed at its key's new
+   * alloc (one Map.set — its key, the key's ref count and the key's source are unchanged), dead keys, their meshes and
+   * mapped meshes off this frame's list are dropped, and only meshes the pool has not seen yet are added. The same
+   * allocs, refs and residency as the rebuild; `_geomPoolIds` (a diagnostic) restarts empty. See performance-plan §P20.
+   */
+  private _compactBookkeepingP20(meshes: Mesh3D[], ents: { key: string; a: GeomAlloc; nv: number; ni: number }[],
+    fresh: Map<string, import('./mesh-generators').MeshGeometry>, vTail: number, iTail: number, t0: number, moves: number): boolean {
+    const allocs = this._geomKeyAllocs, live = new Set<string>();
+    for (const e of ents) {
+      live.add(e.key);
+      allocs.set(e.key, Renderer3D._movedAlloc(e.a, e.nv, e.ni));
+    }
+    for (const k of [...allocs.keys()]) if (!live.has(k)) { allocs.delete(k); this._geomKeySrc.delete(k); this._geomKeyRefs.delete(k); }
+    this._geomPartial.clear();
+    this._geomFree = [];
+    this._geomPoolIds = [];
+    this._r3Gen++;
+    // every mapped mesh of this frame's list → its key's new alloc; meshes of dead keys, and mapped meshes not in the
+    // list (the rebuild drops them too), leave the maps (an off-list mesh's ref on a live key is released)
+    const inList = new Set<string>();
+    for (const m of meshes) inList.add(m.id);
+    for (const [id, key] of this._geomMeshKey) {
+      const a = allocs.get(key);
+      if (a && inList.has(id)) { this._geomAllocs.set(id, a); continue; }
+      this._geomAllocs.delete(id); this._geomMeshKey.delete(id);
+      if (a) { const n = (this._geomKeyRefs.get(key) ?? 1) - 1; if (n > 0) this._geomKeyRefs.set(key, n); else this._geomKeyRefs.delete(key); }
+    }
+    const holdFresh = STREAM_HITCH.uploadLedger && Renderer3D.slicedUploads && this.incrementalArrayGroups && fresh.size > 0;
+    if (!holdFresh) for (const [key, g] of fresh) {
+      this._geomKeySrc.set(key, g);
+      const pv = this._poolView(g);
+      this._writePoolView(vTail, iTail, pv);
+      allocs.set(key, this._poolAlloc(vTail, iTail, g, pv));
+      if (pv.pk) dropPoolView(g);
+      vTail += pv.vtxBytes; iTail += pv.idxBytes;
+    }
+    // meshes not mapped yet (a new mesh sharing a live key, or a fresh one placed above)
+    const meshKey = this._geomMeshKey;
+    for (const m of meshes) {
+      if (meshKey.has(m.id)) { if (m.gpuDirty && allocs.has(meshKey.get(m.id)!)) m.gpuDirty = false; continue; }
+      const g = m.geometry;
+      if (!g || g.vertices.length === 0) continue;
+      const key = m.geometryKey, alloc = allocs.get(key);
+      if (!alloc) continue;   // P16: a held fresh geometry (appended later)
+      this._geomAllocs.set(m.id, alloc);
+      meshKey.set(m.id, key);
+      this._geomKeyRefs.set(key, (this._geomKeyRefs.get(key) ?? 0) + 1);
+      m.gpuDirty = false;
+    }
+    this._geomVtxTail = vTail;
+    this._geomIdxTail = iTail;
+    this._geomAppendDeferred = holdFresh;
+    if (holdFresh) this.onDeferredWork?.();
+    this._shadowMapStale = true;
+    this._perf.poolRebuilds++;
+    this._perf.gpuCompactions++;
+    this._perf.lastPoolMs = performance.now() - t0;
+    this._lastGpuCompaction = { ms: this._perf.lastPoolMs, moves, liveMB: Math.round((vTail + iTail) / 1048576), fresh: fresh.size };
+    return this._geomAllocs.size > 0;
   }
 
   private _fullRebuildGeomPool(meshes: Mesh3D[]): boolean {
     const t0 = performance.now();
     this._perf.poolRebuilds++;
+    this._geomAppendDeferred = false;   // a full rebuild uploads everything
     this._shadowMapStale = true;   // geometry changed → the throttled shadow map must refresh
     // First pass: compute total sizes counting each unique geometry key once.
     // Meshes sharing the same geometryKey (e.g. 10 default spheres) contribute
     // only one copy of their vertex/index data to the pool.
+    // P22: a full rebuild re-places everything, so it is where the packing mode follows its switch
+    this._pkMode = P22_RENDER.packedVertices; this._pkRepack = false;
+    // (sizes are the UNPACKED spans — an upper bound of the packed ones: no packed copy of the whole pool is ever held)
     const keyToSize = new Map<string, { vtxBytes: number; idxBytes: number }>();
     for (const m of meshes) {
       const g = m.geometry;
       if (!g || g.vertices.length === 0) continue;
       if (!keyToSize.has(m.geometryKey)) {
-        keyToSize.set(m.geometryKey, { vtxBytes: g.vertices.byteLength, idxBytes: g.indices.byteLength });
+        keyToSize.set(m.geometryKey, { vtxBytes: this._pkMode ? alignVtx(g.vertices.byteLength) : g.vertices.byteLength, idxBytes: g.indices.byteLength });
       }
     }
     if (keyToSize.size === 0) return false;
@@ -4907,21 +8989,25 @@ export class Renderer3D {
     // the cap, appends just compact more often instead of crashing. (Keeping resident geometry well under this is
     // the streaming budget's job — see _streamBudget's small full-detail radius.)
     const maxBuf = this.device.limits.maxBufferSize || 0x10000000;   // WebGPU guarantees ≥ 256 MB
-    if (totalVtxBytes > this._geomVBCap) {
+    // P10.D4: also REALLOCATE smaller when the buffer is > 3× the live data (a rebuild re-uploads everything anyway).
+    const shrinkV = Renderer3D.geomPoolShrink && planPoolShrink(this._geomVBCap, totalVtxBytes) !== null;
+    const shrinkI = Renderer3D.geomPoolShrink && planPoolShrink(this._geomIBCap, totalIdxBytes) !== null;
+    if (shrinkV || shrinkI) this._perf.poolShrinks++;
+    if (totalVtxBytes > this._geomVBCap || shrinkV) {
       this._geomVB?.destroy();
       this._geomVBCap = Math.min(Math.ceil(totalVtxBytes * Renderer3D.GEOM_OVERPROVISION), maxBuf);
       this._geomVB = this.device.createBuffer({
         size: this._geomVBCap,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,   // COPY_SRC: P5 growth
         label: 'GeomPool VB',
       });
     }
-    if (totalIdxBytes > this._geomIBCap) {
+    if (totalIdxBytes > this._geomIBCap || shrinkI) {
       this._geomIB?.destroy();
       this._geomIBCap = Math.min(Math.ceil(totalIdxBytes * Renderer3D.GEOM_OVERPROVISION), maxBuf);
       this._geomIB = this.device.createBuffer({
         size: this._geomIBCap,
-        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         label: 'GeomPool IB',
       });
     }
@@ -4930,7 +9016,9 @@ export class Renderer3D {
     // the append tails + key map + FREE LIST + ref counts — so any stale allocs / dead space / fragmentation from
     // removed meshes are reclaimed here (a clean, contiguous repack).
     this._geomKeyAllocs.clear();
-    this._geomAllocs.clear();
+    this._geomPartial.clear();   // step 3: every geometry is re-placed (sliced regions are not live allocations)
+    this._geomKeySrc.clear();
+    this._r3Gen++; this._geomAllocs.clear();
     this._geomKeyRefs.clear();
     this._geomMeshKey.clear();
     this._geomFree = [];
@@ -4946,24 +9034,18 @@ export class Renderer3D {
       let alloc = this._geomKeyAllocs.get(key);
 
       if (!alloc) {
-        // New unique geometry — upload it to the pool.
-        const baseVertex = vtxByteOffset / MESH3D_VERTEX_STRIDE;
-        const firstIndex = idxByteOffset / 4;  // uint32 = 4 bytes per index element
-        this.device.queue.writeBuffer(
-          this._geomVB!, vtxByteOffset,
-          g.vertices.buffer, g.vertices.byteOffset, g.vertices.byteLength,
-        );
-        this.device.queue.writeBuffer(
-          this._geomIB!, idxByteOffset,
-          g.indices.buffer, g.indices.byteOffset, g.indices.byteLength,
-        );
-        alloc = { baseVertex, firstIndex, indexCount: g.indices.length, vtxBytes: g.vertices.byteLength, idxBytes: g.indices.byteLength };
+        // New unique geometry — upload it to the pool (P22: as its pool view: packed or not, spans padded in pack mode).
+        const pv = this._poolView(g);
+        this._writePoolView(vtxByteOffset, idxByteOffset, pv);
+        alloc = this._poolAlloc(vtxByteOffset, idxByteOffset, g, pv);
+        if (pv.pk) dropPoolView(g);
         this._geomKeyAllocs.set(key, alloc);
-        vtxByteOffset += g.vertices.byteLength;
-        idxByteOffset += g.indices.byteLength;
+        this._geomKeySrc.set(key, g);
+        vtxByteOffset += pv.vtxBytes;
+        idxByteOffset += pv.idxBytes;
       }
       // Shared: all instances of the same geometry point to the same pool slot.
-      this._geomAllocs.set(m.id, alloc);
+      this._r3Gen++; this._geomAllocs.set(m.id, alloc);
       this._geomPoolIds.push(m.id);
       this._geomMeshKey.set(m.id, key);
       this._geomKeyRefs.set(key, (this._geomKeyRefs.get(key) ?? 0) + 1);
@@ -5054,14 +9136,30 @@ export class Renderer3D {
     canvasHeight: number,
     uploadUniforms = true,
   ): void {
+    const _sk0 = performance.now();
+    if (meshes.length > 0) this._drew3DThisFrame = true;   // AA gate (runPostProcess)
+    this._prewarmForScene(meshes, true);   // P2.2
+    const fs = this._frame;
     const visible = this._skinnedVisibleScratch; visible.length = 0;
-    for (const m of meshes) if (m.isEffectivelyVisible() && m.skeleton) visible.push(m);
+    let nVisible = 0;
+    for (const m of meshes) if (m.isEffectivelyVisible() && m.skeleton) { visible.push(m); nVisible++; }
     // E1 tail (c): a ROSTER change (spawn/despawn/hide — including down to zero) must refresh the shadow
     // map, or a throttled/static map holds the departed character's silhouette indefinitely. Checked
     // BEFORE the empty early-return so deleting the last character clears its shadow too.
-    if (this._shadowsEnabled && visible.length !== this._lastSkinnedCount) this._shadowMapStale = true;
-    this._lastSkinnedCount = visible.length;
-    if (visible.length === 0) return;
+    if (this._shadowsEnabled && nVisible !== this._lastSkinnedCount) this._skinnedShadowChanged();
+    this._lastSkinnedCount = nVisible;
+    fs.skinnedMeshes = nVisible; fs.skinnedDrawn = 0; fs.skinnedCulled = 0; fs.skinnedShadow = 0;
+    fs.skinUploads = 0; fs.skinnedTris = 0; fs.msSkinned = 0; fs.skinnedWaiting = 0;
+    if (visible.length === 0) { this._skelAnimCulled.clear(); fs.skelAnimCulled = 0; return; }
+
+    this.camera.aspect = canvasWidth / canvasHeight;
+    // P1: drawMeshes already uploaded identical scene uniforms this frame in the mixed-scene path → skip the repeat.
+    // (Before the cull: it refreshes the light matrix + camera the cull reads.)
+    if (uploadUniforms) this.uploadSceneUniforms(canvasWidth, canvasHeight);
+
+    // R6.1: frustum-cull the parts (in place: `visible` becomes the LIVE list; flags land on each cache entry).
+    this._cullSkinned(visible);
+    if (visible.length === 0) { fs.msSkinned = performance.now() - _sk0; return; }
 
     // ── E1: order the parts so consecutive draws share pipeline + skeleton, letting the draw loops
     // below ELIDE redundant setPipeline / setBindGroup calls (a multi-part character used to pay a
@@ -5080,9 +9178,10 @@ export class Renderer3D {
       });
     }
 
-    this.camera.aspect = canvasWidth / canvasHeight;
-    // P1: drawMeshes already uploaded identical scene uniforms this frame in the mixed-scene path → skip the repeat.
-    if (uploadUniforms) this.uploadSceneUniforms(canvasWidth, canvasHeight);
+    // Per-slot flags in the SORTED order (the instance slots below and the shadow replay index by position).
+    if (this._skinnedFlags.length < visible.length) this._skinnedFlags = new Uint8Array(Math.max(visible.length, this._skinnedFlags.length * 2));
+    const flags = this._skinnedFlags;
+    for (let i = 0; i < visible.length; i++) flags[i] = this._skCull.get(visible[i].id)?.flags ?? 3;
 
     // Ensure dedicated small instance buffer (one slot per skinned mesh).
     const needed = visible.length * MESH_INSTANCE_STRIDE;
@@ -5098,6 +9197,7 @@ export class Renderer3D {
 
     // Upload instance data (transform + material) for each skinned mesh.
     this._uploadSkinnedInstances(visible);
+    if (this._taaVelOn) this._taaSkinFrame = this._taaFrameNo;   // temporal AA: this frame's skinned list is valid
 
     // Fresh draw call → each dirty skeleton's shared skin buffer uploads once below.
     this._skinBufUploaded.clear();
@@ -5113,7 +9213,7 @@ export class Renderer3D {
       // Skinned meshes never set glassEnhance, so refraction never samples this — bind the 1×1 default at 5/6.
       this._skinnedMeshBG = this.device.createBindGroup({
         layout: this.pipeline.meshBindGroupLayout,
-        entries: [
+        entries: this._skinnedMeshBGEntries = [
           { binding: 0, resource: { buffer: this._skinnedInstBuf! } },
           { binding: 1, resource: { buffer: this.sceneUniformBuffer } },
           { binding: 2, resource: { buffer: this._iblUniformBuffer! } },
@@ -5139,7 +9239,9 @@ export class Renderer3D {
     // E1 tail (c): a POSE change (idle breathing, clip playback) must refresh the shadow map too —
     // matricesDirty is still set here (cleared at the end of this method, after the skin uploads).
     if (this._shadowsEnabled && !this._shadowMapStale) {
-      for (const m of visible) { if (m.skeleton!.matricesDirty) { this._shadowMapStale = true; break; } }
+      // With near CASCADES live, a moving pose only refreshes them (every frame, cheap: few casters); the far map picks
+      // the pose up on its own throttle - so an animated player no longer redraws the whole city's shadow every frame.
+      for (let i = 0; i < visible.length; i++) { if ((flags[i] & 2) && visible[i].skeleton!.matricesDirty) { if (this._cascadeCount > 0) { if (this._cascadeSplitLists) this._cascadeDynStale = true; else this._cascadeStale = true; } else this._skinnedShadowChanged(); break; } }   // P14: split → only the dynamic layer
     }
 
     // E1 state elision: the sort above put same-(pipeline, skeleton) parts adjacent — only emit the
@@ -5150,17 +9252,23 @@ export class Renderer3D {
     let curPipe: GPURenderPipeline | null = null;
     let curBG1: GPUBindGroup | null = null;
     let curBG2: GPUBindGroup | null = null;
+    let faceOverlays: number[] | null = null;
+    let skStuck = false;   // a live part skipped for a reason other than a compiling pipeline (see below)
     for (let i = 0; i < visible.length; i++) {
       const mesh = visible[i];
       if (!mesh.skeleton) continue;
 
       this._ensureSkinnedVBIB(mesh);
-      this._ensureSkinMatBuf(mesh);
+      this._ensureSkinMatBuf(mesh);   // live parts only (in view or casting) — a culled character uploads nothing
+      if (!(flags[i] & 1)) continue;  // R6.1: shadow-only part — its slot + skin buffer are ready for the replay
 
       const vb = this._skinnedVBs.get(mesh.id);
       const ib = this._skinnedIBs.get(mesh.id);
       const skinBG = this._skinBGs.get(mesh.skeleton.id);   // shared per-skeleton bind group
-      if (!vb || !ib || !skinBG) continue;
+      // (No buffers / bind group is not a pipeline wait, so the pipeline cache's ready event can't re-request a frame:
+      // ask for one here, or an idle on-demand loop could sit on a frame without this part — performance-plan §P15.)
+      if (!vb || !ib || !skinBG) { fs.skinnedWaiting++; skStuck = true; continue; }
+      if (mesh.isFaceFeatures) { (faceOverlays ??= []).push(i); continue; }   // face kit: multiplied over the lit skin below
 
       pass.setVertexBuffer(0, vb);
       pass.setIndexBuffer(ib, 'uint32');
@@ -5168,10 +9276,14 @@ export class Renderer3D {
       if (mesh.vertexColors) {
         this._ensureSkinnedVCBuf(mesh);
         const vcBG = this._skinnedVCBGs.get(mesh.id);
-        if (vcBG) {
+        // No VC bind group yet → skip (bug-hunt 2026-10-01): falling through drew with the PREVIOUS part's pipeline +
+        // bind groups (or none — a validation error that drops the whole frame).
+        if (!vcBG) { fs.skinnedWaiting++; skStuck = true; continue; }
+        {
           const p = this._weightPaintUnlit
             ? this.pipeline.skinnedWeightPaintUnlitPipeline
             : this.pipeline.skinnedWeightPaintPipeline;
+          if (!p) { fs.skinnedWaiting++; continue; }   // P2: still compiling → skip this part (the cache's ready event re-requests a frame)
           if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
           if (skinBG !== curBG1) { pass.setBindGroup(1, skinBG); curBG1 = skinBG; }
           if (vcBG !== curBG2) { pass.setBindGroup(2, vcBG); curBG2 = vcBG; }
@@ -5181,18 +9293,41 @@ export class Renderer3D {
         const patterned = this._usesPatterns(mesh);   // §3.1: characters are plain → the cheaper skinned pipeline
         if (useTexture) {
           const p = patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline;
+          if (!p) { fs.skinnedWaiting++; continue; }   // P2: still compiling → skip this part (draws once it lands)
           if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
           const texBG = this.createTextureBindGroup(mesh);
           if (texBG !== curBG1) { pass.setBindGroup(1, texBG); curBG1 = texBG; }
           if (skinBG !== curBG2) { pass.setBindGroup(2, skinBG); curBG2 = skinBG; }
         } else {
           const p = patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline;
+          if (!p) { fs.skinnedWaiting++; continue; }   // P2: still compiling → skip this part (draws once it lands)
           if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
           if (skinBG !== curBG1) { pass.setBindGroup(1, skinBG); curBG1 = skinBG; }
         }
       }
 
+      // Counted HERE, once the draw is really issued (§P15 draw-bug 2026-10-04): it used to count before the pipeline
+      // check, so a character whose skinned pipelines were still compiling read "drawn" in the stats while invisible.
+      fs.skinnedDrawn++; fs.skinnedTris += mesh.geometry.indices.length / 3;
       pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
+    }
+
+    // FACE KIT overlays (face-features.ts): drawn after every opaque skinned part with the MULTIPLY pipeline (no depth
+    // write), so brows / mouth / blush / hair shadow darken whatever the skin rendered, in any render style.
+    const faceMulPipe = faceOverlays ? this.pipeline.skinnedFaceMultiplyPipeline : null;
+    if (faceOverlays && !faceMulPipe) fs.skinnedWaiting += faceOverlays.length;   // still compiling (ready event re-requests)
+    if (skStuck) this.onDeferredWork?.();
+    if (faceOverlays && faceMulPipe) {
+      pass.setPipeline(faceMulPipe);
+      for (const i of faceOverlays) {
+        const mesh = visible[i];
+        fs.skinnedDrawn++; fs.skinnedTris += mesh.geometry.indices.length / 3;
+        pass.setVertexBuffer(0, this._skinnedVBs.get(mesh.id)!);
+        pass.setIndexBuffer(this._skinnedIBs.get(mesh.id)!, 'uint32');
+        pass.setBindGroup(1, this.createTextureBindGroup(mesh));
+        pass.setBindGroup(2, this._skinBGs.get(mesh.skeleton!.id)!);
+        pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
+      }
     }
 
     // Persistent PER-OBJECT outlines on SKINNED meshes — grouped by SKELETON so a whole character (body + hair +
@@ -5200,16 +9335,19 @@ export class Renderer3D {
     // where the clothes occlude it). The style comes from whichever part carries mesh.outline (the body, set via the
     // "Character" outliner node). A standalone skinned mesh = a group of one.
     if (this._highlightPass && this._highlightPass.supportsSkinned && this._skinnedMeshBG) {
-      const outlinedSkels = new Map<string, HighlightStyle>();
-      for (const m of visible) if (m.outline && m.skeleton && !outlinedSkels.has(m.skeleton.id)) outlinedSkels.set(m.skeleton.id, m.outline);
+      const outlinedSkels = new Map<string, HighlightStyle[]>();   // skeleton → its outline layers (inner → outer)
+      for (let i = 0; i < visible.length; i++) {
+        const m = visible[i];
+        if ((flags[i] & 1) && m.outline && m.skeleton && !outlinedSkels.has(m.skeleton.id)) outlinedSkels.set(m.skeleton.id, outlineLayers(m.outline, m.outlineRings));
+      }
       if (outlinedSkels.size > 0) {
         const _skTime = performance.now() / 1000;
         let spi = 0;
-        for (const [skelId, st] of outlinedSkels) {
+        for (const [skelId, layers] of outlinedSkels) {
           const parts: { vb: GPUBuffer; ib: GPUBuffer; indexCount: number; instanceSlot: number; skinBG: GPUBindGroup; texBG: GPUBindGroup }[] = [];
           for (let i = 0; i < visible.length; i++) {
             const mesh = visible[i];
-            if (!mesh.skeleton || mesh.skeleton.id !== skelId) continue;
+            if (!(flags[i] & 1) || !mesh.skeleton || mesh.skeleton.id !== skelId || mesh.isFaceFeatures) continue;
             const vb = this._skinnedVBs.get(mesh.id);
             const ib = this._skinnedIBs.get(mesh.id);
             const skinBG = this._skinBGs.get(skelId);
@@ -5218,9 +9356,12 @@ export class Renderer3D {
             parts.push({ vb, ib, indexCount: mesh.geometry.indices.length, instanceSlot: i, skinBG, texBG: this.createTextureBindGroup(mesh) });
           }
           if (parts.length === 0) continue;
-          this._highlightPass.writeCustomParamsSkinned(spi, st, canvasWidth, canvasHeight, st.speed !== 0 ? _skTime : 0);
-          this._highlightPass.drawSkinnedGroupOutline(pass, this._skinnedMeshBG, parts, spi, !!st.merge);
-          spi++;
+          const paramIndices: number[] = [];
+          for (const layer of layers) {
+            this._highlightPass.writeCustomParamsSkinned(spi, layer, canvasWidth, canvasHeight, outlineAnimates(layer) ? _skTime : 0);
+            paramIndices.push(spi++);
+          }
+          this._highlightPass.drawSkinnedGroupOutline(pass, this._skinnedMeshBG, parts, paramIndices, !!layers[0].merge);
         }
       }
     }
@@ -5271,7 +9412,7 @@ export class Renderer3D {
       let pBG2: GPUBindGroup | null = null;
       for (let i = 0; i < visible.length; i++) {
         const mesh = visible[i];
-        if (!mesh.skeleton || mesh.vertexColors) continue;
+        if (!mesh.skeleton || mesh.vertexColors || mesh.isFaceFeatures) continue;   // (face-kit overlays need the multiply blend)
         const vb = this._skinnedVBs.get(mesh.id);
         const ib = this._skinnedIBs.get(mesh.id);
         const skinBG = this._skinBGs.get(mesh.skeleton.id);
@@ -5282,12 +9423,14 @@ export class Renderer3D {
         const patterned = this._usesPatterns(mesh);
         if (useTexture) {
           const p = patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline;
+          if (!p) continue;   // P2: still compiling → skip
           if (p !== pPipe) { pPass.setPipeline(p); pPipe = p; }
           const texBG = this.createTextureBindGroup(mesh);
           if (texBG !== pBG1) { pPass.setBindGroup(1, texBG); pBG1 = texBG; }
           if (skinBG !== pBG2) { pPass.setBindGroup(2, skinBG); pBG2 = skinBG; }
         } else {
           const p = patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline;
+          if (!p) continue;   // P2: still compiling → skip
           if (p !== pPipe) { pPass.setPipeline(p); pPipe = p; }
           if (skinBG !== pBG1) { pPass.setBindGroup(1, skinBG); pBG1 = skinBG; }
         }
@@ -5303,7 +9446,163 @@ export class Renderer3D {
     // (e.g. a face decal on a body) back when each mesh owned its own buffer; with the shared
     // buffer the flag must still survive the whole loop so a skeleton first seen mid-loop (its
     // buffer freshly created) uploads correctly before the flag drops here.
+    // (Live parts only: a culled skeleton keeps its dirty flag, so it uploads the moment it comes back.)
     for (const m of visible) { if (m.skeleton) m.skeleton.matricesDirty = false; }
+    fs.skinUploads = this._skinBufUploaded.size;
+    fs.msSkinned = performance.now() - _sk0;
+  }
+
+  /** Whether the renderer culled every visible part of this skeleton last frame (out of view with a margin, no
+   *  shadow into the view) — the procedural idle skips such characters (R6.1). False when unknown. */
+  isSkeletonAnimCulled3D(skeletonId: string): boolean {
+    return this.skinnedAnimCulling && this._skelAnimCulled.has(skeletonId);
+  }
+
+  /** R6.1: frustum-cull the skinned parts IN PLACE — `list` keeps only the LIVE parts (in view, or casting a shadow
+   *  that can reach the view; all of them while a planar mirror is live), and each kept part's cache entry gets its
+   *  flags (1 = main pass, 2 = shadow caster). Also rebuilds `_skelAnimCulled`. No per-frame allocation once warm. */
+  private _cullSkinned(list: SkinnedMesh3D[]): void {
+    const fs = this._frame;
+    const animCulled = this._skelAnimCulled; animCulled.clear();
+    const live = this._skelLiveScratch; live.clear();
+    this._skFade.clear(); fs.skinnedFogHidden = 0;
+    const on = this.skinnedCulling && this._frustumCulling;
+    const shadows = this._shadowsEnabled && !this._shadowsSuspended;
+    if (!on) {
+      for (const m of list) { const e = this._skCull.get(m.id); if (e) e.flags = 3; }
+      fs.skinnedShadow = shadows ? list.length : 0;
+      fs.skelAnimCulled = 0;
+      if (shadows && list.length !== this._lastSkinnedCasters) { this._skinnedShadowChanged(); this._lastSkinnedCasters = list.length; }
+      return;
+    }
+    const culler = this._skCuller.setFromViewProjection(this.camera.getViewProjectionMatrix());
+    // Shadow reach (the Round 5 test): the part's box swept along the sun down to the scene floor must touch the view.
+    // Off with a planar mirror live (it shows receivers outside the view) or in the old camera-list mode.
+    const reach = shadows && this._shadowLightCull && !this._planarActive;
+    const ld = this._shadowDir, ll = Math.hypot(ld[0], ld[1], ld[2]) || 1, lightDir = this._lightDirN;
+    lightDir[0] = ld[0] / ll; lightDir[1] = ld[1] / ll; lightDir[2] = ld[2] / ll;
+    const floorY = this._sceneFloorY;
+    const keepAll = this._planarActive;
+    // FOG HORIZON (2026-10-01): skinned characters obey "Buildings only in fog" like the city's class-2 meshes: a part
+    // whose whole box is past the fog edge x 1.01 (from the fog eye) is dropped from every pass, and while the fade
+    // band is live every part dissolves in it (flags2 fade bit, _uploadSkinnedInstances; colour + shadow passes).
+    // Never the active Play player, the selection or a no-fog part (_skFogExempt), so the camera cannot lose them.
+    const fhS = this._fogHorizon;
+    const fhSk = fhS.buildingsOnly && this.fogHorizonActive && !this._planarActive && Renderer3D.fogHorizonCpuCull && Renderer3D.skinnedFogHorizon;
+    const fhC = fhSk ? fogHorizonEdge(this._fog) * 1.01 : Infinity, fhC2 = fhC * fhC;
+    const fhFadeOn = fhSk && fhS.fadeM > 0;
+    const skFade = this._skFade;
+    let n = 0, casters = 0;
+    for (let i = 0; i < list.length; i++) {
+      const m = list[i];
+      const skel = m.skeleton!;
+      let flags = 3;
+      let animLive = true;
+      // Weight-paint previews (vertexColors) and the weight-paint target are never culled (editing state).
+      const e = m.vertexColors || m === this._wpMesh ? null : this._skinnedCullEntry(m);
+      const fogged = fhSk && !!e && e.ok && !m.material.noFog && !this._skFogExempt(m);
+      if (fogged && fhFadeOn) skFade.add(m.id);
+      if (fogged && this._skBoxFogDist2(e!.box, 0) > fhC2) {
+        // Past the fog: not drawn, no shadow. Its idle keeps running only within a margin (half the part's size) of
+        // the edge, so a character walking back in is current (as the off-view margin below).
+        const b = e!.box;
+        flags = 0;
+        fs.skinnedCulled++; fs.skinnedFogHidden++;
+        animLive = this._skBoxFogDist2(b, 0.5 * Math.max(b[3] - b[0], b[4] - b[1], b[5] - b[2])) <= fhC2;
+      } else if (e && e.ok) {
+        const b = e.box;
+        const inView = culler.testAABB(b[0], b[1], b[2], b[3], b[4], b[5]);
+        const casts = shadows && (inView || !reach || shadowReachesView(culler, lightDir, floorY, b[0], b[1], b[2], b[3], b[4], b[5]));
+        flags = (inView ? 1 : 0) | (casts ? 2 : 0);
+        if (!inView) {
+          fs.skinnedCulled++;
+          // The idle keeps running inside a margin around the view (half the part's size), so a character walking
+          // or turning into view is already current — no stale-pose pop at the screen edge.
+          const g = 0.5 * Math.max(b[3] - b[0], b[4] - b[1], b[5] - b[2]);
+          animLive = casts || culler.testAABB(b[0] - g, b[1] - g, b[2] - g, b[3] + g, b[4] + g, b[5] + g);
+        }
+      }
+      if (e) e.flags = flags;
+      else { const old = this._skCull.get(m.id); if (old) old.flags = 3; }
+      if (animLive) live.add(skel.id); else animCulled.add(skel.id);
+      if (flags & 2) casters++;
+      if (flags !== 0 || keepAll) list[n++] = m;
+    }
+    list.length = n;
+    for (const id of live) animCulled.delete(id);   // a skeleton is paused only when ALL its parts are
+    fs.skinnedShadow = shadows ? casters : 0;
+    fs.skelAnimCulled = animCulled.size;
+    // A part entering / leaving the caster set must refresh a throttled shadow map (like the roster check above).
+    if (shadows && casters !== this._lastSkinnedCasters) { this._skinnedShadowChanged(); this._lastSkinnedCasters = casters; }
+  }
+
+  /** FOG HORIZON skinned: the parts that carry the fade bit this frame (filled by _cullSkinned). */
+  private readonly _skFade = new Set<string>();
+  /** A/B: false = skinned characters ignore the fog horizon (the pre-2026-10-01 behaviour). */
+  static skinnedFogHorizon = true;
+  /** Host hook (scene3d-manager, while Play runs): true for every mesh of the active Play player. Such meshes are never
+   *  fog-culled or faded, nor is the selection (_selectedMeshIds / the selected group target). */
+  fogCullExempt: ((m: Mesh3D) => boolean) | null = null;
+  private _skFogExempt(m: Mesh3D): boolean {
+    if (this._selectedMeshIds.has(m.id) || this._selectedGroupTarget === m) return true;
+    if (this._selectedMeshIds.size > 0 || this._selectedGroupTarget) {   // a selected ancestor (a character's group)
+      for (let p = (m as unknown as { parent?: { id?: string; parent?: unknown } | null }).parent; p; p = p.parent as typeof p) {
+        if ((p.id && this._selectedMeshIds.has(p.id)) || (p as unknown) === this._selectedGroupTarget) return true;
+      }
+    }
+    return !!this.fogCullExempt?.(m);
+  }
+  /** Squared distance from the fog eye to a skinned part's box grown by `pad` on every side. */
+  private _skBoxFogDist2(b: Float64Array, pad: number): number {
+    const e = this._fogEye, px = e[0], py = e[1], pz = e[2];
+    const dx = px < b[0] - pad ? b[0] - pad - px : px > b[3] + pad ? px - b[3] - pad : 0;
+    const dy = py < b[1] - pad ? b[1] - pad - py : py > b[4] + pad ? py - b[4] - pad : 0;
+    const dz = pz < b[2] - pad ? b[2] - pad - pz : pz > b[5] + pad ? pz - b[5] - pad : 0;
+    return dx * dx + dy * dy + dz * dz;
+  }
+
+  /** The cull entry for a skinned part, with its world box current for this pose. Radii rebuild when the skin data
+   *  changes (skinDirty / new arrays / joint count); the box rebuilds only when the pose or model matrix changed. The
+   *  joint spheres (pose) are computed once per SKELETON per pose and shared by every part riding it. */
+  private _skinnedCullEntry(m: SkinnedMesh3D): { ok: boolean; box: Float64Array; flags: number } {
+    const skel = m.skeleton!;
+    const joints = skel.data.joints;
+    let sk = this._skSpheres.get(skel.id);
+    let e = this._skCull.get(m.id);
+    const stale = !e || m.skinDirty || e.skelId !== skel.id || e.cr.jointCount !== joints.length
+      || e.verts !== m.geometry.vertices || e.ji !== m.jointIndices || e.jw !== m.jointWeights;
+    if (stale || !sk || sk.bindPos.length !== joints.length * 3) {
+      // (Re)derive the skeleton's bind positions too — a skin change may come with a rebind (new inverse binds).
+      const ibs: ArrayLike<number>[] = new Array(joints.length);
+      for (let j = 0; j < joints.length; j++) ibs[j] = joints[j].inverseBindMatrix;
+      for (const j of joints) if (j.index >= 0 && j.index < joints.length) ibs[j.index] = j.inverseBindMatrix;
+      const bindPos = computeJointBindPositions(ibs);
+      if (!sk) { sk = { bindPos, poseVer: -1, spheres: new Float32Array(joints.length * 4) }; this._skSpheres.set(skel.id, sk); }
+      else { sk.bindPos = bindPos; sk.poseVer = -1; }
+    }
+    if (stale) {
+      if (m.skinDirty) this._ensureSkinnedVBIB(m);   // builds the VB once and clears skinDirty (no per-frame rebuild while culled)
+      const cr = computeSkinnedCullRadii(m.geometry.vertices, 12, m.jointIndices, m.jointWeights, sk.bindPos);
+      if (!e) {
+        e = { cr, skelId: skel.id, verts: m.geometry.vertices, ji: m.jointIndices, jw: m.jointWeights,
+          poseVer: -1, matVer: -1, viaSkel: m.transformViaSkeleton, ok: false, box: new Float64Array(6), flags: 3 };
+        this._skCull.set(m.id, e);
+      } else {
+        e.cr = cr; e.skelId = skel.id; e.verts = m.geometry.vertices; e.ji = m.jointIndices; e.jw = m.jointWeights; e.poseVer = -1;
+      }
+    }
+    if (sk.poseVer !== skel.poseVersion) {
+      sk.spheres = computeJointSpheres(skel.skinMatrices, sk.bindPos, sk.spheres);
+      sk.poseVer = skel.poseVersion;
+    }
+    const ent = e!;
+    const viaSkel = m.transformViaSkeleton;
+    if (ent.poseVer !== skel.poseVersion || ent.viaSkel !== viaSkel || (!viaSkel && ent.matVer !== m.localMatrixVersion)) {
+      // 6 % pad: dual-quat skinning is not strictly a convex blend, plus the one-frame pose lag of the shadow replay.
+      ent.ok = skinnedAABBFromSpheres(sk.spheres, ent.cr, viaSkel ? null : (m.localMatrix as unknown as Float32Array), 0.06, ent.box);
+      ent.poseVer = skel.poseVersion; ent.matVer = m.localMatrixVersion; ent.viaSkel = viaSkel;
+    }
+    return ent;
   }
 
   /** Upload transform + material data for skinned meshes into the skinned instance buffer. */
@@ -5372,6 +9671,11 @@ export class Renderer3D {
 
       // patternColor (floats 48-51) + patternParams (52-55) — boardShade repurposes both (see helper)
       this._writePatternSlots(data, off, m.material);
+      this._writeGroundUvScale(data, off, m);
+      // FOG HORIZON (2026-10-01): a skinned part dissolves in the fade band like a class-2 city mesh (see _cullSkinned).
+      // (The hair-band bit is a pure look bit, so a banded hair still fades: OR the fade in.)
+      if (this._skFade.size > 0 && (data[off + FLAGS2_FLOAT_OFFSET] & ~FLAGS2_HAIR_BAND) === 0 && this._skFade.has(m.id)) data[off + FLAGS2_FLOAT_OFFSET] += FLAGS2_DISTANCE_FADE;
+      if (m.faceDepthPull > 0) data[off + FLAGS2_FLOAT_OFFSET + 2] = m.faceDepthPull;   // face kit brows (flags2 bit 6; column 3 .z)
     }
 
     // Write only the used portion (data may be a larger reused scratch buffer).
@@ -5421,7 +9725,9 @@ export class Renderer3D {
     this._skinnedVBs.get(mesh.id)?.destroy();
     this._skinnedVBs.set(mesh.id, vb);
 
-    const idxData = mesh.geometry.indices;
+    // A body-hiding mask (SkinnedMesh3D.drawIndices, same length) replaces the drawn triangles; geometry.indices otherwise.
+    const di = mesh.drawIndices;
+    const idxData = di && di.length === mesh.geometry.indices.length ? di : mesh.geometry.indices;
     const ib = this.device.createBuffer({
       size:  idxData.byteLength,
       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
@@ -5478,9 +9784,23 @@ export class Renderer3D {
     // buffer the per-call uploaded-set plays that dedupe role, and the flag is cleared once, after
     // all skinned meshes draw, in drawSkinnedMeshes().
     if (isNew || (skel.matricesDirty && !this._skinBufUploaded.has(skel.id))) {
-      this.device.queue.writeBuffer(entry.buf, 0, skel.skinMatrices);
+      this.device.queue.writeBuffer(entry.buf, 0, this._skinUploadData(skel));
       this._skinBufUploaded.add(skel.id);
     }
+  }
+
+  /** Per-skeleton scratch for the dual-quaternion-packed upload (reused every frame — no per-frame allocation). */
+  private readonly _dqsScratch = new Map<string, Float32Array>();
+  /** The bytes to upload for a skeleton's skin buffer: the plain matrices (linear blend), or — for a 'dualQuat'
+   *  skeleton — the DQS packing the shared WGSL skinMatrixFor decodes (dual-quat-skin.ts). Falls back to the plain
+   *  matrices for any frame where a joint has non-uniform scale/shear (DQS can't represent it). */
+  private _skinUploadData(skel: Skeleton3D): Float32Array {
+    if (skel.skinningMethod !== 'dualQuat') { this._dqsScratch.delete(skel.id); return skel.skinMatrices; }
+    const scratch = this._dqsScratch.get(skel.id);
+    const packed = packDualQuatSkin(skel.skinMatrices, scratch);
+    if (!packed) return skel.skinMatrices;
+    if (packed !== scratch) this._dqsScratch.set(skel.id, packed);
+    return packed;
   }
 
   /** Drop one mesh's ref on a skeleton's shared skin buffer; destroy buffer + bind group when the
@@ -5491,12 +9811,15 @@ export class Renderer3D {
     this._skelBufRefs.delete(skelId);
     this._skinMatBufs.get(skelId)?.buf.destroy();
     this._skinMatBufs.delete(skelId);
+    this._dqsScratch.delete(skelId);   // the dual-quat upload scratch goes with the buffer
+    this._skSpheres.delete(skelId);    // R6.1 cull spheres
     this._skinBGs.delete(skelId);   // GPUBindGroup has no destroy() — GC'd when unreferenced
   }
 
   // ── Cleanup ────────────────────────────────────────────────────
 
   destroy(): void {
+    this._gd?.destroy(); this._gd = null;
     this.sceneUniformBuffer.destroy();
     this.instanceStorageBuffer?.destroy();
     this._shadowTexture?.destroy();
@@ -5505,23 +9828,30 @@ export class Renderer3D {
     this._outlinePass?.destroy();
     this._geomVB?.destroy();
     this._geomIB?.destroy();
+    this._geomScratch?.destroy(); this._geomScratch = null;
     this._atlasTexture?.destroy();
     this._normalAtlasTexture?.destroy();
     this._particleSceneUniBuf?.destroy();
     this._particleInstBuf?.destroy();
+    this._transientInstBuf?.destroy();
     this._bloomPass?.destroy();
+    this._fxaaPass?.destroy();
     this._loFiPass?.destroy();
+    this._taa?.destroy(); this._taa = null;   // temporal AA history / velocity targets
     this._prefilteredCubeTex?.destroy();   // specular IBL (P1b)
     this._dummyCubeTex?.destroy();
     this._brdfLutTex?.destroy();
+    this._iblGpu?.destroy(); this._iblGpu = null; this._pendingSkyBake = null;
+    this._shadowStaticTex?.destroy(); this._shadowStaticTex = null;
     this._dummyWorldPosTex?.destroy();     // SSR (P2)
     this._ssaoWhiteTex?.destroy();
     this._sceneColorDefaultTex?.destroy();
-    this._geomAllocs.clear();
-    this._meshInstanceSlots.clear();
+    this._r3Gen++; this._geomAllocs.clear();
+    this._r3Gen++; this._meshInstanceSlots.clear();
     this._atlasLayerMap.clear();
     this._normalAtlasLayerMap.clear();
     this._texBindGroupCache.clear();
+    for (const e of this._meshAABBCache.values()) e.dead = true;
     this._meshAABBCache.clear();
     this._normalMatCache.clear();
     this._gizmoRenderer?.destroy();
@@ -5531,5 +9861,18 @@ export class Renderer3D {
     this._skinMatBufs.forEach(e => e.buf.destroy());
     this._skinnedVCBufs.forEach(b => b.destroy());
     this._skinnedInstBuf?.destroy();
+    // bug-hunt 2026-10-01: passes + targets added since destroy() was written (leaked on every viewer teardown).
+    this._highlightPass?.destroy(); this._highlightPass = null;
+    this._silhouettePass?.destroy(); this._silhouettePass = null;
+    this._spriteOutlinePass?.destroy(); this._spriteOutlinePass = null;
+    this._postProcessPass?.destroy(); this._postProcessPass = null;
+    this._ssao?.destroy(); this._ssao = null;
+    this._cascadeTex?.destroy(); this._cascadeTex = null;
+    this._shadowMM?.destroy(); this._shadowMM = null;
+    for (const b of this._cascadeSceneBufs) b.destroy();
+    this._cascadeSceneBufs = [];
+    this._planarTex?.destroy(); this._planarTex = null;
+    this._planarDepthTex?.destroy(); this._planarDepthTex = null;
+    this._garpAtlasTexture?.destroy(); this._garpAtlasTexture = null;
   }
 }

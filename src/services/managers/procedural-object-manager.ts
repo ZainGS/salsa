@@ -19,6 +19,7 @@
 import type { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import type { LayoutPreviewLayer } from '../../world/types';
 import type { Scene3DManager } from './scene3d-manager';
+import { applyObjectStyle, isEmptyStyle, mergeObjectStyle, patchClearsField, sanitizeObjectStyle, type ObjectStyle, type ObjectStylePatch } from './object-style';
 
 /** A placed object's transform (translation + Euler rotation). Scale is tracked separately (display scale). */
 export interface ProcTransform { x: number; y: number; z: number; rx: number; ry: number; rz: number; }
@@ -38,10 +39,12 @@ export interface ProcRec<TParams, TMeta> {
     transform: ProcTransform;
     scale: number;
     meta: TMeta | null;
+    /** The object's persisted LOOK (render style / toon shadows / rim) — re-applied after every rebuild. */
+    style?: ObjectStyle;
 }
 
 /** The persisted marker every subclass writes — `kind` distinguishes owners so no manager adopts another's. */
-export interface ProcMarker<TParams> { kind: string; params: Partial<TParams>; transform: Partial<ProcTransform>; scale?: number; }
+export interface ProcMarker<TParams> { kind: string; params: Partial<TParams>; transform: Partial<ProcTransform>; scale?: number; style?: ObjectStyle; }
 
 export abstract class ProceduralObjectManager<TParams, TMeta> {
     protected _items = new Map<string, ProcRec<TParams, TMeta>>();
@@ -57,6 +60,8 @@ export abstract class ProceduralObjectManager<TParams, TMeta> {
     protected abstract resolveParams(partial: unknown): TParams;
     /** Outliner label for a new object. */
     protected abstract makeName(params: TParams): string;
+    /** The style a NEW object starts with — set by the Environment style (ShapeManager); undefined = none. */
+    defaultStyle: (() => ObjectStyle | undefined) | null = null;
 
     constructor(protected readonly scene3d: Scene3DManager) {
         // Persist gizmo moves: when a managed container is dragged, mirror its live transform (incl. a scale
@@ -75,7 +80,9 @@ export abstract class ProceduralObjectManager<TParams, TMeta> {
         const params = this.resolveParams(partial);
         const container = this.scene3d.createCityContainer(this.makeName(params));
         const t: ProcTransform = { ...IDENTITY_T, ...transform };
-        const rec: ProcRec<TParams, TMeta> = { container, group: null, params, transform: t, scale: opts.scale ?? 1 / DEFAULT_METERS_PER_UNIT, meta: null };
+        const style = this.defaultStyle?.();
+        const rec: ProcRec<TParams, TMeta> = { container, group: null, params, transform: t, scale: opts.scale ?? 1 / DEFAULT_METERS_PER_UNIT, meta: null,
+            ...(isEmptyStyle(style) ? {} : { style: { ...style } }) };
         this._items.set(container.id, rec);
         this._rebuild(rec);
         this.scene3d.setGroupTransform(container, { ...t, s: rec.scale });
@@ -101,6 +108,24 @@ export abstract class ProceduralObjectManager<TParams, TMeta> {
     }
 
     getParams(id: string): TParams | null { const r = this._items.get(id); return r ? { ...r.params } : null; }
+
+    /** Set (merge) this object's persisted LOOK. A `null` field clears it back to the generator's own value (that
+     *  needs a rebuild; setting values applies in place). Persists in the marker. False if `id` isn't managed. */
+    setStyle(id: string, patch: ObjectStylePatch): boolean {
+        const rec = this._items.get(id);
+        if (!rec) return false;
+        const rebuild = patchClearsField(rec.style, patch);
+        const next = mergeObjectStyle(rec.style, patch);
+        rec.style = isEmptyStyle(next) ? undefined : next;
+        if (rebuild) this._rebuild(rec);
+        else { if (rec.group) applyObjectStyle(rec.group, rec.style); this._stamp(rec); }
+        this.scene3d.requestRender3D();
+        return true;
+    }
+    /** This object's persisted look ({} = none). Null if `id` isn't managed. */
+    getStyle(id: string): ObjectStyle | null { const r = this._items.get(id); return r ? { ...(r.style ?? {}) } : null; }
+    /** Every managed object's id (for scene-wide operations like the Environment style). */
+    ids(): string[] { return [...this._items.keys()]; }
     getMeta(id: string): TMeta | null { return this._items.get(id)?.meta ?? null; }
     /** True if this manager owns `id` (each subclass also exposes a domain-named alias, e.g. isBuilding). */
     isManaged(id: string): boolean { return this._items.has(id); }
@@ -163,6 +188,7 @@ export abstract class ProceduralObjectManager<TParams, TMeta> {
                 transform: { ...IDENTITY_T, ...(wp.transform ?? {}) },
                 scale: wp.scale && wp.scale > 0 ? wp.scale : 1 / DEFAULT_METERS_PER_UNIT,
                 meta: null,
+                style: sanitizeObjectStyle(wp.style),
             };
             this._items.set(child.id, rec);
             this._rebuild(rec);
@@ -177,7 +203,8 @@ export abstract class ProceduralObjectManager<TParams, TMeta> {
     protected _acceptRestore(_marker: ProcMarker<TParams>): boolean { return true; }
 
     protected _stamp(rec: ProcRec<TParams, TMeta>): void {
-        rec.container.worldParams = { kind: this.kind, params: rec.params, transform: rec.transform, scale: rec.scale } satisfies ProcMarker<TParams>;
+        rec.container.worldParams = { kind: this.kind, params: rec.params, transform: rec.transform, scale: rec.scale,
+            ...(isEmptyStyle(rec.style) ? {} : { style: rec.style }) } satisfies ProcMarker<TParams>;
     }
 
     /** (Re)generate geometry into the container: build layers, swap the child group, re-cache bounds + marker. */
@@ -185,6 +212,7 @@ export abstract class ProceduralObjectManager<TParams, TMeta> {
         const { layers, meta } = this.build(rec.params);
         if (rec.group) { this.scene3d.removeFlatColorMeshGroup(rec.group); rec.group = null; }
         rec.group = this.scene3d.addFlatColorMeshGroup(`${this.meshLabel} ${rec.container.id}`, layers, false, rec.container);
+        applyObjectStyle(rec.group, rec.style);   // the persisted look survives the rebuild
         rec.meta = meta;
         this._stamp(rec);
         this.scene3d.cacheGroupBounds(rec.container);

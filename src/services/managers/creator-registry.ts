@@ -49,8 +49,10 @@ export const VENDING_SCHEMA: CreatorParamSchema[] = [
     { key: 'heightM', label: 'Height (m)', type: 'range', default: DEFAULT_VENDING_PARAMS.heightM, min: 0.6, max: 2.6, step: 0.05, group: 'Dimensions' },
     { key: 'widthM',  label: 'Width (m)',  type: 'range', default: DEFAULT_VENDING_PARAMS.widthM,  min: 0.4, max: 1.4, step: 0.02, group: 'Dimensions' },
     { key: 'depthM',  label: 'Depth (m)',  type: 'range', default: DEFAULT_VENDING_PARAMS.depthM,  min: 0.3, max: 1.0, step: 0.02, group: 'Dimensions' },
-    { key: 'productCols', label: 'Product columns', type: 'range', default: DEFAULT_VENDING_PARAMS.productCols, min: 1, max: 4, step: 1, group: 'Display' },
-    { key: 'productRows', label: 'Product rows',    type: 'range', default: DEFAULT_VENDING_PARAMS.productRows, min: 1, max: 4, step: 1, group: 'Display' },
+    { key: 'stock', label: 'Stock', type: 'select', default: DEFAULT_VENDING_PARAMS.stock, group: 'Display',
+        options: [{ value: 'cans', label: '3D cans' }, { value: 'image', label: 'Flat image' }] },
+    { key: 'shelves',      label: 'Shelves',        type: 'range', default: DEFAULT_VENDING_PARAMS.shelves,      min: 1, max: 5,  step: 1, group: 'Display' },
+    { key: 'cansPerShelf', label: 'Cans per shelf', type: 'range', default: DEFAULT_VENDING_PARAMS.cansPerShelf, min: 2, max: 12, step: 1, group: 'Display' },
     { key: 'glow', label: 'Window glow', type: 'range', default: DEFAULT_VENDING_PARAMS.glow, min: 0, max: 2, step: 0.05, group: 'Display' },
     { key: 'seed', label: 'Seed', type: 'seed', default: DEFAULT_VENDING_PARAMS.seed, group: 'Seed' },
 ];

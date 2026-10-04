@@ -10,7 +10,13 @@
     "clean": "rm -rf dist",
     "test": "vitest",
     "build:viewer": "vite build --config vite.viewer.config.ts",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "check": "node scripts/check.mjs",
+    "check:fast": "node scripts/check.mjs --fast",
+    "lint": "node tools/lint/node_modules/eslint/bin/eslint.js . --pass-on-unpruned-suppressions",
+    "lint:fast": "node scripts/check.mjs --fast --steps=lint",
+    "lint:install": "npm ci --prefix tools/lint",
+    "sanity": "node scripts/check-source-sanity.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.13.1",

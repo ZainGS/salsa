@@ -21,6 +21,8 @@ import { SectionDrawingService } from './services/drawing/section-drawing-servic
 import { SdfTextDrawingService } from './services/drawing/sdftext-drawing-service';
 import { StampDrawingService } from './services/drawing/stamp-drawing-service';
 import { RasterDrawingService } from './services/raster-drawing-service';
+import { rebuildInPlace } from './renderer/core/gpu-device-recovery';
+import { TextureCache } from './renderer/caches/texture-cache/texture-cache';
 
 let existingRenderer: WebGPURenderer | null = null;
 let isRendererLive: boolean = false;
@@ -186,6 +188,22 @@ async function startWebGPURendering(canvasId: string) {
     webgpuRenderer.setPolygonDrawingService(ShapeManager.getInstance().polygonDrawingService);
     webgpuRenderer.setSdfTextDrawingService(sdfTextDrawingService);
 
+    // Device-lost recovery (docs/ui/device-recovery.md): rebuild the 2D render stack IN PLACE on the new device. The
+    // shape factory, drawing tools, ShapeManager and the renderer all hold these instances, so each keeps its identity
+    // and gets fresh GPU state (pipelines, bind groups, uniform/geometry caches, atlases). Registries come back empty:
+    // the document restore that follows re-registers every shape. (Constructors here register no callbacks.)
+    webgpuRenderer.registerGpuResourceOwner('2d-render-stack', (device) => {
+        TextureCache.clearGpuTextures();
+        rebuildInPlace(pipelineManager, new PipelineManager(device));
+        rebuildInPlace(bindGroupManager, new BindGroupManager(device, pipelineManager));
+        rebuildInPlace(cacheService, new CacheService(device, interactionService, bindGroupManager, pipelineManager),
+            ['sdfAtlas', 'textureArrayAtlas'] as never);   // the SDF tool + strategy hold these two
+        bindGroupManager.setCacheService(cacheService);
+        bindGroupManager.initBindGroups();
+        rebuildInPlace(webgpuRenderStrategy, new WebGPURenderStrategy(device, pipelineManager, interactionService, cacheService));
+        webgpuRenderer.setPipelineManager(pipelineManager, bindGroupManager, cacheService);
+    }, 10);
+
     // Animation Test:
     // const sceneGraphFrameJsons: string[] = TestAnimations.getTestSceneGraphFrames(); // your JSON animation frames
     // const animationService = new AnimationService(sceneGraph, ShapeManager.getInstance());
@@ -224,6 +242,7 @@ export { startWebGPURendering, reinitializeWebGPURendering, stopWebGPURendering,
 export { SceneAuthoringAPI } from './services/scene-authoring-api';
 export type { Vec3 } from './services/scene-authoring-api';
 export type { RestoreIssue, RestoreReport } from './services/persistence/document-state-coordinator';
+export type { WorkerJobProgress, WorkerJobStats, JobPriority } from './services/workers/worker-job-service';
 export { sceneAuthoringTools, runSceneAuthoringTool } from './services/scene-authoring-tools';
 export type { ToolDef } from './services/scene-authoring-tools';
 export { runAuthoringSession, DEFAULT_AUTHORING_SYSTEM } from './services/scene-authoring-session';
@@ -244,6 +263,10 @@ export { deriveViewRules, viewModeLabel, normalizeViewState, DEFAULT_VIEW_STATE 
 export type { ViewState, ViewRules, ViewTarget, CameraMode, FlatCamPose, FreeCamPose } from './services/managers/view-state';
 // Outline style — hover/select AND persistent per-object outlines (sm.setMeshOutline3D / setHoverOutlineStyle3D).
 export type { HighlightStyle } from './renderer/3d/renderer-3d';
+// P2 pipeline cache (docs/ui/performance.md): compile status for the host toast + the cache for host-side passes.
+export { GPUPipelineCache, PipelineSet, PIPELINE_PRIORITY } from './renderer/core/gpu-pipeline-cache';
+export type { PipelineWarmupStatus, PipelineHandle, PipelinePriority } from './renderer/core/gpu-pipeline-cache';
+export type { SpriteOutlineShape } from './renderer/3d/mesh-highlight-pass';
 
 // Play mode (scene target, L3) — the game runtime. GameLoop + CharacterController are also usable standalone.
 export { GameLoop } from './game/game-loop';

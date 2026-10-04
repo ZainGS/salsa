@@ -12,6 +12,11 @@
 import type { GarpPool, GarpSkin } from '../../world/garp';
 import { validateGarpPool, skinSlot } from '../../world/garp';
 import type { DecalSource } from './decal-geometry';
+import { SignageLibrary } from './signage-library';
+import { planAdvertPages, SIGNAGE_POOL_ID, SIGNAGE_SLOT, ADVERT_PAGE_PX, type AdvertPage } from '../../world/adverts';
+
+/** Texture-key prefix of the DERIVED signage pages (packed from the library — never persisted). */
+const SIGNAGE_KEY_PREFIX = 'signage/';
 
 /** Layer 0 of the GARP atlas is reserved as the BLANK/white fallback (an unknown or unresolved texture key
  *  renders blank rather than garbage), exactly like the mesh atlas's layer 0. Real textures start at 1. */
@@ -25,6 +30,9 @@ export class GarpManager {
     private _nextLayer = 1;                                        // 0 reserved (GARP_BLANK_LAYER)
     /** Set when a texture is (re)registered — the atlas must be (re)built before the next draw. */
     private _atlasDirty = false;
+    /** ADVERTS (docs/ui/garp.md §Adverts): the user's signage images. Its packed PAGES are the `salsa/signage`
+     *  pool (skins `<bucket>-<page>`, slot `sheet`) — derived via {@link syncSignagePool}, never serialized. */
+    readonly signage = new SignageLibrary();
 
     /** Drop every pool + texture source + atlas layer assignment (document load — stale-registry rule, audit P6).
      *  Built-in pools are re-seeded on demand by ShapeManager's idempotent _ensure*Garp helpers during procedural
@@ -36,6 +44,28 @@ export class GarpManager {
         this._notLive.clear();
         this._nextLayer = 1;
         this._atlasDirty = true;
+        this.signage.clear();
+    }
+
+    /** Anything worth saving (a pool, or signage images)? The document save writes garp.json only when true. */
+    hasContent(): boolean { return this._pools.size > 0 || !this.signage.empty; }
+
+    /** Re-derive the `salsa/signage` pool from the signage library (SYNC — every page key gets its stable atlas
+     *  layer now, so a city instantiated right after resolves its advert meshes to the right layers even though
+     *  the packed pixels arrive later). New pages start on `placeholder` until the packer registers the real
+     *  sheet; pages that no longer exist are freed. Returns the plan (for the packer). An empty library drops the
+     *  pool entirely. */
+    syncSignagePool(placeholder: DecalSource = { kind: 'image', dataUrl: '' }): AdvertPage[] {
+        const { pages } = planAdvertPages(this.signage.list());
+        const keep = new Set(pages.map(pg => pg.key));
+        for (const k of [...this._textures.keys()]) {
+            if (k.startsWith(SIGNAGE_KEY_PREFIX) && !keep.has(k)) { this._textures.delete(k); this._layer.delete(k); this._atlasDirty = true; }
+        }
+        if (!pages.length) { this._pools.delete(SIGNAGE_POOL_ID); return pages; }
+        for (const pg of pages) if (!this._textures.has(pg.key)) this.registerTexture(pg.key, placeholder);
+        this.registerPool({ id: SIGNAGE_POOL_ID, name: 'Adverts', version: this.signage.version, size: [ADVERT_PAGE_PX, ADVERT_PAGE_PX], slots: [SIGNAGE_SLOT],
+            skins: pages.map(pg => ({ name: pg.skin, slots: { [SIGNAGE_SLOT]: pg.key } })) });
+        return pages;
     }
 
     /** Register (or replace) a texture under a stable KEY, from a DecalSource (an ephemera generator or an
@@ -46,6 +76,9 @@ export class GarpManager {
         this._atlasDirty = true;
         return this._layer.get(key)!;
     }
+
+    /** The registered source of a texture key (the packer checks whether its page is still the live one). */
+    textureSource(key: string): DecalSource | undefined { return this._textures.get(key); }
 
     /** The GARP atlas layer for a texture key — {@link GARP_BLANK_LAYER} for an unknown/null key. */
     layerOf(key: string | null): number {
@@ -101,7 +134,7 @@ export class GarpManager {
      *  variant list + per-skin delete button, and `.length` for the count. `slots[i].live` = does that slot
      *  render in-world yet (default true; see {@link setSlotLive}) — drive the "not shown in-city" badge from it. */
     listPools(): { id: string; name: string; version: number; slots: { name: string; live: boolean }[]; skins: { name: string }[] }[] {
-        return [...this._pools.values()].map((p) => ({
+        return [...this._pools.values()].filter((p) => p.id !== SIGNAGE_POOL_ID).map((p) => ({
             id: p.id, name: p.name, version: p.version,
             skins: p.skins.map((s) => ({ name: s.name })),
             slots: p.slots.map((name) => ({ name, live: !(this._notLive.get(p.id)?.has(name)) })),
@@ -170,15 +203,23 @@ export class GarpManager {
     // textures in order and reassigns layers, so a saved city that referenced a skin BY NAME still resolves.
 
     /** A JSON-serializable snapshot of the registered pools + their texture sources (no atlas / no layers). */
-    serialize(): { pools: GarpPool[]; textures: Record<string, DecalSource> } {
-        return { pools: [...this._pools.values()], textures: Object.fromEntries(this._textures) };
+    serialize(): { pools: GarpPool[]; textures: Record<string, DecalSource>; signage?: unknown } {
+        // The signage pool + its page textures are DERIVED (re-packed from the library on load) — save the images only.
+        const signage = this.signage.serialize();
+        return {
+            pools: [...this._pools.values()].filter((p) => p.id !== SIGNAGE_POOL_ID),
+            textures: Object.fromEntries([...this._textures].filter(([k]) => !k.startsWith(SIGNAGE_KEY_PREFIX))),
+            ...(signage ? { signage } : {}),
+        };
     }
 
     /** Re-register pools + texture sources from a {@link serialize} snapshot (textures FIRST so pools resolve).
      *  Fresh session-local layers are assigned; the caller rebuilds the atlas afterwards. */
-    restore(data: { pools?: GarpPool[]; textures?: Record<string, DecalSource> } | null | undefined): void {
+    restore(data: { pools?: GarpPool[]; textures?: Record<string, DecalSource>; signage?: unknown } | null | undefined): void {
         if (!data) return;
         for (const [key, source] of Object.entries(data.textures ?? {})) this.registerTexture(key, source);
         for (const pool of data.pools ?? []) this.registerPool(pool);
+        // Adverts: restore the images, then re-derive the page pool (layers assigned now; the atlas rebuild packs).
+        if (data.signage) { this.signage.restore(data.signage); this.syncSignagePool(); }
     }
 }

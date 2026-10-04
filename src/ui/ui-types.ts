@@ -103,7 +103,9 @@ export interface UIOverlayState {
 
 /** Visual effect played between two states (spec §TransitionAnimation). */
 export interface TransitionAnimation {
-  type: 'none' | 'fade' | 'slideLeft' | 'slideRight' | 'slideUp' | 'slideDown' | 'zoom' | 'zoomOut' | 'wipe' | 'custom';
+  type: 'none' | 'fade' | 'slideLeft' | 'slideRight' | 'slideUp' | 'slideDown' | 'zoom' | 'zoomOut' | 'wipe' | 'custom'
+    // UI-kit transitions (docs/ui/persona-ui-kit.md) — drawn by the kit over everything, full resolution
+    | 'slash' | 'shatter' | 'stripeBurst' | 'panelSlide' | 'zoomPunch';
   duration: number;
   easing?: 'linear' | 'easeIn' | 'easeOut' | 'easeInOut' | 'spring';
   customClipId?: string;
@@ -210,6 +212,10 @@ export interface UILayerData {
   backgroundOverlay?: { color: [number, number, number, number] };
   /** Per-shape interaction props, keyed by shapeId (shapes may live in any layer). */
   shapeInteractions: Record<string, ShapeInteractionProps>;
+  /** UI-kit widgets (screen-space HUD / menu pieces, docs/ui/persona-ui-kit.md). Optional: documents without a
+   *  kit omit it and load unchanged. A widget id works anywhere a shape id does (visibility, interactions,
+   *  click triggers, playAnimation targets). */
+  kit?: import('./kit/kit-types').UIKitWidget[];
 }
 
 // ── Effects (engine → host) ─────────────────────────────────────────────────────────────────────────────────

@@ -38,6 +38,15 @@ export class SkinnedMesh3D extends Mesh3D {
    */
   public skinDirty = true;
 
+  /**
+   * DRAW index list override (clothing fit round 2, 2026-10-04: the BODY-HIDING MASK, body-hide-mask.ts). When set, the
+   * renderer's skinned index buffer is built from this instead of geometry.indices — same length, with the triangles
+   * the character's garments fully cover collapsed to degenerate (a, a, a), so the skin they enclose is never drawn and
+   * can't poke through the cloth. geometry.indices stays the full mesh (picking, export, garment fit and persistence all
+   * read that). Runtime only, never serialized; set skinDirty after changing it (that re-uploads the index buffer).
+   */
+  public drawIndices: Uint32Array | null = null;
+
   constructor(
     interactionService: InteractionService,
     x = 0, y = 0, z = 0,

@@ -1,8 +1,13 @@
 # Salsa — Systems Inventory
 
-> **Snapshot: 2026-07-29** (from a full codebase sweep). This doc tells you **where to look**, not what's
-> guaranteed still true. Status claims decay — **verify against the code** before relying on any status/line-ref
-> that hasn't been touched in the last few sessions, and update the entry when you do.
+> **Snapshot: 2026-07-29** (from a full codebase sweep), **partly refreshed 2026-10-04** (MeshInstance stride, flag
+> bits 25–31 + flags2, the renderer / streaming systems of performance-plan P13–P22). This doc tells you **where to
+> look**, not what's guaranteed still true. Status claims decay — **verify against the code** before relying on any
+> status/line-ref that hasn't been touched in the last few sessions, and update the entry when you do.
+>
+> ★ **What landed 2026-09-28 → 10-04 (built vs not built, defaults, caveats): [STATUS-2026-10-04.md](./STATUS-2026-10-04.md)**
+> — read it first; it is newer than every section below. Perf / renderer detail: [specs/performance-plan.md](./specs/performance-plan.md)
+> P1–P22 · ordered roadmap: [specs/engine-roadmap-todo.md](./specs/engine-roadmap-todo.md) · host APIs: [ui/performance.md](./ui/performance.md).
 
 An at-a-glance map of **what already exists**, so we reuse/extend instead of rebuilding. Grouped bottom-up by
 layer. Each entry: **role · key file(s) · status · reuse notes**. The **[Integration & reuse map](#integration--reuse-map)**
@@ -58,7 +63,7 @@ instancing `instances`/`instanceKey`/`arrayGroup` + `garp:{pool,slot,seed}`).
 - **building-parts** / **building-geom** — geometry part-builders (`emitMassing/Storefront/Balconies/WindowTrim/Roof/Signage/Traditional/Greenery`) + pure geom helpers.
 
 ### Foliage (recipes over primitives)
-- **foliage** (`world/foliage.ts`) — `buildFoliage`; chunky v1 built, **`render:'card'` alpha leaf path partial** (falls back to chunky).
+- **foliage** (`world/foliage.ts`) — `buildFoliage`; chunky v1 built, `render:'card'` alpha leaf path built (used by the city trees; status 2026-10-04).
 - Primitives: `blade`, `whorl`, `stalk`, `branch`, `runner`, `curve-frame` (shared bezier sweep), `conifer`, `planting` (vessel arrangements).
 - **city-foliage** — instanced city trees (canonical pool + `InstanceXform`) · **biome** — scatters trees/gardens/rocks into the graph.
 
@@ -104,7 +109,8 @@ instancing `instances`/`instanceKey`/`arrayGroup` + `garp:{pool,slot,seed}`).
 | **Camera3D** | Perspective/ortho, adaptive near/far | `camera-3d.ts` | `autoNear`/`autoFar` track orbit distance (depth precision). |
 | **Shadow/depth** | Depth-only pass → 2048 `depth32float` map, PCF | `pipeline-3d.ts`, `shaders/shadow-shaders.ts` | Throttled; wind runs in shadow VS too. |
 | **Passes** | Outline (depth+normal→Sobel), MeshHighlight (stencil), LoFi (PS1 pixelation), PostProcess (bloom+grade+vignette), Bloom, GpRenderer3D, weight-paint overlay, ghost/cloth previews, ViewGizmo | `outline-pass.ts`, `mesh-highlight-pass.ts`, `lofi-pass.ts`, `post-process-pass.ts`, `bloom-pass.ts`, … | Each returns null / no-ops when disabled (zero overhead). |
-| **Sim/rig** | skeleton-animator, spring-bone-solver, ik-solver, constraint-solver, cloth-simulator, mesh-bvh, gltf/obj import-export | various | |
+| **Sim/rig** | skeleton-animator, spring-bone-solver, ik-solver, constraint-solver, cloth-simulator, mesh-bvh, gltf/obj import-export, dual-quat-skin | various | |
+| **Perf / frame systems (2026-09-30 → 10-04)** | GPU-driven cull + indirect draws (P15, on) · shader variants (P21, on) · TAA / TAAU (P18, off) · shadow cascades + static/dynamic caches + quality presets (P14) · cull ranges / clusters (P9, P11) · CPU occlusion cull (P11, off) · fog horizon · draw-order rank / render-list index / structure version (P13) · pipeline cache (P2) · resolution scaler · stream hitch ledger (P16) · lighter tiles / tile landing / packed vertices (P20, P22) · scene budgets · GPU frame timer · device-lost recovery | `gpu-driven.ts`, `gpu-scene.ts`, `shader-variants.ts`, `temporal-aa.ts`, `shadow-*.ts`, `cull-*.ts`, `occlusion-culler.ts`, `fog-horizon.ts`, `draw-order-rank.ts`, `stream-hitch.ts`, `vertex-pack.ts`, `tile-landing.ts`, `core/gpu-pipeline-cache.ts`, `core/gpu-device-*.ts` | Detail + A/B switches: performance-plan.md P1–P22, docs/ui/performance.md; index STATUS-2026-10-04.md. |
 
 **Bind groups** (Pipeline3D): **G0** = MeshInstance storage(0) + SceneUniforms(1) + IBL(2). **G1 (textures)** = diffuse
 array(0) + sampler(1) + normal array(2) + sampler(3) + **GARP array(4)** (sampled unconditionally, `select()`ed;
@@ -125,15 +131,30 @@ allowed). Skin/weight-paint groups appended per variant.
 | 9–11 | patternMode (none/stripes/dots/diamonds/checker/grid/windows/waves) | | 22 | neonShade |
 | 12 | sparkleStar | | 23 | metalShade |
 | 13 | leafCard | | 24 | **garpTex** (sample GARP atlas; last exact-f32 bit 2²⁴) |
-| 14 | glassEnhance (**free composable flag**) | | | |
+| 14 | glassEnhance (**free composable flag**) | | 25 | noEnvReflection (per-object matte) |
+| | | | 26 | planarReflector (planar mirror) |
+| | | | 27 | worldTriplanar |
+| | | | 28 | softLighting · 29 skinRamp · 30 toonShadow |
+| | | | 31 | retroColor opt-in (**the last free bit**) |
+
+(Bits 25–31 added 2026-09; the u32 is written via `setUint32`, `encodeMaterialFlags` returns `flags >>> 0`.) **All 32 bits
+are taken** — new per-object switches go into **flags2** (2026-10-01): an integer-valued f32 in the MeshInstance
+normalMatrix column 3 `.x` (instance float 28, a lane every normal transform multiplies by 0). flags2 bits: 0 distanceFade ·
+1 distanceFadeAttach · 2 noFog · 3 noFogHardEdge · 4 crowdPalette (P12) · 5 hlodFade (P17; coverage in column 3 `.y`) ·
+6 faceDepthPull (face kit; amount in `.z`) · 7 hairBand · 8 clothLining (clothing round 2) · 9–23 free. Registry +
+rules: the comment block above `encodeMeshFlags2` in `material-3d.ts`; `wgsl-static-check.test.ts` allows reading only
+those lanes.
 
 ★ **Pattern-family rule:** `patternMode`/`boardShade`/`groundShade`/`windSway`+`foliageShade`/`waterShade`/`neonShade`/
 `metalShade` all reuse the same 4 instance floats (patternColor 48–51 + patternParams 52–55) → **mutually exclusive per
 mesh**. `glassEnhance` (14) and `garpTex` (24) are free/composable.
 
-**MeshInstance buffer** — 224 B / 56 floats: model(0–15), normalMatrix(16–31), diffuse+opacity(32–35),
+**MeshInstance buffer** — **240 B / 60 floats** (`MESH_INSTANCE_STRIDE`, renderer-3d.ts; was 224 B / 56 before 2026-09):
+model(0–15), normalMatrix(16–31; column 3 = flags2 / HLOD fade / face pull / 1, floats 28–31), diffuse+opacity(32–35),
 specular+shininess(36–39), emissive.rgb+**flags@43**, **textureIndex@44**, normalMapIndex@45, roughness@46, metalness@47,
-patternColor(48–51), patternParams(52–55). *Stride must match all 9 WGSL struct declarations.*
+patternColor(48–51), patternParams(52–55), uvTransform (tileXY, offXY)(56–59). *Stride must match every WGSL
+`struct MeshInstance` — guarded by `mesh-instance-layout.test.ts`.* (P22 packed vertices change the VERTEX format of
+streamed full tiles to 32 B, not this instance struct.)
 
 **WGSL shading families** (`shaders/mesh3d-shaders.ts`): PBR/IBL, render styles, patterns + `windowsPattern`/interior-mapping,
 ground (9 tilers + weathering), metal, water, neon, foliage wind/transmission, PS1 (grid-snap/affine/color-depth/LoFi).
@@ -182,7 +203,7 @@ the GARP texture source type.**
 - **AnimationManager** (2D cel timeline) · **ShellUIManager** (home-screen state; renderer lifecycle partial).
 - **RasterManager** façade over: `RasterLayerManager` (layer stack + timeline), `RasterSelection/Drawing/Move/Text` services, `FloodFillEngine`. **DrawingToolManager** (vector tools) · **TextManager** (SDF/LiveText) · **PersistenceManager**.
 - **Character generators**: `body-generator` (**v1 partial**), `hair-generator`, `clothing-generator`, `eye-generator`, `attachment-generator`, `vert-grid`, `default-animations`, `kitbash-library`.
-- **Adjacent**: `ephemera/` (EphemeraService + ~28 generators — source of DecalSource, GARP textures, creator schemas), `streaming/` (StreamManager/CityStreamSource/TileWorkerPool), `persistence/`, `drawing/`, top-level `interaction-service`/`selection-service`/`texture-library`/`cache-service`.
+- **Adjacent**: `ephemera/` (EphemeraService + ~28 generators — source of DecalSource, GARP textures, creator schemas), `streaming/` (StreamManager/CityStreamSource/TileWorkerPool + 2026-10: `tile-window` eye-centred window, `motion-window` speed-aware prediction, `hlod-select`, `byte-lru`), `workers/` (WorkerJobService lanes: world / near / atlas / character, P3), `persistence/`, `drawing/`, top-level `interaction-service`/`selection-service`/`texture-library`/`cache-service`.
 - **2D editing loop (2026-09-14/15, spec `editing-loop-polish.md`)**: `vector-object-undo.ts` (snapshot-diff object undo, Ctrl+Z consumed only when its stack can act) · duplicate/align/distribute/flip on ShapeManager · `managers/transform-rebase-3d.ts` (reparent 3D nodes w/o world jump) · persistence round-trip drive hardening (see spec P6 — six bugs fixed incl. attached-decal persistence). Host doc: `docs/ui/edit-menu.md`.
 
 ### Modes (enter/exit)

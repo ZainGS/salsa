@@ -93,7 +93,7 @@ export class Scene3DParticles {
       }
       return hasActive;
     };
-    this.ctx.webgpuRenderer.addPreRenderCallback(this._tickCb);
+    this.ctx.webgpuRenderer.addPreRenderCallback(this._tickCb, 'particles');
   }
 
   private _stopTick(): void {

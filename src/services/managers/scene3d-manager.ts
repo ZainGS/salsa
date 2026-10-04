@@ -12,6 +12,9 @@
  * Frogmarks can access this via `shapeManager.scene3d`.
  */
 
+import { splitPassStats, type PassSplit } from '../../renderer/3d/pass-stats';
+import { STREAM_HITCH } from '../../renderer/3d/stream-hitch';
+import { sceneFrameBounds, framePose } from './scene-frame';
 import type { ManagerContext } from './manager-context';
 import { EventEmitter } from '../../renderer/util/event-emitter';
 import { deriveViewRules, normalizeViewState, DEFAULT_VIEW_STATE, type ViewState, type ViewTarget, type CameraMode } from './view-state';
@@ -21,21 +24,43 @@ import { ScriptCompiler } from '../scripting/script-compiler';
 import { ScriptRunner } from '../scripting/script-runner';
 import type { ScriptSceneAdapter, ScriptBehavior, ScriptInput } from '../scripting/script-types';
 import { SCRIPT_CONTEXT_DTS, SCRIPT_SNIPPETS, type ScriptSnippet } from '../scripting/script-context-dts';
-import { CharacterController, type CharacterInput, type CharacterConfig } from '../../game/character-controller';
+import { CharacterController, DEFAULT_CHARACTER, PLAY_JUMP_WINDUP, type CharacterInput, type CharacterConfig } from '../../game/character-controller';
+import { PlaySettings, type PlaySettingsState } from './play-settings';
+import { buildLocomotionClips, playArmClearance, applyWalkStyle, LOCOMOTION_CLIP, DEFAULT_LOCOMOTION_CLIP_NAMES, JUMP_VARIANT_CLIPS } from './default-locomotion';
+import { buildIdleVariantClips, GLASSES_CHARMS } from './default-idle-variants';
+import { PlayDustDriver, type DustEnvironment } from './play-dust-driver';
+import type { DustLighting } from '../../game/landing-dust';
+import { relaxedStance } from './pose-authoring';
+import { ThirdPersonCamera, avatarCameraFraming } from '../../game/third-person-camera';
+import { avatarCollisionScale, clampCharacterScale, feetAnchoredY, geometryMinY, scaleFactorForHeight } from '../../game/character-scale';
+import { GamepadInput, type GamepadReading } from '../../game/gamepad-input';
+import { LocomotionAnimator, LocomotionLean, LocomotionSecondary, seedFromString, DEFAULT_LOCOMOTION_ANIM } from '../../game/locomotion-animator';
+import { sampleClipPose, overlayPoseMasked, addPoseMasked } from '../../renderer/3d/skeleton-animator';
+import { composeLocomotionPose, applyLocomotionLean, applyLocomotionSecondary, secondaryInputFor } from './locomotion-pose';
+import { PlayAutoPlayer, AUTO_PLAYER_CLIPS, AUTO_PLAYER_SEED, AUTO_PLAYER_HEIGHT_M, type AutoPlayerBody } from './play-auto-player';
+import { randomCharacterParams } from './character-randomizer';
 import { KeyboardInput } from '../../game/keyboard-input';
 import { FlyController } from '../../game/fly-controller';
 import { MouseLook } from '../../game/mouse-look';
-import { slideAlongWall, isClimbableStep, expSmooth, clampCameraDistance } from '../../game/collision-math';
-import { LocomotionClipDriver, resolveBlend1D, locomotionBlendStops, DEFAULT_LOCOMOTION_BLEND, type LocomotionClips, type LocomotionState, type LocomotionBlendConfig } from '../../game/locomotion';
+import { placePlayerLight } from '../../game/player-light';
+import { sampleStandableGround, findStandableGround, resolveHorizontalMove, type RayCaster } from '../../game/collision-math';
+import { LocomotionClipDriver, DEFAULT_LOCOMOTION_BLEND, type LocomotionClips, type LocomotionState, type LocomotionBlendConfig } from '../../game/locomotion';
 import { TriggerVolumeSystem, type TriggerVolume, type TriggerEvent } from '../../game/trigger-volumes';
 import { InteractionSystem, type Interactable } from '../../game/interaction';
 import { EnvironmentManager, DEFAULT_ENVIRONMENT, type SkyState, type ReflectionsState } from './environment-manager';
 import { bakeSkyEquirect, DEFAULT_SKY } from '../../renderer/3d/procedural-sky';
 import { SKY_PRESETS, skyPresetNames, type SkyPresetName } from '../../renderer/3d/sky-presets';
 import { SpatialGridXZ, type XZBounds } from '../../game/spatial-grid';
+import { CollisionSnapshot } from '../../game/collision-snapshot';
+import { evaluateSceneBudget, SCENE_BUDGET_DEFAULTS, type SceneBudgetLimits } from '../../renderer/3d/scene-budget';
+import { GroupBoundsJob } from './group-bounds';
+import { CollisionHood } from '../../game/collision-hood';
+import { CollisionCellManager, cellRaycast, newCellRayScratch, type CollisionCell, type CellRayPicker } from '../../game/collision-cells';
+import { buildCellBvhAsync } from '../workers/near-lane';
 
-/** Captured TRS of a mesh for Play-mode non-destructive snapshot/restore (see _snapshotTransforms). */
-type PlayXform = { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number };
+/** Play's pre-run TRS snapshot for the non-destructive Stop restore (see _snapshotTransforms): mesh refs + 9 packed floats each (bug-hunt 2026-10-01 — one object per mesh in a big
+ *  city, and a full 3-setter rebuild of every mesh on Stop, made Stop hitch). */
+type PlayXformSnapshot = { meshes: Mesh3D[]; trs: Float64Array };
 
 /** Neutral studio backdrop for the free3D / scene VIEW (as opposed to mesh-edit / UV-paint focus mode, which keeps
  *  the busy 'wavy' default). Flat near-black #0D0D0D to match the app canvas — one shared backdrop for every
@@ -54,6 +79,7 @@ import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET
 import { Material3D, type SceneWind3D, type SkinRampSettings } from '../../renderer/3d/material-3d';
 import { MeshGeometry, generateRibbon, generateRoundedSlab, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { DEFAULT_RESOLUTION_SCALE, type ResolutionScaleState } from '../../renderer/core/resolution-scaler';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
 import type { EyeParams } from './eye-generator';
 import { HairParams } from './hair-generator';
@@ -61,6 +87,7 @@ import {
     ClothingParams, ClothingPattern, patternPresetNames, patternPreset,
 } from './clothing-generator';
 import { generateBodyResult } from './body-generator';
+import { generateBodyAsync, generateCharacterPartsAsync } from '../workers/character-lane';
 import {
     AttachmentType, AttachmentParams, AttachmentPlacement, generateAttachment,
     defaultAttachmentParams, defaultAttachmentPlacement, attachmentMaterial,
@@ -135,6 +162,8 @@ import { planTurntable, boundsCenterRadius, orbitCameraPose } from '../../render
 import { AssetReferenceStore, type DocumentAssetReference } from '../assets/asset-reference-store';
 import { buildDefaultPoses, buildDefaultClips, DEFAULT_CLIP_NAMES, DEFAULT_BREAK_CLIP_NAMES } from './default-animations';
 import { exportSceneToGlb, type GltfExportResult } from '../../renderer/3d/gltf-exporter';
+import { sanitizeObjectStyle } from './object-style';
+import { fogHorizonDiff } from '../../renderer/3d/fog-horizon';
 import { RenderStyle } from '../../renderer/3d/material-3d';
 import { HtmlTexture3DOptions } from '../../renderer/3d/html-texture-3d';
 import { RibbonData, RibbonControlPoint, RibbonPathMode } from '../../types/ribbon-3d';
@@ -168,13 +197,18 @@ import { Scene3DGreasePencil } from './scene3d-grease-pencil';
 import { Scene3DBlendShapes } from './scene3d-blend-shapes';
 import { Scene3DCloth } from './scene3d-cloth';
 import { Scene3DRibbons } from './scene3d-ribbons';
-import { Scene3DCharacter } from './scene3d-character';
+import { Scene3DCharacter, applyMatte } from './scene3d-character';
 import { Scene3DArmature } from './scene3d-armature';
 import type { GpPoint, GpStroke3D } from '../../types/grease-pencil-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { Modifier } from '../../scene-graph/shapes/modifiers';
 import { ArrayToolController, ArrayToolMode } from './array-tool-controller';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
+import { resolveArmClearance, withGarments } from './arm-clearance';
+import { DEFAULT_TOON_SHADOWS, DEFAULT_RIM_LIGHT } from '../../renderer/3d/material-3d';
+import type { SkinnedMeshData } from './skin-deform-metrics';
+import { SimLod, newSimSlot, SIM_NEAR, type SimSlot } from '../../world/sim-lod';
+import { computeFogEye } from '../../renderer/3d/fog-horizon';
 export type { DrapeProxy, LiveClothHandle };
 export type { ArrayToolMode };
 export type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta };
@@ -207,7 +241,8 @@ export interface GlobalScene3DSettings {
     ssao?:         SSAOConfig;
     /** Scene wind (foliage sway direction/strength/speed) — optional for back-compat. */
     wind?:         SceneWind3D;
-    shadows:       { enabled: boolean; mapSize: number; halfExtent: number; bias: number; strength?: number; softness?: number };
+    /** `cascades` (persona-polish A2, optional): near shadow cascades — absent = the original single map. */
+    shadows:       { enabled: boolean; mapSize: number; halfExtent: number; bias: number; strength?: number; softness?: number; cascades?: import('../../renderer/3d/shadow-cascades').ShadowCascadeSettings };
     snap:          SnapMode;
     /** Snap increments (optional for back-compat): grid cell size (world units, also the visible grid
      *  spacing), rotate step (radians), scale step (factor). */
@@ -222,6 +257,39 @@ export interface GlobalScene3DSettings {
     /** Scene-global skin toon-ramp look (bands / softness / shadowFloor / warm shadowTint) for skinRamp materials.
      *  Optional; absent in old saves → the renderer default (a clean 2-band ramp). See character-shading spec Part A. */
     skinRamp?: SkinRampSettings;
+    /** Sketch style paper amount (0 colour .. 1 paper); absent = 0.75, the original look. */
+    sketchPaper?: number;
+    /** E3 CHARACTER OUTLINES (persona-polish-plan.md E3): the scene's characters-only outline style, applied to every
+     *  procedural character (body + clothes + hair as one silhouette) and to characters created later. null / absent =
+     *  off (the default). Each body also stores its own outline, so a load restores what was drawn. */
+    characterOutlines?: Partial<HighlightStyle> | null;
+    /** PLAY CHARACTER OUTLINES (visual-polish item 10): while Play runs and characterOutlines is off, every procedural
+     *  character without its own outline gets the default ink line (runtime only — nothing is written to the meshes).
+     *  New documents: true. Absent (a save from before it existed) = false, so old documents play as they did. */
+    playCharacterOutlines?: boolean;
+    /** Toon-shadow look for toonShadow materials in Cel (absent = defaults). */
+    toonShadows?: import('../../renderer/3d/material-3d').ToonShadowSettings;
+    /** Parameterised rim light (absent = strength 0 = the original rim). */
+    rimLight?: import('../../renderer/3d/material-3d').RimLightSettings;
+    /** The ENVIRONMENT style (2026-09-29): the look the city / blocks / creator objects get, and new ones start with.
+     *  Characters are never environment. Each object also saves its own style, so this is the default + bulk setter. */
+    environmentStyle?: import('./object-style').ObjectStyle;
+    /** COLOURED cast-shadow tint (null / absent = neutral grey, the original). */
+    shadowTint?: [number, number, number] | null;
+    /** HEIGHT FOG (city-quality P9): [density (0 = off), baseY, falloff, reach]. Absent = off. */
+    heightFog?: [number, number, number, number];
+    /** AERIAL HAZE (persona-polish A5): [strength (0 = off), reach, contrast, tint]. Absent = off. */
+    aerialHaze?: [number, number, number, number];
+    /** HARD FOG EDGE (2026-10-01): only the plain fog draws + the city leaves the fog alone. Absent = off. */
+    fogHardEdge?: boolean;
+    /** FOG HORIZON (docs/specs/fog-horizon.md): only the fields that differ from the defaults. Absent = the defaults. */
+    fogHorizon?: Partial<import('../../renderer/3d/fog-horizon').FogHorizonSettings>;
+    /** Screen-space EDGE outline (enableOutlines3D) — null/absent = off. Wasn't persisted before 2026-09-28. */
+    edgeOutlines?: { color: [number, number, number, number]; threshold: number; depthFade?: { near: number; far: number; minAlpha: number } } | null;
+    /** 3D ANTI-ALIASING (persona-polish A1): post FXAA on the 3D frame. Absent (older saves) = the default, FXAA medium. */
+    antiAliasing?: import('../../renderer/3d/fxaa-pass').AntiAliasingSettings;
+    /** PARTICLE bloom ("Bloom Glow", enableBloom3D) — null/absent = off. Wasn't persisted before 2026-09-28. */
+    particleBloom?: { threshold: number; intensity: number } | null;
     /** Script Behaviors (docs/specs/script-behaviors.md) — custom per-node game logic sources. Optional; absent in old
      *  saves → none. Only the source persists (runtime state resets each Play). */
     scriptBehaviors?: ScriptBehavior[];
@@ -235,6 +303,8 @@ export interface GlobalScene3DSettings {
      *  See asset-reference-store.ts + docs/specs/shared-asset-library.md §2.3. Optional. */
     assetReferences?: DocumentAssetReference[];
     /** Play-mode Player binding + locomotion set (so a game's avatar + walk survive reload). Optional. */
+    /** Play settings (polish-round-3 T5): first-person eye height + auto default character. Absent = defaults. */
+    play?: PlaySettingsState;
     player?: { meshId?: string | null; locomotionSet?: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null; locomotionBlend?: LocomotionBlendConfig | null; overlay?: { clip: string; region: RegionMask; mode?: 'replace' | 'additive'; weight?: number } | null };
 }
 
@@ -265,6 +335,11 @@ export interface FaceBlinkConfig {
     /** Min / max random gap (ms) between the two blinks of a double blink. Default 150 / 320. */
     doubleGapMinMs?: number;
     doubleGapMaxMs?: number;
+    /** A PROCEDURAL blink frame (eyeParams with closed:true — what auto-blink makes) follows the ACTIVE expression's
+     *  eyes: re-drawn closed whenever they're edited or the state changes, so e.g. deco dots turned off in Neutral
+     *  don't flash back during a blink. Default true. `false` = the blink frame keeps its own settings. Hand-drawn
+     *  blink frames are never touched. */
+    followOpenEyes?: boolean;
 }
 /** Serializable face-rig state (no GPU/texture refs — textures persist separately as PNGs). */
 export interface FaceRigState {
@@ -276,11 +351,17 @@ export interface FaceRigState {
     activeId: string | null;
     blinkId: string | null;
     blink: FaceBlinkConfig;
+    /** FACE KIT (face-features.ts): brows / mouth / nose / shading params — the overlays regenerate from these on load
+     *  (no texture is saved). ABSENT on faces saved before the kit: those load exactly as before (eyes only) until the
+     *  user turns the kit on (setFaceFeatures3D). */
+    features?: import('./face-features').FaceFeatureParams;
 }
 
 // HairRig / ClothingRig / AttachmentRig now live in the character subsystem (scene3d-character.ts).
 
 const _nanoid = () => Math.random().toString(36).slice(2, 10);
+/** City character-preview ghost: minimum ms between view-ray spawn casts while the camera moves (see _ghostPreviewOrigin). */
+const GHOST_SPAWN_RECAST_MS = 120;
 
 /** '#rrggbb' / '#rgb' → {r,g,b} in 0..1. */
 const hexToRgb01 = (hex: string): { r: number; g: number; b: number } => {
@@ -317,6 +398,16 @@ function cloneSubmesh3D(s: Submesh3D): Submesh3D {
     return { ...s, material: cloneMaterial3D(s.material) };
 }
 
+/** PLAY CHARACTER OUTLINES on a settings restore (visual-polish item 10). The key is always saved since it existed, so:
+ *  present → its value; a FULL document save from before it (it carries the always-written characterOutlines /
+ *  viewState keys) → off, so old documents play as they did; anything else (a partial lighting patch, a new / empty
+ *  document) → unchanged (the session default is on). Pure. */
+export function playCharacterOutlinesOnRestore(s: Partial<GlobalScene3DSettings>, current: boolean): boolean {
+    if ('playCharacterOutlines' in s) return s.playCharacterOutlines === true;
+    if ('characterOutlines' in s || 'viewState' in s) return false;
+    return current;
+}
+
 /** Validate saved submesh slots against a mesh's restored index count (audit P8). Returns the typed clones, or null
  *  when ANY slot is out of range — a save whose geometry no longer matches must not draw garbage index ranges. */
 export function validSavedSubmeshes(saved: unknown, indexCount: number): Submesh3D[] | null {
@@ -347,6 +438,20 @@ export interface Scene3DHierarchyNode {
      *  still flat, so whole-character ops (hide/delete/select all) should fan out via `characterPartIds3D(id)`. */
     character?: boolean;
 }
+
+/** Step 3 scene budgets (Scene3DManager.getSceneBudget3D; scene-budget.ts). 0 = no limit. */
+export type SceneBudgetLimits3D = SceneBudgetLimits;
+export interface SceneBudget3D {
+    drawnTris: number; drawCalls: number; geometryMB: number; instances: number; meshes: number; mainTris: number; shadowTris: number;
+    limits: SceneBudgetLimits3D;
+    over: Array<{ key: keyof SceneBudgetLimits3D; value: number; limit: number; ratio: number }>;
+    ok: boolean;
+    /** One line for a HUD ("Over budget: 6.1 M tris (3.0 M tris), 3.4 k draws (2.0 k draws)"), null when within. */
+    warning: string | null;
+}
+
+/** One layer of addFlatColorMeshGroup (a world-built flat-colour layer). */
+export type FlatColorLayer3D = { name: string; geometry: MeshGeometry; color: [number, number, number]; pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number }; ground?: { surface: GroundSurfaceName; tint?: [number, number, number]; tileMm?: number; groutMm?: number; jitter?: number; metersPerUnit?: number; weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty' }; castShadow?: boolean; water?: { deep?: [number, number, number]; shallow?: [number, number, number]; waveScale?: number; waveSpeed?: number; choppy?: number; glitter?: number }; emissive?: number; opacity?: number; instanceKey?: string; excludeFromFrame?: boolean; singleSided?: boolean; metal?: { tint?: [number, number, number]; streak?: [number, number, number]; roughness?: number; streakAmount?: number; grime?: number; scale?: number }; neon?: { glow?: [number, number, number]; accent?: [number, number, number]; scanDensity?: number; flicker?: number; scroll?: number; phase?: number }; leafCard?: boolean; glass?: boolean; radialFade?: boolean; noFog?: boolean | 'hardEdge'; outlineRanges?: { id: number; start: number; count: number }[]; reflect?: { strength?: number; roughness?: number }; renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean; wind?: FoliageWindSpec; foliageShade?: FoliageShadeSpec; instances?: { x: number; y: number; z: number; ry: number; s?: number; tint?: [number, number, number]; skin?: string; sv?: [number, number, number]; cs?: [number, number, number]; pi?: number }[]; arrayGroup?: boolean; propInst?: boolean; propXf?: Float32Array; garp?: { pool: string; slot: string; seed: number; skin?: string }; groundUvSample?: MeshGeometry; nearTwin?: { key: string; role: 'near' | 'far' | 'mid' | 'xfar'; dist: number; dist2?: number; uvFromNear?: boolean }; crowdInst?: { id: string } };
 
 export class Scene3DManager {
     private ctx: ManagerContext;
@@ -464,6 +569,24 @@ export class Scene3DManager {
 
     // Animation playback + NLA (extracted subsystem — audit C4 Slice A, scene3d-animation.ts)
     private _animation!: Scene3DAnimation;
+    /** The animation subsystem, for DIRECT ShapeManager forwards of new animation APIs (audit A1: no new middle hop). */
+    get animation(): Scene3DAnimation { return this._animation; }
+    /** The Environment style value (persisted in the global scene settings; ShapeManager applies it). */
+    private _environmentStyle: import('./object-style').ObjectStyle | undefined = undefined;
+    get environmentStyle(): import('./object-style').ObjectStyle | undefined { return this._environmentStyle; }
+    set environmentStyle(s: import('./object-style').ObjectStyle | undefined) { this._environmentStyle = s; }
+    /** COLOURED cast shadows: the hue of the shadow floor (null = neutral grey). Persists with the document. */
+    setShadowTint3D(c: [number, number, number] | null): void { this.renderer3D.setShadowTint(c); this.ctx.scheduleRender(); }
+    getShadowTint3D(): [number, number, number] | null { return this.renderer3D.shadowTint; }
+    /** HEIGHT FOG (city-quality P9): ground-hugging haze riding the distance fog. density 0 = off. */
+    setHeightFog3D(density: number, baseY = 0, falloff = 1, reach = 0.05): void { this.renderer3D.setHeightFog(density, baseY, falloff, reach); this.ctx.scheduleRender(); }
+    /** AERIAL PERSPECTIVE (persona-polish A5): contrast fade + horizon tint with distance. `strength` 0..1 (0 = off),
+     *  `reach` = world distance for ~63 % build-up, `contrast` / `tint` shares 0..1. Needs fog on. Global, persisted. */
+    setAerialHaze3D(strength: number, reach = 20, contrast = 0.6, tint = 0.5): void { this.renderer3D.setAerialHaze(strength, reach, contrast, tint); this.ctx.scheduleRender(); }
+    get aerialHaze3D(): [number, number, number, number] { return this.renderer3D.aerialHaze; }
+    getHeightFog3D(): [number, number, number, number] { return this.renderer3D.heightFog; }
+    /** The materials sub-module (render style, patterns, retro-colour opt-in) — ShapeManager forwards to it directly. */
+    get materials(): Scene3DMaterials { return this._materials; }
 
     // Camera keyframe tracks (position, target, fov)
     private _cameraKeyframeTracks: Camera3DKeyframeTracks = {};
@@ -549,6 +672,7 @@ export class Scene3DManager {
 
     constructor(ctx: ManagerContext) {
         this.ctx = ctx;
+        this.playSettings.onChange = () => this._applyPlaySettingsLive();   // live eye height / auto-player toggle
         this._particles = new Scene3DParticles(ctx);
         this._gp = new Scene3DGreasePencil(ctx);
         this._blendShapes = new Scene3DBlendShapes(ctx, { getMesh: (id) => this.getMesh(id) });
@@ -570,6 +694,7 @@ export class Scene3DManager {
             getCamera: () => this.renderer3D.getCamera(),
             setRenderStyle: (id, style) => this.setRenderStyle(id, style),
             keepSpringsAlive: (skelId) => this._keepSpringsAlive(skelId),
+            isPlaying: () => this._playing,
         });
         this._htmlTex = new Scene3DHtmlTextures(ctx, {
             getMesh: (id) => this.getMesh(id),
@@ -634,10 +759,16 @@ export class Scene3DManager {
             applyAllKeyframesAtFrame: (frame) => this.applyAllKeyframesAtFrame(frame),
             isBoneOverlayActive: () => this._armature.isBoneOverlayActive(),
             setIdleLiveHold: (on) => { this._idleHeldLive = on; this._syncCohortLiveLoop(); },
+            isSkeletonAnimCulled: (skelId) => this.renderer3D.isSkeletonAnimCulled3D(skelId),
+            simLodBegin: (system) => this.simLod.counter(system).begin(),
+            simLodDue: (skelId, bodyMeshId) => this.simLodDue('characters', skelId, bodyMeshId),
+            isSkeletonPlayDriven: (skelId) => this._isSkeletonPlayDriven(skelId),
             // Slice D (default anims + pose library) hooks:
             getMesh: (id) => this.getMesh(id),
             getAllMeshes: () => this.getAllMeshes(),
             getBodyParams: (bodyMeshId) => this.getBodyParams(bodyMeshId),
+            clearArmsForSkeleton: (skel) => this.clearArmsForSkeleton(skel),
+            clipFaceEvent: (skel, ev) => this._clipFaceEvent(skel, ev),
             getBoneOverlaySkeletonId: () => this.getBoneOverlaySkeletonId(),
             findClip: (clipId) => this._findClip(clipId),
             startScrollAnimation: (meshId) => this._ribbons.startScrollAnimation(meshId),
@@ -667,6 +798,7 @@ export class Scene3DManager {
             character: this._character,
             weightPaint: this._weightPaint,
             get cityModeActive() { return self._cityModeActive; },
+            get isPlaying() { return self._playing; },
             get autoKey3D() { return self.autoKey3D; },
             flaRestTransforms: this._animation.flaRestTransforms,
             getMesh: (id) => this.getMesh(id),
@@ -685,13 +817,15 @@ export class Scene3DManager {
             pushGridConfig: () => this._pushGridConfig(),
             ensureIdleCallback: () => this._animation.ensureIdleCallback(),
             springsActiveFor: (skelId, now) => this._springsActiveFor(skelId, now),
+            simLodBegin: (system) => this.simLod.counter(system).begin(),
+            simLodSpringsDue: (skelId) => this.simLodDue('springs', skelId, null),
             syncFocusBgLiveLoop: () => this._syncFocusBgLiveLoop(),
         });
         // Sync each procedural character's skeleton object-transform from its body mesh's transform
         // every frame, so the gizmo (which moves the body mesh) carries the skeleton + bones with it.
-        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._syncCharacterSkeletons());
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._syncCharacterSkeletons(), 'characterSkeletonSync');
         // Keep the selected camera-node's frustum wireframe in sync as you place/aim it (cinematic cameras).
-        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._refreshCameraFrustum());
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._refreshCameraFrustum(), 'cameraFrustum');
         // ★ Keep the on-demand loop alive whenever an ANIMATED focus background ('wavy') is showing, so it animates
         // continuously instead of freezing when idle (only ticking on mouse-move). Self-evaluating each frame — robust
         // vs. the older begin/endInteractive hold in _syncFocusBgLiveLoop, which depended on EVERY enter/exit path
@@ -703,14 +837,91 @@ export class Scene3DManager {
         // ★ Same on-demand keep-alive for the ANIMATED hover outline. Its scrolling-pattern phase is read from
         // performance.now() each frame, so it freezes the instant frames stop scheduling — i.e. when the pointer
         // hovers a mesh but stops moving. Hold the loop live while an animated outline is actually on screen.
-        this.ctx.webgpuRenderer.addPreRenderCallback(() => this.renderer3D.hoverOutlineActive);
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this.renderer3D.hoverOutlineActive, 'hoverOutline');
         // Same for a persistent per-object outline that SCROLLS (patternMode + speed): its phase reads scene time,
         // so keep frames flowing while any assigned outline animates.
-        this.ctx.webgpuRenderer.addPreRenderCallback(() => this.renderer3D.hasAnimatedOutline);
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this.renderer3D.hasAnimatedOutline, 'animatedOutline');
         // ★ Keep the loop alive while a TIME-ANIMATED material (water / neon / sparkle) is visible. Their shader
         // phase advances with scene time, so with no other driver (e.g. no city traffic) they'd freeze until a
         // mouse-move. Throttled scan (≤5×/sec, cached between) so it's cheap even in a large scene.
-        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._animatedMaterialVisible());
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._animatedMaterialVisible(), 'animatedMaterial');
+        // SIM LOD (src/world/sim-lod.ts): refresh the frame's view facts (camera, view-projection, fog eye + fog-horizon
+        // cull distance) once per rendered frame, before the systems that band their updates by them.
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => { this._refreshSimLodView(); return false; }, 'simLod');
+    }
+
+    // ── SIM LOD (engine-roadmap step 1, performance-plan §P13) ──────────────────────────────────────────────────
+    /** The simulation-LOD state shared by every simulated system (traffic, crowd, character idles, springs): the
+     *  settings (the A/B switch + distance bands), this frame's view, the per-system counters. ShapeManager's
+     *  getSimLodStats3D / the world LOD settings' `sim` group read and write it. */
+    readonly simLod = new SimLod();
+    private readonly _simSlots = new Map<string, SimSlot>();
+    private readonly _simFogEye = new Float64Array(3);
+    private _simSkelBodyVer = -1;
+    private readonly _simSkelBody = new Map<string, string>();
+    private _refreshSimLodView(): void {
+        const L = this.simLod;
+        if (!L.enabled) return;
+        const cam = this.renderer3D.getCamera(), v = L.view;
+        v.cam[0] = cam.position[0]; v.cam[1] = cam.position[1]; v.cam[2] = cam.position[2];
+        v.vp = cam.getViewProjectionMatrix() as unknown as ArrayLike<number>;
+        computeFogEye(cam, this._simFogEye);
+        v.fogEye[0] = this._simFogEye[0]; v.fogEye[1] = this._simFogEye[1]; v.fogEye[2] = this._simFogEye[2];
+        v.fogEdge = L.settings.fogFreeze ? this.renderer3D.simFogEdge : Infinity;
+        // anti-stutter scale: pixels per world unit at unit distance (perspective) or everywhere (ortho)
+        const h = (this.ctx.webgpuRenderer.getCanvas() as { height?: number } | null)?.height ?? 0;
+        v.ortho = cam.mode === 'orthographic';
+        v.pxPerUnit = h > 0 ? (v.ortho ? h / Math.max(1e-6, 2 * cam.orthoSize) : h / (2 * Math.tan(cam.fov / 2))) : 0;
+    }
+    /** Never throttled: the Play player, the selection, a skeleton being posed, a script behaviour's target, and any
+     *  character while a timeline / clip preview plays (the user is watching it animate). */
+    private _simLodExempt(skelId: string, bodyMeshId: string | null): boolean {
+        const body = bodyMeshId ? this.getMesh(bodyMeshId) : null;
+        if (this._playing && body && this._isPlayerPart(body)) return true;
+        if (this._playing && skelId === this._playerSkeletonId()) return true;
+        if (bodyMeshId && this.renderer3D.getSelectedMeshIds().has(bodyMeshId)) return true;
+        if (this._armature.isBoneOverlayActive() && this._armature.getBoneOverlaySkeletonId() === skelId) return true;
+        if (bodyMeshId && this._scriptManager.size > 0 && this._scriptManager.has(bodyMeshId)) return true;
+        if (this._animation.hasActivePlayback()) return true;
+        return false;
+    }
+    /** The body mesh driving a skeleton (cached per scene-structure version). */
+    private _simBodyOf(skelId: string): string | null {
+        const sv = this.ctx.sceneStructureVersion();
+        if (sv !== this._simSkelBodyVer) {
+            this._simSkelBodyVer = sv; this._simSkelBody.clear();
+            for (const m of this.getAllMeshes()) if (m instanceof SkinnedMesh3D && m.skeletonId && (m.isProceduralBody || m.transformViaSkeleton) && !this._simSkelBody.has(m.skeletonId)) this._simSkelBody.set(m.skeletonId, m.id);
+        }
+        return this._simSkelBody.get(skelId) ?? null;
+    }
+    /**
+     * SIM LOD for a character: should `system` ('characters' = the procedural idle, 'springs' = the spring-bone solve)
+     * update this skeleton this frame? Banded by the body's world box from the last skinned cull (its centre and
+     * half-diagonal). Springs run only in the NEAR band (a 10 Hz spring solve would jitter): the caller resets them
+     * when they resume. With sim LOD off: always true.
+     */
+    simLodDue(system: 'characters' | 'springs', skelId: string, bodyMeshId: string | null): boolean {
+        const L = this.simLod;
+        if (!L.enabled) return true;
+        const key = system + ':' + skelId;
+        let slot = this._simSlots.get(key);
+        if (!slot) { slot = newSimSlot(); this._simSlots.set(key, slot); }
+        const counter = L.counter(system);
+        const body = bodyMeshId ?? this._simBodyOf(skelId);
+        if (this._simLodExempt(skelId, body)) { slot.band = SIM_NEAR; counter.count(SIM_NEAR, true); return true; }
+        let x: number, y: number, z: number, r = 0;
+        const box = body ? this.renderer3D.skinnedBoxOf(body) : null;
+        if (box) {
+            x = (box[0] + box[3]) / 2; y = (box[1] + box[4]) / 2; z = (box[2] + box[5]) / 2;
+            r = 0.5 * Math.hypot(box[3] - box[0], box[4] - box[1], box[5] - box[2]);
+        } else {
+            const skel = this.getSkeleton(skelId), t = skel?.objectTransform as unknown as ArrayLike<number> | undefined;
+            if (!t) { counter.count(SIM_NEAR, true); return true; }
+            x = t[12]; y = t[13]; z = t[14];
+        }
+        let h = 0; for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+        const due = L.step(counter, slot, performance.now() / 1000, (h % 1000) / 1000, x, y, z, r);
+        return system === 'springs' ? due && slot.band === SIM_NEAR : due;
     }
 
     private _animMatCache = false;
@@ -732,25 +943,43 @@ export class Scene3DManager {
     private _charSkelSyncVer = new Map<string, number>();
     private _charSkelHasBodies = false;    // per-structure-version memo: any procedural bodies in the scene at all?
     private _charSkelStructVer = -1;
+    private _charSkinned: SkinnedMesh3D[] | null = null;   // Step 2: the skinned meshes of this structure version
+    /** Step 2 A/B switches for the scene-manager side (all on by default; sm.setFrameScanOptions3D). */
+    static readonly STEP2 = { cachedSkeletonSync: true, cachedRenderStats: true, iterativeSceneWalk: true };
+    /** Step 3 A/B switches for the scene-manager side (all on by default; sm.setStep3Options3D):
+     *  - cachedGroupBounds: cacheGroupBounds folds cached per-geometry boxes (group-bounds.ts) instead of every vertex;
+     *  - collisionCells: Play collision rays inside a ready collision cell test its merged BVH (collision-cells.ts). */
+    static readonly STEP3 = { cachedGroupBounds: true, collisionCells: true };
+    /** Step 3b A/B switches (all on by default; sm.setStep3Options3D):
+     *  - incrementalCollisionGrid: the Play collision broadphase follows structure changes incrementally
+     *    (collision-snapshot.ts: only attached / detached / moved meshes are touched) instead of a full rebuild. */
+    static readonly STEP3B = { incrementalCollisionGrid: true };
     /** Mirror each procedural body's transform onto its skeleton's objectTransform (matrix copy) so the
      *  skeleton + bones follow the character gizmo. Re-FKs only when the body's transform changed. */
     private _syncCharacterSkeletons(): boolean {
         // Structure-version-gated: a pure-city scene (no characters) paid a full O(meshes) instanceof scan EVERY
         // frame for nothing. Re-scan for bodies only when the scene structure changes; skip entirely when none.
         const sv = this.ctx.sceneStructureVersion();
-        if (sv !== this._charSkelStructVer) {
+        // Step 2 (performance-plan §P13): the two per-frame passes below walked getAllMeshes() (~11.5 k meshes in a
+        // tiled world, instanceof each) every frame a character existed. The skinned meshes are now listed once per
+        // structure version (same order: a filter of getAllMeshes) and the passes loop over those alone.
+        const cached = Scene3DManager.STEP2.cachedSkeletonSync;
+        if (sv !== this._charSkelStructVer || (cached && !this._charSkinned) || (!cached && this._charSkinned)) {
             this._charSkelStructVer = sv;
+            const skinned = this.getAllMeshes().filter((m): m is SkinnedMesh3D => m instanceof SkinnedMesh3D);
+            this._charSkinned = cached ? skinned : null;
             // A skinned mesh whose OWN transform drives its skeleton: a procedural humanoid body, OR any mesh
             // that owns a skeleton via transformViaSkeleton (a bound creature/prop). Attachments (clothing/hair/
             // charms/decals) also set transformViaSkeleton but RIDE a body-driven skeleton — excluded below.
-            this._charSkelHasBodies = this.getAllMeshes().some(m => m instanceof SkinnedMesh3D && (m.isProceduralBody || m.transformViaSkeleton) && !!m.skeleton);
+            this._charSkelHasBodies = skinned.some(m => (m.isProceduralBody || m.transformViaSkeleton) && !!m.skeleton);
         }
         if (!this._charSkelHasBodies) return false;
+        const list: readonly Mesh3D[] = this._charSkinned ?? this.getAllMeshes();
         // Pass 1: skeletons already driven by a procedural body — their attachments must NOT fight them.
         const bodyDriven = new Set<string>();
-        for (const m of this.getAllMeshes()) if (m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId) bodyDriven.add(m.skeletonId);
+        for (const m of list) if (m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId) bodyDriven.add(m.skeletonId);
         let changed = false;
-        for (const m of this.getAllMeshes()) {
+        for (const m of list) {
             if (!(m instanceof SkinnedMesh3D) || !m.skeleton) continue;
             // Driver = a procedural body, OR a mesh owning its own (non-body-driven) skeleton. An attachment that
             // rides a body's skeleton has transformViaSkeleton too, but bodyDriven excludes it so it can't clobber.
@@ -849,12 +1078,14 @@ export class Scene3DManager {
     get redoDescription3D(): string | null { return this._undoManager.redoDescription; }
 
     undo3D(): boolean {
+        if (this._playing) return false;   // Round 8: editor history never runs under a live Play session
         const ok = this._undoManager.undo();
         if (ok) this.ctx.scheduleRender();
         return ok;
     }
 
     redo3D(): boolean {
+        if (this._playing) return false;
         const ok = this._undoManager.redo();
         if (ok) this.ctx.scheduleRender();
         return ok;
@@ -880,9 +1111,24 @@ export class Scene3DManager {
     /** Request a render pass (for callers that mutate mesh materials directly and set gpuDirty). */
     requestRender3D(): void { this.ctx.scheduleRender(); }
 
+    /** Tell the host renderer that mesh VISIBILITY flipped hidden → shown by a direct `visible = true` write (zoom LOD,
+     *  chat emotes, a walker leaving a building). The host's render list is rebuilt only on a structure change or a 2D
+     *  pan and filters `visible` when it rebuilds, so a node that was hidden at the last rebuild stays out of the draw
+     *  list after it is shown — the static crowd + walkers never appeared after zooming in (headless shots, orbit-only
+     *  sessions). This marks the list dirty (the cheap viewport re-filter, not a tree re-walk) and schedules a frame. */
+    notifyVisibilityChanged3D(): void { this.ctx.interactionService.requestBackgroundRender(); this.ctx.scheduleRender(); }
+
     /** Tell the host the 3D hierarchy changed so it re-reads getScene3DHierarchy (outliner refresh). Use after
      *  a batch of SILENT mutations (e.g. async city staging, exiting City mode) that skipped their own emit. */
     notifySceneGraphChanged3D(): void { this.ctx.emitSceneGraphChanged(); }
+    /** QUIET structural change (engine-internal node churn inside the City container — the live crowd): the mesh-list
+     *  caches re-walk + the render list re-filters, but the host's onSceneGraphChanged (outliner, connectors) does NOT
+     *  fire. Falls back to the full notification on a host without the quiet bump. */
+    notifySceneStructureChanged3D(): void {
+        const r = this.ctx.webgpuRenderer as unknown as { markStructureDirty?: () => void } | undefined;
+        if (this.ctx.bumpSceneStructure && r?.markStructureDirty) { this.ctx.bumpSceneStructure(); r.markStructureDirty(); }
+        else this.ctx.emitSceneGraphChanged();
+    }
 
     /** Notify that mesh TRANSFORMS were written directly (node x/y/z + updateLocalMatrix) — takes the renderer's
      *  transforms-only FAST PATH next frame (rewrites just the moved slots' matrices; no re-sort/repack/atlas).
@@ -896,8 +1142,29 @@ export class Scene3DManager {
     setShadowsSuspended3D(on: boolean): void { this.renderer3D.setShadowsSuspended(on); }
     /** PCF quality tier: 1 = fast 3x3 (city-scale win), 0/2 = default 5x5. Live uniform, no rebuild. */
     setShadowQuality3D(radius: number): void { this.renderer3D.setShadowQuality(radius); this.ctx.scheduleRender(); }
+    /** P14 shadow quality presets: the far map's refresh interval = the scene's own × `k` (1 = unchanged). */
+    setShadowIntervalScale3D(k: number): void { this.renderer3D.setShadowIntervalScale(k); }
+    /** P14: the far shadow map's resolution (keeps its box; no-op while shadows are off). */
+    setShadowMapSize3D(size: number): void { this.renderer3D.setShadowMapSize(size); this.ctx.scheduleRender(); }
+    get shadowMapSize3D(): number { return this.renderer3D.shadowMapSize; }
+    /** 3D ANTI-ALIASING (persona-polish A1): `{ mode: 'fxaa' | 'off', quality: 'low' | 'medium' | 'high' }` (partial OK).
+     *  Default FXAA medium. Global scene setting (persisted with the document). */
+    setAntiAliasing3D(s: Partial<import('../../renderer/3d/fxaa-pass').AntiAliasingSettings>): void { this.renderer3D.setAntiAliasing(s); this.ctx.scheduleRender(); }
+    get antiAliasing3D(): import('../../renderer/3d/fxaa-pass').AntiAliasingSettings { return this.renderer3D.antiAliasing; }
+    /** CASCADED SHADOWS (persona-polish A2), partial OK: `{ cascades: 1 | 2 | 3, nearExtent (world units, 0 = auto),
+     *  mapSize, blend, updateInterval }`. 1 = the original single map (default outside a city). Global scene setting. */
+    setShadowCascades3D(s: Partial<import('../../renderer/3d/shadow-cascades').ShadowCascadeSettings>): void { this.renderer3D.setShadowCascades(s); this.ctx.scheduleRender(); }
+    get shadowCascades3D(): import('../../renderer/3d/shadow-cascades').ShadowCascadeSettings { return this.renderer3D.shadowCascades; }
     /** Dynamic-resolution render scale (<1 = lo-res + linear upscale while the camera pans; 1 = native). */
     setDynamicResScale3D(s: number): void { this.renderer3D.setDynamicResScale(s); }
+    /** Step 2 (C): what the camera-motion resolution drop needs — the resolution setting, the smoothed GPU ms and its
+     *  source, whether Play runs, and the motion scale in force now. `leaseMs` keeps GPU timing on (Play 'auto'). */
+    getMotionResolutionContext3D(leaseMs = 0): { settings: ResolutionScaleState; playing: boolean; engaged: number } {
+        const wr = this.ctx.webgpuRenderer as unknown as { getResolutionScale?: () => ResolutionScaleState; leaseGpuTiming?: (ms: number) => void } | undefined;
+        if (leaseMs > 0) wr?.leaseGpuTiming?.(leaseMs);
+        const settings = wr?.getResolutionScale?.() ?? { ...DEFAULT_RESOLUTION_SCALE, current: 1, gpuMs: null, timing: 'estimate' as const };
+        return { settings, playing: this._playing, engaged: this.renderer3D.motionResolutionScale };
+    }
     /** Resize the directional shadow ortho box (world half-extent) so a bigger scene stays inside the frustum. */
     setShadowHalfExtent3D(he: number): void { this.renderer3D.setShadowHalfExtent(he); }
     /** Centre the shadow box on the camera focus (default, texel-snapped — consistent shadows across a panned/
@@ -919,19 +1186,106 @@ export class Scene3DManager {
     /** Assign (or clear with null) a PERSISTENT outline on a mesh — its own colour + optional scrolling pattern
      *  (patternMode 1 stripes / 2 dots / 3 checker, secondary = patternColor, speed = scroll). Stored on the mesh
      *  (persists) and mirrored into the renderer's runtime cache. v1: regular meshes (not skinned characters). */
+    /** Persistent outline (+ stacked rings) from a saved mesh state → the mesh + the renderer's draw cache. */
+    private _restoreOutline(mesh: Mesh3D, state: { outline?: HighlightStyle | null; outlineRings?: HighlightStyle[] | null }): void {
+        mesh.outline = state.outline ?? null;
+        mesh.outlineRings = Array.isArray(state.outlineRings) && state.outlineRings.length ? state.outlineRings : null;
+        this.renderer3D.setMeshOutline(mesh.id, mesh.outline, mesh.outlineRings);
+    }
+    /** Which mesh OWNS the outline for `meshId`: a character part (hair / garment / charm — a skinned mesh riding a
+     *  procedural body's skeleton) → that BODY. A character is outlined as one silhouette anyway, and its parts are
+     *  rebuilt from params on every reload / slider change, so an outline stored on a part was silently lost. */
+    private _outlineOwnerId(meshId: string): string {
+        const m = this.getMesh(meshId);
+        if (!(m instanceof SkinnedMesh3D) || m.isProceduralBody || !m.skeletonId) return meshId;
+        const body = this.getAllMeshes().find(b => b instanceof SkinnedMesh3D && b.isProceduralBody && b.skeletonId === m.skeletonId);
+        return body?.id ?? meshId;
+    }
+
     setMeshOutline3D(meshId: string, style: Partial<HighlightStyle> | null): boolean {
+        meshId = this._outlineOwnerId(meshId);
         const m = this.getMesh(meshId);
         if (!m) return false;
-        if (style === null) { m.outline = null; this.renderer3D.setMeshOutline(meshId, null); }
+        if (style === null) { m.outline = null; this.renderer3D.setMeshOutline(meshId, null, m.outlineRings); }
         else {
             const merged: HighlightStyle = { ...Scene3DManager.DEFAULT_OUTLINE, ...m.outline, ...style };
-            m.outline = merged; this.renderer3D.setMeshOutline(meshId, merged);
+            m.outline = merged; this.renderer3D.setMeshOutline(meshId, merged, m.outlineRings);
         }
+        m.stateDirty = true;   // persist (the outline rides the mesh's toJSON)
         this.ctx.scheduleRender();
         return true;
     }
+    // ── E3 CHARACTER OUTLINES (persona-polish-plan.md E3) ─────────────────
+    /** The characters-only outline setting (null = off). Persisted in the scene settings. */
+    private _charOutlines: Partial<HighlightStyle> | null = null;
+    /** Default characters-only look: a thin near-black ink line (P5 outlines its characters, not the city). */
+    static readonly CHARACTER_OUTLINE_DEFAULT: Partial<HighlightStyle> = { color: [0.04, 0.03, 0.05, 1], width: 0.012, patternMode: 0, glow: 1 };
+    /**
+     * Outline every PROCEDURAL CHARACTER (body + clothes + hair, one union silhouette via the per-object outline
+     * system) — and every character created afterwards — with `style` (merged onto CHARACTER_OUTLINE_DEFAULT); null
+     * turns them off (clears the outline on every procedural body). Scenery is never touched. Returns how many
+     * characters were updated. Persisted (scene settings + each body's own outline).
+     */
+    setCharacterOutlines3D(style: Partial<HighlightStyle> | null): number {
+        this._charOutlines = style ? { ...Scene3DManager.CHARACTER_OUTLINE_DEFAULT, ...style } : null;
+        let n = 0;
+        for (const m of this.getAllMeshes()) {
+            if (!(m instanceof SkinnedMesh3D) || !m.isProceduralBody) continue;
+            if (this.setMeshOutline3D(m.id, this._charOutlines)) n++;
+        }
+        this.ctx.scheduleRender();
+        return n;
+    }
+    /** The characters-only outline setting, or null when off. */
+    getCharacterOutlines3D(): Partial<HighlightStyle> | null { return this._charOutlines ? { ...this._charOutlines } : null; }
+
+    /** PLAY CHARACTER OUTLINES (see GlobalScene3DSettings.playCharacterOutlines). New session/doc: on. */
+    private _playCharOutlines = true;
+    /** Body ids given the runtime Play outline this run (renderer-only; restored on Stop). */
+    private _playOutlined: string[] = [];
+    /** Outline characters in Play (when the scene's character outlines are off). Persists; takes effect next Play. */
+    setPlayCharacterOutlines3D(on: boolean): void { this._playCharOutlines = on; }
+    getPlayCharacterOutlines3D(): boolean { return this._playCharOutlines; }
+    /** Play start: draw the default ink line on every procedural character that has no outline of its own. Renderer
+     *  cache only (mesh.outline untouched), so a save during Play and the editor after Stop are unchanged. */
+    private _beginPlayOutlines(): void {
+        this._endPlayOutlines();
+        if (!this._playCharOutlines || this._charOutlines) return;
+        const style: HighlightStyle = { ...Scene3DManager.DEFAULT_OUTLINE, ...Scene3DManager.CHARACTER_OUTLINE_DEFAULT };
+        for (const m of this.getAllMeshes()) {
+            if (!(m instanceof SkinnedMesh3D) || !m.isProceduralBody || m.outline) continue;
+            this.renderer3D.setMeshOutline(m.id, style, null);
+            this._playOutlined.push(m.id);
+        }
+        if (this._playOutlined.length) this.ctx.scheduleRender();
+    }
+    private _endPlayOutlines(): void {
+        for (const id of this._playOutlined) { const m = this.getMesh(id); this.renderer3D.setMeshOutline(id, m?.outline ?? null, m?.outlineRings ?? null); }
+        this._playOutlined = [];
+    }
+
     /** The mesh's persistent outline style, or null if none / the mesh is gone. */
-    getMeshOutline3D(meshId: string): HighlightStyle | null { return this.getMesh(meshId)?.outline ?? null; }
+    getMeshOutline3D(meshId: string): HighlightStyle | null { return this.getMesh(this._outlineOwnerId(meshId))?.outline ?? null; }
+    /**
+     * STACKED outlines: extra rings drawn OUTSIDE the mesh's outline, inner → outer (a red outline + a white ring
+     * around it = setMeshOutline3D(id, { color: red }) then setMeshOutlineRings3D(id, [{ color: white, width: 0.02 }])).
+     * Each ring's `width` is its own thickness; unset fields default to the main outline's (so a ring inherits its
+     * pattern/glow/merge unless given). Replaces the whole ring list; [] or null clears. Needs the main outline set to
+     * draw (rings wrap it). A character (body + clothes + hair) gets the rings around its one union silhouette too.
+     */
+    setMeshOutlineRings3D(meshId: string, rings: Partial<HighlightStyle>[] | null): boolean {
+        meshId = this._outlineOwnerId(meshId);
+        const m = this.getMesh(meshId);
+        if (!m) return false;
+        const base: HighlightStyle = { ...Scene3DManager.DEFAULT_OUTLINE, ...m.outline };
+        m.outlineRings = rings && rings.length ? rings.map(r => ({ ...base, ...r, merge: base.merge })) : null;
+        this.renderer3D.setMeshOutline(meshId, m.outline, m.outlineRings);
+        m.stateDirty = true;
+        this.ctx.scheduleRender();
+        return true;
+    }
+    /** The mesh's extra outline rings (inner → outer), or [] if none. */
+    getMeshOutlineRings3D(meshId: string): HighlightStyle[] { return (this.getMesh(this._outlineOwnerId(meshId))?.outlineRings ?? []).map(r => ({ ...r })); }
 
     // ── Soft (wrapped/half-Lambert) skin lighting ─────────────────────
     /** Global soft-lighting strength 0..1 (the "skin softness" slider). Only affects materials with softLighting on
@@ -970,6 +1324,61 @@ export class Scene3DManager {
      *  "house style" shared by every ramp-flagged skin. Merged over the current settings + clamped. */
     setSkinRampSettings3D(patch: Partial<SkinRampSettings>): void { this.renderer3D.setSkinRamp(patch); this.ctx.scheduleRender(); }
     getSkinRampSettings3D(): SkinRampSettings { return this.renderer3D.skinRamp; }
+    /** Sketch style PAPER amount 0..1 — scene-global (every Sketch mesh): 1 = off-white paper with a colour wash, 0 = the
+     *  full colour with pencil hatching. Default 0.75 = the original look. Persists with the document. */
+    setSketchPaper3D(amount: number): void { this.renderer3D.setSketchPaper(amount); this.ctx.scheduleRender(); }
+    getSketchPaper3D(): number { return this.renderer3D.sketchPaper; }
+
+    // ── Toon shadows + rim light (docs/specs/film-look-and-toon-shadows.md §B/§C) ──
+    /** Scene-wide TOON SHADOW look (every `toonShadow` material in the Cel / Cel-HD styles): bands, softness, how
+     *  bright the shadow is, its colour tint and extra saturation. Merge-style; persists with the document. */
+    setToonShadows3D(patch: Partial<import('../../renderer/3d/material-3d').ToonShadowSettings>): void { this.renderer3D.setToonShadows(patch); this.ctx.scheduleRender(); }
+    getToonShadows3D(): import('../../renderer/3d/material-3d').ToonShadowSettings { return this.renderer3D.toonShadows; }
+    /** Scene-wide RIM LIGHT for `rimEnabled` materials: strength (0 = the original built-in rim), width, hardness
+     *  (soft → crisp toon edge), colour. Merge-style; persists. */
+    setRimLight3D(patch: Partial<import('../../renderer/3d/material-3d').RimLightSettings>): void { this.renderer3D.setRimLight(patch); this.ctx.scheduleRender(); }
+    getRimLight3D(): import('../../renderer/3d/material-3d').RimLightSettings { return this.renderer3D.rimLight; }
+    /** Opt ONE mesh into toon shadows (material flag bit 30 — visible in the Cel / Cel-HD styles). False if gone. */
+    setMeshToonShadow3D(meshId: string, on: boolean): boolean {
+        const m = this.getMesh(meshId);
+        if (!m) return false;
+        m.material.toonShadow = on;
+        m.materialDirty = true; m.stateDirty = true;   // flags live in the instance material block → re-pack; persist
+        this.ctx.scheduleRender();
+        return true;
+    }
+    /** Every mesh of a character: the body + eye decal + hair + ALL garments (every clothing slot). */
+    characterMeshIds3D(bodyMeshId: string): string[] { return [bodyMeshId, ...this._character.overlayMeshIds(bodyMeshId)]; }
+    /** Toon shadows on a whole character (body + hair + every garment; the unlit eye decal ignores it). */
+    setCharacterToonShadows3D(bodyMeshId: string, on: boolean): void {
+        for (const id of this.characterMeshIds3D(bodyMeshId)) this.setMeshToonShadow3D(id, on);
+    }
+    /** Rim light on a whole character (body + hair + every garment). */
+    setCharacterRimLight3D(bodyMeshId: string, on: boolean): void {
+        for (const id of this.characterMeshIds3D(bodyMeshId)) {
+            const m = this.getMesh(id);
+            if (!m) continue;
+            m.material.rimEnabled = on;
+            m.materialDirty = true; m.gpuDirty = true; m.stateDirty = true;
+        }
+        this.ctx.scheduleRender();
+    }
+    /** MATTE on a whole character (visual-polish item 10): the skin and every garment lose their specular (matte cel
+     *  skin + cloth instead of glossy plastic highlights in Cel / Cel-HD; hair keeps its sheen), now and whenever a
+     *  garment is regenerated. Stored on the body (persists). False if gone. */
+    setCharacterMatte3D(bodyMeshId: string, on: boolean): boolean {
+        const body = this.getMesh(bodyMeshId);
+        if (!body) return false;
+        body.material.matte = on;
+        applyMatte(body, on);   // the skin too (also marks the body for re-pack + persist)
+        for (const id of this._character.overlayMeshIds(bodyMeshId)) {
+            const m = this.getMesh(id);
+            if (m instanceof SkinnedMesh3D && m.isClothing) applyMatte(m, on);
+        }
+        this.ctx.scheduleRender();
+        return true;
+    }
+    getCharacterMatte3D(bodyMeshId: string): boolean { return this.getMesh(bodyMeshId)?.material.matte === true; }
     /** Render the raw AO buffer to screen — verify the occlusion looks right before it feeds lighting (stage 2). */
     setSSAODebug3D(on: boolean): void { this.renderer3D.setSSAODebug(on); this.ctx.scheduleRender(); }
     /** Current SSAO config (seed a panel from this). */
@@ -984,10 +1393,27 @@ export class Scene3DManager {
     /** Renderer perf counters for hitch diagnosis (pool/atlas rebuilds, repacks, shadow passes, appends/warms). */
     getPerf3D(): ReturnType<Renderer3D['getPerfCounters']> { return this.renderer3D.getPerfCounters(); }
     getFrameStats3D(): ReturnType<Renderer3D['getFrameStats3D']> { return this.renderer3D.getFrameStats3D(); }
+    /** R6.1 DISTANCE LOD (Mesh3D.drawDistance): `bias` = world units added to every draw distance this frame (the city
+     *  sets it to the camera's distance to the city volume, so an aerial overview keeps its detail while street level
+     *  uses the true per-chunk distances); `enabled` = the renderer master switch; `scale` = a global multiplier. */
+    setDistanceLod3D(opts: { bias?: number; enabled?: boolean; scale?: number }): void {
+        const r = this.renderer3D;
+        if (opts.bias !== undefined) r.distanceLodBias = Math.max(0, opts.bias);
+        if (opts.enabled !== undefined) r.distanceLod = opts.enabled;
+        if (opts.scale !== undefined && opts.scale > 0) r.distanceLodScale = opts.scale;
+    }
 
     /** Diagnostic: number of registered per-frame pre-render callbacks (watch for leaks — climbs = a
      *  callback isn't being removed on teardown). */
     getPreRenderCallbackCount3D(): number { return this.ctx.webgpuRenderer.getPreRenderCallbackCount(); }
+    /** Per-frame CPU profile of the pre-render callbacks (springs / IK / idle / gizmos …) + the whole frame. First call
+     *  turns profiling ON and returns null; later calls return the averages; `setCallbackProfiling3D(false)` stops it. */
+    getCallbackProfile3D(): ReturnType<import('../../renderer/core/webgpu-renderer').WebGPURenderer['getCallbackProfile']> {
+        const p = this.ctx.webgpuRenderer.getCallbackProfile();
+        if (!p) this.ctx.webgpuRenderer.setCallbackProfiling(true);
+        return p;
+    }
+    setCallbackProfiling3D(on: boolean): void { this.ctx.webgpuRenderer.setCallbackProfiling(on); }
 
     /** Register / unregister a per-frame pre-render callback (e.g. WorldManager's zoom-gated detail LOD). Passthrough
      *  to the renderer's callback list. Return false from the callback (it's a "keep running" flag, not a result). */
@@ -998,10 +1424,27 @@ export class Scene3DManager {
     getGeomPoolStats3D(): ReturnType<Renderer3D['getGeomPoolStats']> { return this.renderer3D.getGeomPoolStats(); }
     /** Request a one-time geometry-pool compaction next frame (reclaims disposed-tile dead space). Call on idle. */
     requestGeomCompaction3D(): void { this.renderer3D.requestGeomCompaction(); }
+    /** P22: re-place every pooled geometry under the current packedVertices switch (tile-landing.ts) next frame. */
+    repackGeometryPool3D(): void { this.renderer3D.repackGeometryPool(); this.requestRender3D(); }
+    /** Re-upload `mesh.geometry.indices[start, start + count)` after an IN-PLACE edit (no pool rebuild) — see
+     *  Renderer3D.patchMeshIndices. The live crowd hides / restores one person inside a merged crowd layer with it. */
+    patchMeshIndices3D(mesh: Mesh3D, start: number, count: number): boolean { return this.renderer3D?.patchMeshIndices?.(mesh, start, count) ?? false; }
+    /** Re-upload vertices [start, start + count) of `mesh.geometry.vertices` after an IN-PLACE edit (no pool rebuild) — see
+     *  Renderer3D.patchMeshVertices. The moving contact blobs (world-mover-shadows.ts) rewrite their quads with it. */
+    patchMeshVertices3D(mesh: Mesh3D, start: number, count: number): boolean { return this.renderer3D?.patchMeshVertices?.(mesh, start, count) ?? false; }
+    /** visual-polish #16: the Play player's feet (world space, the last rendered frame) + body height, or null outside
+     *  Play. The city's moving contact blobs put one under the player. */
+    get playerFeet3D(): { x: number; y: number; z: number; height: number } | null {
+        const f = this._lastPlayerFeet, cc = this._playController;
+        return this._playing && f && cc ? { x: f[0], y: f[1], z: f[2], height: cc.cfg.eyeHeight } : null;
+    }
+    private _lastPlayerFeet: [number, number, number] | null = null;
 
-    /** PRE-UPLOAD a group's geometry so a later reveal is a cheap visibility flip (async city staging). */
-    warmGroupGeometry3D(group: MeshGroup3D): boolean {
-        return this.renderer3D.warmGeometry(group.children as unknown as Mesh3D[]);
+    /** PRE-UPLOAD a group's geometry so a later reveal is a cheap visibility flip (async city staging). `budgetBytes`
+     *  (P10.D8) caps one call's upload — false while some of the group is still not resident (call again / let the
+     *  render-time append finish it). */
+    warmGroupGeometry3D(group: MeshGroup3D, budgetBytes = Infinity): boolean {
+        return this.renderer3D.warmGeometry(group.children as unknown as Mesh3D[], budgetBytes);
     }
 
     /** Screen (CSS) point → the (x, z) where the view ray meets the y=`groundY` plane, or null if it doesn't.
@@ -1200,6 +1643,7 @@ export class Scene3DManager {
         // P5: the visible reference grid keeps its own floor — reframing a small scene must not clip the grid.
         cam.autoFar = true;
         cam.sceneRadius = Math.max(radius, this._gridRadiusFloor());
+        this._setDollyFloor(radius);
 
         const oldDir = vec3.fromValues(
             cam.position[0] - cam.target[0],
@@ -1237,17 +1681,35 @@ export class Scene3DManager {
         let minX = Infinity, minY = Infinity, minZ = Infinity;
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
+        const box = { minX: 0, minY: 0, minZ: 0, maxX: 0, maxY: 0, maxZ: 0 };
         for (const mesh of meshes) {
             const m = mesh.localMatrix;
             const v = mesh.geometry?.vertices;
 
             if (v && v.length >= 3) {
-                // Primary path: GPU geometry flat buffer
+                // P1.3 (performance-plan.md): this ran vec4.fromValues + vec4.create + transformMat4 PER VERTEX — ~300 ms for
+                // a city on the first free3D entry (frameAllMeshes). Same exact result, cheaper:
+                //  - no rotation/shear (every city chunk): the extremes of an axis-aligned scale+translate ARE the
+                //    transformed local box corners, which the renderer caches per mesh (O(1) per mesh);
+                //  - otherwise the per-vertex transform, inlined (no allocation).
+                const e = m as unknown as Float32Array;
+                if (e[1] === 0 && e[2] === 0 && e[4] === 0 && e[6] === 0 && e[8] === 0 && e[9] === 0 && e[3] === 0 && e[7] === 0 && e[11] === 0 && e[15] === 1
+                    && this.renderer3D.getMeshWorldAABB3D(mesh, box)) {
+                    if (box.minX < minX) minX = box.minX; if (box.minY < minY) minY = box.minY; if (box.minZ < minZ) minZ = box.minZ;
+                    if (box.maxX > maxX) maxX = box.maxX; if (box.maxY > maxY) maxY = box.maxY; if (box.maxZ > maxZ) maxZ = box.maxZ;
+                    continue;
+                }
+                // Rotated: the transformed-corner box CONTAINS the exact vertex box, so when it already sits inside the
+                // running bounds this mesh cannot extend them — skip its vertices (exact result either way).
+                if (this.renderer3D.getMeshWorldAABB3D(mesh, box) && box.minX >= minX && box.minY >= minY && box.minZ >= minZ
+                    && box.maxX <= maxX && box.maxY <= maxY && box.maxZ <= maxZ) continue;
                 for (let i = 0; i < v.length; i += FLOATS_PER_VERT) {
-                    const p = vec4.fromValues(v[i], v[i + 1], v[i + 2], 1);
-                    const wp = vec4.transformMat4(vec4.create(), p, m as mat4);
-                    minX = Math.min(minX, wp[0]); minY = Math.min(minY, wp[1]); minZ = Math.min(minZ, wp[2]);
-                    maxX = Math.max(maxX, wp[0]); maxY = Math.max(maxY, wp[1]); maxZ = Math.max(maxZ, wp[2]);
+                    const x = v[i], y = v[i + 1], z = v[i + 2];
+                    const wx = e[0] * x + e[4] * y + e[8] * z + e[12];   // = vec4.transformMat4(p, m).xyz (no w divide, as before)
+                    const wy = e[1] * x + e[5] * y + e[9] * z + e[13];
+                    const wz = e[2] * x + e[6] * y + e[10] * z + e[14];
+                    if (wx < minX) minX = wx; if (wy < minY) minY = wy; if (wz < minZ) minZ = wz;
+                    if (wx > maxX) maxX = wx; if (wy > maxY) maxY = wy; if (wz > maxZ) maxZ = wz;
                 }
             } else if (mesh.editMesh?.vertices?.length) {
                 // Fallback: editMesh object vertices (x/y/z properties in local space)
@@ -1311,6 +1773,7 @@ export class Scene3DManager {
      * Pair with {@link exitCityMode3D}. World generation itself lives in `sm.world` (WorldManager).
      */
     enterCityMode3D(center: [number, number, number] = [0, 0, 0]): void {
+        this._stopPlayForEditorCamera('enterCityMode3D');
         if (!this._inCameraSubMode()) this._captureCurrentPose();   // snapshot the mode we're leaving (first entry only) so exitCityMode3D restores it
 
         const cam = this.renderer3D.getCamera();
@@ -1322,6 +1785,7 @@ export class Scene3DManager {
             cam.orthoSize = 1 / zoom;
         }
         this.enableOrbitControls({ altOrbitOnly: true });
+        this._configureFreeZoom();   // T7.4: no City-mode zoom-out cap (was the orbit default maxRadius = 50)
         cam.setTarget(center[0], center[1], center[2]);
         this._armature.getOrbitController()?.syncFromCamera();
         this._armature.setMeshEditOrbitCenter([center[0], center[1], center[2]]);   // orbit now owns the camera
@@ -1374,6 +1838,7 @@ export class Scene3DManager {
      *  = the locked illustration camera at that projection. Non-destructive. */
     setCameraMode3D(mode: CameraMode): void {
         if (this._viewState.cameraMode === mode) return;
+        if (this._deferViewChangeInPlay(() => { this._viewState.cameraMode = mode; })) return;
         this._captureCurrentPose();            // remember where we were in the mode we're LEAVING
         this._viewState.cameraMode = mode;
         this._applyViewState();                // restores the entered mode's remembered pose (else frames all)
@@ -1386,12 +1851,31 @@ export class Scene3DManager {
      *  render changes (dropping the artboard composite) land in P2. Non-destructive either way. */
     setTarget3D(target: ViewTarget): void {
         if (this._viewState.target === target) return;
+        if (this._deferViewChangeInPlay(() => { this._viewState.target = target; })) return;
         this._captureCurrentPose();            // camera mode is unchanged → keeps the vantage across the target flip
         this._viewState.target = target;
         this._applyViewState();
         this.onViewStateChanged.emit();
         this.ctx.scheduleRender();
         void this._refreshArtboardTexture();
+    }
+
+    // bug-hunt 2026-10-01 (Play): editor camera calls during Play applied at once, so the orbit controller and the Play
+    // loop fought over the camera. A view-mode / target switch is RECORDED (host UI + onViewStateChanged stay in sync)
+    // and lands on Stop (exitPlayMode3D's _applyViewState); an editor ORBIT mode (city / mesh / group orbit) is an exit
+    // from Play, so it stops Play first.
+    private _viewChangedInPlay = false;
+    private _deferViewChangeInPlay(record: () => void): boolean {
+        if (!this._playing) return false;
+        record();   // no _captureCurrentPose: the live camera is the PLAY camera, not an editor vantage
+        this._viewChangedInPlay = true;
+        this.onViewStateChanged.emit();
+        return true;
+    }
+    private _stopPlayForEditorCamera(api: string): void {
+        if (!this._playing) return;
+        console.debug('[scene3d] ' + api + ' during Play — stopping Play first (the editor camera and Play cannot share the camera)');
+        this.exitPlayMode3D();
     }
 
     /** Snapshot the CURRENT mode's camera vantage into `_viewState` (free3D orbit vantage → `freeCam`;
@@ -1767,7 +2251,7 @@ export class Scene3DManager {
      *  Memoized on (id + transform version + settings) so it only rebuilds when something actually moves. */
     private _frustumMemo: { id: string; ver: number; settings: string } | null = null;
     private _refreshCameraFrustum(): boolean {
-        if (this._lookThroughCamId !== null || this._previewThroughCameras) {   // looking through a camera — no frustum
+        if (this._lookThroughCamId !== null || this._previewThroughCameras || this._playing) {   // looking through a camera / playing — no frustum
             if (this._frustumMemo) { this.renderer3D.setCameraFrustum(null); this._frustumMemo = null; }
             return false;
         }
@@ -1822,12 +2306,12 @@ export class Scene3DManager {
     private _scriptVarBridge: { get(name: string): number | string | boolean | null; set(name: string, v: number | string | boolean): void; emit(event: string): void } | null = null;
     private _lastPlayBase: CharacterInput = { forward: 0, right: 0, look: 0, jump: false };   // merged input this tick, for ctx.input
     private _playStartMs = 0;                        // performance.now() at Play start, for ctx.time
-    private readonly _scriptHidden = new Set<string>();   // nodes ctx.destroy() hid this run → restored on Stop
+    private readonly _scriptHidden = new Map<string, boolean>();   // nodes ctx.destroy() hid this run → their PRE-hide visibility, restored on Stop
     private _lastInteract = false;
     private _prePlayCam: { pos: [number, number, number]; target: [number, number, number]; mode: 'perspective' | 'orthographic' } | null = null;
     /** Transform snapshot captured on enter, restored on exit — the non-destructive guarantee once Play mutates the
      *  scene (physics/scripts). Camera-only Play never touches these, so restore is a safe no-op in that case. */
-    private _prePlayXforms: Map<string, PlayXform> | null = null;
+    private _prePlayXforms: PlayXformSnapshot | null = null;
     /** The mesh bound as the "Player" (driven by the controller each tick), if any, + its pre-play visibility. */
     private _playerMesh: Mesh3D | null = null;
     private _playerMeshId: string | null = null;
@@ -1837,16 +2321,254 @@ export class Scene3DManager {
     // center-origin avatar is driven at the right height instead of sinking to feet=origin. 0 when nothing bound.
     private _playerHeight = 0;
     private _playerFootToOrigin = 0;
+    /** Every mesh that IS the bound Player besides its body: hair, garments, face decal, charms, anything skinned to
+     *  its skeleton or parented under it / its skeleton. Excluded from the ground / wall / camera rays — the auto
+     *  player always excluded its parts, a user-set Player only its body, so the third-person camera ray hit the
+     *  back of its own hair / top from the shoulder pivot and parked the camera inside its head. */
+    private readonly _playerPartIds = new Set<string>();
     // Collision broadphase (built on enter when collision is on): the static mesh set + an XZ grid over their
     // footprints, so per-tick ground/wall casts only test nearby meshes. Null = collision off → no grid.
     private _collisionMeshes: Mesh3D[] | null = null;
     private _collisionGrid: SpatialGridXZ | null = null;
+    // P6 (performance-plan.md): short candidate list for the bounded Play rays (camera bundle, wall + headroom rays) —
+    // the grid meshes that really have a triangle near the character. Rebuilt with the grid. Null = collision off.
+    private _collisionHood: CollisionHood<Mesh3D> | null = null;
     private _candIdx: number[] = [];       // scratch: grid → indices
     private _candMeshes: Mesh3D[] = [];     // scratch: indices → meshes (fed to the picker)
-    // Third-person camera follow-smoothing state (the trailing eye position + the wall-clock of the last render tick).
-    private _camEye: [number, number, number] | null = null;
+    // Third-person follow camera (R6.2: smoothed shoulder pivot + look-ahead + sphere-cast collision with recovery) +
+    // the wall-clock of the last render tick (render-rate dt for the camera + mouse / right-stick look).
+    private readonly _tpCam = new ThirdPersonCamera();
     private _camLastMs = 0;
+    private _prePlayFov: number | null = null;
+    // Built-in gamepad (R6.2): left stick move, right stick orbit, A jump, X use, L3 / Y walk-run toggle. Polled per
+    // render frame; the fixed tick reads the latest reading.
+    private _gamepad: GamepadInput | null = null;
+    private _padReading: GamepadReading | null = null;
+    private _padRunToggles = 0;
+    /** Look applied at render rate since the last fixed tick (for the script ctx.input snapshot). */
+    private _lookAccumYaw = 0;
+    private _lookAccumPitch = 0;
+    /** Fires when the walk/run state changes (Shift / L3 / setPlayerRunning3D). */
+    public readonly onPlayerRunChanged = new EventEmitter<boolean>();
+    /** Walk/run state carried across Play runs (a new run starts in the last state). Round 8: Play starts WALKING (Shift
+     *  toggles a true run). */
+    private _playRunning = false;
+    /** Sneak (Round 8): C / gamepad B toggle it, Ctrl holds it; the effective state is either. Reset each Play run. */
+    private _playSneakToggle = false;
+    private _playSneaking = false;
+    /** Fires when the effective sneak state changes (Ctrl / C / B / setPlayerSneaking3D). */
+    public readonly onPlayerSneakChanged = new EventEmitter<boolean>();
+    /** Procedural lean / head-lead layer over the engine locomotion (Round 8). */
+    private readonly _locoLean = new LocomotionLean();
+    /** Secondary motion (follow-through, per-cycle variation, head drift) over the RUNTIME default gaits only (gait feel
+     *  2026-10-03; an authored walk plays exactly as before). Seeded per character. */
+    private readonly _locoSecondary = new LocomotionSecondary();
+    /** True while the bound walk is a runtime default gait (the auto player / the default gait without an own Walk). */
+    private _locoRuntimeGait = false;
+    private _padSneakToggles = 0;
     public readonly onPlayStateChanged = new EventEmitter<void>();
+
+    // ── Play settings + auto default player (polish-round-3 T5; docs/ui/play-mode.md §Play settings) ──────────
+    /** Play settings panel state (first-person eye height, auto default character). Persisted as globalScene.play.
+     *  ShapeManager forwards straight to it (setPlayerEyeHeight3D / setAutoDefaultPlayer3D). */
+    public readonly playSettings = new PlaySettings();
+    /** The runtime default character spawned in third-person Play when no Player is set (never saved). */
+    public readonly autoPlayer = new PlayAutoPlayer({
+        createBody: (x, y, z) => this._createAutoPlayerCharacter(x, y, z),
+        markRuntimeBody: (id) => this._character.markRuntimeBody(id),
+        attach: (n) => { this.ctx.sceneGraph.root.addChild(n); this.ctx.emitSceneGraphChanged(); },
+        detach: (n) => { n.parent?.removeChild(n); this._picker.evictMesh((n as unknown as { id: string }).id); this.ctx.emitSceneGraphChanged(); },
+    });
+    /** The enterPlayMode3D `config` of the current run (host overrides win over the play settings). */
+    private _playOptsConfig: Partial<CharacterConfig> | undefined;
+    /** The host's setPlayerAnimation3D binding, parked while the auto player drives locomotion; restored on release. */
+    private _autoSpawnFor: CharacterController | null = null;
+    private _autoPrevAnim: { clips: LocomotionClips | null; handler: ((clipName: string) => void) | null; engineSkel: string | null; defaultGait: boolean } | null = null;
+
+    /** The explicit controller config for a Play run: the play settings (eye height), overridden by the host's own
+     *  enterPlayMode3D config. Fields left out fall back to the scale-correct defaults (_playScaleConfig) / avatar
+     *  framing. */
+    private _explicitPlayConfig(): Partial<CharacterConfig> {
+        const eye = this.playSettings.getEyeHeight();
+        const camDist = this.playSettings.getCameraDistance();   // metres → world units
+        return {
+            ...(eye !== null ? { eyeHeight: eye } : {}),
+            ...(camDist !== null ? { thirdPersonDistance: camDist / this.getPlayMetresPerUnit3D() } : {}),
+            ...(this._playOptsConfig ?? {}),
+        };
+    }
+
+    // ── Scene metre scale (Round 4) ────────────────────────────────────────────────────────────────────────
+    // The controller's defaults (DEFAULT_CHARACTER) are in METRES (1 unit = 1 m Creator content). A city is built at
+    // cityMetresPerUnit() metres per unit (~15), so there those defaults made a 1.6-unit = 24 m tall player that walked
+    // at 52 m/s. ShapeManager installs a provider returning the city's metres-per-unit when a city exists (null
+    // otherwise = 1, today's behaviour); every length/speed default is divided by it.
+    private _playMetresPerUnitProvider: (() => number | null) | null = null;
+    /** Install the scene's metres-per-unit source for Play (ShapeManager: the city scale while a city exists). */
+    setPlayMetresPerUnitProvider(fn: (() => number | null) | null): void { this._playMetresPerUnitProvider = fn; }
+    /** The scene's metre scale for Play: metres per world unit, or null when the scene has none (not a city). */
+    private _playMetreScale(): number | null {
+        const v = this._playMetresPerUnitProvider?.() ?? null;
+        return v !== null && Number.isFinite(v) && v > 0 ? v : null;
+    }
+    /** Metres per world unit Play uses (1 outside a city). */
+    getPlayMetresPerUnit3D(): number { return this._playMetreScale() ?? 1; }
+
+    /** Controller defaults converted to world units: every length / speed / acceleration of DEFAULT_CHARACTER ÷
+     *  metresPerUnit, and the move speed from the play settings (m/s). Identity outside a city at the default speed. */
+    private _playScaleConfig(): Partial<CharacterConfig> & { moveSpeed: number } {
+        const u = 1 / this.getPlayMetresPerUnit3D(), d = DEFAULT_CHARACTER;
+        return {
+            moveSpeed: this.playSettings.getMoveSpeed() * u,
+            walkSpeed: this.playSettings.getWalkSpeed() * u,
+            sneakSpeed: Math.min(d.sneakSpeed, this.playSettings.getWalkSpeed()) * u,
+            groundAccel: d.groundAccel * u, groundDecel: d.groundDecel * u,
+            apexHangSpeed: d.apexHangSpeed * u, maxFallSpeed: d.maxFallSpeed * u,
+            jumpSpeed: d.jumpSpeed * u, gravity: d.gravity * u, eyeHeight: d.eyeHeight * u,
+            radius: d.radius * u, stepHeight: d.stepHeight * u,
+            thirdPersonDistance: d.thirdPersonDistance * u, thirdPersonHeight: d.thirdPersonHeight * u,
+            cameraCollisionPadding: d.cameraCollisionPadding * u, cameraMinDistance: d.cameraMinDistance * u,
+            cameraCollisionRadius: d.cameraCollisionRadius * u, cameraShoulderOffset: (d.cameraShoulderOffset ?? 0) * u,
+            thirdPersonFovDeg: this.playSettings.getFov(),
+            jumpWindup: PLAY_JUMP_WINDUP,   // item 13: a ~60 ms anticipation crouch before a ground jump (a time: unscaled)
+        };
+    }
+
+    /** The eye height Play uses when no height is set: 0.9 × the bound avatar's measured height, else 1.6 m (in world
+     *  units: 1.6 outside a city, 1.6 / cityMetresPerUnit in one). */
+    getDefaultPlayerEyeHeight3D(): number {
+        if (this._playing && this._playerHeight > 0) return this._playerHeight * 0.9;
+        // Outside Play: the bound Player's CURRENT size (it may have been scaled / regenerated since the last run).
+        const m = this._playerMeshId ? this.getMesh(this._playerMeshId) : null;
+        const h = m ? this._meshStandingHeight(m) : 0;
+        if (h > 0) return h * 0.9;
+        return this._playerHeight > 0 ? this._playerHeight * 0.9 : DEFAULT_CHARACTER.eyeHeight / this.getPlayMetresPerUnit3D();
+    }
+
+    /** For a HOST-owned clip handler (setPlayerAnimation3D + the discrete LocomotionClipDriver): the planar speed
+     *  re-expressed on the R6.2 reference scale — the controller's walk speed reads as 1.5 and its run speed as 3.5 —
+     *  so the driver's walk/run threshold (2.2) follows the gait speeds, the move-speed settings AND the scene scale:
+     *  a full-input walk walks, a run runs. (The engine animator reads real speeds: _driveLocomotionAnimator.) */
+    private _locoForAnim(cc: CharacterController, loco: LocomotionState): LocomotionState {
+        const walk = cc.walkTopSpeed(), run = cc.cfg.moveSpeed, s = loco.planarSpeed;
+        if (!(walk > 0) || !(run > walk)) return loco;
+        const mapped = s <= walk ? (s * 1.5) / walk : 1.5 + ((s - walk) / (run - walk)) * 2.0;
+        return mapped === s ? loco : { ...loco, planarSpeed: mapped };
+    }
+
+    /** Build the auto default player (Round 4): the SEEDED random character (character-randomizer, the same look as
+     *  sm.randomCharacterParams3D(AUTO_PLAYER_SEED)): body + face/procedural eyes + hair + top/bottom/socks/shoes +
+     *  skin tone + rim light, assembled straight on the character subsystem (no ShapeManager wrappers, so no undo and
+     *  no paint-carry registries). The body is excluded + marked runtime BEFORE any overlay is generated, so no rig
+     *  of it is ever serializable. Each dressing step is guarded: a failure leaves a plainer character, never none. */
+    private async _createAutoPlayerCharacter(x: number, y: number, z: number): Promise<AutoPlayerBody | null> {
+        const p = randomCharacterParams(AUTO_PLAYER_SEED);
+        // Garments in the order they are applied below: shoes BEFORE the bottom (it piles onto them — applied after,
+        // the shoes would re-pile i.e. regenerate the bottom; the final result is the same), then hair (fitted against
+        // all of them). Body + garments + hair are generated in ONE worker job and primed (P3.2d).
+        const garments = [p.top, p.socks, p.shoes, p.bottom];
+        // sceneScale off: PlayAutoPlayer measures the GENERATED size and scales per acquire (the cache outlives the
+        // document, so a city-baked scale would leak into a non-city scene).
+        const r = await this.createProceduralCharacter3D({ body: p.body, garments, hair: p.hair }, x, y, z, { sceneScale: false });
+        try { return this._dressAutoPlayerCharacter(r, p, garments); } finally { this._character.clearPrimedParts(r.meshId); }
+    }
+    private _dressAutoPlayerCharacter(r: { meshId: string; skeletonId: string }, p: ReturnType<typeof randomCharacterParams>, garments: ClothingParams[]): AutoPlayerBody | null {
+        const mesh = this.getMesh(r.meshId), skeleton = this.getSkeleton(r.skeletonId);
+        if (!mesh || !skeleton) return null;
+        mesh.excludeFromDocument = true; skeleton.excludeFromDocument = true;
+        this._character.markRuntimeBody(mesh.id);
+        const step = (what: string, fn: () => void) => { try { fn(); } catch (e) { console.warn(`[Play] auto default player: ${what} failed`, e); } };
+        step('face', () => {
+            if (!this._character.ensureFace3D(mesh.id)) return;
+            const expr = this._character.createFaceExpression(mesh.id, 'Neutral');
+            if (expr) this._character.setFaceExpressionProcedural(mesh.id, expr, p.eyes);
+        });
+        // Garments BEFORE hair: the hair is fitted (collision) against the clothes, and a garment added after hair
+        // regenerates the hair each time.
+        for (const c of garments) step(c.slot, () => this._character.setClothingParams(mesh.id, c));
+        step('hair', () => this._character.setHairParams(mesh.id, p.hair));
+        step('skin', () => this._character.setSkinTone(mesh.id, p.skinTone));
+        step('face kit', () => { this._character.setFaceFeatures(mesh.id, p.face); });
+        step('rim light', () => this.setCharacterRimLight3D(mesh.id, p.rimLight));
+        const parts: Mesh3D[] = [];
+        for (const id of this._character.overlayMeshIds(mesh.id)) {
+            const m = this.getMesh(id);
+            if (m) { m.excludeFromDocument = true; parts.push(m); }
+        }
+        return { mesh, skeleton, parts };
+    }
+
+    /** Re-apply the play settings to the running controller (live slider / checkbox). */
+    private _applyPlaySettingsLive(): void {
+        const cc = this._playController;
+        if (!cc || !this._playing) return;
+        const explicit = this._explicitPlayConfig();
+        cc.cfg.eyeHeight = explicit.eyeHeight ?? this.getDefaultPlayerEyeHeight3D();
+        const scaled = this._playScaleConfig();
+        cc.cfg.moveSpeed = explicit.moveSpeed ?? scaled.moveSpeed;   // live move-speed (run) slider
+        cc.cfg.walkSpeed = explicit.walkSpeed ?? scaled.walkSpeed!;  // live walk-speed slider
+        cc.cfg.sneakSpeed = explicit.sneakSpeed ?? scaled.sneakSpeed!;
+        cc.cfg.thirdPersonDistance = explicit.thirdPersonDistance ?? scaled.thirdPersonDistance!;   // live camera-distance slider
+        cc.cfg.thirdPersonFovDeg = explicit.thirdPersonFovDeg ?? scaled.thirdPersonFovDeg!;         // live FOV slider
+        this._applyAvatarCameraFraming(cc, explicit);
+        this._applyPlayFov(cc);
+        // Auto default player toggled mid-play: spawn / remove it to match.
+        const wantAuto = PlayAutoPlayer.shouldSpawn({ enabled: this.playSettings.autoDefaultPlayer, cameraMode: cc.cfg.cameraMode, hasPlayer: this._playerMesh !== null && !this._isAutoPlayerMesh(this._playerMesh) });
+        if (wantAuto && !this._playerMesh) void this._spawnAutoPlayer(cc);
+        else if (!wantAuto && this._isAutoPlayerMesh(this._playerMesh)) this._releaseAutoPlayer();
+        this.ctx.scheduleRender();
+    }
+
+    private _isAutoPlayerMesh(m: Mesh3D | null): boolean { return !!m && this.autoPlayer.isRuntimeNode(m.id); }
+
+    /** Spawn (or re-attach the cached) auto default player at the controller's feet and bind it as the driven avatar —
+     *  WITHOUT touching the persisted player binding (_playerMeshId / locomotion set). Async on first use (body
+     *  generation); a Stop before it's ready drops the result. */
+    private async _spawnAutoPlayer(cc: CharacterController): Promise<void> {
+        if (this._autoSpawnFor === cc) return;   // already spawning for this run (e.g. repeated live-settings changes)
+        this._autoSpawnFor = cc;
+        let body: Awaited<ReturnType<PlayAutoPlayer['acquire']>>;
+        // In a city: real human size (1.7 m in city units). Elsewhere: the generated size (unchanged behaviour).
+        const mpu = this._playMetreScale();
+        try { body = await this.autoPlayer.acquire(cc.pos[0], cc.pos[1], cc.pos[2], mpu !== null ? { height: AUTO_PLAYER_HEIGHT_M / mpu } : undefined); }
+        finally { if (this._autoSpawnFor === cc) this._autoSpawnFor = null; }
+        if (!body) return;
+        // Stale: Play stopped / restarted, a user Player got bound, or the setting was switched off meanwhile.
+        if (!this._playing || this._playController !== cc || (this._playerMesh && !this._isAutoPlayerMesh(this._playerMesh)) || !this.playSettings.autoDefaultPlayer) {
+            if (!this._isAutoPlayerMesh(this._playerMesh)) this.autoPlayer.release();
+            return;
+        }
+        const m = body.mesh;
+        this._playerMesh = m;
+        this._playerPrevVisible = true;
+        m.visible = true;
+        this._measureBoundAvatar(m);
+        this._applyAvatarCameraFraming(cc, this._explicitPlayConfig());
+        this._drivePlayerMesh(cc);
+        this._tpCam.reset();   // re-frame onto the new body (first frame snaps)
+        // Locomotion: Breathe / Walk / Run on the auto body. Park the host's own binding (if any) and restore it later.
+        if (!this._autoPrevAnim) this._autoPrevAnim = { clips: this._playerClips, handler: this._playerAnimHandler, engineSkel: this._locoEngineSkelId, defaultGait: this._locoDefaultGait };
+        this._bindEngineLocomotion(body.skeleton.id, { ...AUTO_PLAYER_CLIPS });
+        this._locoRuntimeGait = true;
+        this._bindIdleVariants(body.skeleton.id);   // idle variety over its runtime Stand (2026-10-04)
+        this.ctx.scheduleRender();
+    }
+
+    /** Unbind + remove the auto default player (kept cached), restoring the host's animation binding. */
+    private _releaseAutoPlayer(): void {
+        if (this._isAutoPlayerMesh(this._playerMesh)) {
+            this._playerMesh = null;
+            this._playerHeight = 0; this._playerFootToOrigin = 0; this._playerPartIds.clear();
+            this._restoreLocoRest();
+        }
+        if (this._autoPrevAnim) {
+            const prev = this._autoPrevAnim;
+            this._autoPrevAnim = null;
+            this.setPlayerAnimation3D(prev.clips, prev.handler);
+            this._locoEngineSkelId = prev.engineSkel; this._locoDefaultGait = prev.defaultGait;
+        }
+        this.autoPlayer.release();
+    }
 
     get isPlaying3D(): boolean { return this._playing; }
 
@@ -1868,6 +2590,8 @@ export class Scene3DManager {
         this._playerClips = clips;
         this._playerAnimHandler = handler;
         this._locoDriver.reset();
+        // A host-owned binding: the engine locomotion animator steps aside (the host plays the clips).
+        this._locoEngineSkelId = null; this._locoDefaultGait = false;
     }
 
     // ── Player movement params → UI variables (§4.3) ─────────────────
@@ -1879,22 +2603,39 @@ export class Scene3DManager {
     // ── Locomotion set from the Animation Library (§4.4) ─────────────
     // Bind the five locomotion slots to LIBRARY entries (or existing clip names/ids); the engine self-wires
     // setPlayerAnimation3D with a CROSSFADING handler so binding a character animates its walk with no host code.
-    private _locoSet: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null = null;
-    private _locoPlayer: AnimationPlayer3D | null = null;
-    private _locoCurrentClip = '';
-    private static readonly LOCO_BLEND_FRAMES = 6;
-    // 1D blend tree (§8): when set + grounded, drive the avatar by a CONTINUOUS idle↔walk↔run mix instead of the
-    // discrete crossfade. Airborne stays discrete. Phase is a shared normalized cycle position [0,1); bind is the
-    // fallback pose for joints outside the gait clips (captured lazily at rest).
+    private _locoSet: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string; jumps?: string[] } | null = null;
+    // ENGINE-driven locomotion (R6.2): the LocomotionAnimator state machine (idle ⇄ walk ⇄ run, jump / fall, crossfades)
+    // samples the clips against the avatar's REST pose and blends them per tick. Used for the auto default player, a
+    // setPlayerLocomotionSet3D set, and a user Player with the default gait; a host-owned setPlayerAnimation3D handler
+    // opts out (the host plays the clips). `_locoEngineSkelId` = the skeleton it drives (null = host-owned / none).
+    private _locoEngineSkelId: string | null = null;
+    private readonly _locoAnim = new LocomotionAnimator();
+    /** The pose captured when the engine took the rig (restored on Stop / unbind), and the joints' fallback pose. */
+    private _locoRest: { skelId: string; pose: import('../../renderer/3d/skeleton-animator').SkeletonPose } | null = null;
+    /** Runtime-only gait clips (default Walk / Run) for a user Player that has none — NEVER written to the skeleton,
+     *  so they can't reach a saved document. */
+    private _locoRuntimeClips: SkeletonAnimClip[] = [];
+    /** True while the current engine binding is the automatic default gait (cleared on Stop). */
+    private _locoDefaultGait = false;
+    /** Name of the synthetic "rest pose" idle used when a rig has no idle clip. */
+    private static readonly LOCO_REST_CLIP = '__rest__';
+    // 1D blend tree config (§8): when set, its walk/run speeds tune the animator's walk ⇄ run blend points.
     private _locoBlend: LocomotionBlendConfig | null = null;
-    private _locoBlendPhase = 0;
-    private _locoBlendBind: import('../../renderer/3d/skeleton-animator').SkeletonPose | null = null;
     // Layered overlay (§8): a masked clip (wave/aim) driving only its region's joints OVER the blended locomotion.
     // `_playerOverlayRef` is the raw request (clip ref + region); `_playerOverlay` is it resolved against the bound
     // avatar's skeleton (clip NAME + joint-index mask). Overlay has its own looping phase.
     private _playerOverlayRef: { clip: string; region: RegionMask; mode?: 'replace' | 'additive'; weight?: number } | null = null;
     private _playerOverlay: { clipName: string; mask: number[]; mode: 'replace' | 'additive'; weight: number } | null = null;
     private _overlayPhase = 0;
+
+    /** Play mode: does the Play locomotion own this skeleton's pose (the engine animator's rig, or the Player's rig
+     *  under a host clip handler)? The procedural idle yields to it (an idle left ON from the character panel otherwise
+     *  re-posed the Player after every tick: it slid around breathing, no walk cycle). */
+    private _isSkeletonPlayDriven(skelId: string): boolean {
+        if (!this._playing) return false;
+        if (skelId === this._locoEngineSkelId) return true;
+        return !!this._playerClips && !!this._playerAnimHandler && skelId === this._playerSkeletonId();
+    }
 
     /** The skeleton id driving the bound Player avatar (a SkinnedMesh3D's skeleton), or null. */
     private _playerSkeletonId(): string | null {
@@ -1905,12 +2646,15 @@ export class Scene3DManager {
     /** Bind the Play-mode locomotion slots to Animation Library entries (or clip names/ids already on the
      *  avatar). Pass null to clear. Resolves + applies from the library on demand, then self-wires a
      *  crossfading playback handler. Persisted with the player binding. */
-    setPlayerLocomotionSet3D(set: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null): void {
+    setPlayerLocomotionSet3D(set: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string; jumps?: string[] } | null): void {
+        // `jumps` (2026-10-03): two or more jump clips / library entries; each jump picks one (jump variety).
+        const jumps = Array.isArray(set?.jumps) ? set!.jumps.filter((j) => typeof j === 'string' && !!j) : null;
         this._locoSet = set ? { ...set } : null;
+        if (this._locoSet) { delete this._locoSet.jumps; if (jumps && jumps.length) this._locoSet.jumps = jumps; }
         this._applyLocomotionSet();
     }
-    getPlayerLocomotionSet3D(): { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null {
-        return this._locoSet ? { ...this._locoSet } : null;
+    getPlayerLocomotionSet3D(): { idle?: string; walk?: string; run?: string; jump?: string; fall?: string; jumps?: string[] } | null {
+        return this._locoSet ? { ...this._locoSet, ...(this._locoSet.jumps ? { jumps: [...this._locoSet.jumps] } : {}) } : null;
     }
 
     /** Resolve the locomotion set against the bound avatar's skeleton (applying library entries as needed) and
@@ -1919,38 +2663,267 @@ export class Scene3DManager {
         const set = this._locoSet;
         const skelId = this._playerSkeletonId();
         if (!set || !skelId) return;
-        // Resolve a slot value (library entry id OR existing clip id/name) → a clip NAME present on the skeleton.
+        // Resolve a slot value (library entry id OR existing clip id/name) → a clip NAME present on the skeleton. Last, a
+        // RUNTIME default clip name (2026-10-03: e.g. { walk: 'Stomp' }) — generated for this rig, never written to it.
+        const runtime: SkeletonAnimClip[] = [];
         const resolve = (v?: string): string | undefined => {
             if (!v) return undefined;
             const existing = this.getSkeletonClips3D(skelId).find((c) => c.id === v || c.name === v);
             if (existing) return existing.name;
             const newId = this.applyLibraryEntry3D(v, skelId);   // maybe a library entry → instantiate it
             if (newId) return this.getSkeletonClips3D(skelId).find((c) => c.id === newId)?.name;
+            if (DEFAULT_LOCOMOTION_CLIP_NAMES.includes(v)) {
+                const skel = this.getSkeleton(skelId);
+                if (skel && !runtime.length) runtime.push(...buildLocomotionClips(skel.data.joints, { armClearance: this._playArmClearance(skel), variation: this._locoCharacterSeed(skelId) }));
+                if (runtime.some((c) => c.name === v)) return v;
+            }
             return undefined;
         };
+        // Jump variety for an authored set (2026-10-03): `jumps` = two or more jump clips, one picked per jump.
+        const jumps = (set.jumps ?? []).map((j) => resolve(j)).filter((n): n is string => !!n);
         const clips: LocomotionClips = {
             idle: resolve(set.idle) ?? '', walk: resolve(set.walk) ?? '',
-            run: resolve(set.run), jump: resolve(set.jump), fall: resolve(set.fall),
+            run: resolve(set.run), jump: resolve(set.jump) ?? jumps[0], fall: resolve(set.fall),
+            ...(jumps.length >= 2 ? { jumps } : {}),
         };
         if (!clips.idle || !clips.walk) return;   // idle + walk are required by the locomotion picker
-        this._locoCurrentClip = '';
-        this.setPlayerAnimation3D(clips, (clipName) => this._playLocomotionClip(skelId, clipName));
+        this._bindEngineLocomotion(skelId, clips);
+        this._locoRuntimeClips = runtime;   // the runtime clips the set named (none = []); _locoClip looks them up
     }
 
-    /** Crossfade the avatar into a locomotion clip by name (the engine handler for the locomotion set). */
-    private _playLocomotionClip(skelId: string, clipName: string): void {
-        if (clipName === this._locoCurrentClip) return;
-        const clip = this.getSkeletonClips3D(skelId).find((c) => c.name === clipName);
-        if (!clip) return;
-        const from = this._locoCurrentClip ? this.snapshotSkeletonPose3D(skelId) : null;
-        this._locoPlayer?.destroy();
-        const player = from
-            ? this.playSkeletonClipBlended(skelId, clip, from, Scene3DManager.LOCO_BLEND_FRAMES)
-            : this.playSkeletonClip(skelId, clip);
-        player.loop = true;
-        this._locoPlayer = player;
-        this._locoCurrentClip = clipName;
-        player.play();
+    /** Hand the avatar's skeleton to the engine locomotion animator with these clip names. Captures the rest pose
+     *  (the rig's pose right now) the first time this skeleton is taken. */
+    private _bindEngineLocomotion(skelId: string, clips: LocomotionClips): void {
+        // The auto player's default clips live on its RUNTIME skeleton (never saved): refit them to its body + outfit.
+        if (this.autoPlayer.isRuntimeNode(skelId)) this._refitAutoPlayerClips(skelId);
+        this.setPlayerAnimation3D(clips, () => { /* engine-driven: the animator plays the clips (_driveLocomotionAnimator) */ });
+        this._locoEngineSkelId = skelId;
+        this._locoRuntimeGait = false;   // the default-gait / auto-player binders set it after
+        // Seeded per CHARACTER (its body id): the jump-variant sequence and the secondary motion's per-cycle variation.
+        const seed = seedFromString(this._locoCharacterSeed(skelId));
+        this._locoAnim.cfg.jumpSeed = seed;
+        this._locoSecondary.reset(seed);
+        this._locoAnim.reset();
+        this._locoIdleVariants = []; this._locoIdleNames = []; this._idleFace = null;   // the default-gait binders add them
+        if (this._locoRest?.skelId !== skelId) {
+            this._restoreLocoRest();
+            const pose = this.snapshotSkeletonPose3D(skelId);
+            this._locoRest = pose ? { skelId, pose } : null;
+        }
+    }
+
+    // ── Idle variety (Play polish 2026-10-04; default-idle-variants.ts) ──────────────────────────────────────────
+    /** Runtime idle-variant clips for the bound rig (never written to the skeleton) and their names. Only over the
+     *  runtime Stand idle: an authored Idle clip (or a host / locomotion-set binding) plays as authored. */
+    private _locoIdleVariants: SkeletonAnimClip[] = [];
+    private _locoIdleNames: string[] = [];
+    /** The variant whose face events are being fired, and the last frame fired. */
+    private _idleFace: { clip: string; frame: number } | null = null;
+    /** Build the idle variants for an engine-bound rig whose idle is the runtime Stand (fitted to the body's arm
+     *  clearance; Adjust Glasses only when it wears a glasses charm). */
+    private _bindIdleVariants(skelId: string): void {
+        this._locoIdleVariants = []; this._locoIdleNames = [];
+        const skel = this.getSkeleton(skelId);
+        if (!skel || this._playerClips?.idle !== LOCOMOTION_CLIP.idle) return;
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skelId);
+        let glasses = false;
+        try { glasses = !!body && this.listAttachments(body.id).some((a) => GLASSES_CHARMS.includes(a.type)); } catch { glasses = false; }
+        this._locoIdleVariants = buildIdleVariantClips(skel.data.joints, { armClearance: this._playArmClearance(skel), glasses });
+        this._locoIdleNames = this._locoIdleVariants.map((c) => c.name);
+    }
+    /** Fire the playing idle variant's face events (gaze / blink / face-kit expression) between the last tick and now. */
+    private _fireIdleFace(skelId: string): void {
+        const iv = this._locoAnim.idleVariant;
+        if (!iv) {
+            // A variant cancelled mid-way: put the eyes / expression back.
+            if (this._idleFace && this._idleFace.frame >= 0) { const skel = this.getSkeleton(skelId); if (skel) this._clipFaceEvent(skel, { frame: 0, restore: true }); }
+            this._idleFace = null; return;
+        }
+        const clip = this._locoIdleVariants.find((c) => c.name === iv.clip);
+        if (!clip?.faceTrack?.length) { this._idleFace = { clip: iv.clip, frame: -1 }; return; }
+        const f = clip.startFrame + iv.phase * (clip.endFrame - clip.startFrame);
+        const prev = this._idleFace && this._idleFace.clip === iv.clip ? this._idleFace.frame : -1;
+        const skel = this.getSkeleton(skelId);
+        if (skel) for (const ev of clip.faceTrack) if (ev.frame > prev && ev.frame <= f) this._clipFaceEvent(skel, ev);
+        this._idleFace = { clip: iv.clip, frame: f };
+    }
+
+    // ── Landing dust (Play polish 2026-10-04; src/game/landing-dust.ts + play-dust-driver.ts) ─────────────────────
+    /** The Play dust: puffs on landings, running footstep puffs, splashes when wet. Holds no memory while idle. */
+    private readonly _playDust = new PlayDustDriver(0x5a17d057);
+    /** How wet the ground is right now (0..1: the city's rain / wet sheen) — ShapeManager wires it to the world.
+     *  null = always dry. */
+    playWetness: (() => number) | null = null;
+    /** Diagnostics / tests: the dust driver (bursts by kind, live particles). */
+    get playDust(): PlayDustDriver { return this._playDust; }
+    /** Diagnostics (ShapeManager.getPlayPolishStats3D): dust bursts by kind + live particles; idle variants played. */
+    getPlayPolishStats3D(): { dust: Record<string, number>; dustLive: number; idleVariants: string[]; idleVariant: string | null } {
+        return {
+            dust: { ...this._playDust.emitted }, dustLive: this._playDust.system.count,
+            idleVariants: [...this._locoAnim.idleVariantHistory], idleVariant: this._locoAnim.idleVariant?.clip ?? null,
+        };
+    }
+    private _dustEnvCache: DustEnvironment | null = null;
+    private get _dustEnv(): DustEnvironment {
+        return this._dustEnvCache ??= {
+            groundColor: (x, y, z) => {
+                // The surface under the burst: a short down ray over the ground candidates; its material's base colour.
+                const up = Math.max(0.05, this._playerHeight * 0.2 || 0.3);
+                const hit = this._picker.raycastWorld([x, y + up, z] as unknown as vec3, [0, -1, 0] as unknown as vec3, this._groundCandidates(x, z), true, up * 3, true);
+                const d = hit?.mesh?.material?.diffuse;
+                return d ? [d.r, d.g, d.b] : null;
+            },
+            lighting: (x, y, z): DustLighting => {
+                const r = this.renderer3D, cam = r.getCamera();
+                const amb = r.ambientConfig as { color?: number[]; intensity?: number } | undefined;
+                const sun = r.lightConfig as { direction?: number[]; color?: number[]; intensity?: number } | undefined;
+                const fog = r.fogConfig as Partial<FogConfig> | undefined;
+                const dir = sun?.direction ?? [0, -1, 0];
+                const dl = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+                return {
+                    ambient: amb?.color ?? [0.17, 0.17, 0.17], ambientIntensity: amb?.intensity ?? 1,
+                    sun: sun?.color ?? [1, 1, 1], sunIntensity: sun?.intensity ?? 1, sunElevation: Math.max(0, -dir[1] / dl),
+                    fogMode: fog?.mode ?? 'off', fogColor: fog?.color ?? [0, 0, 0], fogNear: fog?.near ?? 0, fogFar: fog?.far ?? 1, fogDensity: fog?.density ?? 0,
+                    distance: Math.hypot(x - cam.position[0], y - cam.position[1], z - cam.position[2]),
+                };
+            },
+            visible: (x, y, z, footstep) => {
+                const cam = this.renderer3D.getCamera();
+                const d = Math.hypot(x - cam.position[0], y - cam.position[1], z - cam.position[2]);
+                // Sim LOD: nothing past the fog-horizon edge (the same edge that freezes the simulated crowd).
+                if (this.simLod.enabled && d > this.renderer3D.simFogEdge) return false;
+                // Too small to see: a footstep puff past ~40 m, a landing ring past ~120 m (at the avatar's scale).
+                const s = Math.max(1e-6, (this._playerHeight || 1.7) / 1.7);
+                return d < (footstep ? 40 : 120) * s;
+            },
+        };
+    }
+    /** Per fixed Play tick: let the dust driver decide on bursts (cheap edge checks; the environment is only queried
+     *  when a burst is emitted). */
+    private _tickPlayDust(cc: CharacterController, loco: LocomotionState): void {
+        const on = this.playSettings.landingDust;
+        const anim = this._locoEngineSkelId ? this._locoAnim : null;
+        const hasLand = !!anim && !!this._playerClips?.land;
+        const h = this._playerHeight > 0 ? this._playerHeight : cc.cfg.eyeHeight / 0.94;
+        let wet = 0;
+        if (on) { try { wet = this.playWetness?.() ?? 0; } catch { wet = 0; } }
+        try {
+            this._playDust.tick({
+                enabled: on, feet: cc.pos, facing: cc.facing, vx: cc.vel[0], vz: cc.vel[2], grounded: cc.grounded,
+                landImpact: loco.landImpact ?? 0,
+                landCount: hasLand ? anim!.landCount : undefined, lastLanding: hasLand ? anim!.lastLanding : null,
+                gaitPhase: anim ? anim.gaitPhase : undefined, moveWeight: anim ? anim.weights.move : undefined, runMix: anim ? anim.runMix : undefined,
+                sneaking: !!loco.sneaking, scale: h / 1.7, wet,
+            }, this._dustEnv);
+        } catch { /* a cosmetic effect never breaks the Play tick */ }
+    }
+
+    /** The per-character seed string for a rig: the auto player's fixed seed, else its procedural body's id, else the
+     *  skeleton id (gait personality, jump-variant sequence, secondary motion). */
+    private _locoCharacterSeed(skelId: string): string {
+        if (this.autoPlayer.isRuntimeNode(skelId)) return 'auto-player:' + AUTO_PLAYER_SEED;
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skelId);
+        return body?.id ?? skelId;
+    }
+
+    /** Put the engine-driven rig back in the pose it had when the engine took it (Stop / avatar swap). */
+    private _restoreLocoRest(): void {
+        const r = this._locoRest;
+        this._locoRest = null;
+        if (!r) return;
+        const skel = this.getSkeleton(r.skelId);
+        if (!skel) return;
+        writePoseToSkeleton(r.pose, skel);
+        skel.computeWorldMatrices();
+        this._keepSpringsAlive(r.skelId);
+        this.ctx.scheduleRender();
+    }
+
+    /** Arm clearance (deg) for the default Play clips of a procedural body (item 13): the arm-clearance fit of the
+     *  RELAXED stance on this body (resolveArmClearance) + room for its top's bulk (playArmClearance). 0 for a skeleton
+     *  without a procedural body or when the fit fails. Cached per body + top (the fit skins the body a few dozen times). */
+    private _playArmClearanceCache = new Map<string, { key: string; verts: Float32Array; top: Float32Array | null; deg: number }>();
+    private _playArmClearance(skel: Skeleton3D): number {
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skel.id) as SkinnedMesh3D | undefined;
+        if (!body?.geometry || !body.jointIndices || !body.jointWeights) return 0;
+        // The top (if any) joins the fit: sleeves / bare forearms against its torso panel (a bulky jacket).
+        const topId = this._character.getClothingMeshId(body.id, 'top');
+        const top = topId ? this.getMesh(topId) as SkinnedMesh3D | null : null;
+        const topGeo = top instanceof SkinnedMesh3D && top.geometry && top.jointIndices && top.jointWeights ? top : null;
+        const key = `${skel.skinningMethod}:${topGeo ? topGeo.geometry!.vertices.length : 0}`;
+        const hit = this._playArmClearanceCache.get(body.id);
+        if (hit && hit.key === key && hit.verts === body.geometry.vertices && hit.top === (topGeo?.geometry?.vertices ?? null)) return hit.deg;
+        const joints = skel.data.joints;
+        const m: SkinnedMeshData = {
+            vertices: body.geometry.vertices, stride: 12, posOffset: 0, indices: body.geometry.indices,
+            jointIndices: body.jointIndices, jointWeights: body.jointWeights, jointNames: joints.map(j => j.name),
+            jointParents: Int16Array.from(joints.map(j => j.parentIndex)),
+            jointLocalPositions: Float32Array.from(joints.flatMap(j => [j.localPosition[0], j.localPosition[1], j.localPosition[2]])),
+            inverseBindMatrices: Float32Array.from(joints.flatMap(j => Array.from(j.inverseBindMatrix))),
+        };
+        const relaxed = relaxedStance();
+        const rot = new Map(joints.map(j => [j.name, [...(relaxed[j.name] ?? [0, 0, 0, 1])] as [number, number, number, number]]));
+        let deg = 0;
+        const outfit = topGeo ? withGarments(m, [{ vertices: topGeo.geometry!.vertices, indices: topGeo.geometry!.indices, jointIndices: topGeo.jointIndices!, jointWeights: topGeo.jointWeights! }]) : m;
+        try { deg = playArmClearance(resolveArmClearance(outfit, rot, skel.skinningMethod)); } catch { deg = 0; }
+        this._playArmClearanceCache.set(body.id, { key, verts: body.geometry.vertices, top: topGeo?.geometry?.vertices ?? null, deg });
+        return deg;
+    }
+
+    /** Re-install the auto player's default locomotion clips fitted to its body + outfit (its skeleton is runtime-only,
+     *  so this never reaches a document). */
+    private _refitAutoPlayerClips(skelId: string): void {
+        const skel = this.getSkeleton(skelId);
+        if (!skel) return;
+        const clips = (skel.data.clips ??= []);
+        for (const c of buildLocomotionClips(skel.data.joints, { armClearance: this._playArmClearance(skel), variation: this._locoCharacterSeed(skelId) })) {
+            if (!DEFAULT_LOCOMOTION_CLIP_NAMES.includes(c.name)) continue;
+            const i = clips.findIndex((k) => k.name === c.name);
+            if (i >= 0) clips[i] = c; else clips.push(c);
+        }
+    }
+
+    /** A user Player with no locomotion set and no host handler gets the DEFAULT gait: its own "Walk"/"Run" clips if it
+     *  has them, else runtime-generated ones (default-locomotion.ts, never saved; their arms fitted to this body +
+     *  outfit), idling on its own "Idle" clip, else the runtime "Stand" (item 13: was the stock torso-only "Breathe"),
+     *  else "Breathe", else the rest pose. No-op for a rig the gait can't drive (non-humanoid). */
+    private _bindDefaultGait(skelId: string): void {
+        const skel = this.getSkeleton(skelId);
+        if (!skel) return;
+        const own = this.getSkeletonClips3D(skelId);
+        const has = (n: string) => own.some((c) => c.name === n);
+        const runtime = buildLocomotionClips(skel.data.joints, { armClearance: this._playArmClearance(skel), variation: this._locoCharacterSeed(skelId) }).filter((c) => !has(c.name));
+        const avail = (n: string) => has(n) || runtime.some((c) => c.name === n);
+        if (!avail('Walk')) return;
+        this._locoRuntimeClips = runtime;
+        const idle = has('Idle') ? 'Idle' : avail(LOCOMOTION_CLIP.idle) ? LOCOMOTION_CLIP.idle : has('Breathe') ? 'Breathe' : Scene3DManager.LOCO_REST_CLIP;
+        const opt = (n: string) => (avail(n) ? n : undefined);
+        // Jump VARIETY only when the Jump is the runtime one (an own "Jump" clip plays as authored, every jump); the
+        // STROLL only under a runtime Walk (it would not match an authored walk's stride).
+        const ownWalk = has('Walk'), ownJump = has('Jump');
+        const jumps = ownJump ? undefined : JUMP_VARIANT_CLIPS.filter((n) => runtime.some((c) => c.name === n));
+        this._bindEngineLocomotion(skelId, {
+            idle, walk: 'Walk', run: opt('Run'), sneak: opt('Sneak'), crouch: opt('Crouch'), jump: opt('Jump'), fall: opt('Fall'), land: opt('Land'),
+            ...(jumps && jumps.length >= 2 ? { jumps } : {}), ...(!ownWalk && avail('Stroll') ? { stroll: 'Stroll' } : {}),
+            // The JOG (2026-10-04) only under the runtime Run (it is matched to that run's stride and phase).
+            ...(!has('Run') && avail('Jog') ? { jog: 'Jog' } : {}),
+        });
+        this._locoDefaultGait = true;
+        this._locoRuntimeGait = !ownWalk;
+        // Idle variety (2026-10-04) only over the RUNTIME Stand: an authored Idle (or an own Stand) plays as authored.
+        if (idle === LOCOMOTION_CLIP.idle && !has(LOCOMOTION_CLIP.idle)) this._bindIdleVariants(skelId);
+    }
+
+    /** A clip by name for the engine locomotion: the skeleton's own, then the runtime gait, then the synthetic rest. */
+    private _locoClip(skelId: string, name: string): SkeletonAnimClip | null {
+        const own = this.getSkeletonClips3D(skelId).find((c) => c.name === name);
+        if (own) return own;
+        const rt = this._locoRuntimeClips.find((c) => c.name === name);
+        if (rt) return rt;
+        const iv = this._locoIdleVariants.length ? this._locoIdleVariants.find((c) => c.name === name) : undefined;
+        if (iv) return iv;
+        if (name === Scene3DManager.LOCO_REST_CLIP) return { id: name, name, startFrame: 0, endFrame: 24, fps: 24, tracks: [] };
+        return null;
     }
 
     /** Enable/disable the 1D locomotion blend tree (continuous idle↔walk↔run mix by speed, §8) for the bound
@@ -1962,8 +2935,6 @@ export class Scene3DManager {
         this._locoBlend = cfg === true
             ? { ...base }
             : { walkSpeed: cfg.walkSpeed ?? base.walkSpeed, runSpeed: cfg.runSpeed ?? base.runSpeed };
-        this._locoBlendPhase = 0;
-        this._locoBlendBind = null;
     }
     getPlayerLocomotionBlend3D(): LocomotionBlendConfig | null { return this._locoBlend ? { ...this._locoBlend } : null; }
 
@@ -2090,42 +3061,80 @@ export class Scene3DManager {
         return `data:${blob.type || 'image/png'};base64,${btoa(bin)}`;
     }
 
-    /** Per-tick continuous grounded locomotion: mix the two clips bracketing planarSpeed and write the blended pose.
-     *  Returns true if it drove the skeleton (so the caller skips the discrete driver). No-op unless a blend tree +
-     *  locomotion set are active, the state is grounded, and idle+walk resolve on the skeleton. */
-    private _driveLocomotionBlend(skelId: string, loco: LocomotionState, dt: number): boolean {
-        if (!this._locoBlend || !this._locoSet || loco.airborne) return false;
-        const clips = this._playerClips;
-        if (!clips || !clips.idle || !clips.walk) return false;
-        const stops = locomotionBlendStops(clips, this._locoBlend);
-        const { a, b, t } = resolveBlend1D(stops, loco.planarSpeed);
-        const all = this.getSkeletonClips3D(skelId);
-        const clipA = all.find(c => c.name === a);
-        if (!clipA) return false;
-        const clipB = (b !== a) ? (all.find(c => c.name === b) ?? null) : null;
-        // Stop any discrete locomotion player so it doesn't fight our per-tick writes; the blend now owns the rig.
-        if (this._locoPlayer) { this._locoPlayer.destroy(); this._locoPlayer = null; this._locoCurrentClip = ''; }
-        if (!this._locoBlendBind) this._locoBlendBind = this.snapshotSkeletonPose3D(skelId);
-        const bind = this._locoBlendBind;
-        if (!bind) return false;
-        const secs = (c: typeof clipA) => Math.max((c.endFrame - c.startFrame) / Math.max(c.fps, 1), 1 / 60);
-        const durA = secs(clipA);
-        const durB = clipB ? secs(clipB) : durA;
-        const blendedDur = durA + (durB - durA) * t;                 // speed-adaptive cadence (run cycles faster)
-        this._locoBlendPhase = (this._locoBlendPhase + dt / Math.max(blendedDur, 1 / 60)) % 1;
-        const frameOf = (c: typeof clipA) => c.startFrame + this._locoBlendPhase * (c.endFrame - c.startFrame);
-        // Optional masked overlay (wave/aim), advanced on its OWN looping phase so it's independent of gait speed.
-        let overlay: { clip: typeof clipA; frame: number; mask: number[]; mode: 'replace' | 'additive'; weight: number; refFrame: number } | undefined;
-        if (this._playerOverlay) {
-            const ov = this._playerOverlay;
-            const oc = all.find(c => c.name === ov.clipName);
-            if (oc) {
-                this._overlayPhase = (this._overlayPhase + dt / Math.max(secs(oc), 1 / 60)) % 1;
-                overlay = { clip: oc, frame: oc.startFrame + this._overlayPhase * (oc.endFrame - oc.startFrame), mask: ov.mask, mode: ov.mode, weight: ov.weight, refFrame: oc.startFrame };
+    /** Per-tick engine locomotion: advance the state machine, sample each weighted clip against the rest pose, blend,
+     *  add the additive layers (landing) and the procedural lean / head lead, layer any masked overlay, write the pose.
+     *  `loco` carries REAL world speeds (Round 8): the animator's blend points are the controller's gait speeds and its
+     *  stride matching uses each clip's own ground speed scaled by the avatar's size. */
+    private _driveLocomotionAnimator(skelId: string, loco: LocomotionState, dt: number, cc: CharacterController): void {
+        // Walk style (2026-10-03): 'stomp' swaps the RUNTIME default Walk for the Stomp clip (never an authored walk).
+        const clips = this._playerClips && this._locoRuntimeGait
+            ? applyWalkStyle(this._playerClips, this.playSettings.walkStyle, (n) => !!this._locoClip(skelId, n))
+            : this._playerClips;
+        const skel = this.getSkeleton(skelId);
+        if (!clips || !skel) return;
+        if (!this._locoRest || this._locoRest.skelId !== skelId) {
+            const pose = this.snapshotSkeletonPose3D(skelId);
+            if (!pose) return;
+            this._locoRest = { skelId, pose };
+        }
+        const rest = this._locoRest.pose;
+        const b = this._locoBlend, mpu = this.getPlayMetresPerUnit3D();
+        const ac = this._locoAnim.cfg;
+        // Blend points: a setPlayerLocomotionBlend3D override (m/s) or the controller's own walk / run speeds.
+        ac.walkSpeed = b ? b.walkSpeed / mpu : cc.walkTopSpeed();
+        ac.runSpeed = b ? Math.max(b.runSpeed, b.walkSpeed + 0.01) / mpu : Math.max(cc.cfg.moveSpeed, ac.walkSpeed + 1e-3);
+        // Stride matching: a clip with a ground speed (the runtime default gaits) is planted for groundSpeed × the rig's
+        // world scale; any other clip for the blend point it stands for.
+        const rigScale = Math.abs(this._playerMesh?.scaleY ?? 1) || 1;
+        const clipSpeed = (name: string | undefined) => { const c = name ? this._locoClip(skelId, name) : null; return c?.groundSpeed ? c.groundSpeed * rigScale : null; };
+        ac.walkClipSpeed = clipSpeed(clips.walk); ac.runClipSpeed = clipSpeed(clips.run);
+        ac.sneakClipSpeed = clipSpeed(clips.sneak) ?? cc.cfg.sneakSpeed;
+        ac.jumpTakeoff = (clips.jump ? this._locoClip(skelId, clips.jump)?.takeoffPhase : 0) ?? 0;   // the default Jump's wind-up part
+        ac.jumpVariety = this.playSettings.jumpVariety;
+        ac.strollClipSpeed = clipSpeed(clips.stroll);
+        ac.jogClipSpeed = clipSpeed(clips.jog);
+        const secs = (c: SkeletonAnimClip) => Math.max((c.endFrame - c.startFrame) / Math.max(c.fps, 1), 1 / 60);
+        // Idle variety (2026-10-04): the runtime idle variants over the runtime Stand, gated by the Play setting.
+        ac.idleVariety = this.playSettings.idleVariety;
+        const animClips = this._locoIdleNames.length ? { ...clips, idles: this._locoIdleNames } : clips;
+        // `info` = each clip's take-off phase + jump-variant weights (the runtime jumps carry them; authored clips don't).
+        const layers = this._locoAnim.update(dt, loco, animClips, (n) => { const c = this._locoClip(skelId, n); return c ? secs(c) : 0; }, (n) => this._locoClip(skelId, n));
+        if (this._locoIdleNames.length) this._fireIdleFace(skelId);
+        let pose = composeLocomotionPose(layers, (n) => this._locoClip(skelId, n), rest);
+        // Procedural lean into acceleration / turns + the head leading a turn (the engine's own humanoid rigs only —
+        // their joints are identity at rest, so a parent-frame axis turn means what it says).
+        if (this._locoProcedural) {
+            const names = skel.data.joints.map((j) => j.name);
+            const lean = this._locoLean.update(dt, cc.vel[0] * mpu, cc.vel[2] * mpu, cc.facing, cc.cfg.moveSpeed * mpu, cc.grounded, cc.turnRemaining());
+            applyLocomotionLean(names, pose, lean);
+            // Secondary motion (gait feel 2026-10-03) over the RUNTIME default gaits only: follow-through, per-cycle arm
+            // variation, head drift, scaled by the Play setting "motion looseness" (0 = the clips exactly).
+            if (this._locoRuntimeGait) {
+                this._locoSecondary.cfg.looseness = this.playSettings.getMotionLooseness();
+                if (this._locoSecondary.cfg.looseness > 0) applyLocomotionSecondary(names, pose, this._locoSecondary.update(dt, secondaryInputFor(this._locoAnim, this._locoLean.accel, cc.grounded)));
             }
         }
-        this._animation.applyBlendedClips(skelId, clipA, frameOf(clipA), clipB, clipB ? frameOf(clipB) : 0, t, bind, overlay);
-        return true;
+        // Optional masked overlay (wave/aim), advanced on its OWN looping phase so it's independent of gait speed.
+        const ov = this._playerOverlay;
+        if (ov) {
+            const oc = this._locoClip(skelId, ov.clipName);
+            if (oc) {
+                this._overlayPhase = (this._overlayPhase + dt / secs(oc)) % 1;
+                const oPose = sampleClipPose(oc, rest, oc.startFrame + this._overlayPhase * (oc.endFrame - oc.startFrame));
+                pose = ov.mode === 'additive'
+                    ? addPoseMasked(pose, oPose, sampleClipPose(oc, rest, oc.startFrame), ov.weight, ov.mask)
+                    : overlayPoseMasked(pose, oPose, ov.mask);
+            }
+        }
+        writePoseToSkeleton(pose, skel);
+        this._keepSpringsAlive(skelId);
+        this.ctx.scheduleRender();
+    }
+
+    /** True while the engine drives one of its OWN humanoid rigs (the auto default player / the default gait), whose
+     *  joint rest rotations are identity — the procedural lean is only applied there. */
+    private get _locoProcedural(): boolean {
+        return this._locoDefaultGait || this._isAutoPlayerMesh(this._playerMesh);
     }
 
     /** Set the Play-mode trigger volumes (scene zones that fire enter/exit as the player walks through). */
@@ -2170,13 +3179,25 @@ export class Scene3DManager {
      *  on exit and saves normally then. */
     isPlayModeActive(): boolean { return this._playLoop !== null; }
 
-    enterPlayMode3D(opts?: {
+    enterPlayMode3D(opts?: { start?: [number, number, number]; config?: Partial<CharacterConfig>; keyboard?: boolean; mouseLook?: boolean; collision?: boolean; playerMeshId?: string; gamepad?: boolean }): void {
+        if (this._playing) return;
+        try { this._enterPlayMode3D(opts); this._beginPlayOutlines(); }
+        catch (e) {
+            // bug-hunt 2026-10-01: a throw part-way (locomotion bind, library apply, …) left the WASD keydown
+            // preventDefault + canvas pointer-lock listeners live in the EDITOR (exit no-op'd: _playing was still
+            // false) and the editor suspended. Unwind whatever was set up, then rethrow.
+            if (!this._playing) { this._playing = true; try { this.exitPlayMode3D(); } catch { /* best effort */ } }
+            throw e;
+        }
+    }
+    private _enterPlayMode3D(opts?: {
         start?: [number, number, number];
         config?: Partial<CharacterConfig>;
         keyboard?: boolean;
         mouseLook?: boolean;
         collision?: boolean;
         playerMeshId?: string;
+        gamepad?: boolean;
     }): void {
         if (this._playing) return;
         // Play owns the camera — it's mutually exclusive with cut-preview and manual look-through (all three drive
@@ -2186,39 +3207,77 @@ export class Scene3DManager {
         const cam = this.renderer3D.getCamera();
         this._prePlayCam = { pos: [cam.position[0], cam.position[1], cam.position[2]], target: [cam.target[0], cam.target[1], cam.target[2]], mode: (cam.mode === 'orthographic' ? 'orthographic' : 'perspective') };
         this._prePlayXforms = this._snapshotTransforms();
+        // Stop's _applyViewState restores the free3D vantage from _viewState.freeCam (overriding _prePlayCam), and that
+        // is only captured on a mode switch / save — so Stop jumped to a stale pose or reframed (bug-hunt 2026-10-01).
+        if (this._viewState.cameraMode === 'free3D' && !this._inCameraSubMode()) this._captureCurrentPose();
         // Bind the "Player" avatar (if any): the controller drives its transform each tick, and its spawn defaults to
         // wherever the avatar sits in the scene. See setPlayerObject3D.
         const playerId = opts?.playerMeshId ?? this._playerMeshId;
         this._playerMesh = playerId ? (this.getAllMeshes().find(m => m.id === playerId) ?? null) : null;
-        this._playerMeshId = this._playerMesh ? playerId! : null;
+        // NOT written back to _playerMeshId (bug-hunt 2026-10-01): a Player still restoring async (GLB / character) or a
+        // one-off opts.playerMeshId used to wipe / replace the PERSISTED binding, and the next save dropped player.meshId.
         // Measure the bound avatar so the camera frames THIS body (not a hardcoded ~1.7-unit human) and so a
         // non-feet origin is driven at the right height. Spawn the FEET at the avatar's bbox bottom, not its
         // origin — a center-origin avatar would otherwise drop by half its height on the first gravity tick.
-        if (this._playerMesh) this._measureBoundAvatar(this._playerMesh); else { this._playerHeight = 0; this._playerFootToOrigin = 0; }
+        if (this._playerMesh) this._measureBoundAvatar(this._playerMesh); else { this._playerHeight = 0; this._playerFootToOrigin = 0; this._playerPartIds.clear(); }
         const start = opts?.start ?? (this._playerMesh
             ? [this._playerMesh.x, this._playerMesh.y - this._playerFootToOrigin, this._playerMesh.z] as [number, number, number]
             : [cam.position[0], 0, cam.position[2]]);
-        const controller = new CharacterController(opts?.config, start);
+        // Controller config = the play settings (first-person eye height, T5.1) overridden by the host's own config.
+        this._playOptsConfig = opts?.config ? { ...opts.config } : undefined;
+        const explicitCfg = this._explicitPlayConfig();
+        // Scale-correct defaults (metres → world units; move speed from the settings) under the explicit overrides.
+        const controller = new CharacterController({ ...this._playScaleConfig(), ...explicitCfg }, start);
         this._playController = controller;
-        this._applyAvatarCameraFraming(controller, opts?.config);
+        this._applyAvatarCameraFraming(controller, explicitCfg);
         this._playInput = { forward: 0, right: 0, look: 0, jump: false };
         // Collision against real scene geometry (opt-out → flat fallback plane). Ground = downward ray per tick;
         // walls = horizontal ray along the move. An XZ broadphase grid (built now over the static mesh set) means
         // each cast only tests nearby meshes, so it scales to a street-sized city. BVHs still build lazily per mesh
         // on first contact — but only for meshes the character actually approaches.
+        // Heading: camera AND body start along the avatar's authored facing (it faces +Z at rest, so rotationY is its
+        // heading), else along the edit camera's view, so Play doesn't spin the view / the character on enter.
+        {
+            const third = controller.cfg.cameraMode === 'third';
+            const heading = this._playerMesh ? this._playerMesh.rotationY
+                : Math.atan2(cam.target[0] - cam.position[0], cam.target[2] - cam.position[2]);
+            controller.setHeading(Number.isFinite(heading) ? heading : 0, third ? -0.3 : 0);
+        }
+        controller.running = this._playRunning;
+        controller.sneaking = false;
         if (opts?.collision !== false) {
             this._buildCollisionGrid();
-            controller.groundSampler = (x, z) => this._picker.sampleGroundHeight(x, z, this._groundCandidates(x, z));
+            // Ground = the STANDABLE surface under the feet (collision-math sampleStandableGround): the ray starts at
+            // feet + stepHeight (nothing higher is ever ground: an awning / canopy / bridge deck / bench overhead or
+            // ahead is not the floor) and a step UP needs headroom (no foliage-card / low-beam cascades).
+            controller.groundSampler = (x, z) => {
+                const skips = this._picker.bvhSkips;
+                const g = sampleStandableGround(this._rayCaster(this._groundCandidates(x, z)), x, z,
+                    controller.pos[1], controller.cfg.stepHeight, controller.cfg.eyeHeight);
+                // P10.D: a mesh under the feet was skipped by the BVH-build budget this frame (a freshly streamed tile)
+                // → hold the current height for this frame instead of falling.
+                return g === null && this._picker.bvhSkips !== skips ? controller.pos[1] : g;
+            };
             controller.moveResolver = (fx, fz, tx, tz, r) => this._resolveWallMove(controller, fx, fz, tx, tz, r);
+            // Spawned from the camera (no Player, no explicit start): stand on the first surface under the camera with
+            // room to stand (never inside / on top of a canopy's inner cards), instead of at y = 0.
+            if (!opts?.start && !this._playerMesh) {
+                const g = findStandableGround(this._rayCaster(this._groundCandidates(start[0], start[2]), false), start[0], start[2], cam.position[1], controller.cfg.eyeHeight);
+                if (g !== null) { controller.teleport([start[0], g, start[2]]); controller.grounded = true; }
+            }
         }
-        this._camEye = null; this._camLastMs = 0;   // third-person follow smoothing starts fresh (first frame snaps)
+        this._tpCam.reset(); this._camLastMs = 0;   // third-person follow smoothing starts fresh (first frame snaps)
+        this._lookAccumYaw = 0; this._lookAccumPitch = 0;
         this._locoDriver.reset();                    // first tick emits the initial locomotion clip (idle)
         this._triggerSystem.reset();                 // enter events fire fresh from the spawn position
         this._lastInteract = false;                  // don't fire a stale "use" on the first tick
         // Built-in WASD keyboard unless the host opts out (to feed its own input via setPlayInput3D).
-        if (opts?.keyboard !== false) { this._keyboard = new KeyboardInput(); this._keyboard.attach(); }
+        if (opts?.keyboard !== false) { this._keyboard = new KeyboardInput({ sneakKeys: true }); this._keyboard.attach(); this._lockPlayKeys(true); }
         // Built-in pointer-lock mouse-look unless opted out — click the canvas to capture the pointer.
         if (opts?.mouseLook !== false) { this._mouseLook = new MouseLook(); this._mouseLook.attach(this.ctx.webgpuRenderer.getCanvas() as unknown as Element | null); }
+        // Built-in gamepad unless opted out (left stick move, right stick orbit, A jump, X use, L3 / Y walk-run).
+        if (opts?.gamepad !== false) { this._gamepad = new GamepadInput(); this._padReading = null; this._padRunToggles = 0; this._padSneakToggles = 0; }
+        this._playSneakToggle = false; this._playSneaking = false; this._locoLean.reset(); this._locoSecondary.reset(); this._playDust.reset();
         // Player avatar visibility: in first-person you're INSIDE the body (hide it, so it doesn't fill the view);
         // in third-person you follow it (keep it shown). Restored on exit.
         if (this._playerMesh) {
@@ -2226,39 +3285,69 @@ export class Scene3DManager {
             this._playerMesh.visible = controller.cfg.cameraMode === 'third';
             this._drivePlayerMesh(controller);
         }
-        // Now the avatar (and its skeleton) is bound — resolve any locomotion set against it.
-        this._locoCurrentClip = '';
-        this._locoBlendPhase = 0; this._locoBlendBind = null;   // blend tree starts fresh (bind recaptured at rest)
+        // Now the avatar (and its skeleton) is bound — resolve any locomotion set against it; a user Player with no
+        // set and no host handler gets the default gait (runtime clips, never saved).
         this._overlayPhase = 0; this._resolvePlayerOverlay();   // resolve any masked overlay against the bound avatar
         this._applyLocomotionSet();
+        {
+            const skelId = this._playerSkeletonId();
+            if (skelId && !this._locoEngineSkelId && !this._playerAnimHandler && this._playerMesh && !this._isAutoPlayerMesh(this._playerMesh)) this._bindDefaultGait(skelId);
+        }
+        // Auto default player (T5.2): third-person with no Player → spawn the runtime default character (async the
+        // first time; cached after). Never touches the persisted player binding.
+        if (PlayAutoPlayer.shouldSpawn({ enabled: this.playSettings.autoDefaultPlayer, cameraMode: controller.cfg.cameraMode, hasPlayer: this._playerMesh !== null })) {
+            void this._spawnAutoPlayer(controller);
+        }
         cam.mode = 'perspective';
+        this._prePlayFov = cam.fov;
+        this._applyPlayFov(controller);
         this._flyController?.disable();                         // Play owns input now (fly re-applies on exit)
         this.disableOrbitControls();                            // the controller owns the camera now
+        // Round 8: editor input + overlays off for the run (keyboard shortcuts, 2D pointer, hover pick / outline,
+        // click-select + gizmo drag, selection / gizmo / bone / snap / frustum overlays). Restored on Stop.
+        this._setEditorSuspended(true);
         this._playLoop = new GameLoop();
         this._playLoop.start(
             (dt) => {
                 const cc = this._playController; if (!cc) return;
-                // Merge keyboard (WASD/turn/jump) with mouse-look (yaw/pitch deltas) and any host-fed intent.
-                const base = this._keyboard ? this._keyboard.read() : { ...this._playInput };
-                if (this._mouseLook) {
-                    const d = this._mouseLook.consume();
-                    base.lookYaw = (base.lookYaw ?? 0) + d.yaw;
-                    base.lookPitch = (base.lookPitch ?? 0) + d.pitch;
+                // Merge keyboard (WASD/turn/jump) + gamepad (left stick / A / X) or the host-fed intent. Mouse / right
+                // stick / host look deltas are applied per RENDER frame (crisp at any refresh rate), not here.
+                // readTick (not read): a Space TAP that went down AND up between two ticks still jumps (item 13).
+                const base: CharacterInput = this._keyboard ? this._keyboard.readTick() : { ...this._playInput };
+                base.lookYaw = 0; base.lookPitch = 0;
+                const pad = this._padReading;
+                if (pad?.active) {
+                    const f = base.forward + pad.forward, r = base.right + pad.right;
+                    base.forward = Math.max(-1, Math.min(1, f)); base.right = Math.max(-1, Math.min(1, r));
+                    base.jump = base.jump || pad.jump;
+                    base.interact = (base.interact ?? false) || pad.interact;
                 }
+                // Walk / run toggle: Shift (a press, not a hold) or L3 / Y on a pad.
+                const toggles = (this._keyboard ? this._keyboard.takePress('ShiftLeft', 'ShiftRight') : 0) + this._padRunToggles;
+                this._padRunToggles = 0;
+                if (toggles % 2 === 1) this._setRunning(cc, !cc.running);
+                // Sneak (Round 8): Ctrl held, or C / pad B toggled.
+                const sneakToggles = (this._keyboard ? this._keyboard.takePress('KeyC') : 0) + this._padSneakToggles;
+                this._padSneakToggles = 0;
+                if (sneakToggles % 2 === 1) this._playSneakToggle = !this._playSneakToggle;
+                this._setSneaking(cc, this._playSneakToggle || (this._keyboard?.ctrlHeld() ?? false));
+                this._collisionCellsTick(cc);   // step 3: collision cells around the player (validate / request / gather)
                 cc.update(dt, base);
+                // For scripts' ctx.input: the look applied at render rate since the previous tick.
+                base.lookYaw = this._lookAccumYaw; base.lookPitch = this._lookAccumPitch;
+                this._lookAccumYaw = 0; this._lookAccumPitch = 0;
                 const loco = cc.locomotion();
-                // Avatar locomotion animation. With a blend tree active + grounded, drive a CONTINUOUS idle↔walk↔run
-                // mix each tick (§8); otherwise (or airborne) emit a discrete clip name on transitions only.
-                if (this._playerClips && this._playerAnimHandler) {
-                    const skelId = this._locoBlend ? this._playerSkeletonId() : null;
-                    const blended = skelId ? this._driveLocomotionBlend(skelId, loco, dt) : false;
-                    if (blended) {
-                        this._locoDriver.reset();   // so re-entering discrete (e.g. jump) re-emits the airborne clip
-                    } else {
-                        const clip = this._locoDriver.update(loco, this._playerClips);
-                        if (clip) this._playerAnimHandler(clip);
-                    }
+                const animLoco = this._locoForAnim(cc, loco);   // speed at the default move speed → thresholds follow
+                // Avatar locomotion animation. Engine-driven rigs run the LocomotionAnimator state machine every tick
+                // (crossfaded idle ⇄ walk ⇄ run, jump / fall); a host-owned handler gets a clip NAME on transitions.
+                if (this._locoEngineSkelId) {
+                    this._driveLocomotionAnimator(this._locoEngineSkelId, loco, dt, cc);
+                } else if (this._playerClips && this._playerAnimHandler) {
+                    const clip = this._locoDriver.update(animLoco, this._playerClips);
+                    if (clip) this._playerAnimHandler(clip);
                 }
+                // Landing dust (2026-10-04): landing puffs / running footstep puffs / wet splashes (no-op while idle).
+                this._tickPlayDust(cc, loco);
                 // Publish player movement as UI-machine variables (player.speed/moving/… — §4.3); the handler
                 // (wired by ShapeManager) writes them into the active UI layer, change-gated. No-op with no UI.
                 this._playerParamHandler?.(loco);
@@ -2275,16 +3364,41 @@ export class Scene3DManager {
                 this._lastPlayBase = base;
                 this._scriptRunner?.tick(dt);
             },
-            () => {
+            (alpha) => {
                 const cc = this._playController; if (!cc) return;
-                if (this._playerMesh) this._drivePlayerMesh(cc);
+                const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+                const rdt = this._camLastMs ? Math.min(0.1, (now - this._camLastMs) / 1000) : 0;
+                this._camLastMs = now;
+                // Look at render rate: pointer-lock mouse + right stick + host-fed deltas (consumed once).
+                let ly = 0, lp = 0;
+                if (this._mouseLook) { const d = this._mouseLook.consume(); ly += d.yaw; lp += d.pitch; }
+                if (this._gamepad) {
+                    const pad = this._gamepad.poll();
+                    this._padReading = pad;
+                    this._padRunToggles += pad.runToggle;
+                    this._padSneakToggles += pad.sneakToggle;
+                    if (pad.active) { ly += pad.lookX * Scene3DManager.PAD_YAW_RATE * rdt; lp += pad.lookY * Scene3DManager.PAD_PITCH_RATE * rdt; }
+                }
+                // Host-fed look deltas (setPlayInput3D lookYaw / lookPitch) are consumed ONCE, alongside any built-in input.
+                ly += this._playInput.lookYaw ?? 0; lp += this._playInput.lookPitch ?? 0;
+                this._playInput.lookYaw = 0; this._playInput.lookPitch = 0;
+                if (ly !== 0 || lp !== 0) { cc.applyLook(ly, lp); this._lookAccumYaw += ly; this._lookAccumPitch += lp; }
+                // Draw between the last two fixed steps (no stutter when the display rate ≠ the 60 Hz sim).
+                const feet = cc.renderPos(alpha);
+                this._lastPlayerFeet = [feet[0], feet[1], feet[2]];   // visual-polish #16 (the player's contact blob)
+                if (this._playerMesh) this._drivePlayerMesh(cc, feet, cc.renderFacing(alpha));
                 let eye: [number, number, number], tgt: [number, number, number];
                 if (cc.cfg.cameraMode === 'third') {
-                    [eye, tgt] = this._thirdPersonCamera(cc);
+                    [eye, tgt] = this._thirdPersonCamera(cc, feet, rdt);
                 } else {
-                    eye = cc.cameraEye(); tgt = cc.cameraTarget();   // first-person is rigid to the head (no smoothing)
+                    // First-person is rigid to the head (no smoothing).
+                    const f = cc.forwardDir();
+                    eye = [feet[0], feet[1] + cc.cfg.eyeHeight, feet[2]];
+                    tgt = [eye[0] + f[0], eye[1] + f[1], eye[2] + f[2]];
                 }
                 cam.lookAt(eye[0], eye[1], eye[2], tgt[0], tgt[1], tgt[2]);
+                this._updatePlayerLight(cc, feet, eye);   // visual-polish #7c (no-op while the light is off)
+                this._playDust.frame(rdt, this.renderer3D);   // landing dust: advance + (un)register (nothing when idle)
                 this.ctx.scheduleRender();
             },
         );
@@ -2299,38 +3413,69 @@ export class Scene3DManager {
             this._scriptRunner.start();
         }
         this._playing = true;
+        // Fog horizon (2026-10-01): the renderer fog-culls / fades skinned characters; never the player (the camera
+        // would lose it), whatever the fog's Far.
+        const fr3 = this.ctx.webgpuRenderer?.getRenderer3D?.();
+        if (fr3) fr3.fogCullExempt = (m) => this._playing && this._isPlayerPart(m);
         this.onPlayStateChanged.emit();
     }
 
     /** Exit Play mode: stop the loop, restore the pre-play camera + scene transforms + re-apply the edit view. */
     exitPlayMode3D(): void {
         if (!this._playing) return;
+        this._endPlayOutlines();   // the runtime Play character outlines off (item 10)
         this._playLoop?.stop();
         this._playLoop = null;
         // Script Behaviors: drop instances; restore anything ctx.destroy() hid this run (Play is non-destructive).
         this._scriptRunner?.stop();
         this._scriptRunner = null;
-        for (const id of this._scriptHidden) { const m = this.getMesh(id); if (m) m.visible = true; }
+        for (const [id, wasVisible] of this._scriptHidden) { const m = this.getMesh(id); if (m) m.visible = wasVisible; }   // not "true": an editor-hidden mesh stays hidden
         this._scriptHidden.clear();
         this._playController = null;
         this._keyboard?.detach();
+        if (this._keyboard) this._lockPlayKeys(false);
         this._keyboard = null;
         this._mouseLook?.detach();
         this._mouseLook = null;
+        this._gamepad = null; this._padReading = null; this._padRunToggles = 0; this._padSneakToggles = 0;
+        if (this._playSneaking) { this._playSneaking = false; this.onPlayerSneakChanged.emit(false); }
+        this._playSneakToggle = false;
         this._playing = false;
-        this._locoPlayer?.destroy(); this._locoPlayer = null; this._locoCurrentClip = '';
+        const fr3 = this.ctx.webgpuRenderer?.getRenderer3D?.();
+        if (fr3) fr3.fogCullExempt = null;   // fog horizon: the player exemption ends with Play
+        this.renderer3D.setPinnedPointLights([]);   // visual-polish #7c: the player light ends with Play
+        this._playDust.detach(this.renderer3D);     // landing dust: drop the particles + the renderer registration
+        this._locoIdleVariants = []; this._locoIdleNames = []; this._idleFace = null;
+        this._releaseAutoPlayer();                            // auto default player out of the scene (kept cached)
+        this._playOptsConfig = undefined;
+        this._restoreLocoRest();                                // the engine-driven rig back to its pre-play pose
+        if (this._locoDefaultGait) { this.setPlayerAnimation3D(null, null); this._locoRuntimeClips = []; }   // runtime-only binding
         if (this._playerMesh) { this._playerMesh.visible = this._playerPrevVisible; this._playerMesh = null; }
-        this._collisionGrid = null; this._collisionMeshes = null; this._camEye = null;
+        this._collisionGrid = null; this._collisionMeshes = null; this._collSnap = null; this._collisionHood = null; this._collisionSet = null; this._collCells?.clear(); this._collCells = null; this._tpCam.reset(); this._playerPartIds.clear();
         if (this._prePlayXforms) { this._restoreTransforms(this._prePlayXforms); this._prePlayXforms = null; }
+        this._candMeshes.length = 0;   // the picker scratch held refs to (possibly disposed) meshes after Stop
         const cam = this.renderer3D.getCamera();
+        if (this._prePlayFov !== null) { cam.fov = this._prePlayFov; this._prePlayFov = null; }
         if (this._prePlayCam) {
             const p = this._prePlayCam;
             cam.mode = p.mode;
             cam.lookAt(p.pos[0], p.pos[1], p.pos[2], p.target[0], p.target[1], p.target[2]);
             this._prePlayCam = null;
         }
+        this._setEditorSuspended(false);
         this._applyViewState();                                 // land back in the edit view (free3D orbit etc.)
+        if (this._viewChangedInPlay) { this._viewChangedInPlay = false; void this._refreshArtboardTexture(); }   // a mode/target switch deferred during Play
         this.onPlayStateChanged.emit();
+        this.ctx.scheduleRender();
+    }
+
+    /** Suspend (Play enter) / resume (Stop) the editor's input + overlays: the InteractionService playActive flag gates
+     *  every 2D key / pointer path and the editor overlay draws; the armature's hover pick, joint picking and the
+     *  transform controller read isPlaying. The hover outline is cleared (no per-frame silhouette pass). */
+    private _setEditorSuspended(on: boolean): void {
+        const is = this.ctx.interactionService as { playActive?: boolean } | undefined;
+        if (is) is.playActive = on;
+        if (on) { try { this.setHoveredMesh(null); } catch { /* no armature yet */ } }
         this.ctx.scheduleRender();
     }
 
@@ -2366,7 +3511,7 @@ export class Scene3DManager {
      *  destroy hides the node and is restored on Stop (non-destructive Play). */
     private _buildScriptAdapter(): ScriptSceneAdapter {
         return {
-            playerId: () => this._playerMeshId,
+            playerId: () => this._playerMesh?.id ?? this.autoPlayer.meshId,   // the auto default player counts as the player
             getPos: (id) => { const m = this.getMesh(id); return m ? [m.x, m.y, m.z] : null; },
             setPos: (id, x, y, z) => { this.getMesh(id)?.setPosition3D(x, y, z); this.ctx.scheduleRender(); },
             getYaw: (id) => this.getMesh(id)?.rotationY ?? 0,
@@ -2380,7 +3525,7 @@ export class Scene3DManager {
                 return { id: hit.mesh.id, point: hit.hitPoint };
             },
             spawn: () => null,   // v1: real prefab spawn is a later phase
-            destroy: (id) => { const m = this.getMesh(id); if (m) { m.visible = false; this._scriptHidden.add(id); this.ctx.scheduleRender(); } },
+            destroy: (id) => { const m = this.getMesh(id); if (m) { if (!this._scriptHidden.has(id)) this._scriptHidden.set(id, m.visible); m.visible = false; this.ctx.scheduleRender(); } },
             getVar: (name) => this._scriptVarBridge?.get(name) ?? null,
             setVar: (name, v) => { this._scriptVarBridge?.set(name, v); },
             input: () => this._scriptInputSnapshot(),
@@ -2396,8 +3541,14 @@ export class Scene3DManager {
     setPlayerObject3D(meshId: string | null): void {
         this._playerMeshId = meshId;
         if (!this._playing) return;
-        // Re-bind live: restore the old avatar's visibility, adopt the new one.
+        // Re-bind live: restore the old avatar's visibility, adopt the new one. (The auto default player is simply
+        // released — a user-set Player always replaces it.)
+        if (this._isAutoPlayerMesh(this._playerMesh)) this._releaseAutoPlayer();
         if (this._playerMesh) { this._playerMesh.visible = this._playerPrevVisible; this._playerMesh = null; }
+        // Release the old rig from the engine locomotion (back to its pre-play pose; a runtime default gait is dropped).
+        this._restoreLocoRest();
+        if (this._locoDefaultGait) { this.setPlayerAnimation3D(null, null); this._locoRuntimeClips = []; }
+        this._locoEngineSkelId = null;
         const m = meshId ? (this.getAllMeshes().find(x => x.id === meshId) ?? null) : null;
         this._playerMesh = m;
         if (m && this._playController) {
@@ -2406,21 +3557,43 @@ export class Scene3DManager {
             // Re-measure + re-frame for the new avatar, and snap the controller feet to its base so the camera and
             // the driven mesh stay consistent (a mid-play swap otherwise keeps the previous avatar's framing).
             this._measureBoundAvatar(m);
-            this._applyAvatarCameraFraming(this._playController);
-            this._playController.pos = [m.x, m.y - this._playerFootToOrigin, m.z];
+            // The broadphase was built without the OLD Player; rebuild it so the new one (all its parts) is excluded.
+            if (this._collisionOn()) this._buildCollisionGrid();
+            this._applyAvatarCameraFraming(this._playController, this._explicitPlayConfig());
+            this._playController.teleport([m.x, m.y - this._playerFootToOrigin, m.z]);
+            this._playController.setHeading(m.rotationY, this._playController.pitch);
             this._drivePlayerMesh(this._playController);
-        } else { this._playerHeight = 0; this._playerFootToOrigin = 0; }
+            this._tpCam.reset();
+            // Re-resolve the avatar's animation against the new rig.
+            this._resolvePlayerOverlay();
+            this._applyLocomotionSet();
+            const skelId = this._playerSkeletonId();
+            if (skelId && !this._locoEngineSkelId && !this._playerAnimHandler) this._bindDefaultGait(skelId);
+        } else {
+            this._playerHeight = 0; this._playerFootToOrigin = 0; this._playerPartIds.clear();
+            if (this._collisionOn()) this._buildCollisionGrid();   // the old Player is now an ordinary obstacle
+            // Cleared mid-play in third-person → the auto default player takes over (if enabled).
+            const cc = this._playController;
+            if (cc && PlayAutoPlayer.shouldSpawn({ enabled: this.playSettings.autoDefaultPlayer, cameraMode: cc.cfg.cameraMode, hasPlayer: false })) void this._spawnAutoPlayer(cc);
+        }
     }
     get playerObjectId3D(): string | null { return this._playerMeshId; }
+    /** The Play character's FEET position (world space) while Play runs, else null. A streamed tiled city centres its
+     *  active tile window on it (performance-plan P10.D). */
+    getPlayerFeet3D(): [number, number, number] | null {
+        const cc = this._playing ? this._playController : null;
+        return cc ? [cc.pos[0], cc.pos[1], cc.pos[2]] : null;
+    }
 
     /** Place the bound Player mesh at the controller's feet, facing its yaw (TRS — localMatrix is derived). Keeps the
      *  avatar's authored scale + pitch/roll; only position and yaw are driven. cc.pos is the FEET; _playerFootToOrigin
      *  lifts the mesh origin back to its authored height above the feet (0 for a feet-origin avatar), so a
      *  center-origin avatar isn't half-buried. */
-    private _drivePlayerMesh(cc: CharacterController): void {
+    private _drivePlayerMesh(cc: CharacterController, feet: [number, number, number] = cc.pos, facing: number = cc.facing): void {
         const m = this._playerMesh; if (!m) return;
-        m.setRotation3D(m.rotationX, cc.yaw, m.rotation);
-        m.setPosition3D(cc.pos[0], cc.pos[1] + this._playerFootToOrigin, cc.pos[2]);   // last → single localMatrix rebuild with the new yaw
+        // The BODY facing (turns toward the move direction in third-person), never the camera yaw.
+        m.setRotation3D(m.rotationX, facing, m.rotation);
+        m.setPosition3D(feet[0], feet[1] + this._playerFootToOrigin, feet[2]);   // last → single localMatrix rebuild with the new yaw
     }
 
     /** Measure the bound player mesh's world bounding box so Play can frame THIS avatar. Sets _playerHeight (world
@@ -2429,6 +3602,10 @@ export class Scene3DManager {
      *  want at Play-enter (authored standing height); they don't track live skeletal deformation. */
     private _measureBoundAvatar(m: Mesh3D): void {
         this._playerHeight = 0; this._playerFootToOrigin = 0;
+        this._collectPlayerParts(m);
+        // Fresh bounds: a body regenerated in place (the height / proportion sliders swap its geometry) kept the OLD
+        // box until its next transform change, so the first Play after a height edit framed and lifted the old size.
+        m.calculateBoundingBox();
         const c = m.obbCorners;
         if (!c || c.length === 0) return;
         let minY = Infinity, maxY = -Infinity;
@@ -2448,53 +3625,324 @@ export class Scene3DManager {
         if (H <= 0) return;
         const eye = explicit?.eyeHeight ?? H * 0.9;
         cc.cfg.eyeHeight = eye;
-        if (explicit?.thirdPersonHeight === undefined) cc.cfg.thirdPersonHeight = H * 0.6 - eye;
-        if (explicit?.thirdPersonDistance === undefined) cc.cfg.thirdPersonDistance = Math.max(1, H * 2.2);
+        // R6.2: a SHOULDER-height pivot (0.8·H) and a further follow distance (2.6·H ≈ 4.4 m for a 1.7 m body), which
+        // with the wider 72° FOV frames the whole character with room around it, like a released third-person game.
+        // The collision min distance / ray radius / padding scale with H too (avatarCameraFraming): metre values in a
+        // city put a giant user Player's pulled-in camera 3 cm behind its shoulder pivot, i.e. inside its head. The
+        // camera never comes closer than the min distance (ThirdPersonCamera), so even a short metre camera-distance
+        // setting keeps it outside the body.
+        const f = avatarCameraFraming(H, eye, DEFAULT_CHARACTER);
+        if (explicit?.thirdPersonHeight === undefined) cc.cfg.thirdPersonHeight = f.thirdPersonHeight;
+        if (explicit?.thirdPersonDistance === undefined) cc.cfg.thirdPersonDistance = f.thirdPersonDistance;
+        if (explicit?.cameraMinDistance === undefined) cc.cfg.cameraMinDistance = f.cameraMinDistance;
+        if (explicit?.cameraCollisionRadius === undefined) cc.cfg.cameraCollisionRadius = f.cameraCollisionRadius;
+        if (explicit?.cameraCollisionPadding === undefined) cc.cfg.cameraCollisionPadding = f.cameraCollisionPadding;
+        if (explicit?.cameraShoulderOffset === undefined) cc.cfg.cameraShoulderOffset = f.cameraShoulderOffset;   // visual-polish #7a
+        // Character scale (2026-10-04): the collision CAPSULE follows the avatar's size too (radius + step height × H /
+        // 1.7 m). It stayed at the metre defaults, so a 2× giant walked half into walls and a doll stopped 35 cm short.
+        // A 1.7 m avatar (a fitted city character) gets exactly the defaults. Speeds stay in metres per second (the
+        // gait's cadence follows the size instead: LocomotionAnimator scaleRateClamp).
+        if (Scene3DManager.avatarScaledCapsule) {
+            const cap = avatarCollisionScale(H, DEFAULT_CHARACTER);
+            if (explicit?.radius === undefined) cc.cfg.radius = cap.radius;
+            if (explicit?.stepHeight === undefined) cc.cfg.stepHeight = cap.stepHeight;
+        }
+    }
+    /** A/B (character scale 2026-10-04): false = the Play capsule keeps the metre defaults whatever the avatar's size. */
+    static avatarScaledCapsule = true;
+    /** A/B (character scale 2026-10-04): false = a body-param edit (height / legs) grows the body about its hips (the
+     *  feet sink / float) instead of keeping the soles where they were. */
+    static bodyEditKeepsFeet = true;
+    /** A/B (character scale 2026-10-04): false = a new city character's ORIGIN (its hips) sits on the spawn floor point
+     *  (its feet buried below the street) instead of its soles. Same for the live ghost preview. */
+    static citySpawnFeetOnFloor = true;
+
+    /** Third-person camera (R6.2): the ThirdPersonCamera rig — crisp orbit, lagged shoulder pivot with look-ahead, and a
+     *  sphere-cast pull-in that eases back out. `feet` is the render-interpolated feet position; `dt` the render dt.
+     *  Returns [eye, lookTarget]. */
+    private _thirdPersonCamera(cc: CharacterController, feet: [number, number, number], dt: number): [[number, number, number], [number, number, number]] {
+        const pivot = cc.orbitPivot(feet);
+        const reach = cc.cfg.thirdPersonDistance + cc.cfg.cameraCollisionRadius + cc.cfg.cameraCollisionPadding;
+        // P9: the grid query + copy is the FALLBACK list for rays the collision hood cannot answer — built on first
+        // use only (most frames every camera ray is inside the hood). Scene3DManager.lazyCameraCandidates = false:
+        // built every frame as before (A/B).
+        let cand: Mesh3D[] | null = null;
+        const candidates = (): Mesh3D[] => cand ??= this._regionCandidates(pivot[0] - reach, pivot[2] - reach, pivot[0] + reach, pivot[2] + reach).slice();
+        const caster = cc.cfg.cameraCollision
+            ? this._rayCaster(Scene3DManager.lazyCameraCandidates ? candidates : candidates(), /*bvhBudget*/ true)
+            : null;
+        const r = this._tpCam.update(dt, { pivot, velX: cc.vel[0], velZ: cc.vel[2], yaw: cc.yaw, pitch: cc.pitch, airborne: !cc.grounded }, cc.cfg, caster);
+        return [r.eye, r.target];
     }
 
-    /** Third-person camera: eye behind the pivot, follow-smoothed (frame-rate independent) and pulled in when a wall
-     *  sits between it and the character. Returns [eye, lookTarget]. */
-    private _thirdPersonCamera(cc: CharacterController): [[number, number, number], [number, number, number]] {
-        const pivot = cc.orbitPivot();
-        const f = cc.forwardDir();
-        const dist = cc.cfg.thirdPersonDistance;
-        const desired: [number, number, number] = [pivot[0] - f[0] * dist, pivot[1] - f[1] * dist, pivot[2] - f[2] * dist];
-
-        // Follow smoothing: trail the desired eye. First frame (or rate ≤ 0) snaps.
-        const now = performance.now();
-        const dt = this._camLastMs ? Math.min(0.1, (now - this._camLastMs) / 1000) : 0;
-        this._camLastMs = now;
-        const rate = cc.cfg.cameraFollowRate;
-        let eye: [number, number, number] = this._camEye
-            ? [expSmooth(this._camEye[0], desired[0], rate, dt), expSmooth(this._camEye[1], desired[1], rate, dt), expSmooth(this._camEye[2], desired[2], rate, dt)]
-            : [desired[0], desired[1], desired[2]];
-
-        // Camera-vs-wall: pull the (smoothed) eye in so it never sits inside / through a wall this frame.
-        if (cc.cfg.cameraCollision) {
-            const dx = eye[0] - pivot[0], dy = eye[1] - pivot[1], dz = eye[2] - pivot[2];
-            const d = Math.hypot(dx, dy, dz);
-            if (d > 1e-4) {
-                const inv = 1 / d, rx = dx * inv, ry = dy * inv, rz = dz * inv;
-                const meshes = this._regionCandidates(pivot[0] - dist, pivot[2] - dist, pivot[0] + dist, pivot[2] + dist);
-                const hit = this._picker.raycastWorld([pivot[0], pivot[1], pivot[2]], [rx, ry, rz], meshes, true);
-                const clamped = clampCameraDistance(d, hit ? hit.distance : Infinity, cc.cfg.cameraCollisionPadding, cc.cfg.cameraMinDistance);
-                if (clamped < d) eye = [pivot[0] + rx * clamped, pivot[1] + ry * clamped, pivot[2] + rz * clamped];
+    /** A collision RayCaster over a fixed mesh set (the BVH picker; includes non-pickable city decoration). */
+    private _rayCaster(meshes: Mesh3D[] | (() => Mesh3D[]), bvhBudget = Scene3DManager.collisionBvhBudget): RayCaster {
+        return (origin, dir, maxDist) => {
+            // P6: a bounded ray inside the collision hood tests only the meshes near the character (same nearest hit);
+            // maxDist also lets the picker skip meshes whose box starts beyond reach. P9: `meshes` may be lazy.
+            const list = (Scene3DManager.collisionHood && this._collisionHood?.candidatesFor(origin, dir, maxDist)) || (typeof meshes === 'function' ? meshes() : meshes);
+            // Step 3: a ray inside a ready collision cell walks the cell's merged BVH (+ the old path over what the cell
+            // does not cover). Same nearest hit, distance and normal (collision-cells.ts).
+            const cells = Scene3DManager.STEP3.collisionCells ? this._collCells : null;
+            if (cells) {
+                const cell = cells.cellForRay(origin, dir, maxDist);
+                if (cell) {
+                    const r = this._cellRaycast(cell, origin, dir, maxDist, list as Mesh3D[], bvhBudget);
+                    if (r !== undefined) return r;
+                }
             }
+            // bvhBudget (P10.D): the camera bundle builds at most MeshPicker.bvhBuildBudgetMs of new BVHs per frame.
+            this._cellRayStats.old++;
+            const hit = this._picker.raycastWorld(origin as unknown as vec3, dir as unknown as vec3, list as Mesh3D[], true, maxDist, bvhBudget);
+            if (!hit || hit.distance > maxDist) return null;
+            return { distance: hit.distance, normal: hit.faceNormal };
+        };
+    }
+
+    // ── Step 3 collision cells (src/game/collision-cells.ts; Scene3DManager.STEP3.collisionCells) ──────────────────────
+    private _collCells: CollisionCellManager<Mesh3D> | null = null;
+    private _collCellsReach = 0;
+    /** The collision snapshot as a set (a cell member answers only while it is in the current snapshot). */
+    private _collisionSet: Set<Mesh3D> | null = null;
+    private readonly _cellScratch = newCellRayScratch();
+    /** Cell core size and margin, as multiples of the longest Play ray (the third-person camera reach). */
+    static COLLISION_CELL_CORE = 4;
+    static COLLISION_CELL_MARGIN = 1.5;
+    /** Main-thread gather budget per Play tick (ms). */
+    static COLLISION_CELL_GATHER_MS = 1.5;
+    /** Diagnostics: rays answered through a cell / by the old path, residual meshes tested, cell rays that fell back. */
+    private readonly _cellRayStats = { cell: 0, old: 0, residual: 0, fallback: 0 };
+
+    /** Per Play tick: (re)size the cells to the camera reach, then let the manager validate / request / gather. */
+    private _collisionCellsTick(cc: CharacterController): void {
+        if (!Scene3DManager.STEP3.collisionCells || !this._collisionOn()) { if (this._collCells) { this._collCells.clear(); this._collCells = null; } return; }
+        this._refreshCollisionGrid();
+        const reach = Math.max(1e-4, cc.cfg.thirdPersonDistance + cc.cfg.cameraCollisionRadius + cc.cfg.cameraCollisionPadding, cc.cfg.radius + cc.cfg.stepHeight);
+        if (!this._collCells || Math.abs(reach - this._collCellsReach) > 0.1 * this._collCellsReach) {
+            this._collCells?.clear();
+            this._collCellsReach = reach;
+            this._collCells = new CollisionCellManager<Mesh3D>({
+                region: (x0, z0, x1, z1) => this._regionCandidates(x0, z0, x1, z1),
+                staticGeometry: (m) => this._cellStaticGeometry(m),
+                same: (m, key, ver) => m.geometry === key && m.localMatrixVersion === ver && !m.gpuDirty && m.geometry.vertices.length > 0,
+                xzBox: (m) => { const b = this._meshXZBounds(m); return [b.minX, b.minZ, b.maxX, b.maxZ]; },
+                build: (soup) => buildCellBvhAsync(soup),
+                now: () => (typeof performance !== 'undefined' ? performance.now() : Date.now()),
+            }, { core: reach * Scene3DManager.COLLISION_CELL_CORE, margin: reach * Scene3DManager.COLLISION_CELL_MARGIN, gatherMs: Scene3DManager.COLLISION_CELL_GATHER_MS });
         }
-        this._camEye = eye;
-        return [eye, pivot];
+        this._collCells.update(cc.pos[0], cc.pos[2]);
+    }
+
+    /** A mesh is STATIC cell geometry when the per-mesh path would take its BVH branch with an identity matrix:
+     *  uploaded (not gpuDirty), not skinned, not a per-frame mover, indexed, and exactly the identity model matrix. */
+    private _cellStaticGeometry(m: Mesh3D): { vertices: Float32Array; indices: Uint32Array; key: object; ver: number; runBoxes?: unknown } | null {
+        if (m.gpuDirty || m.cheapBounds || m instanceof SkinnedMesh3D || m.arraySourceOnly) return null;
+        const g = m.geometry;
+        if (!g || !g.vertices || g.vertices.length === 0 || !g.indices || g.indices.length < 3) return null;
+        const mm = m.localMatrix as unknown as Float32Array;
+        if (mm[0] !== 1 || mm[5] !== 1 || mm[10] !== 1 || mm[15] !== 1 || mm[1] !== 0 || mm[2] !== 0 || mm[3] !== 0 || mm[4] !== 0
+            || mm[6] !== 0 || mm[7] !== 0 || mm[8] !== 0 || mm[9] !== 0 || mm[11] !== 0 || mm[12] !== 0 || mm[13] !== 0 || mm[14] !== 0) return null;
+        return { vertices: g.vertices, indices: g.indices, key: g, ver: m.localMatrixVersion, runBoxes: (g as { runBoxes?: unknown }).runBoxes };
+    }
+
+    /** One ray through a ready cell (collision-cells.ts cellRaycast): the cell BVH for the meshes it covers + the
+     *  per-mesh path for the rest of `list`, combined by the old rules. undefined = the caller takes the old path. */
+    private _cellRaycast(cell: CollisionCell<Mesh3D>, origin: [number, number, number], dir: [number, number, number], maxDist: number,
+        list: Mesh3D[], bvhBudget: boolean): { distance: number; normal: [number, number, number] } | null | undefined {
+        const pk = this._picker, set = this._collisionSet;
+        return cellRaycast(cell.cur!, origin, dir, maxDist, list, pk as unknown as CellRayPicker<Mesh3D>, bvhBudget,
+            (m) => m.visible && !pk.isDetached(m) && (!set || set.has(m)),
+            (m) => this._cellStaticGeometry(m) !== null,
+            () => this._collCells?.markStale(cell),
+            this._cellScratch, this._cellRayStats);
+    }
+
+    /** Play collision diagnostics: the cells (counts, builds, bytes, rays served / not), the rays answered through cells
+     *  vs the per-mesh path, the hood, the per-mesh BVHs built. Null outside Play. */
+    getCollisionStats3D(): { cells: unknown; rays: { cell: number; old: number; residual: number; fallback: number }; hood: unknown; meshBvhs: number; snapshot: number; snapshotSync?: unknown } | null {
+        if (!this._playing) return null;
+        return {
+            cells: this._collCells ? { ...this._collCells.stats, core: this._collCells.opts.core, margin: this._collCells.opts.margin } : null,
+            rays: { ...this._cellRayStats }, hood: this._collisionHood ? { ...this._collisionHood.stats } : null,
+            meshBvhs: this._picker.bvhCount(), snapshot: this._collSnap?.size ?? this._collisionMeshes?.length ?? 0,
+            ...(this._collSnap ? { snapshotSync: { ...this._collSnap.stats, cellSize: this._collSnap.cellSize, hoodKept: this._hoodKept } } : {}),
+        };
+    }
+
+    /** Right-stick orbit speed at full tilt (rad/s): yaw / pitch. */
+    private static readonly PAD_YAW_RATE = 3.2;
+    private static readonly PAD_PITCH_RATE = 2.0;
+
+    /** Set walk/run on the controller (and remember it for the next Play), firing onPlayerRunChanged on a change. */
+    private _setRunning(cc: CharacterController | null, running: boolean): void {
+        const changed = running !== this._playRunning || (cc !== null && cc.running !== running);
+        this._playRunning = running;
+        if (cc) cc.running = running;
+        if (changed) this.onPlayerRunChanged.emit(running);
+    }
+    /** Walk / run state (true = running). Shift (keyboard) or L3 / Y (gamepad) toggles it while playing. */
+    getPlayerRunning3D(): boolean { return this._playController ? this._playController.running : this._playRunning; }
+    /** Force walk (false) or run (true); applies live while playing and to the next Play. */
+    setPlayerRunning3D(running: boolean): void { this._setRunning(this._playController, !!running); }
+
+    /** Set the effective sneak on the controller, firing onPlayerSneakChanged on a change. */
+    private _setSneaking(cc: CharacterController | null, on: boolean): void {
+        if (cc) cc.sneaking = on;
+        if (on !== this._playSneaking) { this._playSneaking = on; this.onPlayerSneakChanged.emit(on); }
+    }
+    /** Sneak state while playing (Ctrl held, or C / pad B toggled). False when not playing. */
+    getPlayerSneaking3D(): boolean { return this._playing && this._playSneaking; }
+    /** Toggle-style sneak from the host (an on-screen button): true = sneak until set false / C / B. Ctrl still adds a
+     *  hold on top. No-op when not playing (sneak resets every run). */
+    setPlayerSneaking3D(on: boolean): void {
+        if (!this._playing) return;
+        this._playSneakToggle = !!on;
+        this._setSneaking(this._playController, this._playSneakToggle || (this._keyboard?.ctrlHeld() ?? false));
+    }
+    /** The active gait while playing ('walk' | 'run' | 'sneak'), else null. */
+    getPlayerGait3D(): 'walk' | 'run' | 'sneak' | null { return this._playController ? this._playController.gait() : null; }
+
+    /** Keyboard Lock (Chromium): while the page is FULLSCREEN, let Play receive Ctrl+W / Ctrl+S / … (browser shortcuts)
+     *  instead of the browser closing the tab mid-sneak. No effect outside fullscreen; harmless where unsupported. */
+    private _lockPlayKeys(on: boolean): void {
+        const kb = (typeof navigator !== 'undefined' ? (navigator as Navigator & { keyboard?: { lock?: (codes?: string[]) => Promise<void>; unlock?: () => void } }).keyboard : undefined);
+        try {
+            if (on) void kb?.lock?.(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyC', 'KeyQ', 'KeyE', 'KeyF', 'Space', 'ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'])?.catch?.(() => { /* not fullscreen / unsupported */ });
+            else kb?.unlock?.();
+        } catch { /* unsupported */ }
+    }
+
+    /** Apply the Play FOV: third-person = cfg.thirdPersonFovDeg; first-person = cfg.firstPersonFovDeg, or the camera's
+     *  pre-play FOV when that is null. */
+    private _applyPlayFov(cc: CharacterController): void {
+        const cam = this.renderer3D.getCamera();
+        const deg = cc.cfg.cameraMode === 'third' ? cc.cfg.thirdPersonFovDeg : cc.cfg.firstPersonFovDeg;
+        if (deg !== null && Number.isFinite(deg) && deg > 0) cam.fov = deg * Math.PI / 180;
+        else if (this._prePlayFov !== null) cam.fov = this._prePlayFov;
+    }
+
+    /** The live third-person camera numbers while playing (for a host HUD / debug), else null. */
+    getPlayCameraState3D(): { mode: 'first' | 'third'; distance: number; targetDistance: number; fovDeg: number; yaw: number; pitch: number; facing: number } | null {
+        const cc = this._playController;
+        if (!cc) return null;
+        const cam = this.renderer3D.getCamera();
+        return {
+            mode: cc.cfg.cameraMode, distance: this._tpCam.distance < 0 ? cc.cfg.thirdPersonDistance : this._tpCam.distance,
+            targetDistance: cc.cfg.thirdPersonDistance, fovDeg: cam.fov * 180 / Math.PI, yaw: cc.yaw, pitch: cc.pitch, facing: cc.facing,
+        };
+    }
+
+    /** The engine locomotion animator's live state (state / weights / walk-run mix), or null when the host owns playback. */
+    getPlayerAnimationState3D(): { state: string; weights: Record<string, number>; runMix: number; crouchMix: number; strollMix: number; jogMix: number; landWeight: number; speed: number; gait: 'walk' | 'run' | 'sneak' | null; lean: { pitch: number; roll: number; headYaw: number }; jumpClip: string | null; jumpCount: number } | null {
+        if (!this._locoEngineSkelId || !this._playing) return null;
+        const a = this._locoAnim, l = this._locoLean.output;
+        return {
+            state: a.state, weights: { ...a.weights }, runMix: a.runMix, crouchMix: a.crouchMix, strollMix: a.strollMix, jogMix: a.jogMix, landWeight: a.landWeight,
+            speed: a.smoothedSpeed, gait: this.getPlayerGait3D(), lean: { pitch: l.pitch, roll: l.roll, headYaw: l.headYaw },
+            jumpClip: a.jumpClip, jumpCount: a.jumpCount,
+        };
     }
 
     /** Build the collision broadphase: snapshot the static mesh set (minus the Player avatar — you don't collide
      *  with yourself) and index their world XZ footprints into a grid. Rebuilt each Play-enter; the scene is treated
      *  as static during Play (moving city traffic isn't re-indexed — a v1 limitation, see the spec). */
     private _buildCollisionGrid(): void {
-        const meshes = this.getAllMeshes().filter(m => m !== this._playerMesh);
-        const aabbs: XZBounds[] = meshes.map(m => this._meshXZBounds(m));
-        this._collisionMeshes = meshes;
-        this._collisionGrid = SpatialGridXZ.build(aabbs);
+        // Never the Player itself: body, hair, garments, face decal, charms (a user-set Player's parts too).
+        // P10.D: a streamed tile's merged static crowd (0.1-0.7 M triangles per layer, spanning the whole tile) is not
+        // collided with — every ground / camera ray near it built its BVH (seconds per tile entered). The centre city's
+        // crowd keeps its collision (unchanged); the live near crowd is lifted out of these layers anyway.
+        if (Scene3DManager.STEP3B.incrementalCollisionGrid) {
+            // Step 3b: the same broadphase, kept by CollisionSnapshot (same query answers; see _refreshCollisionGrid).
+            // (a survivor's footprint is re-read only when its matrix version, geometry or the global geometry epoch moved)
+            this._collSnap = new CollisionSnapshot<Mesh3D>({ include: (m) => this._isCollisionMesh(m), bounds: (m, out) => this._meshXZBoundsInto(m, out),
+                version: (m) => m.localMatrixVersion, source: (m) => m.geometry, geomVersion: (m) => m.geometryVersion,
+                // P16 snapshotMeshVersion: the per-mesh geometry version above replaces the global epoch (every new
+                // streamed mesh bumped it, so every sync on a tile change re-read all ~13 k footprints)
+                epoch: () => STREAM_HITCH.snapshotMeshVersion ? 0 : Mesh3D.geometryEpoch });
+            this._collSnap.rebuild(this.getAllMeshes());
+            this._collisionMeshes = null; this._collisionGrid = null;
+            this._collisionSet = this._collSnap.members;
+        } else {
+            this._collSnap = null;
+            const meshes = this.getAllMeshes().filter(m => this._isCollisionMesh(m));
+            const aabbs: XZBounds[] = meshes.map(m => this._meshXZBounds(m));
+            this._collisionMeshes = meshes;
+            this._collisionSet = new Set(meshes);
+            this._collisionGrid = SpatialGridXZ.build(aabbs);
+        }
+        this._collisionVer = this.ctx.sceneStructureVersion();
+        this._collisionAt = typeof performance !== 'undefined' ? performance.now() : 0;
+        this._newCollisionHood();
     }
+    /** A collision snapshot member: never the Player (body, hair, garments, face decal, charms), never an array
+     *  source-only phantom, and (collisionSkipTileCrowd) not a streamed tile's merged static crowd. */
+    private _isCollisionMesh(m: Mesh3D): boolean {
+        return !this._isPlayerPart(m) && !m.arraySourceOnly && !(Scene3DManager.collisionSkipTileCrowd && (m.name ?? '').startsWith('world:ped-')
+            && /^World Tile .* World Pedestrians$/.test((m.parent as { name?: string } | null)?.name ?? ''));
+    }
+    private _newCollisionHood(): void {
+        this._collisionHood = new CollisionHood<Mesh3D>({
+            region: (x0, z0, x1, z1) => this._regionCandidates(x0, z0, x1, z1),
+            touches: (m, b) => this._picker.meshMayTouchWorldBox(m, b[0], b[1], b[2], b[3], b[4], b[5]),
+            alwaysKeep: (m) => m.cheapBounds,   // city movers (traffic, walkers): the snapshot says nothing about them
+        });
+    }
+    /** Step 3b: the incremental collision snapshot (null = off / the legacy grid / collision off). */
+    private _collSnap: CollisionSnapshot<Mesh3D> | null = null;
+    /** Syncs that kept the hood's candidate list (no change near it). */
+    private _hoodKept = 0;
+    /** Collision is on (a broadphase exists: the legacy grid or the snapshot). */
+    private _collisionOn(): boolean { return !!(this._collisionGrid || this._collSnap); }
+    private _collisionVer = -1;
+    private _collisionAt = 0;
+    /** performance-plan P10.D: a streamed tiled city adds / removes tiles DURING Play — the snapshot then had no ground
+     *  under the new tiles (the player walked on the fallback plane) and kept the removed tiles' meshes alive. Rebuild
+     *  it when the scene structure changed, at most every COLLISION_REFRESH_MS. */
+    private _refreshCollisionGrid(): void {
+        if (!Scene3DManager.collisionFollowsStructure) return;
+        const v = this.ctx.sceneStructureVersion();
+        if (v === this._collisionVer) return;
+        const now = typeof performance !== 'undefined' ? performance.now() : 0;
+        if (now - this._collisionAt < Scene3DManager.COLLISION_REFRESH_MS) return;
+        const snap = this._collSnap;
+        if (!snap || !Scene3DManager.STEP3B.incrementalCollisionGrid) { this._buildCollisionGrid(); return; }
+        // Step 3b: only what attached / detached / moved since the last sync (same answers as a rebuild). The hood's
+        // short list is rebuilt only when a change lands in the cells its box covers (else it is still exactly what
+        // region() returns for that box).
+        const d = snap.sync(this.getAllMeshes());
+        this._collisionVer = v;
+        this._collisionAt = now;
+        const hb = this._collisionHood?.box;
+        if (d.rebuilt) this._newCollisionHood();
+        else if (hb && (d.added.length || d.removed.length || d.moved.length)) {
+            if (snap.touches(d, hb[0], hb[2], hb[3], hb[5])) this._collisionHood!.reset(); else this._hoodKept++;
+        }
+    }
+    /** P10.D A/B: false = the Play-enter collision snapshot only (the old behaviour). */
+    static collisionFollowsStructure = true;
+    /** P10.D A/B: false = streamed tiles' static crowd layers are collision geometry too. */
+    static collisionSkipTileCrowd = true;
+    /** P10.D A/B: every Play collision ray (ground / walls / camera) builds at most MeshPicker.bvhBuildBudgetMs of new
+     *  mesh BVHs per frame (false = only the camera bundle is budgeted). */
+    static collisionBvhBudget = true;
+    static COLLISION_REFRESH_MS = 500;
+    /** P6 A/B switch: false = every Play ray tests its full broadphase list (the pre-P6 path). */
+    static collisionHood = true;
+    /** P9 A/B switch: false = the third-person camera's fallback candidate list (grid query + copy) is built every
+     *  frame instead of on first use. */
+    static lazyCameraCandidates = true;
 
+    /** _meshXZBounds into [minX, minZ, maxX, maxZ] (no allocation; the collision snapshot's per-sync read). */
+    private _meshXZBoundsInto(m: Mesh3D, out: Float64Array): void {
+        const c = m.obbCorners;
+        if (!c || c.length === 0) { out[0] = m.x; out[1] = m.z; out[2] = m.x; out[3] = m.z; return; }
+        let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+        for (const p of c) {
+            if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+            if (p[2] < minZ) minZ = p[2]; if (p[2] > maxZ) maxZ = p[2];
+        }
+        out[0] = minX; out[1] = minZ; out[2] = maxX; out[3] = maxZ;
+    }
     /** World-space XZ AABB of a mesh from its OBB corners (falls back to a point at its origin if not yet computed). */
     private _meshXZBounds(m: Mesh3D): XZBounds {
         const c = m.obbCorners;
@@ -2509,16 +3957,49 @@ export class Scene3DManager {
 
     /** Meshes to test for the ground under (x,z) — grid candidates, or all meshes if no grid (fallback). */
     private _groundCandidates(x: number, z: number): Mesh3D[] {
-        if (!this._collisionGrid || !this._collisionMeshes) return this.getAllMeshes();
-        this._collisionGrid.queryPoint(x, z, this._candIdx);
+        if (!this._collisionOn()) return this._nonPlayerMeshes();
+        this._refreshCollisionGrid();
+        if (this._collSnap) return this._collSnap.queryPoint(x, z, this._candMeshes);   // step 3b
+        this._collisionGrid!.queryPoint(x, z, this._candIdx);
         return this._fillCandidates();
     }
 
     /** Meshes overlapping an XZ region — the wall-cast candidate set. */
     private _regionCandidates(minX: number, minZ: number, maxX: number, maxZ: number): Mesh3D[] {
-        if (!this._collisionGrid || !this._collisionMeshes) return this.getAllMeshes();
+        if (this._collSnap) return this._collSnap.query({ minX, minZ, maxX, maxZ }, this._candMeshes);
+        if (!this._collisionGrid || !this._collisionMeshes) return this._nonPlayerMeshes();
         this._collisionGrid.query({ minX, minZ, maxX, maxZ }, this._candIdx);
         return this._fillCandidates();
+    }
+
+    /** Every mesh except the driven Player avatar (the no-grid fallback — you don't collide with / pull the camera in
+     *  against your own body). */
+    private _nonPlayerMeshes(): Mesh3D[] {
+        const all = this.getAllMeshes();
+        // The auto default player's hair / garments / face decal are the player too (else the camera ray hits its hair).
+        return (this._playerMesh || this.autoPlayer.isLive) ? all.filter(m => !this._isPlayerPart(m)) : all;
+    }
+    /** A mesh of the auto default player (body or any overlay part). */
+    private _isAutoPlayerPart(m: Mesh3D): boolean { return this.autoPlayer.isRuntimeNode(m.id); }
+    /** A mesh that belongs to the driven Player (its body, any part of it, or the auto player): never a ray obstacle. */
+    private _isPlayerPart(m: Mesh3D): boolean {
+        return m === this._playerMesh || this._playerPartIds.has(m.id) || this._isAutoPlayerPart(m);
+    }
+    /** Collect the bound Player's parts (see _playerPartIds): the character overlays of a procedural body, every mesh
+     *  skinned to its skeleton, and the mesh descendants of the body and of that skeleton (joint-attached props). */
+    private _collectPlayerParts(m: Mesh3D): void {
+        const ids = this._playerPartIds;
+        ids.clear();
+        ids.add(m.id);
+        for (const id of this._character.overlayMeshIds(m.id)) ids.add(id);
+        const skelId = (m as Mesh3D & { skeletonId?: string | null }).skeletonId ?? null;
+        type Walkable = { forEachDeep(cb: (n: unknown) => void): void };
+        const addDeep = (n: Walkable | null | undefined) => n?.forEachDeep((c) => { if (c instanceof Mesh3D) ids.add(c.id); });
+        addDeep(m as unknown as Walkable);
+        if (skelId) {
+            for (const x of this.getAllMeshes()) if ((x as Mesh3D & { skeletonId?: string | null }).skeletonId === skelId) ids.add(x.id);
+            addDeep(this.getSkeleton(skelId) as unknown as Walkable | null);
+        }
     }
 
     /** Map the scratch index list (_candIdx) → the scratch mesh list (_candMeshes). */
@@ -2530,63 +4011,45 @@ export class Scene3DManager {
         return out;
     }
 
-    /** Horizontal wall collision: cast a ray from mid-body along the move direction; step up small ledges, else stop
-     *  short of a wall and slide along it (cancels the into-wall component). Best-effort v1 — no capsule / step
-     *  clearance beyond the ground clamp; see docs/specs/play-mode.md. */
+    /** Horizontal wall collision (R6.2): knee / mid-body / head rays along the move (collision-math
+     *  resolveHorizontalMove) — anything the knee ray hits is too tall to step onto and blocks (with a slide along it);
+     *  lower steps pass and the ground clamp lifts the feet by at most stepHeight. Best-effort — no capsule sweep; see
+     *  docs/specs/play-mode.md. */
     private _resolveWallMove(cc: CharacterController, fx: number, fz: number, tx: number, tz: number, radius: number): [number, number] {
-        const dx = tx - fx, dz = tz - fz;
-        const dist = Math.hypot(dx, dz);
-        if (dist < 1e-6) return [tx, tz];
-        // Broadphase: the meshes near the whole move segment (± radius) — reused for the step sample + both wall casts.
+        if (Math.hypot(tx - fx, tz - fz) < 1e-6) return [tx, tz];
+        // Broadphase: the meshes near the whole move segment (± radius) — shared by every wall cast.
         const pad = radius + cc.cfg.stepHeight;
         const meshes = this._regionCandidates(Math.min(fx, tx) - pad, Math.min(fz, tz) - pad, Math.max(fx, tx) + pad, Math.max(fz, tz) + pad);
-
-        // Step-up: if the ground at the destination only rises a little (curb/stair), it's not a wall — allow the
-        // move and let the controller's ground clamp lift the feet onto it.
-        const groundDest = this._picker.sampleGroundHeight(tx, tz, meshes);
-        if (isClimbableStep(cc.pos[1], groundDest, cc.cfg.stepHeight)) return [tx, tz];
-
-        const inv = 1 / dist;
-        const dirX = dx * inv, dirZ = dz * inv;
-        const midY = cc.pos[1] + cc.cfg.eyeHeight * 0.5;   // cast from mid-body so a knee-high step isn't a "wall"
-        const hit = this._picker.raycastWorld([fx, midY, fz], [dirX, 0, dirZ], meshes, true);
-        if (!hit || hit.distance >= dist + radius) return [tx, tz];   // clear path
-
-        // Blocked → slide along the wall. Re-cast along the slide to avoid tunnelling a perpendicular wall.
-        const n = hit.faceNormal;
-        const [sx, sz] = slideAlongWall(fx, fz, tx, tz, hit.distance, n[0], n[2], radius);
-        const sdx = sx - fx, sdz = sz - fz;
-        const sdist = Math.hypot(sdx, sdz);
-        if (sdist < 1e-6) return [sx, sz];
-        const sdirX = sdx / sdist, sdirZ = sdz / sdist;
-        const hit2 = this._picker.raycastWorld([fx, midY, fz], [sdirX, 0, sdirZ], meshes, true);
-        if (hit2 && hit2.distance < sdist + radius) {
-            const allowed = Math.max(0, hit2.distance - radius);
-            return [fx + sdirX * allowed, fz + sdirZ * allowed];
-        }
-        return [sx, sz];
+        return resolveHorizontalMove(this._rayCaster(meshes), fx, fz, tx, tz, cc.pos[1], radius, cc.cfg.stepHeight, cc.cfg.eyeHeight);
     }
 
     /** Snapshot every mesh's TRS (the source of truth — localMatrix is derived) so Play exits non-destructively.
      *  Captures position/rotation/scale because the Player mesh (and later physics/scripts) move via setPosition3D
      *  etc., which rebuild localMatrix from these fields — restoring only the matrix would be undone by any later
      *  rebuild. */
-    private _snapshotTransforms(): Map<string, PlayXform> {
-        const snap = new Map<string, PlayXform>();
-        for (const m of this.getAllMeshes()) {
-            snap.set(m.id, { x: m.x, y: m.y, z: m.z, rx: m.rotationX, ry: m.rotationY, rz: m.rotation, sx: m.scaleX, sy: m.scaleY, sz: m.scaleZ });
+    private _snapshotTransforms(): PlayXformSnapshot {
+        const meshes = this.getAllMeshes();
+        const trs = new Float64Array(meshes.length * 9);
+        for (let i = 0, o = 0; i < meshes.length; i++, o += 9) {
+            const m = meshes[i];
+            trs[o] = m.x; trs[o + 1] = m.y; trs[o + 2] = m.z;
+            trs[o + 3] = m.rotationX; trs[o + 4] = m.rotationY; trs[o + 5] = m.rotation;
+            trs[o + 6] = m.scaleX; trs[o + 7] = m.scaleY; trs[o + 8] = m.scaleZ;
         }
-        return snap;
+        return { meshes: meshes.slice(), trs };
     }
 
-    /** Restore transforms captured by _snapshotTransforms (only meshes that still exist). */
-    private _restoreTransforms(snap: Map<string, PlayXform>): void {
-        for (const m of this.getAllMeshes()) {
-            const s = snap.get(m.id);
-            if (!s) continue;
-            m.setRotation3D(s.rx, s.ry, s.rz);
-            m.setScale3D(s.sx, s.sy, s.sz);
-            m.setPosition3D(s.x, s.y, s.z);   // last → one final localMatrix rebuild with all fields restored
+    /** Restore transforms captured by _snapshotTransforms — only the meshes Play actually MOVED (a compare of 9 floats;
+     *  the static city never pays the 3 matrix rebuilds). A mesh removed meanwhile is a harmless detached object. */
+    private _restoreTransforms(snap: PlayXformSnapshot): void {
+        const { meshes, trs } = snap;
+        for (let i = 0, o = 0; i < meshes.length; i++, o += 9) {
+            const m = meshes[i];
+            if (m.x === trs[o] && m.y === trs[o + 1] && m.z === trs[o + 2] && m.rotationX === trs[o + 3] && m.rotationY === trs[o + 4]
+                && m.rotation === trs[o + 5] && m.scaleX === trs[o + 6] && m.scaleY === trs[o + 7] && m.scaleZ === trs[o + 8]) continue;
+            m.setRotation3D(trs[o + 3], trs[o + 4], trs[o + 5]);
+            m.setScale3D(trs[o + 6], trs[o + 7], trs[o + 8]);
+            m.setPosition3D(trs[o], trs[o + 1], trs[o + 2]);   // last → one final localMatrix rebuild with all fields restored
         }
     }
 
@@ -2607,6 +4070,7 @@ export class Scene3DManager {
             // select). Illustration target keeps the classic orbit scheme (you're inspecting the artboard).
             const sceneFly = this._viewState.target === 'scene';
             this.enableOrbitControls({ freeLookNav: sceneFly });
+            this._configureFreeZoom();   // T7.1: constant-rate dolly-through zoom, no near stall, effectively unbounded
             if (sceneFly) {
                 const orb = this._armature.getOrbitController();
                 if (orb) {
@@ -2619,7 +4083,12 @@ export class Scene3DManager {
             this.enableViewGizmo();
             this._armature.setMeshEditOrbitCenter([0, 0, 0]);   // any non-null center → the 2D sync stops fighting orbit
             this.renderer3D.setMeshEditModeActive(true);        // clean 3D workspace bg (drops the 2D artboard composite)
-            this.renderer3D.setMeshEditBgMode(VIEW_3D_BG);      // …with a NEUTRAL backdrop, not the 'wavy' focus default
+            // …with a NEUTRAL backdrop, not the 'wavy' focus default. ★ NOT while City mode is up: there the same bg slot
+            // IS the city's time-of-day SKY gradient (WorldManager._applyTimeOfDay), only rewritten when the time / look
+            // changes — overwriting it here (a camera-mode switch, Play exit, mesh-edit exit...) left the near-black
+            // workspace grey as the "sky" until the next time-of-day change: black above the skyline, all-black from
+            // above the clouds (polish-round-3 "black sky at altitude").
+            if (!this._cityModeActive) this.renderer3D.setMeshEditBgMode(VIEW_3D_BG);
             // Restore the remembered free-cam vantage (leaving+returning, and reload, land where you were);
             // frame all meshes only on the FIRST entry when nothing has been captured yet.
             const orbit = this._armature.getOrbitController();
@@ -2638,8 +4107,9 @@ export class Scene3DManager {
             // Locked 2D camera (ortho2D / perspective2D). The SCENE target has no artboard, so keep the clean 3D
             // workspace bg (no 2D composite) even in these modes; the illustration target restores its composite.
             const sceneBg = this._viewState.target === 'scene';
-            this.renderer3D.setMeshEditModeActive(sceneBg);
-            if (sceneBg) this.renderer3D.setMeshEditBgMode(VIEW_3D_BG);
+            // City mode keeps its sky backdrop in every camera mode (see the free3D branch above).
+            this.renderer3D.setMeshEditModeActive(sceneBg || this._cityModeActive);
+            if (sceneBg && !this._cityModeActive) this.renderer3D.setMeshEditBgMode(VIEW_3D_BG);
             this.disableOrbitControls();                        // also tears down the nav gizmo
             this._armature.setMeshEditOrbitCenter(null);
             this.setIllustrationProjection(rules.projection);
@@ -2649,6 +4119,25 @@ export class Scene3DManager {
         this._applyFly();                                       // fly camera only lives in free3D edit
     }
 
+    /** T7.1 / T7.4 — free-3D zoom: the wheel dolly is DOLLY-THROUGH (constant rate near the pivot, which is pushed
+     *  forward instead of the zoom stalling — see wheelDollyStep) and effectively unbounded (tiny min radius, huge
+     *  max; autoFar keeps the far plane enclosing the scene at any distance). Used by free3D and City mode. */
+    _configureFreeZoom(): void {
+        const orb = this._armature.getOrbitController();
+        if (!orb) return;
+        orb.dollyThrough = true;
+        orb.minRadius = 1e-4;
+        orb.maxRadius = 1e5;
+    }
+
+    /** T7.1: the dolly-through floor follows the FRAMED CONTENT size (10% of its bounding radius) — not the camera's
+     *  sceneRadius, which the reference-grid floor inflates (a tiny object would otherwise stop the orbit 1.4 units
+     *  away and fly straight through it). */
+    private _setDollyFloor(contentRadius: number): void {
+        const orb = this._armature.getOrbitController();
+        if (orb) orb.dollyFloor = Math.max(1e-4, contentRadius * 0.1);
+    }
+
     /** Enter a clean ORBIT view of a SINGLE mesh (packaging box / product preview). Frames it, then CLAIMS the
      *  camera for orbit by setting `_meshEditOrbitCenter` so the 2D illustration auto-sync BACKS OFF. Without this
      *  claim, the sync locks the 3D camera to the 2D pan/zoom (a front view looking down −Z) EVERY frame, so a
@@ -2656,6 +4145,7 @@ export class Scene3DManager {
      *  invisible thin line (the "box never shows" bug). Default 3/4 top-down angle makes the flat net face-on;
      *  `altOrbitOnly` keeps left-drag free (for surface painting). Pair with {@link exitMeshOrbit3D}. */
     enterMeshOrbit3D(meshId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
+        this._stopPlayForEditorCamera('enterMeshOrbit3D');
         if (!this._inCameraSubMode()) this._captureCurrentPose();   // snapshot the mode we're leaving (first entry only) so exitMeshOrbit3D restores it
         this._armature.enterMeshOrbit3D(meshId, opts);
     }
@@ -2675,6 +4165,7 @@ export class Scene3DManager {
     /** Like {@link enterMeshOrbit3D} but frames + orbits a whole GROUP container (the packaging box's
      *  rigid-panel hierarchy: a root MeshGroup3D over N panel meshes). Centre = mean of the panel centres. */
     enterGroupOrbit3D(groupId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
+        this._stopPlayForEditorCamera('enterGroupOrbit3D');
         if (!this._inCameraSubMode()) this._captureCurrentPose();   // snapshot the mode we're leaving (first entry only) so exitMeshOrbit3D restores it
         this._armature.enterGroupOrbit3D(groupId, opts);
     }
@@ -2757,116 +4248,51 @@ export class Scene3DManager {
      * preview (a top-down city map). World-agnostic (plain geometry + colour), so core never depends on
      * `src/world`. No per-mesh selection/undo spam; returns the group so the caller can remove it wholesale.
      */
-    addFlatColorMeshGroup(name: string, layers: { name: string; geometry: MeshGeometry; color: [number, number, number]; pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number }; ground?: { surface: GroundSurfaceName; tint?: [number, number, number]; tileMm?: number; groutMm?: number; jitter?: number; metersPerUnit?: number; weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty' }; castShadow?: boolean; water?: { deep?: [number, number, number]; shallow?: [number, number, number]; waveScale?: number; waveSpeed?: number; choppy?: number; glitter?: number }; emissive?: number; opacity?: number; instanceKey?: string; excludeFromFrame?: boolean; singleSided?: boolean; metal?: { tint?: [number, number, number]; streak?: [number, number, number]; roughness?: number; streakAmount?: number; grime?: number; scale?: number }; neon?: { glow?: [number, number, number]; accent?: [number, number, number]; scanDensity?: number; flicker?: number; scroll?: number; phase?: number }; leafCard?: boolean; glass?: boolean; radialFade?: boolean; outlineRanges?: { id: number; start: number; count: number }[]; reflect?: { strength?: number; roughness?: number }; renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean; wind?: FoliageWindSpec; foliageShade?: FoliageShadeSpec; instances?: { x: number; y: number; z: number; ry: number; s?: number; tint?: [number, number, number]; skin?: string }[]; arrayGroup?: boolean; garp?: { pool: string; slot: string; seed: number } }[], silent = false, parent?: MeshGroup3D): MeshGroup3D {
+    addFlatColorMeshGroup(name: string, layers: FlatColorLayer3D[], silent = false, parent?: MeshGroup3D): MeshGroup3D {
+        const group = this.beginFlatColorMeshGroup3D(name);
+        for (const L of layers) this.addFlatColorLayer3D(group, L);
+        this.attachFlatColorMeshGroup3D(group, parent, silent);
+        return group;
+    }
+
+    /** Step 3b (performance-plan §P13 "Step 3b"): addFlatColorMeshGroup in pieces, so a streamed tile's group can be
+     *  wrapped over several frames: begin (a DETACHED group), add layers / instance ranges, attach once complete. The
+     *  pieces run exactly the one-shot code (same meshes, same order); the group is in the scene only once attached. */
+    beginFlatColorMeshGroup3D(name: string): MeshGroup3D {
         const group = new MeshGroup3D(this.ctx.interactionService);
         group.name = name;
-        // Build one mesh for a layer at a given transform + tint. When a layer carries `instances`, its geometry is
-        // LOCAL/canonical and we spawn one mesh PER instance, all sharing the geometry via `instanceKey` (→ one pool
-        // allocation + batched instanced draws). Per-instance `tint` overrides the layer colour (free — material is
-        // per-instance). No `instances` → one world-baked mesh at the origin (the original behaviour).
-        const makeMesh = (L: typeof layers[number], inst?: { x: number; y: number; z: number; ry: number; tint?: [number, number, number] }) => {
-            const m = new Mesh3D(this.ctx.interactionService, inst?.x ?? 0, inst?.y ?? 0, inst?.z ?? 0, { primitive: 'custom', geometry: L.geometry, material: { doubleSided: !L.singleSided, roughness: 1, metalness: 0 } });
-            if (inst && inst.ry) m.setRotation3D(0, inst.ry, 0);
-            m.name = L.name;
-            if (L.outlineRanges) this._meshOutlineRanges.set(m.id, L.outlineRanges);   // per-object sub-ranges (landmark exact-silhouette hover)
-            m.pickable = false;   // the city is decoration, not individually selectable — the picker skips it (no per-mesh BVH build → hover/click stays 60fps after a regen)
-            m.excludeFromDocument = true;   // procedural — regenerates from world params on load; never serialize its geometry (autosave freeze + bloat)
-            if (L.excludeFromFrame) m.frameExclude = true;   // far decoration (void grid / apron) must not drag the auto-frame out
-            // Shared-archetype geometry (traffic movers / instanced building detail): same key → ONE pool allocation + batched instanced draws.
-            if (L.instanceKey) m.setGeometryKeyOverride('wld:' + L.instanceKey);
-            const col = inst?.tint ?? L.color;
-            m.setDiffuseColor(col[0], col[1], col[2], 1);
-            const e = L.emissive ?? 0.45;   // half-emissive default → reads flat/even like a map; higher = glows (neon / lit windows at night)
-            m.material.emissive = { r: col[0] * e, g: col[1] * e, b: col[2] * e, a: 1 };
-            if (L.opacity !== undefined && L.opacity < 1) m.material.opacity = L.opacity;   // clouds → transparent pass
-            if (L.leafCard) m.material.leafCard = true;   // alpha-cut leaf silhouette (foliage cards)
-            if (L.glass) m.material.glassEnhance = true;   // stylized fresnel sky-reflection glass (toggle-gated)
-            if (L.radialFade) m.material.radialFade = true;   // soft radial edge dissolve (lamp light-pools → glow, not sticker)
-            if (L.reflect) {   // car-paint clearcoat: raise metalness + drop roughness → the base envSpecular reflects the sky hemisphere (GT sheen)
-                m.material.metalness = L.reflect.strength ?? 0.4;
-                m.material.roughness = L.reflect.roughness ?? 0.32;
-            }
-            if (L.renderStyle) m.material.renderStyle = L.renderStyle;   // per-layer style override (toon foliage)
-            if (L.rim) m.material.rimEnabled = true;                     // Fresnel back-light (Ghibli leaves)
-            applyFoliageLook(m.material, L.wind, L.foliageShade);        // S1 wind + S2 translucency/AO/ground blend
-            if (L.metal) {
-                const mt = L.metal;
-                m.material.metalShade = true;
-                if (mt.tint) m.material.metalTint = mt.tint;
-                if (mt.streak) m.material.metalStreak = mt.streak;
-                if (mt.roughness !== undefined) m.material.metalRoughness = mt.roughness;
-                if (mt.streakAmount !== undefined) m.material.metalStreakAmount = mt.streakAmount;
-                if (mt.grime !== undefined) m.material.metalGrime = mt.grime;
-                if (mt.scale !== undefined) m.material.metalScale = mt.scale;
-                m.material.metalness = 0.65;
-                m.material.emissive = { r: 0, g: 0, b: 0, a: 1 };
-            } else if (L.neon) {
-                const nn = L.neon;
-                m.material.neonShade = true;
-                if (nn.glow) m.material.neonGlow = nn.glow;
-                if (nn.accent) m.material.neonAccent = nn.accent;
-                if (nn.scanDensity !== undefined) m.material.neonScanDensity = nn.scanDensity;
-                if (nn.flicker !== undefined) m.material.neonFlicker = nn.flicker;
-                if (nn.scroll !== undefined) m.material.neonScroll = nn.scroll;
-                if (nn.phase !== undefined) m.material.neonPhase = nn.phase;
-            } else if (L.water) {
-                const w = L.water;
-                m.material.waterShade = true;
-                if (w.deep) m.material.waterDeep = w.deep;
-                if (w.shallow) m.material.waterShallow = w.shallow;
-                if (w.waveScale !== undefined) m.material.waterWaveScale = w.waveScale;
-                if (w.waveSpeed !== undefined) m.material.waterWaveSpeed = w.waveSpeed;
-                if (w.choppy !== undefined) m.material.waterChoppy = w.choppy;
-                if (w.glitter !== undefined) m.material.waterGlitter = w.glitter;
-                m.material.metalness = 0;
-                // Water is lit, not emissive — the old band motif leaned on emissive to read at all.
-                m.material.emissive = { r: 0, g: 0, b: 0, a: 1 };
-            } else if (L.ground) {
-                // ★ PROCEDURAL GROUND on a city layer (roads / pavements / plaza / parks). Same recipe
-                // resolver the standalone `applyGroundMaterial3D` uses — one source of truth for the maths.
-                // `groundWorldUV`: the city's ground uv is worldXZ * 0.5, i.e. a WORLD parameterisation, so
-                // neighbouring meshes tile continuously; it also retargets the P2 weathering masks, which
-                // would otherwise treat the whole city as one giant region border. See Material3D.
-                const g = resolveGroundRecipe(L.ground.surface, {
-                    tileMm: L.ground.tileMm, groutMm: L.ground.groutMm, tint: L.ground.tint, jitter: L.ground.jitter,
-                });
-                m.material.groundShade = true;
-                // Metres per world unit — the city is a diorama (1 unit = 15 m), so without this every
-                // tile and every noise frequency comes out 15× too large. Also marks the uv world-parameterised.
-                m.material.groundWorldScale = L.ground.metersPerUnit ?? 1;
-                m.material.groundMode = g.mode;
-                m.material.groundTile = g.tile;
-                m.material.groundJitter = g.jitter;
-                m.material.groundGrout = { r: g.seam[0], g: g.seam[1], b: g.seam[2], a: g.groutM };
-                m.material.groundWeather = GROUND_WEATHER[L.ground.weather ?? 'worn'] ?? 1;
-                m.material.groundWearPath = [0, 0, 0];              // noise-only wear; no authored track in the city yet
-                m.material.roughness = g.rough;
-                m.material.metalness = 0;
-                m.setDiffuseColor(g.tint[0], g.tint[1], g.tint[2], 1);
-                // The material IS the detail now — a half-emissive base would wash the pavers flat.
-                const ge = L.emissive ?? 0.15;
-                m.material.emissive = { r: g.tint[0] * ge, g: g.tint[1] * ge, b: g.tint[2] * ge, a: 1 };
-            } else if (L.pattern) {   // in-shader procedural pattern → windows / paving joints / awning stripes / animated waves
-                m.material.patternMode = L.pattern.mode ?? 'grid';
-                m.material.patternColor = { r: L.pattern.color[0], g: L.pattern.color[1], b: L.pattern.color[2], a: 1 };
-                m.material.patternFreq = L.pattern.freq;
-                m.material.patternScale = L.pattern.scale ?? 0.15;
-                if (L.pattern.angle !== undefined) m.material.patternAngle = L.pattern.angle;
-                if (L.pattern.spacing !== undefined) m.material.patternSpacing = L.pattern.spacing;
-            }
-            m.gpuDirty = true;
-            group.addChild(m);
-        };
-        for (const L of layers) {
-            if (L.instances && L.instances.length && L.arrayGroup) {
-                // City-scale: ONE GPU-instanced ArrayGroup for all instances (1 node + 1 draw) instead of N meshes.
-                this.addExplicitArrayInstances(group, { name: L.name, geometry: L.geometry, color: L.color, emissive: L.emissive,
-                    pattern: L.pattern, wind: L.wind, foliageShade: L.foliageShade, leafCard: L.leafCard,
-                    renderStyle: L.renderStyle, rim: L.rim, castShadow: L.castShadow, transforms: L.instances, garp: L.garp });
-            } else if (L.instances && L.instances.length) {
-                for (const inst of L.instances) makeMesh(L, inst);
-            } else makeMesh(L);
+        return group;
+    }
+    /** Units of work in a layer for addFlatColorLayer3D: one per spawned instance mesh, else 1 (one world-baked mesh or
+     *  one GPU-instanced ArrayGroup). */
+    flatColorLayerUnits3D(L: FlatColorLayer3D): number {
+        return L.instances && L.instances.length && !L.arrayGroup ? L.instances.length : 1;
+    }
+    /** Add units [from, from + count) of layer `L` to `group` (see flatColorLayerUnits3D). Returns the next unit. */
+    addFlatColorLayer3D(group: MeshGroup3D, L: FlatColorLayer3D, from = 0, count = Infinity): number {
+        if (L.propXf && L.propXf.length) {   // P20 instanced props (full look + per-copy 3×3s, one typed array)
+            if (from === 0 && count > 0) this._addPropArrayInstances(group, L);
+            return 1;
         }
+        if (L.instances && L.instances.length && L.arrayGroup) {
+            if (from > 0) return 1;
+            // City-scale: ONE GPU-instanced ArrayGroup for all instances (1 node + 1 draw) instead of N meshes.
+            this.addExplicitArrayInstances(group, { name: L.name, geometry: L.geometry, color: L.color, emissive: L.emissive,
+                pattern: L.pattern, wind: L.wind, foliageShade: L.foliageShade, leafCard: L.leafCard,
+                renderStyle: L.renderStyle, rim: L.rim, castShadow: L.castShadow, transforms: L.instances, garp: L.garp,
+                geometryKey: L.instanceKey, nearTwin: L.nearTwin, crowd: L.crowdInst });
+            return 1;
+        }
+        if (L.instances && L.instances.length) {
+            const end = Math.min(L.instances.length, from + count);
+            for (let i = from; i < end; i++) this._makeFlatMesh(group, L, L.instances[i]);
+            return end;
+        }
+        if (from === 0 && count > 0) this._makeFlatMesh(group, L);
+        return 1;
+    }
+    /** Attach a group built with begin / addFlatColorLayer3D (the one-shot path's last step). */
+    attachFlatColorMeshGroup3D(group: MeshGroup3D, parent?: MeshGroup3D, silent = false): void {
         (parent ?? this.ctx.sceneGraph.root).addChild(group);
         // `silent` (async city staging): the group is added HIDDEN and will be revealed on the swap. Skip the
         // scene-graph-changed notification so the host never processes the transient old-city + new-city ("2N")
@@ -2874,7 +4300,119 @@ export class Scene3DManager {
         // soon-to-be-removed old meshes and leak them. One notification fires at the reveal instead.
         if (!silent) this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
-        return group;
+    }
+
+    // Build one mesh for a layer at a given transform + tint. When a layer carries `instances`, its geometry is
+    // LOCAL/canonical and we spawn one mesh PER instance, all sharing the geometry via `instanceKey` (→ one pool
+    // allocation + batched instanced draws). Per-instance `tint` overrides the layer colour (free — material is
+    // per-instance). No `instances` → one world-baked mesh at the origin (the original behaviour).
+    private _makeFlatMesh(group: MeshGroup3D, L: FlatColorLayer3D, inst?: { x: number; y: number; z: number; ry: number; tint?: [number, number, number] }): void {
+        const m = new Mesh3D(this.ctx.interactionService, inst?.x ?? 0, inst?.y ?? 0, inst?.z ?? 0, { primitive: 'custom', geometry: L.geometry, material: { doubleSided: !L.singleSided, roughness: 1, metalness: 0 } });
+        if (inst && inst.ry) m.setRotation3D(0, inst.ry, 0);
+        m.name = L.name;
+        if (L.outlineRanges) this._meshOutlineRanges.set(m.id, L.outlineRanges);   // per-object sub-ranges (landmark exact-silhouette hover)
+        m.pickable = false;   // the city is decoration, not individually selectable — the picker skips it (no per-mesh BVH build → hover/click stays 60fps after a regen)
+        m.excludeFromDocument = true;   // procedural — regenerates from world params on load; never serialize its geometry (autosave freeze + bloat)
+        if (L.excludeFromFrame) m.frameExclude = true;   // far decoration (void grid / apron) must not drag the auto-frame out
+        // Shared-archetype geometry (traffic movers / instanced building detail): same key → ONE pool allocation + batched instanced draws.
+        if (L.instanceKey) m.setGeometryKeyOverride('wld:' + L.instanceKey);
+        if (L.groundUvSample) m.groundUvSample = L.groundUvSample;   // chunked ground → the unsplit uv scale (world/chunking.ts)
+        if (L.nearTwin) {   // E2 near/far twin (chipped edges near only); P9 mid / xfar tiers + degraded prop far twins
+            const tr = L.nearTwin.role;
+            m.lodTwinRole = tr === 'near' ? 1 : tr === 'far' ? 2 : tr === 'mid' ? 3 : 4;
+            m.lodTwinDist = L.nearTwin.dist; m.lodTwinDist2 = L.nearTwin.dist2 ?? 0; m.lodTwinOffNear = !!L.nearTwin.uvFromNear;
+        }
+        const col = inst?.tint ?? L.color;
+        m.setDiffuseColor(col[0], col[1], col[2], 1);
+        const e = L.emissive ?? 0.45;   // half-emissive default → reads flat/even like a map; higher = glows (neon / lit windows at night)
+        m.material.emissive = { r: col[0] * e, g: col[1] * e, b: col[2] * e, a: 1 };
+        if (L.opacity !== undefined && L.opacity < 1) m.material.opacity = L.opacity;   // clouds → transparent pass
+        if (L.leafCard) m.material.leafCard = true;   // alpha-cut leaf silhouette (foliage cards)
+        if (L.glass) m.material.glassEnhance = true;   // stylized fresnel sky-reflection glass (toggle-gated)
+        if (L.radialFade) m.material.radialFade = true;   // soft radial edge dissolve (lamp light-pools → glow, not sticker)
+        if (L.noFog) m.material.noFog = L.noFog;   // sky / clouds: no fog ('hardEdge' = only under Hard fog edge)
+        if (L.reflect) {   // car-paint clearcoat: raise metalness + drop roughness → the base envSpecular reflects the sky hemisphere (GT sheen)
+            m.material.metalness = L.reflect.strength ?? 0.4;
+            m.material.roughness = L.reflect.roughness ?? 0.32;
+        }
+        if (L.renderStyle) m.material.renderStyle = L.renderStyle;   // per-layer style override (toon foliage)
+        if (L.rim) m.material.rimEnabled = true;                     // Fresnel back-light (Ghibli leaves)
+        applyFoliageLook(m.material, L.wind, L.foliageShade);        // S1 wind + S2 translucency/AO/ground blend
+        // GARP on a NON-instanced (world-baked) layer — e.g. the city's advert sign faces (docs/ui/garp.md
+        // §Adverts): the whole mesh samples ONE GARP atlas layer, named by the marker's skin (baked UVs pick the
+        // region). Resolved per session (a layer index is never stored); blank until the pool resolves.
+        if (L.garp && !(L.instances && L.instances.length) && this._garpLayerResolver) {
+            m.material.hasTexture = true;
+            m.material.garpTex = true;
+            m.garpLayer = this._garpLayerResolver(L.garp.pool, L.garp.slot, 0, 0, L.garp.seed, L.garp.skin);
+        }
+        if (L.metal) {
+            const mt = L.metal;
+            m.material.metalShade = true;
+            if (mt.tint) m.material.metalTint = mt.tint;
+            if (mt.streak) m.material.metalStreak = mt.streak;
+            if (mt.roughness !== undefined) m.material.metalRoughness = mt.roughness;
+            if (mt.streakAmount !== undefined) m.material.metalStreakAmount = mt.streakAmount;
+            if (mt.grime !== undefined) m.material.metalGrime = mt.grime;
+            if (mt.scale !== undefined) m.material.metalScale = mt.scale;
+            m.material.metalness = 0.65;
+            m.material.emissive = { r: 0, g: 0, b: 0, a: 1 };
+        } else if (L.neon) {
+            const nn = L.neon;
+            m.material.neonShade = true;
+            if (nn.glow) m.material.neonGlow = nn.glow;
+            if (nn.accent) m.material.neonAccent = nn.accent;
+            if (nn.scanDensity !== undefined) m.material.neonScanDensity = nn.scanDensity;
+            if (nn.flicker !== undefined) m.material.neonFlicker = nn.flicker;
+            if (nn.scroll !== undefined) m.material.neonScroll = nn.scroll;
+            if (nn.phase !== undefined) m.material.neonPhase = nn.phase;
+        } else if (L.water) {
+            const w = L.water;
+            m.material.waterShade = true;
+            if (w.deep) m.material.waterDeep = w.deep;
+            if (w.shallow) m.material.waterShallow = w.shallow;
+            if (w.waveScale !== undefined) m.material.waterWaveScale = w.waveScale;
+            if (w.waveSpeed !== undefined) m.material.waterWaveSpeed = w.waveSpeed;
+            if (w.choppy !== undefined) m.material.waterChoppy = w.choppy;
+            if (w.glitter !== undefined) m.material.waterGlitter = w.glitter;
+            m.material.metalness = 0;
+            // Water is lit, not emissive — the old band motif leaned on emissive to read at all.
+            m.material.emissive = { r: 0, g: 0, b: 0, a: 1 };
+        } else if (L.ground) {
+            // ★ PROCEDURAL GROUND on a city layer (roads / pavements / plaza / parks). Same recipe
+            // resolver the standalone `applyGroundMaterial3D` uses — one source of truth for the maths.
+            // `groundWorldUV`: the city's ground uv is worldXZ * 0.5, i.e. a WORLD parameterisation, so
+            // neighbouring meshes tile continuously; it also retargets the P2 weathering masks, which
+            // would otherwise treat the whole city as one giant region border. See Material3D.
+            const g = resolveGroundRecipe(L.ground.surface, {
+                tileMm: L.ground.tileMm, groutMm: L.ground.groutMm, tint: L.ground.tint, jitter: L.ground.jitter,
+            });
+            m.material.groundShade = true;
+            // Metres per world unit — the city is a diorama (1 unit = 15 m), so without this every
+            // tile and every noise frequency comes out 15× too large. Also marks the uv world-parameterised.
+            m.material.groundWorldScale = L.ground.metersPerUnit ?? 1;
+            m.material.groundMode = g.mode;
+            m.material.groundTile = g.tile;
+            m.material.groundJitter = g.jitter;
+            m.material.groundGrout = { r: g.seam[0], g: g.seam[1], b: g.seam[2], a: g.groutM };
+            m.material.groundWeather = GROUND_WEATHER[L.ground.weather ?? 'worn'] ?? 1;
+            m.material.groundWearPath = [0, 0, 0];              // noise-only wear; no authored track in the city yet
+            m.material.roughness = g.rough;
+            m.material.metalness = 0;
+            m.setDiffuseColor(g.tint[0], g.tint[1], g.tint[2], 1);
+            // The material IS the detail now — a half-emissive base would wash the pavers flat.
+            const ge = L.emissive ?? 0.15;
+            m.material.emissive = { r: g.tint[0] * ge, g: g.tint[1] * ge, b: g.tint[2] * ge, a: 1 };
+        } else if (L.pattern) {   // in-shader procedural pattern → windows / paving joints / awning stripes / animated waves
+            m.material.patternMode = L.pattern.mode ?? 'grid';
+            m.material.patternColor = { r: L.pattern.color[0], g: L.pattern.color[1], b: L.pattern.color[2], a: 1 };
+            m.material.patternFreq = L.pattern.freq;
+            m.material.patternScale = L.pattern.scale ?? 0.15;
+            if (L.pattern.angle !== undefined) m.material.patternAngle = L.pattern.angle;
+            if (L.pattern.spacing !== undefined) m.material.patternSpacing = L.pattern.spacing;
+        }
+        m.gpuDirty = true;
+        group.addChild(m);
     }
 
     /** GARP → dedicated-GARP-atlas layer resolver (registered by ShapeManager, which owns the GarpManager — scene3d
@@ -2913,12 +4451,25 @@ export class Scene3DManager {
          *  runs pickSkin over the runtime pool at the copy's (x,z)+`seed`) → its textureIndex. `pool`+`slot` name
          *  the GARP pool/slot; an explicit transform `skin` overrides the position pick. */
         garp?: { pool: string; slot: string; seed: number };
+        /** Share ONE GPU geometry allocation with every other source carrying the same key (a canonical geometry
+         *  split into per-cell groups by world/chunking.ts). Only set when the geometry object really is identical. */
+        geometryKey?: string;
+        /** P8 instanced NEAR/FAR TWIN (the far tree crowns): the source mesh (instance 0, drawn by the renderer's mesh
+         *  loop) and through it the ArrayGroup (the other N-1, the renderer's group twins) carry the twin role. */
+        nearTwin?: { role: 'near' | 'far' | 'mid' | 'xfar'; dist: number; dist2?: number; uvFromNear?: boolean };
         /** `s` = per-instance uniform scale (tree size variation without another geometry variant); `skin` = the
          *  GARP skin NAME for this copy (only when `garp` is set — resolved to an atlas layer, never serialized). */
-        transforms: { x: number; y: number; z: number; ry: number; s?: number; skin?: string }[];
+        transforms: { x: number; y: number; z: number; ry: number; s?: number; skin?: string; sv?: [number, number, number]; cs?: [number, number, number]; pi?: number }[];
+        /** P12 INSTANCED CROWD (world/crowd-instanced.ts): the source is a never-drawn PHANTOM (Mesh3D.arraySourceOnly) and
+         *  EVERY transform is a copy — so any one person can be hidden (InstanceOverride.visible) for a tier swap or a
+         *  live-crowd promotion. Copies carry a non-uniform scale `sv` (width, height, width) and packed palette
+         *  slots `cs` (Material3D.crowdPalette); `pi` (the person index) rides on the group as `crowdPi`. The twin is
+         *  EXTERNALLY driven (Mesh3D.lodTwinExternal: world-crowd.ts decides which tier of a cell draws). */
+        crowd?: { id: string };
     }): void {
         const T = opts.transforms;
         if (!T.length) return;
+        if (opts.crowd) { this._addCrowdArrayInstances(parent, opts as typeof opts & { crowd: { id: string } }); return; }
         // GARP: resolve a copy's dedicated-GARP-atlas layer — the resolver runs pickSkin over the RUNTIME pool at
         // the copy's (x,z)+seed (an explicit t.skin forces one). 0/blank when no resolver / unknown pool.
         const garpLayer = (t: { x: number; z: number; skin?: string }): number =>
@@ -2931,10 +4482,15 @@ export class Scene3DManager {
         src.name = opts.name;
         src.pickable = false;
         src.excludeFromDocument = true;
+        if (opts.geometryKey) src.setGeometryKeyOverride('wld:' + opts.geometryKey);
         src.setDiffuseColor(opts.color[0], opts.color[1], opts.color[2], 1);
         const e = opts.emissive ?? 0.45;
         src.material.emissive = { r: opts.color[0] * e, g: opts.color[1] * e, b: opts.color[2] * e, a: 1 };
         if (opts.castShadow) src.castsInstancedShadow = true;
+        if (opts.nearTwin && (opts.nearTwin.role === 'near' || opts.nearTwin.role === 'far')) {   // P8 (two-tier only)
+            src.lodTwinRole = opts.nearTwin.role === 'near' ? 1 : 2;
+            src.lodTwinDist = opts.nearTwin.dist; src.lodTwinOffNear = !!opts.nearTwin.uvFromNear; src.lodTwinInstanced = true;
+        }
         if (opts.leafCard) src.material.leafCard = true;
         if (opts.renderStyle) src.material.renderStyle = opts.renderStyle;
         if (opts.rim) src.material.rimEnabled = true;
@@ -2979,6 +4535,87 @@ export class Scene3DManager {
             parent.addChild(arr);
         }
         this.registerRestoredArrayGroups();   // ensure the per-frame array-sync callback is active
+    }
+
+    /** P12 instanced crowd cell group (see addExplicitArrayInstances' `crowd`). */
+    private _addCrowdArrayInstances(parent: MeshGroup3D, opts: { name: string; geometry: MeshGeometry; color: [number, number, number]; emissive?: number; castShadow?: boolean;
+        geometryKey?: string; nearTwin?: { role: 'near' | 'far' | 'mid' | 'xfar'; dist: number; dist2?: number }; crowd: { id: string };
+        transforms: { x: number; y: number; z: number; ry: number; s?: number; sv?: [number, number, number]; cs?: [number, number, number]; pi?: number }[] }): void {
+        const T = opts.transforms;
+        const src = new Mesh3D(this.ctx.interactionService, T[0].x, T[0].y, T[0].z, { primitive: 'custom', geometry: opts.geometry, material: { doubleSided: true, roughness: 1, metalness: 0 } });
+        src.name = opts.name;
+        src.pickable = false;
+        src.excludeFromDocument = true;
+        src.arraySourceOnly = true;
+        if (opts.geometryKey) src.setGeometryKeyOverride('wld:' + opts.geometryKey);
+        src.setDiffuseColor(opts.color[0], opts.color[1], opts.color[2], 1);
+        const e = opts.emissive ?? 0.45;
+        src.material.emissive = { r: opts.color[0] * e, g: opts.color[1] * e, b: opts.color[2] * e, a: 1 };
+        src.material.crowdPalette = true;
+        if (opts.castShadow !== false) src.castsInstancedShadow = true;   // the baked crowd's meshes cast; so do its copies
+        // EXTERNAL three-tier role (mid): world-crowd.ts writes lodTwinNear (false) / lodTwinNear2 (= any copy shown).
+        src.lodTwinRole = 3; src.lodTwinExternal = true; src.lodTwinNear = false; src.lodTwinNear2 = true;
+        src.lodTwinDist = opts.nearTwin?.dist ?? 0; src.lodTwinDist2 = opts.nearTwin?.dist2 ?? 0;
+        src.gpuDirty = true;
+        parent.addChild(src);
+        const arr = new ArrayGroup3D(this.ctx.interactionService, src.id, { mode: 'explicit', offsets: T.map(t => [t.x, t.y, t.z] as [number, number, number]) });
+        arr.name = `${opts.name} ×${T.length}`;
+        const DEG = 180 / Math.PI, overrides = new Map<number, InstanceOverride>();
+        for (let i = 0; i < T.length; i++) {
+            const t = T[i], s = t.s ?? 1;
+            overrides.set(i, { rotationEulerDeg: [0, t.ry * DEG, 0], scale: t.sv ? [t.sv[0], t.sv[1], t.sv[2]] : [s, s, s], ...(t.cs ? { crowdSlots: t.cs } : {}) });
+        }
+        arr.instanceOverrides = overrides;
+        (arr as unknown as { crowdPi?: Int32Array; crowdId?: string }).crowdPi = Int32Array.from(T, t => t.pi ?? -1);
+        (arr as unknown as { crowdId?: string }).crowdId = opts.crowd.id;
+        parent.addChild(arr);
+        this.registerRestoredArrayGroups();
+    }
+
+    /** P20 INSTANCED PROPS (world/prop-instancing.ts): the layer's WHOLE look (metal / ground / neon / pattern / glass …,
+     *  exactly as _makeFlatMesh dresses a baked layer) on a never-drawn PHANTOM source at the origin, and an ArrayGroup
+     *  whose every copy is an instance with its own 3×3 model part + normal matrix, read straight from the layer's
+     *  typed `propXf` (ArrayGroup3D.instanceXf: no per-copy objects). The copies cast shadows and feed the outline
+     *  prepass like the baked layer's mesh did (castsInstancedShadow). */
+    private _addPropArrayInstances(parent: MeshGroup3D, L: FlatColorLayer3D): void {
+        const xf = L.propXf!, S = 21, n = Math.floor(xf.length / S);
+        const { instances: _drop, arrayGroup: _ag, propInst: _pi, propXf: _xf, ...look } = L;
+        void _drop; void _ag; void _pi; void _xf;
+        this._makeFlatMesh(parent, look as FlatColorLayer3D);
+        const src = parent.children[parent.children.length - 1] as Mesh3D;
+        src.arraySourceOnly = true;
+        if (L.castShadow !== false) src.castsInstancedShadow = true;
+        if (src.lodTwinRole === 1 || src.lodTwinRole === 2) src.lodTwinInstanced = true;
+        const offsets: [number, number, number][] = new Array(n);
+        for (let i = 0; i < n; i++) offsets[i] = [xf[i * S], xf[i * S + 1], xf[i * S + 2]];
+        const arr = new ArrayGroup3D(this.ctx.interactionService, src.id, { mode: 'explicit', offsets });
+        arr.name = `${L.name} ×${n}`;
+        arr.instanceXf = xf;
+        parent.addChild(arr);
+        this.registerRestoredArrayGroups();
+    }
+
+    /** P12: re-pack these ArrayGroups' instance slots after their instanceOverrides changed (renderer repackArrayGroups). */
+    repackArrayGroups3D(groups: Iterable<ArrayGroup3D>): number { return this.renderer3D?.repackArrayGroups?.(groups) ?? 0; }
+    /** P12: whether a mesh's geometry is resident on the GPU (drawable this frame). */
+    hasMeshGeometry3D(m: Mesh3D): boolean { return this.renderer3D?.hasMeshGeometry?.(m) ?? false; }
+    /** P12: add ONE procedural flat-colour mesh (a lazily built crowd cell) under an EXISTING city group, quietly
+     *  (no host notification — call notifySceneStructureChanged3D after a batch). Same defaults as addFlatColorMeshGroup's
+     *  meshes: not pickable, never serialized. The caller sets the material / LOD fields. */
+    addProceduralMesh3D(group: MeshGroup3D, name: string, geometry: MeshGeometry): Mesh3D {
+        const m = new Mesh3D(this.ctx.interactionService, 0, 0, 0, { primitive: 'custom', geometry, material: { doubleSided: true, roughness: 1, metalness: 0 } });
+        m.name = name;
+        m.pickable = false;
+        m.excludeFromDocument = true;
+        m.gpuDirty = true;
+        group.addChild(m);
+        return m;
+    }
+    /** P12: remove a mesh added by addProceduralMesh3D (evicts the picker + renderer caches, frees its geometry). */
+    removeProceduralMesh3D(m: Mesh3D): void {
+        this._picker.evictMesh(m.id); this._picker.setDetached(m, true);
+        this.renderer3D.evictMeshCaches([m.id]);
+        m.parent?.removeChild(m);
     }
 
     // ── Procedural GROUND SCATTER (procedural-ground.md §7, P5) ───────────────────────────────────
@@ -3119,14 +4756,17 @@ export class Scene3DManager {
             }
             return false;
         };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._scatterLodCb);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._scatterLodCb, 'scatterLod');
     }
 
     /** RE-ATTACH a group previously removed by {@link removeFlatColorMeshGroup} (the streamed-tile LRU cache).
      *  The group's meshes keep their draped/positioned geometry, so re-attaching skips generation entirely; the
      *  VRAM side was evicted on removal, so children re-mark gpuDirty for a fresh pool append. */
     reattachFlatColorMeshGroup(group: MeshGroup3D, parent?: MeshGroup3D, silent = false): void {
-        for (const ch of group.children) if (ch instanceof Mesh3D) ch.gpuDirty = true;
+        // P16: a removal whose renderer cleanup is still queued finishes now (a resident allocation + gpuDirty would
+        // read as an EDITED mesh and rebuild the whole pool).
+        this.renderer3D.flushDeferredEviction(group.children.filter((ch): ch is Mesh3D => ch instanceof Mesh3D));
+        for (const ch of group.children) if (ch instanceof Mesh3D) { ch.gpuDirty = true; this._picker.setDetached(ch, false); }
         (parent ?? this.ctx.sceneGraph.root).addChild(group);
         this.registerRestoredArrayGroups();   // any ArrayGroup children need the per-frame array-sync callback live
         if (!silent) this.ctx.emitSceneGraphChanged();   // silent = the caller batches ONE notification per tile
@@ -3142,11 +4782,13 @@ export class Scene3DManager {
         if (this._armature.getSelectedThinWrapper() === group) this._setThinWrapper(null);
         // Evict the removed meshes from the picker BVH cache + renderer per-mesh caches — otherwise every
         // regen leaks hundreds of entries (GC pressure → periodic dips) and stale picker BVHs pile up.
-        const ids: string[] = [];
+        // P16 deferredEviction (stream-hitch.ts): the group leaves the scene and the picker NOW (not drawn, not hit), and
+        // the renderer's per-mesh cleanup is queued and drained under a per-frame budget (evictMeshCachesDeferred).
+        const gone: Mesh3D[] = [];
         for (const ch of group.children) {
-            if (ch instanceof Mesh3D) { ids.push(ch.id); this._picker.evictMesh(ch.id); }
+            if (ch instanceof Mesh3D) { gone.push(ch); this._picker.evictMesh(ch.id); this._picker.setDetached(ch, true); }
         }
-        this.renderer3D.evictMeshCaches(ids);
+        this.renderer3D.evictMeshCachesDeferred(gone);
         group.parent?.removeChild(group);
         if (!silent) this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
@@ -3216,6 +4858,33 @@ export class Scene3DManager {
         return meshes.length ? this.frameMeshes(meshes, padding) : false;
     }
 
+    /** T7.2 — "RETURN TO THE SCENE": frame everything VISIBLE in the scene (or under `root`, e.g. the City wrapper)
+     *  from the current view direction, excluding `frameExclude` far decoration (sky stars/moon, void grid, apron,
+     *  border glow). Uses the renderer's CACHED world AABBs (no per-vertex scan — cheap on a whole city). A
+     *  below-horizon / grazing view is lifted to a 3/4 angle. Syncs the orbit controller + autoFar. Returns false
+     *  when there's nothing to frame. The host button sits by the zoom controls (free 3D / City mode). */
+    frameScene3D(opts: { padding?: number; root?: MeshGroup3D | null; skip?: (m: Mesh3D) => boolean } = {}): boolean {
+        let meshes: Mesh3D[];
+        if (opts.root) { meshes = []; opts.root.forEachDeep(n => { if (n instanceof Mesh3D) meshes.push(n); }); }
+        else meshes = this.getAllMeshes();
+        if (opts.skip) meshes = meshes.filter(m => !opts.skip!(m));
+        const b = sceneFrameBounds(meshes, (m) => this.renderer3D.getMeshWorldAABB3D(m));
+        if (!b) return false;
+        const cam = this.renderer3D.getCamera();
+        const orbit = this._armature.getOrbitController();
+        orbit?.stopDamping();
+        const pose = framePose(b, [cam.position[0] - cam.target[0], cam.position[1] - cam.target[1], cam.position[2] - cam.target[2]],
+            { mode: cam.mode, fov: cam.fov, aspect: cam.aspect, padding: opts.padding ?? 1.1 });   // tight 8-corner box fit + 10% margin
+        cam.autoFar = true;
+        cam.sceneRadius = Math.max(pose.radius, this._gridRadiusFloor());
+        this._setDollyFloor(pose.radius);
+        if (pose.orthoSize != null) cam.orthoSize = pose.orthoSize;
+        cam.lookAt(pose.position[0], pose.position[1], pose.position[2], pose.target[0], pose.target[1], pose.target[2]);
+        orbit?.syncFromCamera();
+        this.ctx.scheduleRender();
+        return true;
+    }
+
     /** Mark (or clear) the thin-wrapper container selected as a unit. Drives the renderer's group-target
      *  gizmo/box draw and the transform controller's move/rotate target. Idempotent. */
     private _setThinWrapper(node: MeshGroup3D | null): void { this._armature.setSelectedThinWrapper(node); }
@@ -3238,7 +4907,13 @@ export class Scene3DManager {
      *  O(verts) — call once at build, never per frame/select. Skip `exclude`-named subgroups (e.g. moving
      *  traffic, whose transient positions shouldn't define the box). City meshes are world-baked at identity
      *  local transform, so raw geometry coords are already group-local. */
+    /** The scene STRUCTURE version (bumps on node add / remove): a cheap "did the scene change" stamp for callers. */
+    sceneStructureVersion3D(): number { return this.ctx.sceneStructureVersion(); }
+
     cacheGroupBounds(group: MeshGroup3D, exclude?: (name: string) => boolean): void {
+        // Step 3 (group-bounds.ts): the same min / max from per-geometry boxes cached by vertex array — only geometry
+        // not seen before is scanned. Off = the full vertex walk below.
+        if (Scene3DManager.STEP3.cachedGroupBounds) { const job = new GroupBoundsJob(group, exclude); job.step(); group.cachedBounds = job.result(); return; }
         let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
         for (const child of group.children) {
             if (child instanceof MeshGroup3D && exclude?.(child.name ?? '')) continue;
@@ -3591,6 +5266,7 @@ export class Scene3DManager {
 
             if (state.glbMeshId) this._modelStore.set(skinnedMesh.id, glbBuffer);
 
+            this._restoreOutline(skinnedMesh, state);   // characters' outlines never came back (these branches returned first)
             this.ctx.sceneGraph.root.addChild(skinnedMesh);
             this.ctx.emitSceneGraphChanged();
             skinnedMesh.stateDirty = false;
@@ -3622,6 +5298,7 @@ export class Scene3DManager {
             if (state.keyframeTracks) skinnedMesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
             // re-seed body params + generator surfaces so overlays fit + live edits merge (§5.1: owned by Scene3DCharacter)
             this._character.registerBody(skinnedMesh.id, state.bodyParams, result.armSurface, result.legSurface, result.torsoSurface);
+            this._restoreOutline(skinnedMesh, state);   // characters' outlines never came back (these branches returned first)
             this.ctx.sceneGraph.root.addChild(skinnedMesh);
             this.ctx.emitSceneGraphChanged();
             skinnedMesh.stateDirty = false;
@@ -3656,6 +5333,7 @@ export class Scene3DManager {
             skinnedMesh.textureLibraryId   = state.textureLibraryId   ?? null;
             skinnedMesh.normalMapLibraryId = state.normalMapLibraryId ?? null;
             if (state.keyframeTracks) skinnedMesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
+            this._restoreOutline(skinnedMesh, state);   // characters' outlines never came back (these branches returned first)
             this.ctx.sceneGraph.root.addChild(skinnedMesh);
             this.ctx.emitSceneGraphChanged();
             skinnedMesh.stateDirty = false;
@@ -3753,8 +5431,7 @@ export class Scene3DManager {
         // normal-mapped path with no map to sample. Keep the flag only if a GLB map is bound or a library map will be.
         if (mesh.material.hasNormalMap && !mesh.normalMapTexture && !mesh.normalMapLibraryId) mesh.material.hasNormalMap = false;
         // Persistent per-object outline: restore onto the mesh + mirror into the renderer's runtime draw cache.
-        mesh.outline = state.outline ?? null;
-        this.renderer3D.setMeshOutline(mesh.id, mesh.outline);
+        this._restoreOutline(mesh, state);
         if (state.keyframeTracks) mesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
         if (state.frameLinkAnimation3D) this.setFrameLinkAnimation3D(mesh.id, state.frameLinkAnimation3D);
         this._restoreSubmeshes(mesh, state.submeshes);
@@ -3891,9 +5568,27 @@ export class Scene3DManager {
     // ── Outline pass ─────────────────────────────────────────────────
 
     /** Enable the screen-space ink outline effect. */
-    enableOutlines(color?: [number, number, number, number], threshold?: number): void {
-        this.renderer3D.enableOutlines(color, threshold);
+    enableOutlines(color?: [number, number, number, number], threshold?: number, depthFade?: { near: number; far: number; minAlpha?: number } | null,
+        extras?: import('../../renderer/3d/outline-pass').OutlineExtras): void {
+        this.renderer3D.enableOutlines(color, threshold, depthFade, extras);   // depthFade / extras.creaseFade: world units (visual-polish #8 / #3)
         this.ctx.scheduleRender();
+    }
+
+    // ── PLAYER LIGHT (visual-polish #7c): a small key light riding with the Play player (src/game/player-light.ts) ──
+    private _playerLightCfg: import('../../game/player-light').PlayerLightConfig | null = null;
+    /** Turn the Play player light on (`{ strength, color }`) or off (null). Applied each Play render frame; outside
+     *  Play nothing is lit. WorldManager drives it from CityLook.playerLight × the night level. */
+    setPlayerLight3D(cfg: import('../../game/player-light').PlayerLightConfig | null): void {
+        this._playerLightCfg = cfg && cfg.strength > 0 ? { strength: cfg.strength, color: [cfg.color[0], cfg.color[1], cfg.color[2]] } : null;
+        if (!this._playerLightCfg) this.renderer3D.setPinnedPointLights([]);
+        this.ctx.scheduleRender();
+    }
+    get playerLight3D(): import('../../game/player-light').PlayerLightConfig | null { return this._playerLightCfg ? { ...this._playerLightCfg, color: [...this._playerLightCfg.color] as [number, number, number] } : null; }
+    private _updatePlayerLight(cc: CharacterController, feet: [number, number, number], eye: [number, number, number]): void {
+        const cfg = this._playerLightCfg;
+        if (!cfg) return;
+        const pl = placePlayerLight(feet, eye, cc.cfg.eyeHeight, cfg);
+        this.renderer3D.setPinnedPointLights(pl ? [pl] : []);
     }
 
     /** Disable the screen-space ink outline effect. */
@@ -3977,6 +5672,7 @@ export class Scene3DManager {
     getAllMeshes(): Mesh3D[] {
         const ver = this.ctx.sceneStructureVersion();
         if (this._allMeshesCache && this._allMeshesCacheVer === ver) return this._allMeshesCache;
+        if (Scene3DManager.STEP2.iterativeSceneWalk) { this._walkScene(ver); return this._allMeshesCache!; }
         const meshes: Mesh3D[] = [];
         this.ctx.sceneGraph.root.forEachDeep?.((n: any) => {
             if (n instanceof Mesh3D) meshes.push(n);
@@ -3984,6 +5680,22 @@ export class Scene3DManager {
         this._allMeshesCache = meshes;
         this._allMeshesCacheVer = ver;
         return meshes;
+    }
+    /** Step 2: ONE preorder walk (explicit stack, no closure per node; the same order as forEachDeep) fills both the
+     *  mesh and the skeleton caches for this structure version — they were two separate whole-graph walks per change. */
+    private _walkScene(ver: number): void {
+        const meshes: Mesh3D[] = [], skeletons: Skeleton3D[] = [];
+        const stack: any[] = [this.ctx.sceneGraph.root];
+        while (stack.length) {
+            const n = stack.pop();
+            if (n instanceof Mesh3D) meshes.push(n);
+            else if (n instanceof Skeleton3D) skeletons.push(n);
+            const ch = n.children as any[] | undefined;
+            if (ch) for (let i = ch.length - 1; i >= 0; i--) stack.push(ch[i]);
+        }
+        // (a cache already current for this version keeps its array identity)
+        if (!this._allMeshesCache || this._allMeshesCacheVer !== ver) { this._allMeshesCache = meshes; this._allMeshesCacheVer = ver; }
+        if (!this._allSkeletonsCache || this._allSkeletonsCacheVer !== ver) { this._allSkeletonsCache = skeletons; this._allSkeletonsCacheVer = ver; }
     }
 
     /**
@@ -3993,14 +5705,39 @@ export class Scene3DManager {
      * frame's CPU encode time; `fps` = render rate over the last second (0 when idle — on-demand rendering).
      * NOTE: array-tool GPU instances aren't multiplied in yet (the base mesh is counted once) — a v2 add, like the
      * real GPU time (needs the `timestamp-query` feature). GP strokes are a separate render path → reported as a count.
+     *
+     * ★ P11 (performance-plan.md): `triangles` is the SCENE's geometry — every visible-flagged mesh's triangles summed,
+     * BEFORE frustum culling, distance LOD, near/far twins (both twins count) and fog; instanced copies count once.
+     * It does not change when the camera turns (facing a wall reads the same as facing the whole city). It is kept
+     * for compatibility. What the GPU really draws is `drawn` (triangles submitted last frame, per pass, instanced
+     * copies multiplied): `main` = the colour pass (what is on screen), `shadow` = the shadow maps at their last
+     * refresh, `other` = outline / SSAO-SSR / mirror prepasses. `drawCalls` is the same split for draw calls.
      */
     getRenderStats3D(): {
         triangles: number; vertices: number; objects: number;
         byCategory: { body: number; hair: number; clothing: number; charms: number; face: number; scenery: number };
         geometryBytes: number; gpStrokes: number; frameMs: number; fps: number; gpuName: string | null;
+        sceneTriangles: number;
+        drawn: PassSplit; drawCalls: PassSplit;
+        culling: { meshesCulled: number; groupsCulled: number; lodHidden: number; fogHidden: number; trisCulledMain: number };
     } {
         let triangles = 0, vertices = 0, geometryBytes = 0, objects = 0;
         const byCategory = { body: 0, hair: 0, clothing: 0, charms: 0, face: 0, scenery: 0 };
+        if (Scene3DManager.STEP2.cachedRenderStats) {
+            // Step 2 (performance-plan §P13): each poll walked every mesh's geometry (~0.45 ms at 11.5 k meshes). The
+            // per-mesh figures (triangles, vertices, bytes, category) are cached per (structure version, geometry
+            // epoch); a poll only reads each mesh's `visible` flag and sums. A full refresh every 2 s backs up the
+            // keys (a modifier list edited without invalidateModifierCache).
+            const c = this._statsCache(), meshes = c.meshes, T = c.tris, V = c.verts, B = c.bytes, K = c.cat;
+            const cat = [0, 0, 0, 0, 0, 0];
+            for (let i = 0; i < meshes.length; i++) {
+                if (!meshes[i].visible) continue;
+                objects++;
+                const t = T[i];
+                triangles += t; vertices += V[i]; geometryBytes += B[i]; cat[K[i]] += t;
+            }
+            byCategory.body = cat[0]; byCategory.hair = cat[1]; byCategory.clothing = cat[2]; byCategory.charms = cat[3]; byCategory.face = cat[4]; byCategory.scenery = cat[5];
+        } else
         for (const m of this.getAllMeshes()) {
             if (!m.visible) continue;                           // hidden meshes don't render
             objects++;
@@ -4015,7 +5752,61 @@ export class Scene3DManager {
             else byCategory.scenery += t;
         }
         const timing = this.ctx.webgpuRenderer.getRenderTiming();
-        return { triangles, vertices, objects, byCategory, geometryBytes, gpStrokes: this.getAllGpObjects().length, ...timing };
+        const fs = this.renderer3D.getFrameStats3D();
+        const split = splitPassStats(fs);
+        return { triangles, vertices, objects, byCategory, geometryBytes, gpStrokes: this.getAllGpObjects().length, ...timing,
+            sceneTriangles: triangles, drawn: split.tris, drawCalls: split.draws,
+            culling: { meshesCulled: fs.meshesCulled, groupsCulled: fs.groupsCulled, lodHidden: fs.lodHidden, fogHidden: fs.fogHidden,
+                trisCulledMain: Math.max(0, fs.trisTotal - fs.trisVisible) } };
+    }
+
+    // ── Step 3 BUDGETS (docs/ui/performance.md §Budgets) ────────────────────────────────────────────────────────────
+    /** Scene budgets the HUD warns against (session setting; sm.setSceneBudget3D). */
+    static readonly SCENE_BUDGET_DEFAULTS: SceneBudgetLimits3D = { ...SCENE_BUDGET_DEFAULTS };
+    private _budget: SceneBudgetLimits3D = { ...Scene3DManager.SCENE_BUDGET_DEFAULTS };
+    /** Set (a patch of) the budgets; null / 0 for a key = no limit. Returns the limits now in force. */
+    setSceneBudget3D(patch: Partial<SceneBudgetLimits3D> | null): SceneBudgetLimits3D {
+        if (patch === null) this._budget = { ...Scene3DManager.SCENE_BUDGET_DEFAULTS };
+        else for (const k of Object.keys(patch) as (keyof SceneBudgetLimits3D)[]) { const v = patch[k]; if (v === undefined) continue; this._budget[k] = v && v > 0 ? v : 0; }
+        return { ...this._budget };
+    }
+    /** The scene against its budgets: this frame's submitted triangles and draw calls (every pass that ran this frame:
+     *  main + the shadow maps re-rendered this frame + the depth / mirror passes), the resident geometry (the GPU pool's
+     *  live MB), the instanced copies drawn from array groups, and the keys over budget with a one-line warning (null
+     *  when everything is within). Cheap: reads the renderer's frame counters (poll it like getRenderStats3D). */
+    getSceneBudget3D(): SceneBudget3D {
+        const fs = this.renderer3D.getFrameStats3D();
+        const split = splitPassStats(fs);
+        const pool = this.renderer3D.getGeomPoolStats();
+        const drawnTris = split.tris.main + split.tris.other + split.tris.shadowThisFrame;
+        const drawCalls = split.draws.main + split.draws.other + split.draws.shadowThisFrame;
+        const geometryMB = pool.liveMB;
+        const instances = fs.instances;
+        const L = this._budget;
+        const { over, warning } = evaluateSceneBudget({ drawnTris, drawCalls, geometryMB, instances }, L);
+        return { drawnTris, drawCalls, geometryMB, instances, meshes: fs.meshes, mainTris: split.tris.main, shadowTris: split.tris.shadowThisFrame,
+            limits: { ...L }, over, ok: over.length === 0, warning };
+    }
+
+    private _stats: { ver: number; epoch: number; at: number; meshes: Mesh3D[]; tris: Float64Array; verts: Float64Array; bytes: Float64Array; cat: Uint8Array } | null = null;
+    /** Step 2: the per-mesh stats figures for getRenderStats3D (see there). Category: 0 body · 1 hair · 2 clothing ·
+     *  3 charms · 4 face · 5 scenery — the same if-chain as the uncached loop. */
+    private _statsCache(): { meshes: Mesh3D[]; tris: Float64Array; verts: Float64Array; bytes: Float64Array; cat: Uint8Array } {
+        const ver = this.ctx.sceneStructureVersion(), epoch = Mesh3D.geometryEpoch, now = performance.now();
+        const s = this._stats;
+        if (s && s.ver === ver && s.epoch === epoch && now - s.at < 2000 && s.meshes === this.getAllMeshes()) return s;
+        const meshes = this.getAllMeshes(), n = meshes.length;
+        const tris = new Float64Array(n), verts = new Float64Array(n), bytes = new Float64Array(n), cat = new Uint8Array(n);
+        for (let i = 0; i < n; i++) {
+            const m = meshes[i];
+            tris[i] = m.triangleCount; verts[i] = m.vertexCount;
+            const g = m.geometry; bytes[i] = g.vertices.byteLength + g.indices.byteLength;
+            cat[i] = m.isProceduralBody ? 0 : m.isHair ? 1 : m.isClothing ? 2 : m.isAttachment ? 3 : m.isFaceDecal ? 4 : 5;
+        }
+        // (the geometry reads above can evaluate modifiers and bump the epoch: key on the value after them)
+        const out = { ver, epoch: Mesh3D.geometryEpoch, at: now, meshes, tris, verts, bytes, cat };
+        this._stats = out;
+        return out;
     }
 
     /** Get all Skeleton3D nodes in the scene. */
@@ -4027,6 +5818,7 @@ export class Scene3DManager {
     getAllSkeletons(): Skeleton3D[] {
         const ver = this.ctx.sceneStructureVersion();
         if (this._allSkeletonsCache && this._allSkeletonsCacheVer === ver) return this._allSkeletonsCache;
+        if (Scene3DManager.STEP2.iterativeSceneWalk) { this._walkScene(ver); return this._allSkeletonsCache!; }
         const skeletons: Skeleton3D[] = [];
         this.ctx.sceneGraph.root.forEachDeep?.((n: any) => {
             if (n instanceof Skeleton3D) skeletons.push(n);
@@ -4100,10 +5892,53 @@ export class Scene3DManager {
     async createProceduralBody3D(
         params?: Partial<import('./body-generator').BodyParams>,
         ox = 0, oy = 0, oz = 0,
+        opts?: { sceneScale?: boolean },
     ): Promise<{ meshId: string; skeletonId: string }> {
-        const { generateBodyResult, DEFAULT_BODY_PARAMS } = await import('./body-generator');
-        const result = generateBodyResult(params);
+        const { NEW_BODY_DEFAULTS } = await import('./body-generator');
+        // NEW bodies get the measured joint-smoothness seam blend (audit C1 Phase 1) + the anime face normals (polish item 10);
+        // a caller can still pass its own (0 = classic). Saved bodies never come through here — they restore their own
+        // params (absent = 0 = classic).
+        params = { ...NEW_BODY_DEFAULTS, ...(params ?? {}) };
+        // Generated OFF the main thread ('character' worker lane, performance-plan P3.2d); a worker failure falls back
+        // to the same generator here (identical output either way).
+        const merged = params;
+        const result = await generateBodyAsync(merged).catch(() => generateBodyResult(merged));
+        return this._commitProceduralBody(params, result, ox, oy, oz, opts?.sceneScale !== false);
+    }
+
+    /** createProceduralBody3D + its garments/hair generated in ONE worker job (body → fit → garments → hair, the
+     *  final dressed state). The body is committed like createProceduralBody3D; the garment/hair geometry is PRIMED
+     *  on the character subsystem so the caller's following setClothingParams / setHairParams calls (garments first,
+     *  then hair) just wrap + upload it. Inputs that don't match what was primed simply generate synchronously, as
+     *  before. The caller MUST call `clearPrimedCharacterParts3D(meshId)` when done (createFullCharacter3D does). */
+    async createProceduralCharacter3D(
+        spec: { body?: Partial<import('./body-generator').BodyParams>; garments?: import('./clothing-generator').ClothingParams[]; hair?: import('./hair-generator').HairParams | null },
+        ox = 0, oy = 0, oz = 0,
+        opts?: { sceneScale?: boolean },
+    ): Promise<{ meshId: string; skeletonId: string }> {
+        const { NEW_BODY_DEFAULTS } = await import('./body-generator');
+        const params = { ...NEW_BODY_DEFAULTS, ...(spec.body ?? {}) };
+        const partsSpec = { body: params, garments: spec.garments ?? [], hair: spec.hair ?? null };
+        let parts: import('./character-parts').CharacterParts | null = null;
+        try { parts = await generateCharacterPartsAsync(partsSpec); } catch { parts = null; }
+        const r = await this._commitProceduralBody(params, parts?.body ?? generateBodyResult(params), ox, oy, oz, opts?.sceneScale !== false);
+        if (parts) this._character.primeGeneratedParts(r.meshId, parts);
+        return r;
+    }
+    /** Drop any worker-precomputed garment/hair geometry still primed for a body (see createProceduralCharacter3D). */
+    clearPrimedCharacterParts3D(bodyMeshId: string): void { this._character.clearPrimedParts(bodyMeshId); }
+
+    private async _commitProceduralBody(
+        params: Partial<import('./body-generator').BodyParams>,
+        result: ReturnType<typeof generateBodyResult>,
+        ox: number, oy: number, oz: number,
+        sceneScale = true,
+    ): Promise<{ meshId: string; skeletonId: string }> {
+        const { DEFAULT_BODY_PARAMS } = await import('./body-generator');
         const skeleton = await this._createSkeletonFromResult(result);
+        // NEW bodies skin with dual quaternions (volume-preserving joints — audit C1 Phase 3). Per skeleton, so this
+        // body's clothes/hair/charms (same skeleton) deform identically. Saved skeletons keep what they had ('linear').
+        skeleton.skinningMethod = 'dualQuat';
         const def: CharacterDefinition = {
             id: 'proc_' + Date.now().toString(36),
             name: 'ProcBody',
@@ -4119,6 +5954,9 @@ export class Scene3DManager {
         mesh.isProceduralBody = true;
         mesh.transformViaSkeleton = true;   // object transform lives on the skeleton (gizmo moves the whole character)
         skeleton.isProceduralBody = true;
+        // Scene scale: in a city a new character is generated at REAL human size (see _applySceneCharacterScale).
+        // Before the IK pole targets below, which are placed from the (now scaled) joint world positions.
+        if (sceneScale) this._applySceneCharacterScale(mesh);
 
         // Default IK chains for both arms and legs (end joint + 3-bone chain). Created DISABLED so FK
         // and the preset poses keep driving the body by default; the armature panel enables a chain
@@ -4156,9 +5994,234 @@ export class Scene3DManager {
 
         this._character.registerBody(mesh.id, { ...DEFAULT_BODY_PARAMS, ...(params ?? {}) }, result.armSurface, result.legSurface, result.torsoSurface);
         this.ctx.sceneGraph.root.addChild(mesh);
+        if (this._charOutlines) this.setMeshOutline3D(mesh.id, this._charOutlines);   // E3: new characters pick up the characters-only outline
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
         return { meshId: mesh.id, skeletonId: skeleton.id };
+    }
+
+    /** Metres per world unit of the scene when it has a real-world scale (a city: cityMetresPerUnit), else null. The
+     *  same provider Play uses (setPlayMetresPerUnitProvider). */
+    getSceneMetresPerUnit3D(): number | null { return this._playMetreScale(); }
+
+    /** In a scene with a metre scale (a city, ~15 m per unit) a NEW procedural character is scaled UNIFORMLY on its body
+     *  transform so it stands AUTO_PLAYER_HEIGHT_M (1.7 m) tall, whatever its height slider (the generator builds ~0.75–
+     *  1.7 units, i.e. a 10–25 m giant in a city). The skeleton follows the body transform (transformViaSkeleton) and
+     *  every overlay (face decal, hair, garments, charms, spring bones) rides that skeleton in body space, so all of it
+     *  scales together, and regenerating a part later keeps the scale (the parts are rebuilt in body space). The scale
+     *  is an ordinary node scale: it persists, and the gizmo can still change it. Returns the factor (1 = unchanged). */
+    /** The uniform factor that makes a character `H` world units tall stand AUTO_PLAYER_HEIGHT_M at `mpu` metres per
+     *  unit (1 = leave it). Shared by the committed body (_applySceneCharacterScale) and the live ghost preview, so
+     *  preview == result. */
+    private _sceneCharacterScaleFactor(H: number, mpu: number | null): number {
+        if (mpu === null || !(H > 0) || !Number.isFinite(H)) return 1;
+        const k = (AUTO_PLAYER_HEIGHT_M / mpu) / H;
+        return !Number.isFinite(k) || k <= 0 || Math.abs(k - 1) < 1e-9 ? 1 : k;
+    }
+
+    private _applySceneCharacterScale(mesh: SkinnedMesh3D): number {
+        const mpu = this._playMetreScale();
+        if (mpu === null) return 1;
+        const c = mesh.obbCorners;
+        if (!c || c.length === 0) return 1;
+        let lo = Infinity, hi = -Infinity;
+        for (const p of c) { if (p[1] < lo) lo = p[1]; if (p[1] > hi) hi = p[1]; }
+        const k = this._sceneCharacterScaleFactor(hi - lo, mpu);
+        if (k === 1) return 1;
+        const spawnY = mesh.y;
+        mesh.setScale3D(mesh.scaleX * k, mesh.scaleY * k, mesh.scaleZ * k);
+        // Character scale (2026-10-04): stand the SOLES on the spawn floor point. The origin sits at the hips with the legs
+        // below it, so placing the origin on the floor buried the feet ~0.37 m into the street (Play hid it: the
+        // controller measures the feet).
+        if (Scene3DManager.citySpawnFeetOnFloor) {
+            const soles = this._meshWorldMinY(mesh);
+            if (soles !== null && Math.abs(spawnY - soles) > 1e-9) mesh.setPosition3D(mesh.x, mesh.y + (spawnY - soles), mesh.z);
+        }
+        // Sync the skeleton now (the per-frame _syncCharacterSkeletons would do it next frame) so anything measuring
+        // joints right after creation (spawn reveal, face framing, overlay fits) sees the final transform.
+        if (mesh.skeleton) { mesh.skeleton.objectTransform.set(mesh.localMatrix as unknown as Float32Array); mesh.skeleton.computeWorldMatrices(); }
+        return k;
+    }
+
+    // ── Character scale (2026-10-04; docs/ui/character-creator.md "Scaling a character") ─────────────────────────────
+    // ONE uniform node scale on the procedural body: the body transform drives the skeleton (transformViaSkeleton) and
+    // every overlay (clothes, hair, face kit, eyes, charms, spring bones) is skinned to it, so the whole character scales
+    // with no regeneration, and the scale is saved with the body node. The body's origin sits at its hips, so every path
+    // keeps the SOLES at the same world height. Play re-measures it (camera framing, eye height, capsule, stride).
+
+    /** World height of a mesh's rest geometry with FRESH bounds (a character body: its standing height); 0 = unknown. */
+    private _meshStandingHeight(m: Mesh3D): number {
+        m.calculateBoundingBox();
+        const c = m.obbCorners;
+        if (!c || c.length === 0) return 0;
+        let lo = Infinity, hi = -Infinity;
+        for (const p of c) { if (p[1] < lo) lo = p[1]; if (p[1] > hi) hi = p[1]; }
+        return hi > lo && Number.isFinite(hi - lo) ? hi - lo : 0;
+    }
+    /** Lowest world Y of a mesh's rest geometry (a character's soles), fresh; null = unknown. */
+    private _meshWorldMinY(m: Mesh3D): number | null {
+        m.calculateBoundingBox();
+        const c = m.obbCorners;
+        if (!c || c.length === 0) return null;
+        let lo = Infinity;
+        for (const p of c) if (p[1] < lo) lo = p[1];
+        return Number.isFinite(lo) ? lo : null;
+    }
+    private readonly _restMinYCache = new WeakMap<object, number | null>();
+    /** Lowest MESH-space Y of a body's rest geometry (the soles), cached per vertex buffer. */
+    private _restMinY(m: Mesh3D): number | null {
+        const v = m.geometry?.vertices;
+        if (!v || v.length === 0) return null;
+        const hit = this._restMinYCache.get(v);
+        if (hit !== undefined) return hit;
+        const lo = geometryMinY(v, FLOATS_PER_VERT);
+        this._restMinYCache.set(v, lo);
+        return lo;
+    }
+    /** A procedural character body (the Character group's node) by id, else null. */
+    private _characterBody(id: string): SkinnedMesh3D | null {
+        const m = this.getMesh(id);
+        return m instanceof SkinnedMesh3D && m.isProceduralBody ? m : null;
+    }
+    /** After a body's size changed: skeleton now (not next frame — joints / overlays / measurements see it), save-dirty,
+     *  render, and — when it is the running Play avatar — re-measure + re-frame it (camera, eye height, capsule). */
+    private _afterCharacterResize(m: SkinnedMesh3D): void {
+        if (m.skeleton) { m.skeleton.objectTransform.set(m.localMatrix as unknown as Float32Array); m.skeleton.computeWorldMatrices(); }
+        m.stateDirty = true;
+        // Springs restart from the new rest pose (their world-space tips held the OLD size: a resize yanked the hair tails
+        // up toward where they used to hang).
+        if (m.skeleton) resetSpringState(m.skeleton);
+        const cc = this._playController;
+        if (this._playing && cc && this._playerMesh === m) {
+            this._measureBoundAvatar(m);
+            this._applyAvatarCameraFraming(cc, this._explicitPlayConfig());
+            this._drivePlayerMesh(cc);
+            if (m.skeleton) { m.skeleton.objectTransform.set(m.localMatrix as unknown as Float32Array); m.skeleton.computeWorldMatrices(); }
+            this._tpCam.reset();
+        }
+        this.renderer3D.markTransformsDirty();
+        this.ctx.scheduleRender();
+    }
+
+    /** A character's size: `scale` = the body's uniform node scale (1 = the generated size), `height` = its standing
+     *  height in world units (rest pose, body only — hair can add a little), `heightMetres` = that in metres (the scene's
+     *  metres per unit: a city's scale, else 1 unit = 1 m), `restHeight` = the height at scale 1 (what the height PARAM
+     *  gives). null = not a procedural character body. */
+    getCharacterScale3D(bodyMeshId: string): { scale: number; height: number; heightMetres: number; restHeight: number; metresPerUnit: number; sceneMetresPerUnit: number | null } | null {
+        const m = this._characterBody(bodyMeshId);
+        if (!m) return null;
+        const h = this._meshStandingHeight(m), mpu = this.getPlayMetresPerUnit3D(), s = Math.abs(m.scaleY) || 1;
+        return { scale: Math.abs(m.scaleY), height: h, heightMetres: h * mpu, restHeight: h / s, metresPerUnit: mpu, sceneMetresPerUnit: this._playMetreScale() };
+    }
+
+    /** Scale a whole character UNIFORMLY (body + skeleton + every overlay) to `scale` × its generated size, FEET kept on
+     *  the ground. Clamped to [0.01, 1000]; keeps any authored axis ratio. Undoable (one step) unless `opts.undo` is
+     *  false; live in Play (the camera / capsule / stride follow) and kept after Stop. Returns false for a non-character. */
+    setCharacterScale3D(bodyMeshId: string, scale: number, opts?: { undo?: boolean }): boolean {
+        const m = this._characterBody(bodyMeshId);
+        const s = clampCharacterScale(scale);
+        if (!m || s === null) return false;
+        const f = s / (Math.abs(m.scaleY) || 1);
+        if (!Number.isFinite(f) || Math.abs(f - 1) < 1e-12) return true;
+        type Xf = { x: number; y: number; z: number; sx: number; sy: number; sz: number };
+        const before: Xf = { x: m.x, y: m.y, z: m.z, sx: m.scaleX, sy: m.scaleY, sz: m.scaleZ };
+        const lo = this._restMinY(m);
+        const y = lo !== null ? feetAnchoredY(m.y, m.scaleY, m.scaleY * f, lo) : m.y;
+        m.setScale3D(m.scaleX * f, m.scaleY * f, m.scaleZ * f);
+        m.setPosition3D(m.x, y, m.z);
+        // Mid-Play: Stop restores the pre-Play transforms — carry the new size (feet kept) into that snapshot so it sticks.
+        const snap = this._playing ? this._prePlayXforms : null;
+        const i = snap ? snap.meshes.indexOf(m) : -1;
+        if (snap && i >= 0) {
+            const o = i * 9, sy0 = snap.trs[o + 7];
+            if (lo !== null) snap.trs[o + 1] = feetAnchoredY(snap.trs[o + 1], sy0, sy0 * f, lo);
+            snap.trs[o + 6] *= f; snap.trs[o + 7] *= f; snap.trs[o + 8] *= f;
+        }
+        const after: Xf = { x: m.x, y: m.y, z: m.z, sx: m.scaleX, sy: m.scaleY, sz: m.scaleZ };
+        this._afterCharacterResize(m);
+        if (opts?.undo !== false) {
+            const apply = (t: Xf) => {
+                const b = this._characterBody(bodyMeshId);
+                if (!b) return;
+                b.setScale3D(t.sx, t.sy, t.sz); b.setPosition3D(t.x, t.y, t.z);
+                this._afterCharacterResize(b);
+            };
+            this._undoManager.push({ description: 'Scale character', undo: () => apply(before), redo: () => apply(after) });
+        }
+        return true;
+    }
+
+    /** Scale a character so it stands `height` tall — in METRES by default (the scene's metres per unit: a city's scale,
+     *  else 1 unit = 1 m), or in world units with `unit: 'units'`. Feet kept; undoable. Returns the new scale, or null. */
+    setCharacterHeight3D(bodyMeshId: string, height: number, unit: 'metres' | 'units' = 'metres'): number | null {
+        const m = this._characterBody(bodyMeshId);
+        if (!m || !(height > 0) || !Number.isFinite(height)) return null;
+        const target = unit === 'units' ? height : height / this.getPlayMetresPerUnit3D();
+        const k = scaleFactorForHeight(this._meshStandingHeight(m), target);
+        if (!this.setCharacterScale3D(bodyMeshId, Math.abs(m.scaleY) * k)) return null;
+        return Math.abs(m.scaleY);
+    }
+
+    /** "Fit to city": scale a character to real human size in the scene — `metres` (default 1.7 m, what new characters
+     *  get in a city) at the scene's metres per unit (getSceneMetresPerUnit3D; 1 outside a city). Returns the scale. */
+    fitCharacterToScene3D(bodyMeshId: string, metres: number = AUTO_PLAYER_HEIGHT_M): number | null {
+        return this.setCharacterHeight3D(bodyMeshId, metres, 'metres');
+    }
+
+    /** Where a NEW character should stand. Outside a city: `position` (default the origin), unchanged. In a city, a
+     *  missing position, the origin, or the 2D illustration centre (what hosts pass by default — it means nothing in a
+     *  free-3D city, and is usually far from the streets on screen) is treated as "put it where I'm looking": the first
+     *  floor-like surface along the camera's view ray, else the ground under the camera target. Any other explicit
+     *  position is honoured. */
+    resolveCharacterSpawn3D(position?: readonly [number, number, number] | null): [number, number, number] {
+        const given: [number, number, number] = position ? [position[0], position[1], position[2]] : [0, 0, 0];
+        const mpu = this._playMetreScale();
+        if (mpu === null) return given;
+        const ic = this.getIllustrationCenter3D();
+        const same = (a: readonly number[], b: readonly number[]) => a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+        const hint = !position || same(given, [0, 0, 0]) || (!!ic && same(given, ic));
+        if (!hint) return given;
+        return this._cameraFocusGround(mpu) ?? given;
+    }
+
+    /** The floor point the camera is looking at (city spawn): view ray → first up/down-facing hit; else a down ray at the
+     *  camera target from 3 m above it. Characters are never spawn surfaces. Broadphase by world AABB so a city cast
+     *  only builds BVHs for the few meshes the ray actually crosses. */
+    private _cameraFocusGround(mpu: number): [number, number, number] | null {
+        const cam = this.renderer3D.getCamera();
+        const o = cam.position, t = cam.target;
+        // Never a character, and never far decoration (frameExclude: the sky clouds, void grid, nature apron).
+        const skip = (m: Mesh3D) => m.frameExclude || m instanceof SkinnedMesh3D || m.isHair || m.isClothing || m.isFaceDecal || m.isAttachment || this.autoPlayer.isRuntimeNode(m.id);
+        const boxes: { m: Mesh3D; b: [number, number, number, number, number, number] }[] = [];
+        for (const m of this.getAllMeshes()) {
+            if (!m.visible || skip(m)) continue;
+            const c = m.obbCorners;
+            if (!c || c.length === 0) continue;
+            const b: [number, number, number, number, number, number] = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+            for (const p of c) { for (let i = 0; i < 3; i++) { if (p[i] < b[i]) b[i] = p[i]; if (p[i] > b[i + 3]) b[i + 3] = p[i]; } }
+            boxes.push({ m, b });
+        }
+        const cast = (ox: number, oy: number, oz: number, dx: number, dy: number, dz: number) => {
+            const cands = boxes.filter(({ b }) => _rayAABBIntersect(ox, oy, oz, dx, dy, dz, b[0], b[1], b[2], b[3], b[4], b[5]) !== null).map((e) => e.m);
+            return cands.length ? this._picker.raycastWorld([ox, oy, oz] as unknown as vec3, [dx, dy, dz] as unknown as vec3, cands, true) : null;
+        };
+        const dx = t[0] - o[0], dy = t[1] - o[1], dz = t[2] - o[2];
+        const len = Math.hypot(dx, dy, dz);
+        const u = 1 / mpu;   // one metre in world units
+        if (len > 1e-9) {
+            const ux = dx / len, uy = dy / len, uz = dz / len;
+            const hit = cast(o[0], o[1], o[2], ux, uy, uz);
+            if (hit && Math.abs(hit.faceNormal[1]) > 0.6) return [hit.hitPoint[0], hit.hitPoint[1], hit.hitPoint[2]];
+            if (hit) {
+                // A wall (a facade seen from the street): stand on the floor just IN FRONT of it, on the camera's side.
+                const px = hit.hitPoint[0] - ux * 0.6 * u, py = hit.hitPoint[1] - uy * 0.6 * u, pz = hit.hitPoint[2] - uz * 0.6 * u;
+                const floor = cast(px, py + 0.5 * u, pz, 0, -1, 0);
+                if (floor) return [px, floor.hitPoint[1], pz];
+            }
+        }
+        const down = cast(t[0], t[1] + 3 * u, t[2], 0, -1, 0);
+        if (down) return [t[0], down.hitPoint[1], t[2]];
+        return Number.isFinite(t[0]) && Number.isFinite(t[1]) && Number.isFinite(t[2]) ? [t[0], t[1], t[2]] : null;
     }
 
     // Per-body procedural params + ARM/LEG/TORSO surface caches now live in the character subsystem
@@ -4187,6 +6250,9 @@ export class Scene3DManager {
         // (from a real earlier change) still fires on its own timer.
         if (prev && shallowEqualParams(prev, merged)) return;
         const result = generateBodyResult(merged);
+        // Character scale (2026-10-04): the soles before the swap — the generator roots the rig at the hips, so a height /
+        // leg-length change grew the legs about that point and the character sank into / floated above its floor.
+        const feet0 = Scene3DManager.bodyEditKeepsFeet ? this._meshWorldMinY(body) : null;
         // 1. Update the skeleton's rest pose in place (keeps the object + id + objectTransform → the
         //    skinned overlays stay attached and a moved character stays where it was moved to).
         this._updateSkeletonFromResult(body.skeleton, result);
@@ -4215,6 +6281,11 @@ export class Scene3DManager {
             }
         }
         body.captureRestSkin();
+        // …keep them there (the body is lifted / lowered by the change), with fresh bounds for the selection box and Play.
+        const feet1 = feet0 !== null ? this._meshWorldMinY(body) : null;
+        if (feet0 !== null && feet1 !== null && Math.abs(feet1 - feet0) > 1e-9) body.setPosition3D(body.x, body.y + (feet0 - feet1), body.z);
+        else body.calculateBoundingBox();
+        this._afterCharacterResize(body);
         this._character.registerBody(bodyMeshId, merged, result.armSurface, result.legSurface, result.torsoSurface);
         // The body itself updates NOW (cheap, immediate slider feedback)…
         this.ctx.emitSceneGraphChanged();
@@ -4226,6 +6297,7 @@ export class Scene3DManager {
         if (opts?.immediateRefit) {
             const pending = this._refitDebounce.get(bodyMeshId);
             if (pending) { clearTimeout(pending.timer); this._refitDebounce.delete(bodyMeshId); }
+            this.clearArmsForSkeleton(body.skeleton);   // a heavier body may now swallow the arms
             this._character.refitOverlays(bodyMeshId);
             this.ctx.emitSceneGraphChanged();
             this.ctx.scheduleRender();
@@ -4242,6 +6314,7 @@ export class Scene3DManager {
                 try {
                     // Body may have been deleted while the timer was pending — the refit helpers all
                     // no-op on a missing/typeless mesh, so this is safe to call unconditionally.
+                    if (body.skeleton) this.clearArmsForSkeleton(body.skeleton);   // a heavier body may now swallow the arms
                     this._character.refitOverlays(bodyMeshId);
                 } finally {
                     this.ctx.emitSceneGraphChanged();
@@ -4304,6 +6377,8 @@ export class Scene3DManager {
     setFaceExpressionProcedural(bodyMeshId: string, exprId: string, params: EyeParams): void { this._character.setFaceExpressionProcedural(bodyMeshId, exprId, params); }
     getFaceExpressionParams(bodyMeshId: string, exprId: string): EyeParams | null { return this._character.getFaceExpressionParams(bodyMeshId, exprId); }
     setFaceGaze(bodyMeshId: string, x: number, y: number): void { this._character.setFaceGaze(bodyMeshId, x, y); }
+    /** Face kit (face-features.ts) — the character subsystem, forwarded directly (A1). */
+    get faceKit(): Pick<Scene3DCharacter, 'setFaceFeatures' | 'getFaceFeatures' | 'setCharacterExpression' | 'getCharacterExpression' | 'pulseBrows' | 'getFaceKitMeshIds'> { return this._character; }
     getFaceDecalMeshId(bodyMeshId: string): string | null { return this._character.getFaceDecalMeshId(bodyMeshId); }
     frameFace3D(bodyMeshId: string): boolean { return this._character.frameFace3D(bodyMeshId); }
     serializeFaceRigs(): FaceRigState[] { return this._character.serializeFaceRigs(); }
@@ -4351,6 +6426,11 @@ export class Scene3DManager {
     restoreAttachments(states: { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] | undefined): void { this._character.restoreAttachments(states); }
 
     removeClothing(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): void { this._character.removeClothing(bodyMeshId, slot); }
+    /** Clothing fit round 2: the body-hiding mask + the skirt hem swing (Scene3DCharacter). */
+    getHideBodyUnderClothes(bodyMeshId: string): boolean { return this._character.getHideBodyUnderClothes(bodyMeshId); }
+    setHideBodyUnderClothes(bodyMeshId: string, on: boolean): void { this._character.setHideBodyUnderClothes(bodyMeshId, on); }
+    getSkirtSwing(bodyMeshId: string): number | null { return this._character.getSkirtSwing(bodyMeshId); }
+    setSkirtSwing(bodyMeshId: string, amount: number): void { this._character.setSkirtSwing(bodyMeshId, amount); }
     serializeClothingRigs(): { bodyMeshId: string; slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'; params: ClothingParams; renderStyle?: RenderStyle }[] { return this._character.serializeClothingRigs(); }
     restoreClothingRigs(states: { bodyMeshId: string; slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'; params: ClothingParams; renderStyle?: RenderStyle }[] | undefined): void { this._character.restoreClothingRigs(states); }
     clothingRigKeyForMesh(meshId: string): string | null { return this._character.clothingRigKeyForMesh(meshId); }
@@ -4408,9 +6488,17 @@ export class Scene3DManager {
      * (no skinning needed for a preview). Clear with clearProceduralBodyPreview().
      */
     async previewProceduralBody3D(params?: Partial<import('./body-generator').BodyParams>): Promise<void> {
-        const { generateBodyResult, BODY_POSES } = await import('./body-generator');
-        const result = generateBodyResult(params);
+        const { generateBodyResult, BODY_POSES, NEW_BODY_DEFAULTS } = await import('./body-generator');
+        // Same params the commit uses (createProceduralBody3D / createProceduralCharacter3D add the new-body defaults).
+        const result = generateBodyResult({ ...NEW_BODY_DEFAULTS, ...(params ?? {}) });
         const geom = result.geometry, skin = result.skinning;
+        // SCENE SCALE (preview == result): the committed body is scaled so it stands 1.7 m in a city
+        // (_applySceneCharacterScale, measured on the rest geometry under result.scale). Same factor here, from the same
+        // rest-geometry height; O(verts) once per slider change. 1 outside a city.
+        let yLo = Infinity, yHi = -Infinity;
+        for (let v = 1; v < geom.vertices.length; v += 12) { const y = geom.vertices[v]; if (y < yLo) yLo = y; if (y > yHi) yHi = y; }
+        const baseScale: [number, number, number] = [result.scale[0], result.scale[1], result.scale[2]];
+        const k = this._sceneCharacterScaleFactor((yHi - yLo) * Math.abs(baseScale[1]), this._playMetreScale());
         // Build a THROWAWAY skeleton (not in the scene) so we can pose + idle the ghost. Same joint data the
         // real body uses, so the ghost stands exactly like the character that spawns.
         const joints: Joint3D[] = [];
@@ -4437,6 +6525,9 @@ export class Scene3DManager {
             skel, base, indices: geom.indices, ji: skin.jointIndices, jw: skin.jointWeights,
             rest: new Float32Array(geom.vertices), out: new Float32Array(geom.vertices.length),
             t0: this._ghostIdle?.t0 ?? performance.now(),   // preserve phase across live slider rebuilds
+            scale: [baseScale[0] * k, baseScale[1] * k, baseScale[2] * k],
+            // In a city the committed body stands its SOLES on the floor point (_applySceneCharacterScale) — same lift here.
+            offset: [result.position[0], result.position[1] + (k !== 1 && Scene3DManager.citySpawnFeetOnFloor && Number.isFinite(yLo) ? -yLo * baseScale[1] * k : 0), result.position[2]],
         };
         this._ensureGhostIdleCallback();
         if (!this._ghostHeldLive && !this.ctx.webgpuRenderer.isLive) { this.ctx.webgpuRenderer.play(); this._ghostHeldLive = true; }
@@ -4447,13 +6538,18 @@ export class Scene3DManager {
     /** Hide the procedural-body ghost preview. */
     clearProceduralBodyPreview(): void {
         this._ghostIdle = null;
+        this._ghostSpawn = null;
         if (this._ghostHeldLive) { this.ctx.webgpuRenderer.pause(); this._ghostHeldLive = false; }
         this.renderer3D.setGhostPreviewData(null);
         this.ctx.scheduleRender();
     }
 
     // ── Animated ghost (the preview breathes/sways in the Relaxed stance instead of a static T-pose) ──
-    private _ghostIdle: { skel: Skeleton3D; base: Map<string, [number, number, number, number]>; rest: Float32Array; out: Float32Array; indices: Uint32Array; ji: Uint8Array; jw: Float32Array; t0: number } | null = null;
+    private _ghostIdle: { skel: Skeleton3D; base: Map<string, [number, number, number, number]>; rest: Float32Array; out: Float32Array; indices: Uint32Array; ji: Uint8Array; jw: Float32Array; t0: number; scale: [number, number, number]; offset: [number, number, number] } | null = null;
+    /** City preview placement cache: where a committed character would spawn for the camera pose `key` (the view-ray
+     *  floor cast of resolveCharacterSpawn3D). Re-cast only when the camera moved, at most every GHOST_SPAWN_RECAST_MS,
+     *  so neither slider drags nor the per-frame idle tick pay a city raycast each time. */
+    private _ghostSpawn: { key: number[]; pos: [number, number, number]; at: number } | null = null;
     private _ghostIdleCallback: (() => boolean) | null = null;
     private _ghostHeldLive = false;
     // Spawn REVEAL (a POST-step, NOT a replacement for createProceduralBody3D): a frozen-Relaxed body ghost,
@@ -4468,7 +6564,7 @@ export class Scene3DManager {
                 return false;
             };
         }
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._ghostIdleCallback);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._ghostIdleCallback, 'ghostIdle');
     }
 
     /** Pose the throwaway skeleton (Relaxed + one idle frame), re-FK, CPU-skin the rest verts, push to the ghost. */
@@ -4478,13 +6574,29 @@ export class Scene3DManager {
         this._animation.applyIdle(g.skel, { intensity: 1, base: g.base, legMode: 'none' }, (performance.now() - g.t0) / 1000);   // preview: breathing only
         g.skel.computeWorldMatrices();
         this._skinGhostVerts(g.rest, g.ji, g.jw, g.skel.skinMatrices, g.out);
-        // Place the ghost's ORIGIN (feet) at the camera's look-at point — the spawned character stands
-        // feet-at-origin and the look-at sits at origin too, so both read feet-at-centre and line up.
-        const t = this.getCamera().target;
+        const p = this._ghostPreviewOrigin();
         this.renderer3D.setGhostPreviewData({
             vertices: g.out, indices: g.indices,
-            instances: [{ x: t[0], y: t[1], z: t[2], rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 }], alpha: 0.55,
+            instances: [{ x: p[0] + g.offset[0], y: p[1] + g.offset[1], z: p[2] + g.offset[2], rx: 0, ry: 0, rz: 0, sx: g.scale[0], sy: g.scale[1], sz: g.scale[2] }], alpha: 0.55,
         });
+    }
+
+    /** Where the ghost's ORIGIN (feet) goes. Outside a city: the camera's look-at point (unchanged — the spawned
+     *  character stands feet-at-origin and the look-at sits at origin too, so both read feet-at-centre). In a city:
+     *  exactly where a default-positioned character would spawn (resolveCharacterSpawn3D: the floor the camera looks
+     *  at), cached per camera pose and re-cast at most every GHOST_SPAWN_RECAST_MS while the camera moves. */
+    private _ghostPreviewOrigin(): [number, number, number] {
+        const cam = this.getCamera();
+        const t = cam.target;
+        if (this._playMetreScale() === null) { this._ghostSpawn = null; return [t[0], t[1], t[2]]; }
+        const o = cam.position;
+        const key = [o[0], o[1], o[2], t[0], t[1], t[2]];
+        const c = this._ghostSpawn;
+        const now = performance.now();
+        if (c && (key.every((v, i) => v === c.key[i]) || now - c.at < GHOST_SPAWN_RECAST_MS)) return c.pos;
+        const pos = this.resolveCharacterSpawn3D(null);
+        this._ghostSpawn = { key, pos, at: now };
+        return pos;
     }
 
     /** CPU linear-blend skinning: deform the 12-float-stride rest verts (pos+normal) by the skeleton's
@@ -5491,10 +7603,16 @@ export class Scene3DManager {
         // and restore the actual prior mode on teardown — so leaving the armature panel returns you to free3D
         // if that's where you were, instead of the flat 2D view the auto-sync would otherwise resume.
         const wasActive = this._armature.getBoneOverlaySkeletonId() !== null;
-        if (skeletonId !== null && !this._inCameraSubMode()) this._captureCurrentPose();
+        // enterArmatureMode3D (the panel opening) already captured the pose BEFORE it framed the mesh — capturing again
+        // here would record the armature framing as "where you were", and exit would restore THAT instead of your
+        // free-3D view (the camera bug on leaving armature mode).
+        if (skeletonId !== null && !this._inCameraSubMode() && !this._armatureEntryCaptured) this._captureCurrentPose();
         this._armature.showBoneOverlay3D(skeletonId, meshId);
-        if (skeletonId === null && wasActive) this._applyViewState();
+        if (skeletonId === null && (wasActive || this._armatureEntryCaptured)) this._applyViewState();
+        if (skeletonId === null) this._armatureEntryCaptured = false;
     }
+    /** True between enterArmatureMode3D (which snapshots the pre-armature camera) and the panel closing. */
+    private _armatureEntryCaptured = false;
 
     // ── Armature focus mode helpers ──────────────────────────────────────────
 
@@ -5512,7 +7630,11 @@ export class Scene3DManager {
      * If `meshId` is provided the camera frames that mesh right away.
      * The background is deactivated automatically by showBoneOverlay3D(null).
      */
-    enterArmatureMode3D(meshId?: string): void { return this._armature.enterArmatureMode3D(meshId); }
+    enterArmatureMode3D(meshId?: string): void {
+        // Snapshot the camera BEFORE the armature framing moves it, so leaving armature mode returns to it exactly.
+        if (!this._inCameraSubMode() && !this._armatureEntryCaptured) { this._captureCurrentPose(); this._armatureEntryCaptured = true; }
+        return this._armature.enterArmatureMode3D(meshId);
+    }
 
     /**
      * Fit the camera to the given mesh so it fills the viewport during armature editing.
@@ -5594,9 +7716,68 @@ export class Scene3DManager {
             const i = idxByName.get(joint);
             if (i !== undefined) skel.data.joints[i].localRotation = [...q];
         }
+        this.clearArmsForSkeleton(skel);   // fit the preset to THIS body: hanging arms raised just enough to clear it
         skel.computeWorldMatrices();
         this.ctx.scheduleRender();
         return true;
+    }
+
+    /**
+     * Keep a procedural body's HANGING arms out of its own torso/hips (arm-clearance.ts): raises each down-hanging arm
+     * sideways the minimum that clears THIS body's shape (+ a small margin for the idle sway). A pose that already
+     * clears is untouched. Runs after a preset / pose-library pose and after a body-shape change. If the idle is
+     * running, its captured base is corrected too (else the next idle frame would restore the clipping pose).
+     * Returns the degrees added per side.
+     */
+    clearArmsForSkeleton(skel: Skeleton3D): { L: number; R: number } {
+        const none = { L: 0, R: 0 };
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skel.id) as SkinnedMesh3D | undefined;
+        if (!body?.geometry || !body.jointIndices || !body.jointWeights) return none;
+        const joints = skel.data.joints;
+        const m: SkinnedMeshData = {
+            vertices: body.geometry.vertices, stride: 12, posOffset: 0, indices: body.geometry.indices,
+            jointIndices: body.jointIndices, jointWeights: body.jointWeights, jointNames: joints.map(j => j.name),
+            jointParents: Int16Array.from(joints.map(j => j.parentIndex)),
+            jointLocalPositions: Float32Array.from(joints.flatMap(j => [j.localPosition[0], j.localPosition[1], j.localPosition[2]])),
+            inverseBindMatrices: Float32Array.from(joints.flatMap(j => Array.from(j.inverseBindMatrix))),
+        };
+        const idleBase = this._animation.getIdleBase(body.id);
+        const rot = new Map(joints.map(j => [j.name, [...(idleBase?.get(j.name) ?? j.localRotation)] as [number, number, number, number]]));
+        let added = none;
+        try { added = resolveArmClearance(m, rot, skel.skinningMethod); } catch { return none; }   // never let a fit failure break posing
+        for (const side of ['L', 'R'] as const) {
+            if (!added[side]) continue;
+            const name = `shoulder_${side}`, q = rot.get(name)!, j = joints.find(jj => jj.name === name);
+            if (j) { j.localRotation = [...q]; j.ikRotation = undefined; j.constraintRotation = undefined; }
+            if (idleBase?.has(name)) idleBase.set(name, [...q] as [number, number, number, number]);
+        }
+        if (added.L || added.R) { skel.computeWorldMatrices(); skel.matricesDirty = true; }
+        return added;
+    }
+
+    /** Pre-clip gaze per body, captured at a clip's first gaze event and restored by its `restore` event. */
+    private _clipGazeBase = new Map<string, [number, number]>();
+    /** Bodies whose face-kit expression a clip changed (so its `restore` event returns them to rest). */
+    private _clipExprSet = new Set<string>();
+    /** A clip face event → the procedural body driven by `skel`: gaze jump (offset from the pre-clip gaze), blink,
+     *  restore. Face-less bodies ignore it. */
+    private _clipFaceEvent(skel: Skeleton3D, ev: import('../../types/armature-3d').ClipFaceEvent): void {
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skel.id);
+        if (!body) return;
+        const id = body.id;
+        if (ev.blink) this._character.blinkNow(id);
+        // Face kit (face-features.ts): expressions + brow raises; `restore` also returns to the resting expression.
+        if (ev.expression) { if (this._character.setCharacterExpression(id, ev.expression, { weight: ev.weight, blendMs: 220 })) this._clipExprSet.add(id); }
+        else if (ev.restore && this._clipExprSet.delete(id)) this._character.setCharacterExpression(id, 'default', { blendMs: 260 });
+        if (ev.browRaise) this._character.pulseBrows(id, ev.browRaise);
+        if (ev.gaze || ev.restore) {
+            const cur = this._character.getFaceGaze(id);
+            if (!cur) return;
+            if (!this._clipGazeBase.has(id)) this._clipGazeBase.set(id, cur);
+            const base = this._clipGazeBase.get(id)!;
+            if (ev.restore) { this._character.setFaceGaze(id, base[0], base[1]); this._clipGazeBase.delete(id); }
+            else if (ev.gaze) this._character.setFaceGaze(id, base[0] + ev.gaze[0], base[1] + ev.gaze[1]);
+        }
     }
 
     /** List the available preset-pose names (for a UI dropdown). */
@@ -6172,6 +8353,7 @@ export class Scene3DManager {
                 bias:       this.renderer3D.shadowBias,
                 strength:   this.renderer3D.shadowStrength,
                 softness:   this.renderer3D.shadowSoftness,
+                cascades:   this.renderer3D.shadowCascades,
             },
             snap: this.snapMode,
             snapGridSize:   this.snapGridSize,
@@ -6180,6 +8362,20 @@ export class Scene3DManager {
             grid: { visible: this._gridVisible, color: this.gridColor, opacity: this._gridOpacity },
             softLightStrength: this.renderer3D.softLightStrength,   // global wrapped/half-Lambert amount for soft-lit skin
             skinRamp: { ...this.renderer3D.skinRamp },              // global skin toon-ramp look (bands/softness/tint)
+            sketchPaper: this.renderer3D.sketchPaper,               // Sketch style paper amount (0 colour .. 1 paper)
+            toonShadows: this.renderer3D.toonShadows,               // toon-shadow look (Cel + toonShadow materials)
+            rimLight: this.renderer3D.rimLight,                     // parameterised rim (strength 0 = original)
+            environmentStyle: { ...(this._environmentStyle ?? {}) },   // the Environment style ({} = none)
+            shadowTint: this.renderer3D.shadowTint,                        // coloured shadows (null = neutral)
+            heightFog: this.renderer3D.heightFog,                          // height fog (density 0 = off)
+            aerialHaze: this.renderer3D.aerialHaze,                        // aerial perspective (strength 0 = off)
+            ...(this.renderer3D.fogHardEdge ? { fogHardEdge: true } : {}),  // only when on → old saves stay identical
+            ...((): { fogHorizon?: Partial<import('../../renderer/3d/fog-horizon').FogHorizonSettings> } => { const d = fogHorizonDiff(this.renderer3D.fogHorizon); return d ? { fogHorizon: d } : {}; })(),   // only non-default fields → old saves stay identical
+            edgeOutlines: this.renderer3D.outlineConfig,            // screen-space edge outline (null = off)
+            characterOutlines: this._charOutlines ? { ...this._charOutlines } : null,   // E3 characters-only outline (null = off)
+            playCharacterOutlines: this._playCharOutlines,                  // item 10: ink line in Play (absent in old saves = off)
+            particleBloom: this.renderer3D.bloomConfig,             // particle "Bloom Glow" (null = off)
+            antiAliasing: this.renderer3D.antiAliasing,             // 3D AA (FXAA medium by default)
             scriptBehaviors: this._scriptManager.serialize(),      // custom per-node game-logic sources
             // Refresh the current mode's camera pose so a save made without ever switching modes still
             // records where the camera is (so reload restores the vantage, not a reframe).
@@ -6187,18 +8383,53 @@ export class Scene3DManager {
             // Only serialize the library when it actually has entries (keeps old/empty saves clean).
             ...(this._animLibrary && this._animLibrary.size > 0 ? { animationLibrary: this._animLibrary.serialize() } : {}),
             ...(this._assetRefs.size > 0 ? { assetReferences: this._assetRefs.serialize() } : {}),
+            // Play settings (eye height / auto default character) — only when non-default, so old saves stay identical.
+            ...(this.playSettings.serialize() ? { play: this.playSettings.serialize() } : {}),
             // Play-mode player binding + locomotion set (only when set).
             ...((this._playerMeshId || this._locoSet || this._locoBlend || this._playerOverlayRef) ? { player: { meshId: this._playerMeshId, locomotionSet: this._locoSet, ...(this._locoBlend ? { locomotionBlend: this._locoBlend } : {}), ...(this._playerOverlayRef ? { overlay: this._playerOverlayRef } : {}) } } : {}),
         };
+    }
+
+    /** Device-lost recovery (docs/ui/device-recovery.md): drop the GPU objects this manager's helpers keep across a
+     *  document load (the restore that follows rebuilds the document content on the new device). Returns what the
+     *  recovery can't bring back (not document content). */
+    resetGpuResourcesForDeviceLoss(): string[] {
+        const lost: string[] = [];
+        this._textures.resetForDeviceLoss();
+        const html = this._htmlTex.count;
+        if (html) lost.push(`${html} HTML texture(s) (runtime-only, not document content): set them again`);
+        this._htmlTex.dispose();
+        const cloth = this._cloth.resetForDeviceLoss();
+        if (cloth) lost.push(`${cloth} live cloth simulation(s) stopped: start them again`);
+        return lost;
     }
 
     /** Clear every 3D-side registry before a document restore (audit 2026-09-28 P6): character rigs, the kitbash
      *  catalog + baked parts, and the GLB model store (refilled by restoreMeshState for each GLB mesh — without this
      *  the PREVIOUS doc's 50-200 MB of GLBs were written into the new doc's folder on the next save). */
     clearForDocumentLoad3D(): void {
+        // bug-hunt 2026-10-01: a load while PLAYING left the GameLoop driving the old doc's player, the editor
+        // suspended (autosave blocked), and Stop later wrote the old pre-play transforms/camera onto the new doc.
+        this.exitPlayMode3D();
         this._character.clearForDocumentLoad();
         this._kitbash.clearForDocumentLoad();
         this._modelStore.clear();
+        // Document-content registries that restoreGlobalScene3DSettings used to clear UNCONDITIONALLY — which also
+        // fired on PARTIAL restores (exitCityMode's lighting restore, sm.authoring.applySceneSettings) and wiped the
+        // document's scripts / animation library / asset refs / play settings / player binding (bug-hunt 2026-10-01).
+        // The forget-the-previous-doc step lives here now; the restore only touches keys that are present.
+        this._scriptManager.restore(undefined);
+        this.animLibrary.clearForDocumentLoad();
+        this._assetRefs.clearForDocumentLoad();
+        this.playSettings.restore(undefined);
+        this._playerMeshId = null; this._locoSet = null; this._locoBlend = null; this._playerOverlayRef = null;
+        // The session IBL cache (live ImageData / sky source / encoded data URL) must not outlive its document: the
+        // restore prefers the cache over the doc's own ibl.image, so doc B rendered (and re-saved) doc A's env map.
+        this._envMapImageRaw = null; this._envMapSkySrc = null; this._envMapDataUrlRaw = null;
+        this._preSkyEnv = null;   // resetSky3D in doc B restored doc A's pre-preset sun / ambient / IBL
+        // §P15 stats fix: the GPU-driven records of doc A's meshes must not outlive it (they held the meshes + their
+        // geometry, and their read-back counters showed in doc B's HUD); the next frame rebuilds from doc B
+        (this.ctx.webgpuRenderer.getRenderer3D() as Renderer3D | null)?.resetGpuScene();
     }
 
     /** The engine's global-settings defaults, snapshotted at the START of the first document load (before anything
@@ -6212,9 +8443,32 @@ export class Scene3DManager {
      *  The snapshot is taken lazily at the first load because renderer3D doesn't exist at construction. */
     resetGlobalScene3DSettingsForLoad(): void {
         if (!this._globalSettingsDefaults) {
-            this._globalSettingsDefaults = JSON.parse(JSON.stringify(this.getGlobalScene3DSettings()));
+            const d = JSON.parse(JSON.stringify(this.getGlobalScene3DSettings())) as GlobalScene3DSettings;
+            // Settings only — never the first session's document CONTENT (scripts, library, refs, play, player):
+            // those would otherwise be re-applied to every later doc lacking the key (bug-hunt 2026-10-01).
+            for (const k of ['scriptBehaviors', 'animationLibrary', 'assetReferences', 'play', 'player'] as const) delete (d as Partial<GlobalScene3DSettings>)[k];
+            // Only-when-on keys are absent from a gather → pin their default so a doc without the key loads as off.
+            d.fogHardEdge = false;
+            d.fogHorizon = {};   // (only-non-default too: {} = the defaults)
+            this._globalSettingsDefaults = d;
         }
         this.restoreGlobalScene3DSettings(JSON.parse(JSON.stringify(this._globalSettingsDefaults)));
+    }
+
+    /** How a character's joints blend (audit C1 Phase 3): 'linear' (the original) or 'dualQuat' (keeps volume at bent
+     *  joints). Accepts a Skeleton3D id OR any skinned-mesh id bound to it (body/clothes/hair → the shared skeleton, so
+     *  the whole character switches together). Persists with the skeleton. Returns false if nothing resolved. */
+    setSkinningMethod3D(id: string, method: 'linear' | 'dualQuat'): boolean {
+        const skel = this.getSkeleton(id) ?? this.getSkinnedMesh(id)?.skeleton ?? null;
+        if (!skel) return false;
+        skel.skinningMethod = method;
+        skel.matricesDirty = true;   // re-upload the skin buffer in the new packing
+        this.ctx.scheduleRender();
+        return true;
+    }
+    getSkinningMethod3D(id: string): 'linear' | 'dualQuat' | null {
+        const skel = this.getSkeleton(id) ?? this.getSkinnedMesh(id)?.skeleton ?? null;
+        return skel ? skel.skinningMethod : null;
     }
 
     restoreGlobalScene3DSettings(s: Partial<GlobalScene3DSettings>): void {
@@ -6280,6 +8534,8 @@ export class Scene3DManager {
             }
             if (typeof s.shadows.strength === 'number') this.renderer3D.setShadowStrength(s.shadows.strength);
             if (typeof s.shadows.softness === 'number') this.renderer3D.setShadowSoftness(s.shadows.softness);
+            // Cascades: a shadows block without the key (older saves, partial restores) means the original single map.
+            this.renderer3D.setShadowCascades(s.shadows.cascades ?? { cascades: 1 });
         }
         if (s.snap !== undefined) this.snapMode = s.snap;
         if (s.snapGridSize   !== undefined) this.snapGridSize  = s.snapGridSize;
@@ -6293,7 +8549,32 @@ export class Scene3DManager {
         }
         if (s.softLightStrength !== undefined) this.renderer3D.setSoftLightStrength(s.softLightStrength);
         if (s.skinRamp !== undefined) this.renderer3D.setSkinRamp(s.skinRamp);
-        this._scriptManager.restore(s.scriptBehaviors);   // clears stale first (undefined → empty), then loads
+        // Only touch a setting whose KEY is present: this is also called with PARTIAL objects (the city tool restores
+        // just lighting/bg/fog/shadows; the scene-authoring API a patch), which must not reset everything else. A
+        // document load first resets to the defaults (resetGlobalScene3DSettingsForLoad), so an older save that lacks
+        // a key still lands on the default (Sketch 0.75, toon defaults, rim strength 0, edge outline + particle bloom OFF).
+        if ('sketchPaper' in s) this.renderer3D.setSketchPaper(s.sketchPaper ?? 0.75);
+        if ('toonShadows' in s) this.renderer3D.setToonShadows({ ...DEFAULT_TOON_SHADOWS, ...(s.toonShadows ?? {}) });
+        if ('rimLight' in s) this.renderer3D.setRimLight({ ...DEFAULT_RIM_LIGHT, ...(s.rimLight ?? {}) });
+        // The Environment style VALUE only — every object already carries (and restores) its own style.
+        if ('environmentStyle' in s) this._environmentStyle = sanitizeObjectStyle(s.environmentStyle);
+        if ('shadowTint' in s) this.renderer3D.setShadowTint(Array.isArray(s.shadowTint) ? s.shadowTint : null);
+        if ('aerialHaze' in s) { const a = Array.isArray(s.aerialHaze) && s.aerialHaze.length === 4 ? s.aerialHaze : [0, 20, 0.6, 0.5]; this.renderer3D.setAerialHaze(a[0], a[1], a[2], a[3]); }
+        if ('fogHardEdge' in s) this.renderer3D.fogHardEdge = s.fogHardEdge === true;
+        if ('fogHorizon' in s) this.renderer3D.setFogHorizon({ ...(s.fogHorizon && typeof s.fogHorizon === 'object' ? s.fogHorizon : {}), reset: true });
+        if ('heightFog' in s) { const h = Array.isArray(s.heightFog) && s.heightFog.length === 4 ? s.heightFog : [0, 0, 1, 0.05]; this.renderer3D.setHeightFog(h[0], h[1], h[2], h[3]); }
+        if ('edgeOutlines' in s) { if (s.edgeOutlines) this.renderer3D.enableOutlines(s.edgeOutlines.color, s.edgeOutlines.threshold, s.edgeOutlines.depthFade ?? null); else this.renderer3D.disableOutlines(); }
+        // E3: the setting only (each saved body restores its own outline); future characters pick it up.
+        if ('characterOutlines' in s) this._charOutlines = s.characterOutlines ? { ...s.characterOutlines } : null;
+        // Item 10: always saved since it existed. A FULL document save from before it (it carries the always-written
+        // characterOutlines / viewState keys) has no key → off, so old documents play as they did; a partial patch
+        // (lighting only) leaves it alone; a new / empty document keeps the default (on).
+        this._playCharOutlines = playCharacterOutlinesOnRestore(s, this._playCharOutlines);
+        if ('antiAliasing' in s) this.renderer3D.setAntiAliasing(s.antiAliasing ?? { mode: 'fxaa', quality: 'medium' });
+        if ('particleBloom' in s) { if (s.particleBloom) this.renderer3D.enableBloom(s.particleBloom.threshold, s.particleBloom.intensity); else this.renderer3D.disableBloom(); }
+        // Document-content keys below: only when PRESENT (partial restores must not wipe them — clearForDocumentLoad3D
+        // does the forget-the-previous-doc reset on a real load).
+        if ('scriptBehaviors' in s) this._scriptManager.restore(s.scriptBehaviors);   // clears stale first, then loads
         if (s.viewState) {
             // Restore the target × camera mode (+ poses). normalizeViewState coerces legacy/partial blobs; older
             // saves have no viewState → left at the illustration/ortho2D default (loaded unchanged).
@@ -6304,15 +8585,17 @@ export class Scene3DManager {
         }
         // Animation Library: always CLEAR (stale-registry rule — a doc without a library must not inherit the
         // previous doc's), then load the incoming one. `load(merge:false)` replaces + re-mints ids.
-        this.animLibrary.clearForDocumentLoad();
-        if (s.animationLibrary) this.animLibrary.load(s.animationLibrary);
-        this._assetRefs.clearForDocumentLoad();
-        if (s.assetReferences) this._assetRefs.load(s.assetReferences);
-        // Play-mode player binding + locomotion set (always reset first, then restore).
-        this._playerMeshId = s.player?.meshId ?? null;
-        this._locoSet = s.player?.locomotionSet ? { ...s.player.locomotionSet } : null;
-        this._locoBlend = s.player?.locomotionBlend ? { ...s.player.locomotionBlend } : null;
-        this._playerOverlayRef = s.player?.overlay ? { clip: s.player.overlay.clip, region: Array.isArray(s.player.overlay.region) ? [...s.player.overlay.region] : s.player.overlay.region, mode: s.player.overlay.mode, weight: s.player.overlay.weight } : null;
+        if (s.animationLibrary) { this.animLibrary.clearForDocumentLoad(); this.animLibrary.load(s.animationLibrary); }
+        if (s.assetReferences) { this._assetRefs.clearForDocumentLoad(); this._assetRefs.load(s.assetReferences); }
+        // Play settings (absent = defaults, reset by clearForDocumentLoad3D: automatic eye height, auto default character on).
+        if ('play' in s) this.playSettings.restore(s.play);
+        // Play-mode player binding + locomotion set (reset by clearForDocumentLoad3D; restored when present).
+        if ('player' in s) {
+            this._playerMeshId = s.player?.meshId ?? null;
+            this._locoSet = s.player?.locomotionSet ? { ...s.player.locomotionSet } : null;
+            this._locoBlend = s.player?.locomotionBlend ? { ...s.player.locomotionBlend } : null;
+            this._playerOverlayRef = s.player?.overlay ? { clip: s.player.overlay.clip, region: Array.isArray(s.player.overlay.region) ? [...s.player.overlay.region] : s.player.overlay.region, mode: s.player.overlay.mode, weight: s.player.overlay.weight } : null;
+        }
         this.ctx.scheduleRender();
     }
 
@@ -6369,12 +8652,31 @@ export class Scene3DManager {
     // Cached env-map source so a within-session global-settings restore can re-upload it (the renderer only keeps the
     // derived SH coeffs, not the image). `_envMapDataUrl` is the same image encoded once so it can ALSO be serialized
     // into the document (§2.3) and re-decoded after a fresh reload.
-    private _envMapImage: ImageData | null = null;
-    private _envMapDataUrl: string | null = null;
+    // P4.1: both are LAZY. A procedural-sky bake (the time-of-day path) only records its source params
+    // (`_envMapSkySrc`); the equirect ImageData and its webp data URL are materialized on first read (save / restore /
+    // reset), not on every rebake. `_envMapDataUrlRaw === undefined` = not encoded yet.
+    private _envMapImageRaw: ImageData | null = null;
+    private _envMapSkySrc: { sky: SkyState; sunDir: [number, number, number] } | null = null;
+    private _envMapDataUrlRaw: string | null | undefined = null;
+    private get _envMapImage(): ImageData | null {
+        const src = this._envMapSkySrc;
+        if (!this._envMapImageRaw && src) {
+            const { width, height, data } = bakeSkyEquirect(src.sky, src.sunDir);
+            if (typeof ImageData !== 'undefined') { const img = new ImageData(width, height); img.data.set(data); this._envMapImageRaw = img; }
+            else this._envMapImageRaw = { width, height, data } as unknown as ImageData;
+        }
+        return this._envMapImageRaw;
+    }
+    private set _envMapImage(v: ImageData | null) { this._envMapImageRaw = v; this._envMapSkySrc = null; }
+    private get _envMapDataUrl(): string | null {
+        if (this._envMapDataUrlRaw === undefined) { const img = this._envMapImage; this._envMapDataUrlRaw = img ? Scene3DManager._imageDataToDataUrl(img) : null; }
+        return this._envMapDataUrlRaw;
+    }
+    private set _envMapDataUrl(v: string | null) { this._envMapDataUrlRaw = v; }
     private _envMapIntensity = 1.0;
     setEnvironmentMap3D(imageData: ImageData | null, intensity = 1.0): void {
         this._envMapImage = imageData; this._envMapIntensity = intensity;
-        this._envMapDataUrl = imageData ? Scene3DManager._imageDataToDataUrl(imageData) : null;
+        this._envMapDataUrlRaw = imageData ? undefined : null;   // encoded lazily on save
         if (!imageData) { this.renderer3D.clearEnvironmentMap3D(); }
         else { this.renderer3D.setEnvironmentMap3D(imageData, intensity); }
         this.ctx.scheduleRender();
@@ -6432,11 +8734,16 @@ export class Scene3DManager {
         const st = this._environment.state;
         const s = st.sun.direction;
         const sunDir: [number, number, number] = [-s[0], -s[1], -s[2]];   // light travels FROM the sun, so the sun is the opposite way
-        const { width, height, data } = bakeSkyEquirect(st.sky, sunDir);
-        const img = new ImageData(width, height);   // build then copy — avoids the ArrayBufferLike vs ArrayBuffer ctor mismatch
-        img.data.set(data);
-        this.setEnvironmentMap3D(img, intensity);        // SH diffuse — caches + persists + applies + schedules
-        this.renderer3D.bakeSpecularIBL(st.sky, sunDir); // prefiltered specular cube (crisp reflections)
+        // P4.1: ONE bake call — SH diffuse + prefiltered specular, on the GPU (compute) when available, else the CPU
+        // reference. The env-map cache records only the sky SOURCE; its equirect image + data URL (for save / restore /
+        // reset) are materialized lazily, so a time-of-day rebake costs no CPU equirect + webp encode.
+        const sky = JSON.parse(JSON.stringify(st.sky)) as SkyState;
+        this._envMapImage = null;
+        this._envMapSkySrc = { sky, sunDir };
+        this._envMapDataUrlRaw = undefined;
+        this._envMapIntensity = intensity;
+        this.renderer3D.onSkyBakeApplied ??= () => this.ctx.scheduleRender();   // a pipeline-pending bake lands later
+        this.renderer3D.bakeSkyLighting(sky, sunDir, intensity);
         this.ctx.scheduleRender();
     }
 
@@ -6890,7 +9197,7 @@ export class Scene3DManager {
 
         const tool = this._arrayTool;
         this._arrayToolPreRenderCb = () => tool.checkState();
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._arrayToolPreRenderCb);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._arrayToolPreRenderCb, 'arrayTool');
     }
 
     disableArrayTool(): void {
@@ -7071,17 +9378,21 @@ export class Scene3DManager {
     get shortcutAxis(): 'x' | 'y' | 'z' | null { return this._armature.getTransformController()?.shortcutAxis ?? null; }
     get shortcutNumericDisplay(): string { return this._armature.getTransformController()?.shortcutNumericDisplay ?? ''; }
 
-    beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void { return this._armature.beginTransform3D(mode); }
+    // Round 8: the G/R/S modal-transform family is an EDITOR hotkey path (the host's keydown calls it) — inert while
+    // playing (Play's WASD reaches the host's document listener too; S would start a scale). Cancel still works.
+    beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void { if (this._playing) return; return this._armature.beginTransform3D(mode); }
 
     constrainAxis3D(axis: 'x' | 'y' | 'z'): void {
+        if (this._playing) return;
         this._armature.getTransformController()?.constrainAxis3D(axis);
     }
 
     appendNumericInput(char: string): void {
+        if (this._playing) return;
         this._armature.getTransformController()?.appendNumericInput(char);
     }
 
-    commitTransform3D(): void { return this._armature.commitTransform3D(); }
+    commitTransform3D(): void { if (this._playing) return; return this._armature.commitTransform3D(); }
 
     cancelTransform3D(): void { return this._armature.cancelTransform3D(); }
 
@@ -7970,7 +10281,10 @@ export class Scene3DManager {
      * cache the result and invalidate on scene-graph-changed events rather than calling this every frame.
      */
     getScene3DHierarchy(): Scene3DHierarchyNode[] {
-        const flat = this._grouping.getScene3DHierarchy();
+        let flat = this._grouping.getScene3DHierarchy();
+        // Runtime-only nodes (the Play auto default player: body, skeleton, face decal, hair, garments) never show in
+        // the outliner, including during the first spawn (marked runtime before the cache holds them).
+        flat = flat.filter(n => !this.autoPlayer.isRuntimeNode(n.id) && !this._character.isRuntimePart(n.id));
         // DISPLAY-ONLY character grouping: a procedural character adds its parts (body + eye decal + hair + garments
         // + attachments) as FLAT siblings under root, so the outliner shows ~6-9 rows per character. Nest a
         // character's overlay parts under a single collapsible "Character" node (the body). The scene graph is

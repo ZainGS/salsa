@@ -1,5 +1,12 @@
 # Procedural Foliage Generator
 
+> **Status (2026-10-04): all 4 items BUILT** — `buildFoliage` chunky + card (`src/world/foliage.ts`; `render: 'card'`
+> sets the leafCard material bit 13 and is used by the city trees, `city-foliage.ts` / `biome.ts`; the default param is
+> still `'chunky'`), building greenery params (`baseHedge` / `vines` / `windowBoxes` / `basePlanters`), `FoliageManager` +
+> Foliage Creator ([../ui/foliage-creator.md](../ui/foliage-creator.md)), Building Edit foliage tools
+> (`sm.addBuildingFoliage3D` …). The "falls back to chunky" comment at the top of foliage.ts is stale. Quality work:
+> [foliage-quality.md](foliage-quality.md).
+>
 > **Deliverable of this pass:** this SPEC. Built after in 4 ordered items (below). A sibling sub-object generator to the
 > [[building-generator]] / character / hair systems: a pure `buildFoliage(spec) → { layers, meta }` reused in TWO
 > contexts. Ends the "buildings sit on bare ground" problem and delivers the **lush-nature-bleeding-into-architecture**

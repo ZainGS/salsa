@@ -21,10 +21,11 @@ describe('ground surface library — GROUND_SURFACES', () => {
     }
   });
 
-  it('uses only groundModes the WGSL dispatch implements (0..19), with no gaps', () => {
+  it('uses only groundModes the WGSL dispatch implements (0..21), with no gaps', () => {
     const modes = [...new Set(entries.map(([, s]) => s.mode))].sort((a, b) => a - b);
     // 9-19: shingle/half-timber/radial-shingle/thatch/clay/bark/metal/leaves/fabric/wicker/rope (2026-08-19)
-    expect(modes).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+    // 20-21: road paint + paver tiles (persona-polish B2/B3, 2026-09-30)
+    expect(modes).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
     for (const [, s] of entries) expect(Number.isInteger(s.mode)).toBe(true);
   });
 
@@ -50,7 +51,7 @@ describe('ground surface library — GROUND_SURFACES', () => {
   });
 
   it('gives every surface a physically sane recipe', () => {
-    const ORGANIC = [3, 4, 6];   // grass / asphalt / dirt — no cells, so no tile or grout
+    const ORGANIC = [3, 4, 6, 20];   // grass / asphalt / dirt / road paint — no cells, so no tile or grout
     for (const [name, s] of entries) {
       expect(s.rough, name).toBeGreaterThan(0);
       expect(s.rough, name).toBeLessThanOrEqual(1);

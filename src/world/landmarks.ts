@@ -49,8 +49,9 @@ export function placeLandmarks(graph: WorldGraph): Landmark[] {
     const p = graph.params;
     if (!(p.landmarks ?? true)) return [];
     const minA = (p.radius * 0.05) ** 2;
-    let cands = graph.blocks.filter(b => (b.district === 'civic' || b.district === 'market') && b.poly.length >= 3 && polyArea(b.poly) > minA);
-    if (cands.length < 2) cands = graph.blocks.filter(b => b.zone !== 'park' && b.zone !== 'water' && b.poly.length >= 3 && polyArea(b.poly) > minA);
+    // (A block the railway ARCADE runs over — railway-upgrade R3.1 — is never a landmark site.)
+    let cands = graph.blocks.filter(b => (b.district === 'civic' || b.district === 'market') && !b.viaduct && !b.localLine && b.poly.length >= 3 && polyArea(b.poly) > minA);
+    if (cands.length < 2) cands = graph.blocks.filter(b => b.zone !== 'park' && b.zone !== 'water' && !b.viaduct && !b.localLine && b.poly.length >= 3 && polyArea(b.poly) > minA);
     cands = cands.slice().sort((a, b) => polyArea(b.poly) - polyArea(a.poly));
     const n = Math.min(cands.length, Math.max(3, Math.round(p.radius / 4)));   // ≥3 so all hero templates appear
     // The cyber suite claims the BIGGEST block for the MEGATOWER (the sky-train weaves through its portal).

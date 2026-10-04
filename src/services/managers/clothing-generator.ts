@@ -11,6 +11,8 @@
  * skeleton. See docs/specs/clothing-generation.md.
  */
 
+import { smoothHipWeights } from './hip-weight-smooth';
+import { steerSkirtWeights, type SkirtSteer } from './skirt-steer';
 import type { MeshGeometry } from '../../renderer/3d/mesh-generators';
 import type { ArmRing } from './body-generator';   // the body's actual arm rings → sleeve = these offset outward
 import { VertGrid } from './vert-grid';
@@ -33,6 +35,12 @@ export interface BodyMeshData {
      *  of once per garment. Callers that build a fresh fit per call simply rebuild as before. Only valid
      *  while `verts` is unmutated (grids index into it). */
     gridCache?: Map<number, VertGrid>;
+    /** The body's triangle list (optional). When present AND the body is seam-blended, garment verts inherit weights
+     *  INTERPOLATED over the closest body triangle instead of copied from the nearest vertex — see
+     *  `surfaceWeightsAt` (clothing ROM audit 2026-09-28: the waist tear). Classic bodies ignore it. */
+    indices?: Uint32Array;
+    /** Lazy caches for `surfaceWeightsAt` (vert → incident triangles; whether any vert has >2 influences). */
+    triCache?: { blended: boolean; vertTris: Int32Array[] | null };
 }
 
 /** Get-or-build the body VertGrid for `cell`, using the fit's cache when present. Identical cell size
@@ -57,7 +65,14 @@ export interface ClothingPattern {
     spacing: number;          // per-pattern extra
 }
 
-export interface TopParams {
+/** Options every garment slot shares (clothing fit round 2, 2026-10-04). Persisted with the params. */
+export interface GarmentCommon {
+    /** BODY-HIDING MASK (body-hide-mask.ts): the skin this garment fully covers isn't drawn, so it can't poke through.
+     *  Default (absent) = on. Off for a garment the skin should show through (sheer / mesh fabric). */
+    hideBody?: boolean;
+}
+
+export interface TopParams extends GarmentCommon {
     slot: 'top';
     neckline: 'round' | 'v' | 'crew' | 'collar';
     necklineHeight: number;     // collar height, 0 (scoop, at chest) → 1 (high, at neck)
@@ -73,7 +88,7 @@ export interface TopParams {
     pattern?: ClothingPattern;
 }
 
-export interface BottomParams {
+export interface BottomParams extends GarmentCommon {
     slot: 'bottom';
     bottomStyle: 'skirt' | 'shorts' | 'pants';
     waistWidth: number;         // TOP girth — scales the waist/pants-top width (× hip radius)
@@ -87,9 +102,16 @@ export interface BottomParams {
     baseColor: string; trimColor: string; gradient: boolean; trimWidth: number;
     chunkiness: number;
     pattern?: ClothingPattern;
+    /** Skirt only: how much the skirt below the hips follows the THIGHS/knees when animated (R6.3). 1 (default, also
+     *  for saved skirts that predate it) = swings with the legs; 0 = the old rigid-to-the-pelvis skirt, bit-identical.
+     *  Changes animated deformation only — the rest shape is the same. */
+    legFollow?: number;
+    /** Skirt only: HEM SWING (skirt-swing.ts) — the hem trails / flares with the pelvis's motion in Play. 0 = off,
+     *  1 = the default amount (also what saved skirts without the field get), up to 1.5. Runtime only (no rest change). */
+    hemSwing?: number;
 }
 
-export interface ShoeParams {
+export interface ShoeParams extends GarmentCommon {
     slot: 'shoes';
     shoeStyle: 'sneaker' | 'flat' | 'boot' | 'heel' | 'sandal';
     soleThickness: number;   // sole slab height below the foot (world units)
@@ -104,7 +126,7 @@ export interface ShoeParams {
     pattern?: ClothingPattern;
 }
 
-export interface SockParams {
+export interface SockParams extends GarmentCommon {
     slot: 'socks';
     sockStyle: 'ankle' | 'crew' | 'knee' | 'thigh';   // cosmetic / preset label — legHeight is the real driver
     legHeight: number;       // how far up the leg the sock TUBE rises: 0 = no-show … ~0.1 ankle … ~0.32 crew … ~0.62 knee … 1+ thigh-high
@@ -116,7 +138,7 @@ export interface SockParams {
 
 /** A skin-tight UNDERSHIRT base layer (a tight top with a longer hem that can peek below the main top). Built by
  *  mapping to a tight `TopParams` + `generateTop` (negative hem = below the hips). */
-export interface UndershirtParams {
+export interface UndershirtParams extends GarmentCommon {
     slot: 'undershirt';
     sleeves: number;            // 0 tank … 0.5 tee … 1 long
     shoulderCoverage: number;   // 0 narrow … 1 full
@@ -129,7 +151,7 @@ export interface UndershirtParams {
 }
 
 /** A skin-tight UNDERPANTS base layer (briefs → boxers). Built by mapping to a tight `BottomParams` shorts. */
-export interface UnderpantsParams {
+export interface UnderpantsParams extends GarmentCommon {
     slot: 'underpants';
     legExtend: number;          // 0 = brief (high cut) … 1 = boxer (mid-thigh; peeks below shorts/skirts)
     waistHeight: number;        // raise/lower the waistband (× hip radius)
@@ -288,6 +310,10 @@ interface Accum {
     // the nearest body vert). Used for the crotch-fill rings: each pant leg's crotch fabric stays weighted to
     // ITS OWN leg, so a kick/splits SEPARATES the two legs instead of leaving a hips-weighted sheet (a "dress").
     noXfer: Set<number>;
+    /** Full 4-influence weights for verts that inherited the BODY's skin (fitGarmentToBody). The j0/w0/j1/w1 slots
+     *  still hold the top two (the garment code only ever reads two); `finish` writes all four from here (audit C1
+     *  Phase 2). A classic body has only two non-zero slots, so this reproduces the old output exactly. */
+    xfer4?: Map<number, [number, number, number, number, number, number, number, number]>;
 }
 function pushVert(ac: Accum, p: V3, n: V3, u: number, v: number, ja: number, wa: number, jb: number, wb: number): number {
     const I = ac.island;
@@ -297,6 +323,11 @@ function pushVert(ac: Accum, p: V3, n: V3, u: number, v: number, ja: number, wa:
     return ac.count++;
 }
 export const RING = 24;   // garment ring resolution — MATCHES the body's 24-gon (was 12). When the garment
+/** Trouser crotch protection half-width in ring sectors (±4 of 24 = ±60° around the side facing the other leg) — see
+ *  buildLegs. Wider re-pins the seat to the thigh (skin shows through); narrower lets the crotch web into a skirt. */
+const CROTCH_PROTECT_HALF_SECTORS = 4;
+/** How far (m) past the body midline a protected crotch vert may sit before it's released to the body's weights. */
+const CROTCH_MIDLINE_MARGIN = 0.015;
                           // ring count == the body's, garment verts line up angularly with body verts, so the
                           // body can't poke through a garment FACE (the cause of clipping on the 24-gon body);
                           // it also samples the body radii (GARMENT_RING = this) per-sector at full resolution,
@@ -699,6 +730,144 @@ function buildSkirt(ac: Accum, fit: BodyFit, p: BottomParams, rings: number): vo
     for (let i = 0; i < rings; i++) bandRings(ac, ringList[i], ringList[i + 1]);
 }
 
+/** Ring count for a skirt. The cone is straight (radius and height both linear in t), so extra rings never change
+ *  its rest SURFACE — they only give the leg-follow weights (below) the vertical resolution to fade hips → thighs →
+ *  knees smoothly. Legacy (legFollow 0) keeps the old chunkiness-only count, so it is bit-identical. */
+function skirtRings(p: BottomParams, rings: number): number {
+    if (skirtLegFollow(p) <= 0) return rings;
+    return Math.max(rings, Math.ceil(4 + 10 * Math.max(0.3, Math.min(2.5, p.length))));
+}
+
+/** Subdivide a FITTED skirt (buildSkirt layout: rings+1 rings of RING verts, banded) to ~`target` rings: each band is
+ *  split into `sub` by linear interpolation of the fitted verts (position / normal / uv / skin weights), so every new
+ *  vert sits on an edge of the old surface — the rest shape doesn't move. Returns a fresh Accum. */
+function refineSkirtRings(ac: Accum, rings: number, target: number): Accum {
+    const sub = Math.max(1, Math.ceil(target / Math.max(1, rings)));
+    if (sub <= 1 || ac.count !== (rings + 1) * RING) return ac;
+    const out = newAc();
+    out.island = ac.island;
+    const wOf = (v: number): Map<number, number> => {
+        const m = new Map<number, number>();
+        const x4 = ac.xfer4?.get(v);
+        if (x4) { for (let k = 0; k < 4; k++) if (x4[4+k] > 0) m.set(x4[k], (m.get(x4[k]) ?? 0) + x4[4+k]); }
+        else { if (ac.w0[v] > 0) m.set(ac.j0[v], ac.w0[v]); if (ac.w1[v] > 0) m.set(ac.j1[v], (m.get(ac.j1[v]) ?? 0) + ac.w1[v]); }
+        return m;
+    };
+    const ringIdx: number[][] = [];
+    for (let i = 0; i < rings; i++) for (let s = 0; s < (i === rings - 1 ? sub + 1 : sub); s++) {
+        const a = s / sub, row: number[] = [];
+        for (let k = 0; k < RING; k++) {
+            const v0 = i * RING + k, v1 = (i + 1) * RING + k;
+            const L = (arr: number[], st: number, c: number) => arr[v0*st+c] + (arr[v1*st+c] - arr[v0*st+c]) * a;
+            const g = out.count++;
+            out.pos.push(L(ac.pos, 3, 0), L(ac.pos, 3, 1), L(ac.pos, 3, 2));
+            out.nrm.push(L(ac.nrm, 3, 0), L(ac.nrm, 3, 1), L(ac.nrm, 3, 2));
+            out.uv.push(L(ac.uv, 2, 0), L(ac.uv, 2, 1));
+            const m = wOf(v0);
+            for (const [j, w] of m) m.set(j, w * (1 - a));
+            for (const [j, w] of wOf(v1)) m.set(j, (m.get(j) ?? 0) + w * a);
+            const ranked = [...m].filter((r) => r[1] > 0).sort((x, y) => (y[1] - x[1]) || (x[0] - y[0])).slice(0, 4);
+            const tot = ranked.reduce((q, r) => q + r[1], 0) || 1;
+            const r1 = ranked[1] ?? [ranked[0]?.[0] ?? 0, 0];
+            const s2 = ((ranked[0]?.[1] ?? 1) + r1[1]) || 1;
+            out.j0.push(ranked[0]?.[0] ?? 0); out.w0.push((ranked[0]?.[1] ?? 1) / s2); out.j1.push(r1[0]); out.w1.push(r1[1] / s2);
+            if (ranked.length > 2) {
+                const x4: [number, number, number, number, number, number, number, number] = [0, 0, 0, 0, 0, 0, 0, 0];
+                ranked.forEach(([j, w], q) => { x4[q] = j; x4[4 + q] = w / tot; });
+                out.xfer4?.set(g, x4);
+            }
+            row.push(g);
+        }
+        ringIdx.push(row);
+    }
+    for (let i = 0; i + 1 < ringIdx.length; i++) bandRings(out, ringIdx[i], ringIdx[i + 1]);
+    return out;
+}
+const skirtLegFollow = (p: BottomParams): number => Math.max(0, Math.min(1, p.legFollow ?? 1));
+
+const smooth01 = (x: number): number => { const t = Math.max(0, Math.min(1, x)); return t * t * (3 - 2 * t); };
+
+/**
+ * SKIRT LEG-FOLLOW weights (polish-round-3 R6.3) — the standard game technique for a skirt over animated legs.
+ * A skirt weighted only to the pelvis stays a rigid cone while the thighs swing forward/back inside it, so a stride,
+ * a stair step or a sit pushes the legs straight through the fabric. Instead every skirt vert below the waist blends
+ * onto the THIGHS by where it sits around the body:
+ *   • lateral split — its X offset from the pelvis centre (smoothstep over ±SPLIT × the hip-socket offset): the front
+ *     and back centre lines are 50/50 L/R, anything over a thigh follows that thigh, the sides follow their side;
+ *   • height — starts fading in LIFT of the way up from the hip sockets to the waist (the front of the lap has to rise
+ *     with the thighs when sitting) and is fully leg-driven by LEG_FULL down the thigh;
+ *   • knees — a long dress hem (below the knee) takes a partial KNEE_SHARE of the lower leg, so a flexed knee drags
+ *     the hem back with the calf instead of the calf poking out behind it.
+ * The existing weights (body transfer / hips) are faded out by the same height factor, so the waistband is continuous
+ * with the rest of the garment. The 50/50 centre lines can't be right in a stride with FIXED weights (the forward thigh
+ * pokes through the front centre), so those panels are additionally STEERED each frame toward the forward/trailing
+ * thigh — see skirt-steer.ts; this returns that steer data (the static weights are its signal-0 state).
+ * Rest pose is untouched (skinning at rest is the identity) — only ANIMATED deformation changes. legFollow = 0 is the
+ * old rigid-pelvis skirt, bit-identical (returns null).
+ */
+const SKIRT_SPLIT = 0.75;      // lateral blend half-width, × hip-socket offset (smaller = sharper L/R split, more stretch at the centre lines)
+const SKIRT_LIFT = 1.2;        // leg-follow starts this far up from the hip sockets (× sockets→hips-joint height; >1 = a little above the hips joint)
+const SKIRT_LEG_FULL = 0.4;    // fully thigh-driven this far down the thigh (× thigh length)
+const KNEE_SHARE = 0.6;        // lower-leg share at a long hem (front/back average)…
+const KNEE_BACK = 0.6;         // …× (1 ± this) from the front to the BACK: a flexing knee folds the calf backward into the back hem
+const KNEE_UP = 0.35;          // the knee share starts this far ABOVE the knee (× shin length) and is full half a shin below it
+const STEER_FROM = 0.2, STEER_FULL = 0.5;   // steer gain ramp over |cos(angle from the front/back centre)|
+function applySkirtLegWeights(ac: Accum, fit: BodyFit, p: BottomParams): SkirtSteer | null {
+    const lf = skirtLegFollow(p);
+    const hips = fit.joints['hips'];
+    const uL = fit.joints['upperleg_L'], uR = fit.joints['upperleg_R'], kL = fit.joints['lowerleg_L'], kR = fit.joints['lowerleg_R'];
+    if (lf <= 0 || !hips || !uL || !uR || !kL || !kR) return null;
+    const sockY = (uL.pos[1] + uR.pos[1]) * 0.5, kneeY = (kL.pos[1] + kR.pos[1]) * 0.5;
+    const thighLen = Math.max(1e-3, sockY - kneeY);
+    const fL = fit.joints['foot_L'];
+    const shinLen = fL ? Math.max(1e-3, kneeY - fL.pos[1]) : thighLen;
+    const halfW = Math.max(1e-3, Math.abs(uL.pos[0] - uR.pos[0]) * 0.5) * SKIRT_SPLIT;
+    const cx = (uL.pos[0] + uR.pos[0]) * 0.5, cz = hips.pos[2], sideL = Math.sign(uL.pos[0] - uR.pos[0]) || 1;
+    const yStart = sockY + Math.max(0, hips.pos[1] - sockY) * SKIRT_LIFT, yFull = sockY - thighLen * SKIRT_LEG_FULL;
+    const ent: { g: number; f: number; kn: number; wl: number; gain: number; b: [number, number, number, number] }[] = [];
+    for (let g = 0; g < ac.count; g++) {
+        const x = ac.pos[g*3], y = ac.pos[g*3+1], z = ac.pos[g*3+2];
+        // Angle around the body: phi = +1 front centre … −1 back centre.
+        const dx = x - cx, dz = z - cz, rr = Math.hypot(dx, dz) || 1;
+        const phi = dz / rr;
+        // (Tried: a lower/shorter band for the BACK so the seat stays with the pelvis in a squat — the steeper hips→thigh
+        // ramp stretched the seat MORE; a long band everywhere is what keeps the fabric from tearing. Not kept.)
+        const f = lf * smooth01((yStart - y) / Math.max(1e-4, yStart - yFull));
+        if (f <= 0) continue;
+        const wl = smooth01(0.5 + ((x - cx) * sideL) / (2 * halfW));   // 1 = over/outside the left thigh
+        // Knee share: only once the vert is fully leg-driven (f == 1 → no base term), so ≤ 4 influences.
+        // Steer gain: +1 over the front centre, −1 over the back, 0 at the sides.
+        const kn = f >= 1 ? Math.min(0.95, KNEE_SHARE * (1 + KNEE_BACK * -phi) * smooth01((kneeY + KNEE_UP * shinLen - y) / ((0.5 + KNEE_UP) * shinLen))) : 0;
+        // Only the front/back PANELS steer (|phi| past STEER_FROM, fully by STEER_FULL); the sides keep their own leg. A
+        // narrow ramp tears less: the stretch between a steered panel and its side stays in a few triangles.
+        const gain = Math.sign(phi) * smooth01((Math.abs(phi) - STEER_FROM) / (STEER_FULL - STEER_FROM));
+        // Base (non-leg) weights: the body-transfer 4-slot set if the fit pass gave one, else the two analytic slots — top 2.
+        const acc = new Map<number, number>();
+        // The leg part is added below (f): the BASE keeps only the pelvis / torso influences, so the waistband stays on
+        // the hips even where the body's own (hip-smoothed) weights already lean onto a thigh.
+        const legJ = new Set([uL.idx, uR.idx, kL.idx, kR.idx]);
+        const put = (j: number, w: number) => { if (w > 0 && !legJ.has(j)) acc.set(j, (acc.get(j) ?? 0) + w); };
+        const x4 = ac.xfer4?.get(g);
+        if (x4) for (let k = 0; k < 4; k++) put(x4[k], x4[4+k]); else { put(ac.j0[g], ac.w0[g]); put(ac.j1[g], ac.w1[g]); }
+        const top = [...acc].sort((a2, b2) => (b2[1] - a2[1]) || (a2[0] - b2[0])).slice(0, 2);
+        if (top.length === 0) top.push([hips.idx, 1]);
+        const bt = top.reduce((q, r) => q + r[1], 0) || 1;
+        const b1 = top[1] ?? [top[0][0], 0];
+        ent.push({ g, f, kn, wl, gain, b: [top[0][0], top[0][1] / bt, b1[0], b1[1] / bt] });
+    }
+    const n = ent.length;
+    const st: SkirtSteer = {
+        vert: new Uint32Array(n), f: new Float32Array(n), kn: new Float32Array(n), wl: new Float32Array(n), gain: new Float32Array(n),
+        b0j: new Uint8Array(n), b0w: new Float32Array(n), b1j: new Uint8Array(n), b1w: new Float32Array(n),
+        hips: hips.idx, uL: uL.idx, uR: uR.idx, lL: kL.idx, lR: kR.idx,
+    };
+    ent.forEach((e, i) => {
+        st.vert[i] = e.g; st.f[i] = e.f; st.kn[i] = e.kn; st.wl[i] = e.wl; st.gain[i] = e.gain;
+        st.b0j[i] = e.b[0]; st.b0w[i] = e.b[1]; st.b1j[i] = e.b[2]; st.b1w[i] = e.b[3];
+    });
+    return n ? st : null;
+}
+
 // ── Bottom: shorts / pants — two leg tubes, WIDE at the top (cover the hips) → taper into the legs.
 //    EVERY ring — including the hip yoke — uses the body's per-sector directional radii (like the
 //    torso/sleeves), so the whole bottom HUGS the body's actual cross-section: tight at the front, around
@@ -734,6 +903,7 @@ function buildLegs(ac: Accum, fit: BodyFit, p: BottomParams, rings: number, shoe
     // Keep the leg TOPS pulled toward centre over the top ~half (by t, not raw ring, since N is denser now):
     // the two legs OVERLAP past the inseam so the crotch is filled with fabric and the body can't poke through.
     const pullAt = (t: number): number => Math.min(1, 0.18 + t * 1.64);   // 0.18 at the waist → 1 by mid-thigh
+    const blendedBody = !!fit.body && bodyIsSeamBlended(fit.body);   // new-character crotch handling (see the crotch-fill rings)
     for (const s of ['L', 'R'] as const) {
         const ul = fit.joints['upperleg_' + s], lo = fit.joints['lowerleg_' + s], ft = fit.joints['foot_' + s];
         if (!ul || !lo) continue;
@@ -832,7 +1002,32 @@ function buildLegs(ac: Accum, fit: BodyFit, p: BottomParams, rings: number, shoe
             // vert = the hips-weighted crotch), fusing BOTH legs' crotch sheets into one central panel that stays
             // put when the legs spread = the SKIRT/dress webbing. Protected, each leg's crotch fabric follows ITS
             // upperleg → the inseam opens and the legs separate cleanly on a kick / wide stance / splits.
-            if (t < 0.5) for (const vi of ringList[ringList.length - 1]) ac.noXfer.add(vi);
+            //
+            // ★ Only the INNER sectors (facing the other leg) need that protection — the webbing is between the legs.
+            // Protecting the WHOLE ring (as before) also pinned the SEAT and outer hips to the thigh, while the body's
+            // seat is hips-bound → every trouser showed skin through the seat when walking/sitting (measured: up to
+            // 24% of covered skin, 3–4 cm; clothing-hair audit 2026-09-28, C10). Back/outer/front now take the body's
+            // own hips→thigh weights. Ring vertex k sits at angle 2πk/RING from +X: the inner side is −X (k = RING/2)
+            // for the left leg and +X (k = 0) for the right.
+            // ★ …and only while the vert is still on ITS OWN side of the midline. Near the waist the ring is pulled to
+            // the centre (pullAt), so its inner sector reaches ~10 cm PAST the midline, over the OTHER hip: pinned to
+            // its own thigh there, it stretched 3–6× against the hips-bound fabric around it in a squat (the shorts'
+            // front hip-crease tear, measured 2026-09-28). The webbing only ever forms between the legs.
+            // (Tried: fading crossed-over verts to HIPS — poke dropped a little but the squat tear DOUBLED, the faded
+            // sector now stretching against its own ring's thigh-bound verts. Not kept.)
+            // All of this is for SEAM-BLENDED (new) bodies only; a classic body keeps the old whole-ring protection so
+            // saved characters' trousers are bit-identical.
+            if (t < 0.5 && !blendedBody) {
+                for (const vi of ringList[ringList.length - 1]) ac.noXfer.add(vi);
+            } else if (t < 0.5) {
+                const innerK = s === 'L' ? RING / 2 : 0;
+                const side = Math.sign(ul.pos[0] - hips.pos[0]) || 1;
+                ringList[ringList.length - 1].forEach((vi, k) => {
+                    const dk = Math.min((k - innerK + RING) % RING, (innerK - k + RING) % RING);
+                    const pastMid = -(ac.pos[vi * 3] - hips.pos[0]) * side;          // > 0 = over the other leg
+                    if (dk <= CROTCH_PROTECT_HALF_SECTORS && pastMid <= CROTCH_MIDLINE_MARGIN) ac.noXfer.add(vi);
+                });
+            }
         }
         for (let i = 0; i < N; i++) bandRings(ac, ringList[i], ringList[i + 1]);
         // Raised cuff at the leg end (folds down) → trim band reads as a rolled hem; then cap it closed.
@@ -878,11 +1073,35 @@ function finish(ac: Accum): { geometry: MeshGeometry; jointIndices: Uint8Array; 
         verts[o+8] = t[0];        verts[o+9] = t[1];          verts[o+10] = t[2]; verts[o+11] = 1;
     }
     const ji = new Uint8Array(vc * 4), jw = new Float32Array(vc * 4);
-    for (let i = 0; i < vc; i++) { ji[i*4] = ac.j0[i]; ji[i*4+1] = ac.j1[i]; jw[i*4] = ac.w0[i]; jw[i*4+1] = ac.w1[i]; }
-    return { geometry: { vertices: verts, indices: new Uint32Array(ac.idx), format: '12float' }, jointIndices: ji, jointWeights: jw };
+    for (let i = 0; i < vc; i++) {
+        const x4 = ac.xfer4?.get(i);
+        if (x4) { for (let k = 0; k < 4; k++) { ji[i*4+k] = x4[k]; jw[i*4+k] = x4[4+k]; } continue; }
+        ji[i*4] = ac.j0[i]; ji[i*4+1] = ac.j1[i]; jw[i*4] = ac.w0[i]; jw[i*4+1] = ac.w1[i];
+    }
+    return { geometry: { vertices: verts, indices: orientOutward(ac), format: '12float' }, jointIndices: ji, jointWeights: jw };
 }
 
-const newAc = (): Accum => ({ pos: [], nrm: [], uv: [], j0: [], w0: [], j1: [], w1: [], idx: [], count: 0, island: [0, 0, 1, 1], noXfer: new Set() });
+/**
+ * Triangle list with every face wound COUNTER-CLOCKWISE seen from OUTSIDE (fit round 2, 2026-10-04). The ring builders
+ * wind their bands either way (the tee came out clockwise, the trousers counter-clockwise), which never showed while
+ * garments drew both faces the same. The cloth LINING (Material3D.clothLining: the inside face drawn dark) needs the
+ * GPU's front face to be the outside, so each face is flipped to agree with its smoothed vertex normals (recomputeNormals
+ * already points those outward). Same triangles, same vertices — only the index order of the flipped faces changes.
+ */
+function orientOutward(ac: Accum): Uint32Array {
+    const I = new Uint32Array(ac.idx), P = ac.pos, N = ac.nrm;
+    for (let t = 0; t + 2 < I.length; t += 3) {
+        const a = I[t], b = I[t+1], c = I[t+2];
+        const e1x = P[b*3]-P[a*3], e1y = P[b*3+1]-P[a*3+1], e1z = P[b*3+2]-P[a*3+2];
+        const e2x = P[c*3]-P[a*3], e2y = P[c*3+1]-P[a*3+1], e2z = P[c*3+2]-P[a*3+2];
+        const nx = e1y*e2z-e1z*e2y, ny = e1z*e2x-e1x*e2z, nz = e1x*e2y-e1y*e2x;
+        const s = nx*(N[a*3]+N[b*3]+N[c*3]) + ny*(N[a*3+1]+N[b*3+1]+N[c*3+1]) + nz*(N[a*3+2]+N[b*3+2]+N[c*3+2]);
+        if (s < 0) { I[t+1] = c; I[t+2] = b; }
+    }
+    return I;
+}
+
+const newAc = (): Accum => ({ pos: [], nrm: [], uv: [], j0: [], w0: [], j1: [], w1: [], idx: [], count: 0, island: [0, 0, 1, 1], noXfer: new Set(), xfer4: new Map() });
 
 /** Per-vertex one-ring neighbours (from the garment triangles) — used to smooth the de-collision push. */
 function buildAdjacency(ac: Accum): number[][] {
@@ -964,7 +1183,137 @@ function limbSideSets(fit: BodyFit): { L: Set<number>; R: Set<number> } {
     return { L, R };
 }
 
-function fitGarmentToBody(ac: Accum, body: BodyMeshData, gap: number, maxPush = MAX_DECOLLIDE_PUSH, sides?: { L: Set<number>; R: Set<number> }): void {
+/**
+ * Rank a body vertex's 4 skin slots for weight transfer onto a garment vert. Returns the top two (what the garment's
+ * j0/w0/j1/w1 hold — the same result as the old top-2 scan, ties keep slot order) and, ONLY when the body vert has
+ * more than two non-zero influences, all of them (≤4) normalized to sum 1. A classic 2-influence body → `all4: null`,
+ * so garments on saved characters are bit-identical to before (audit C1 Phase 2).
+ */
+export function rankBodyInfluences(ji: ArrayLike<number>, jw: ArrayLike<number>, b: number): {
+    i0: number; w0: number; i1: number; w1: number;
+    all4: [number, number, number, number, number, number, number, number] | null;
+} {
+    const ranked = [0, 1, 2, 3].map((k) => ({ j: ji[b * 4 + k], w: jw[b * 4 + k], k }))
+        .sort((x, y) => (y.w - x.w) || (x.k - y.k));
+    const nonZero = ranked.filter((r) => r.w > 0);
+    let all4: [number, number, number, number, number, number, number, number] | null = null;
+    if (nonZero.length > 2) {
+        const tot = nonZero.reduce((q, r) => q + r.w, 0);
+        all4 = [0, 0, 0, 0, 0, 0, 0, 0];
+        nonZero.slice(0, 4).forEach((r, k) => { all4![k] = r.j; all4![4 + k] = r.w / tot; });
+    }
+    return { i0: ranked[0].j, w0: ranked[0].w, i1: ranked[1].j, w1: ranked[1].w, all4 };
+}
+
+/** Whether the body was generated with a seam blend (any vertex has a 3rd influence) — the NEW-character mode the
+ *  2026-09-28 clothing fixes are gated on, so garments on classic (saved) characters stay bit-identical. Cached. */
+function bodyIsSeamBlended(body: BodyMeshData): boolean {
+    if (!body.triCache) {
+        let blended = false;
+        for (let v = 0; v * 4 < body.jw.length && !blended; v++) blended = body.jw[v*4+2] > 0;
+        body.triCache = { blended, vertTris: null };
+    }
+    return body.triCache.blended;
+}
+
+/** Barycentric (u,v,w) of the point on triangle abc closest to p (Ericson, Real-Time Collision Detection §5.1.5). */
+function closestBary(px: number, py: number, pz: number, V: Float32Array, a: number, b: number, c: number): [number, number, number, number] {
+    const ax = V[a*12], ay = V[a*12+1], az = V[a*12+2];
+    const abx = V[b*12]-ax, aby = V[b*12+1]-ay, abz = V[b*12+2]-az, acx = V[c*12]-ax, acy = V[c*12+1]-ay, acz = V[c*12+2]-az;
+    const apx = px-ax, apy = py-ay, apz = pz-az;
+    const d1 = abx*apx+aby*apy+abz*apz, d2 = acx*apx+acy*apy+acz*apz;
+    let u: number, v: number, w: number;
+    if (d1 <= 0 && d2 <= 0) { u = 1; v = 0; w = 0; }
+    else {
+        const bpx = px-V[b*12], bpy = py-V[b*12+1], bpz = pz-V[b*12+2];
+        const d3 = abx*bpx+aby*bpy+abz*bpz, d4 = acx*bpx+acy*bpy+acz*bpz;
+        const cpx = px-V[c*12], cpy = py-V[c*12+1], cpz = pz-V[c*12+2];
+        const d5 = abx*cpx+aby*cpy+abz*cpz, d6 = acx*cpx+acy*cpy+acz*cpz;
+        const vc = d1*d4 - d3*d2, vb = d5*d2 - d1*d6, va = d3*d6 - d5*d4;
+        if (d3 >= 0 && d4 <= d3) { u = 0; v = 1; w = 0; }
+        else if (d6 >= 0 && d5 <= d6) { u = 0; v = 0; w = 1; }
+        else if (vc <= 0 && d1 >= 0 && d3 <= 0) { const t = d1 / (d1 - d3); u = 1 - t; v = t; w = 0; }
+        else if (vb <= 0 && d2 >= 0 && d6 <= 0) { const t = d2 / (d2 - d6); u = 1 - t; v = 0; w = t; }
+        else if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) { const t = (d4 - d3) / ((d4 - d3) + (d5 - d6)); u = 0; v = 1 - t; w = t; }
+        else { const den = 1 / (va + vb + vc); v = vb * den; w = vc * den; u = 1 - v - w; }
+    }
+    const qx = ax + abx*v + acx*w - px, qy = ay + aby*v + acy*w - py, qz = az + abz*v + acz*w - pz;
+    return [u, v, w, qx*qx + qy*qy + qz*qz];
+}
+
+/**
+ * The body's skin weights INTERPOLATED at the closest point on the body surface (over the triangles around the
+ * nearest body vertex), as a ranked ≤4-influence set — or null when the body isn't seam-blended / has no triangle
+ * list (→ callers keep the old nearest-VERTEX copy, so classic characters are bit-identical).
+ * Why: the nearest-vertex copy SNAPS. The body's waist rings are ~14 cm apart, so garment rings every ~2 cm between
+ * them jumped from one ring's weights to the other's halfway — the garment stretched 2× there on a forward bend
+ * while the skin (which interpolates across the triangle) didn't (clothing ROM audit 2026-09-28).
+ * TORSO garments only (tops / undershirt / underpants pass `surfaceWeights`): on the ring-aligned trouser legs it was
+ * measured WORSE — at the knee the body rings are ~19 cm apart and in a 110° squat interpolated weights (a few % of the
+ * next ring's hips/thigh joint) drag the fabric ~1.5 cm into the thigh, where the nearest-vertex copy matches the skin.
+ */
+function surfaceWeightsAt(body: BodyMeshData, px: number, py: number, pz: number, nearest: number):
+    { i0: number; w0: number; i1: number; w1: number; all4: [number, number, number, number, number, number, number, number] | null } | null {
+    const idx = body.indices;
+    if (!idx) return null;
+    if (!bodyIsSeamBlended(body)) return null;
+    const tc = body.triCache!;
+    if (!tc.vertTris) {
+        const n = body.verts.length / 12, cnt = new Int32Array(n);
+        for (let t = 0; t < idx.length; t++) cnt[idx[t]]++;
+        const vt = Array.from({ length: n }, (_, v) => new Int32Array(cnt[v]));
+        cnt.fill(0);
+        for (let t = 0; t + 2 < idx.length; t += 3) for (let k = 0; k < 3; k++) { const v = idx[t+k]; vt[v][cnt[v]++] = t; }
+        tc.vertTris = vt;
+    }
+    const tris = tc.vertTris[nearest];
+    if (!tris || tris.length === 0) return null;
+    let bestT = -1, bestD = Infinity, bu = 0, bv = 0, bw = 0;
+    for (const t of tris) {
+        const [u, v, w, d] = closestBary(px, py, pz, body.verts, idx[t], idx[t+1], idx[t+2]);
+        if (d < bestD) { bestD = d; bestT = t; bu = u; bv = v; bw = w; }
+    }
+    const acc = new Map<number, number>();
+    const add = (vert: number, f: number) => {
+        if (f <= 0) return;
+        for (let k = 0; k < 4; k++) { const w = body.jw[vert*4+k]; if (w > 0) { const j = body.ji[vert*4+k]; acc.set(j, (acc.get(j) ?? 0) + w * f); } }
+    };
+    add(idx[bestT], bu); add(idx[bestT+1], bv); add(idx[bestT+2], bw);
+    const ranked = [...acc].sort((x, y) => (y[1] - x[1]) || (x[0] - y[0])).slice(0, 4);
+    if (ranked.length === 0) return null;
+    const tot = ranked.reduce((q, r) => q + r[1], 0);
+    const all4: [number, number, number, number, number, number, number, number] = [0, 0, 0, 0, 0, 0, 0, 0];
+    ranked.forEach(([j, w], k) => { all4[k] = j; all4[4 + k] = w / tot; });
+    const r1 = ranked[1] ?? [ranked[0][0], 0];
+    return { i0: ranked[0][0], w0: ranked[0][1] / tot, i1: r1[0], w1: r1[1] / tot, all4: ranked.length > 2 ? all4 : null };
+}
+
+/**
+ * Weight-only pass for garments built as an OFFSET of the body's captured ring surfaces (undershirt / underpants / socks
+ * — they return before fitGarmentToBody). Those rings carry the generator's ORIGINAL 2-influence weights, so on a
+ * seam-blended body the garment kept the old weights while the skin under it moved with the new ones → the skin poked
+ * through at the arm socket in every arms-down pose (measured: 12 chest verts, clothing ROM audit 2026-09-28).
+ * Each garment vert copies its nearest body vert's weights — but ONLY where that body vert has >2 influences, so a
+ * classic body (≤2 everywhere) is a no-op and saved characters' garments are bit-identical.
+ */
+function inheritBlendedBodyWeights(ac: Accum, body: BodyMeshData | undefined, surfaceWeights = false): void {
+    if (!body || ac.count === 0) return;
+    const grid = bodyGrid(body, WEIGHT_TRANSFER_DIST);
+    for (let g = 0; g < ac.count; g++) {
+        if (ac.noXfer.has(g)) continue;
+        const { best } = grid.nearest(ac.pos[g*3], ac.pos[g*3+1], ac.pos[g*3+2]);
+        if (best < 0) continue;
+        const { i0, w0, i1, w1, all4 } = (surfaceWeights ? surfaceWeightsAt(body, ac.pos[g*3], ac.pos[g*3+1], ac.pos[g*3+2], best) : null)
+            ?? rankBodyInfluences(body.ji, body.jw, best);
+        if (!all4) continue;                                          // classic (≤2 influences) → leave the garment as is
+        const sum = w0 + (w1 > 0 ? w1 : 0);
+        ac.j0[g] = i0; ac.w0[g] = w0 / sum;
+        ac.j1[g] = w1 > 0 ? i1 : i0; ac.w1[g] = w1 > 0 ? w1 / sum : 0;
+        ac.xfer4?.set(g, all4);
+    }
+}
+
+function fitGarmentToBody(ac: Accum, body: BodyMeshData, gap: number, maxPush = MAX_DECOLLIDE_PUSH, sides?: { L: Set<number>; R: Set<number> }, surfaceWeights = false): void {
     const bn = body.verts.length / 12;
     if (bn === 0 || ac.count === 0) return;
     const push = new Float32Array(ac.count);                                   // outward distance per vert
@@ -1033,13 +1382,8 @@ function fitGarmentToBody(ac: Accum, body: BodyMeshData, gap: number, maxPush = 
     for (let g = 0; g < ac.count; g++) {
         if (push[g] > 0) { ac.pos[g*3] += pnx[g]*push[g]; ac.pos[g*3+1] += pny[g]*push[g]; ac.pos[g*3+2] += pnz[g]*push[g]; }
         if (nearD[g] <= WEIGHT_TRANSFER_DIST && !ac.noXfer.has(g)) {   // touching → inherit the body's deformation (unless protected: the crotch fabric keeps its per-leg weight)
-            const b = near[g];
-            let i0 = 0, w0 = -1, i1 = 0, w1 = -1;
-            for (let k = 0; k < 4; k++) {
-                const w = body.jw[b*4+k], jx = body.ji[b*4+k];
-                if (w > w0) { i1 = i0; w1 = w0; i0 = jx; w0 = w; }
-                else if (w > w1) { i1 = jx; w1 = w; }
-            }
+            const { i0, w0, i1, w1, all4 } = (surfaceWeights ? surfaceWeightsAt(body, ac.pos[g*3], ac.pos[g*3+1], ac.pos[g*3+2], near[g]) : null)
+                ?? rankBodyInfluences(body.ji, body.jw, near[g]);
             // SAME-SIDE GUARD: never let a LEFT-limb garment vert inherit a RIGHT-limb body weight (or vice versa).
             // Their verts sit close in the rest pose, so the nearest-vert query grabs the wrong limb and the
             // garment stretches to it on a kick. Keep this vert's analytic (per-limb) weight instead.
@@ -1050,6 +1394,8 @@ function fitGarmentToBody(ac: Accum, body: BodyMeshData, gap: number, maxPush = 
             if (sum > 0 && !crossSide) {
                 ac.j0[g] = i0; ac.w0[g] = w0 / sum;
                 ac.j1[g] = w1 > 0 ? i1 : i0; ac.w1[g] = w1 > 0 ? w1 / sum : 0;
+                // Keep ALL the body's influences (up to 4) so a seam-blended body's garment folds with it (C1 Phase 2).
+                if (all4) ac.xfer4?.set(g, all4); else ac.xfer4?.delete(g);
             }
         }
     }
@@ -1062,7 +1408,7 @@ function fitGarmentToBody(ac: Accum, body: BodyMeshData, gap: number, maxPush = 
  *  >2cm-deep verts poking through). Then `fitGarmentToBody` runs the FACE-AWARE pass (a body bulge poking through
  *  a garment FACE between verts is lifted out) + copies the body's skin weights so it folds with the skin when
  *  posed. There is deliberately NO gap/fit slider — the gap is a fixed hair so it's always form-fit. */
-function conformBaseLayer(ac: Accum, fit: BodyFit): void {
+function conformBaseLayer(ac: Accum, fit: BodyFit, surfaceWeights = false): void {
     if (!fit.body) return;
     // TWO snap passes — pass 1 uses a BIG inward cap (0.22) so even a hip-wide hem ring hanging off the body
     // collapses fully onto the skin (the old single 0.07 cap left anything looser standing off = the flare). A
@@ -1070,7 +1416,7 @@ function conformBaseLayer(ac: Accum, fit: BodyFit): void {
     // re-snaps onto the CORRECT local surface with a tight cap → clean skin-tight fit, no residual flare.
     snapToBody(ac, 0, ac.count, fit.body, BASE_GAP, 0.22, 0.12);
     snapToBody(ac, 0, ac.count, fit.body, BASE_GAP, 0.05, 0.05);
-    fitGarmentToBody(ac, fit.body, BASE_GAP, MAX_DECOLLIDE_PUSH, limbSideSets(fit));   // face-aware lift + body-weight transfer (no face poke-through, poses with the skin)
+    fitGarmentToBody(ac, fit.body, BASE_GAP, MAX_DECOLLIDE_PUSH, limbSideSets(fit), surfaceWeights);   // face-aware lift + body-weight transfer (no face poke-through, poses with the skin)
 }
 
 export function generateTop(fit: BodyFit, p: TopParams) {
@@ -1084,22 +1430,63 @@ export function generateTop(fit: BodyFit, p: TopParams) {
     // sits OUTSIDE the body so its verts get push=0 regardless of the cap — raising it only clears real TORSO
     // clips (deep concavities the small cap left poking through), not the hidden sleeve socket. Slightly under
     // the bottoms' 0.09 to stay gentle on the rare analytic-tube sleeve fallback (which does tuck a socket).
-    if (fit.body) fitGarmentToBody(ac, fit.body, MIN_GAP, 0.06, limbSideSets(fit));
+    if (fit.body) fitGarmentToBody(ac, fit.body, MIN_GAP, 0.06, limbSideSets(fit), true);   // torso garment → surface-interpolated weights (see surfaceWeightsAt)
     return finish(ac);
 }
 
 export function generateBottom(fit: BodyFit, p: BottomParams, shoe: ShoeParams | null = null) {
     const ac = newAc();
     const rings = 4 + Math.round(Math.max(0, Math.min(1, p.chunkiness)) * 4);
-    if (p.bottomStyle === 'skirt') buildSkirt(ac, fit, p, rings);
+    const skirt = p.bottomStyle === 'skirt';
+    if (skirt) buildSkirt(ac, fit, p, rings);
     else buildLegs(ac, fit, p, rings, shoe);
     // Bottoms get a BIG de-collision cap: the legs/hip have no deep internals to hide (unlike a sleeve
     // socket), and the projecting butt / fuller thighs can sit well inside the garment — so allow the
     // shrink-wrap to push the skin back out fully (no clip). Now the garment is at the body's resolution
     // (RING=24) the verts already line up, so this is mostly a safety net for the deepest spots.
     if (fit.body) fitGarmentToBody(ac, fit.body, MIN_GAP, 0.09, limbSideSets(fit));
-    return finish(ac);
+    // R6.3: the skirt swings with the thighs/knees (see applySkirtLegWeights). The fitted skirt is first SUBDIVIDED
+    // along its length (new rings interpolated between the fitted ones → they lie on the old rest surface, so the rest
+    // look is unchanged) to give the hips → thighs → knees weight fade the vertical resolution it needs.
+    const lac = skirt && skirtLegFollow(p) > 0 ? refineSkirtRings(ac, rings, skirtRings(p, rings)) : ac;
+    const steer = skirt ? applySkirtLegWeights(lac, fit, p) : null;
+    const out = finish(lac);
+    if (!skirt && (p.legWidth ?? 1) < 1.5) smoothGarmentHipWeights(out, fit, lac.noXfer);
+    if (!steer) return out;
+    steerSkirtWeights(steer, 0, out.jointIndices, out.jointWeights);   // the static (signal-0) leg-follow weights
+    return { ...out, skirtSteer: steer };
 }
+
+/**
+ * Garment WEIGHT SMOOTHING across the hip (clothing fit round 2): the same pelvis → thigh diffusion the body gets
+ * (hip-weight-smooth.ts), run over the trousers' / shorts' own mesh, so the fabric spreads a raised thigh's rotation over
+ * several rings like the skin under it instead of tearing at the front hip crease. The per-leg crotch fabric (noXfer,
+ * see buildLegs) smooths too but never takes the other thigh, so the two legs' crotch sheets never fuse (the webbing). Seam-blended (new)
+ * bodies only — on a classic body the trousers stay bit-identical.
+ */
+function smoothGarmentHipWeights(out: { geometry: MeshGeometry; jointIndices: Uint8Array; jointWeights: Float32Array }, fit: BodyFit, protectedCrotch: Set<number>): void {
+    const hips = fit.joints['hips'], uL = fit.joints['upperleg_L'], uR = fit.joints['upperleg_R'], kL = fit.joints['lowerleg_L'];
+    if (!hips || !uL || !uR || !kL || !fit.body || !bodyIsSeamBlended(fit.body)) return;
+    let jc = 0; for (const j of Object.values(fit.joints)) if (j) jc = Math.max(jc, j.idx + 1);
+    for (let i = 0; i < out.jointIndices.length; i++) jc = Math.max(jc, out.jointIndices[i] + 1);
+    // The per-leg crotch fabric smooths too (so it follows the hip-smoothed skin of the inner thigh instead of the
+    // rigid thigh, which opened the inseam in a run), but may never take the OTHER thigh — that is the webbing.
+    const forbid = new Map<number, number>();
+    for (const v of protectedCrotch) {
+        let wl = 0, wr = 0;
+        for (let k = 0; k < 4; k++) { const j = out.jointIndices[v * 4 + k], w = out.jointWeights[v * 4 + k]; if (j === uL.idx) wl += w; else if (j === uR.idx) wr += w; }
+        forbid.set(v, wl >= wr ? uR.idx : uL.idx);
+    }
+    const s = smoothHipWeights({
+        vcount: out.geometry.vertices.length / 12, indices: out.geometry.indices, jointIndices: out.jointIndices, jointWeights: out.jointWeights,
+        positions: out.geometry.vertices, stride: 12, jointCount: jc, hips: hips.idx, thighL: uL.idx, thighR: uR.idx,
+        sockY: uL.pos[1], kneeY: kL.pos[1], hipsY: hips.pos[1], forbid,
+    }, GARMENT_HIP_SMOOTH_ITERS, GARMENT_HIP_SMOOTH_LAMBDA);
+    out.jointIndices.set(s.jointIndices); out.jointWeights.set(s.jointWeights);
+}
+// Light (swept 0 / 4 / 8 / 16 passes): more passes tear less but let the fabric drift off the skin under it (poke).
+// Loose legs (legWidth ≥ 1.5) keep their analytic far-vert weights — smoothing those raised the poke 12 → 20-29 %.
+const GARMENT_HIP_SMOOTH_ITERS = 4, GARMENT_HIP_SMOOTH_LAMBDA = 0.5;
 
 // ── Shoes ────────────────────────────────────────────────────────────────────
 // A foot-wrapping upper swept heel→toe (flat sole bottom, rounded top, toe-capped, HEEL OPEN so the leg
@@ -1340,13 +1727,14 @@ export function generateUndershirt(fit: BodyFit, p: UndershirtParams) {
         const neckY = chest.pos[1] + (neck.pos[1] - chest.pos[1]) * tp.necklineHeight;    // crew neckline
         buildTorsoOffset(ac, fit.torsoSurface, hemY, neckY, BASE_GAP, tp);                // ← the real fix: IS the body surface + 1mm
         buildSleeves(ac, fit, tp);                                                        // arm-surface offset (already clip-free); no-op at sleeveLength 0
+        inheritBlendedBodyWeights(ac, fit.body, true);                                    // seam-blended bodies → follow the new skin weights
         return finish(ac);
     }
     // Fallback (no captured torso surface): the old tube + both-way conform.
     const rings = 4 + Math.round(Math.max(0, Math.min(1, p.chunkiness)) * 4);
     buildTorso(ac, fit, tp, Math.max(12, rings * 3));
     buildSleeves(ac, fit, tp);   // no-op when sleeveLength = 0
-    if (fit.body) conformBaseLayer(ac, fit);   // ALWAYS skin-tight to the body (no fit-gap slider, no clipping)
+    if (fit.body) conformBaseLayer(ac, fit, true);   // ALWAYS skin-tight to the body (no fit-gap slider, no clipping)
     return finish(ac);
 }
 
@@ -1427,7 +1815,7 @@ function buildUnderpantsOffset(ac: Accum, fit: BodyFit, p: UnderpantsParams, off
  *  outward (`buildUnderpantsOffset`) → IS the skin + 1mm, can't clip. Fallback: the old scalar-tube + conform. */
 export function generateUnderpants(fit: BodyFit, p: UnderpantsParams) {
     const ac = newAc();
-    if (buildUnderpantsOffset(ac, fit, p, BASE_GAP)) return finish(ac);   // ← the real fix (offset-surface)
+    if (buildUnderpantsOffset(ac, fit, p, BASE_GAP)) { inheritBlendedBodyWeights(ac, fit.body, true); return finish(ac); }   // ← the real fix (offset-surface)
     // Fallback (a non-procedural body with no captured surface): the old scalar-tube shorts + both-way conform.
     const bp: BottomParams = {
         slot: 'bottom', bottomStyle: 'shorts', waistWidth: 0.58, waistHeight: p.waistHeight,
@@ -1437,7 +1825,7 @@ export function generateUnderpants(fit: BodyFit, p: UnderpantsParams) {
     };
     const rings = 4 + Math.round(Math.max(0, Math.min(1, p.chunkiness)) * 4);
     buildLegs(ac, fit, bp, rings, null);
-    if (fit.body) conformBaseLayer(ac, fit);
+    if (fit.body) conformBaseLayer(ac, fit, true);
     return finish(ac);
 }
 
@@ -1484,5 +1872,6 @@ export function generateSock(fit: BodyFit, p: SockParams) {
     // NO de-collision: the LEG is the body's real surface offset outward (buildSockLegOffset → can't clip) and the
     // FOOT ellipse is already sized to the foot + gap. Running the shrink-wrap here only re-introduced the low-poly
     // LUMPINESS it caused before. Both pieces are skin-tight by construction.
+    inheritBlendedBodyWeights(ac, fit.body);   // weights only (no geometry change) — follow a seam-blended body
     return finish(ac);
 }

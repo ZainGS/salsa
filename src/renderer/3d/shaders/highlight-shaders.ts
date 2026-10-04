@@ -14,6 +14,7 @@
  * reliable enough to reject them on all geometry.
  */
 
+import { SKIN_BLEND_WGSL } from '../dual-quat-skin';
 // ── Stencil-write pass ────────────────────────────────────────────
 // Transforms the mesh with no normal expansion; writes nothing to color.
 // The pipeline is configured with writeMask:0 and stencil replace=ref.
@@ -88,7 +89,19 @@ struct HighlightParams {
   patternColor: vec4<f32>,   // secondary pattern colour (rgb) + .w = glow multiplier
   params:       vec4<f32>,   // .x = outlineWidth (model space) .y = patternMode .z = freq .w = scroll speed
   screen:       vec4<f32>,   // .xy = render-target size (px) .z = time (s) .w = unused
+  boil:         vec4<f32>,   // line boil: .x = wobble (0 = off) .y = wobbles per unit .z = redraws per second
 }
+
+// LINE BOIL — outline thickness scale at a model-space point: 1 ± wobble · smooth noise, re-rolled boilFps times a
+// second (hand-drawn lines re-drawn each animation frame). b = (wobble, wobbleFreq, boilFps, _); wobble 0 → exactly 1.
+fn boilScale(p: vec3<f32>, b: vec4<f32>, t: f32) -> f32 {
+  if (b.x <= 0.0) { return 1.0; }
+  let frame = floor(t * max(b.z, 0.0));
+  let f = max(b.y, 0.001);
+  let n = sin(dot(p, vec3<f32>(1.7, 9.2, 3.1)) * f + frame * 2.39) * sin(dot(p, vec3<f32>(8.3, 2.8, 5.6)) * f * 0.73 + frame * 1.37);
+  return max(0.0, 1.0 + b.x * n);
+}
+
 
 @group(0) @binding(0) var<storage, read> instances: array<MeshInstance>;
 @group(0) @binding(1) var<uniform>       scene:     SceneUniforms;
@@ -100,7 +113,7 @@ struct HighlightParams {
   @builtin(instance_index) iIdx: u32,
 ) -> @builtin(position) vec4<f32> {
   let inst = instances[iIdx];
-  let expanded = pos + normalize(normal) * params.params.x;
+  let expanded = pos + normalize(normal) * (params.params.x * boilScale(pos, params.boil, params.screen.z));
   let worldPos  = inst.modelMatrix * vec4<f32>(expanded, 1.0);
   return scene.viewProjection * worldPos;
 }
@@ -159,6 +172,7 @@ struct SceneUniforms {
 @group(0) @binding(0) var<storage, read> instances:    array<MeshInstance>;
 @group(0) @binding(1) var<uniform>       scene:        SceneUniforms;
 @group(1) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
+${SKIN_BLEND_WGSL}
 // Diffuse texture (group 2) — sampled ONLY to alpha-test alpha-cutout meshes (hair cards / fringe) so the mask
 // follows the VISIBLE silhouette, not the full card quad (else a black gap shows between the hair and its outline).
 @group(2) @binding(0) var diffuseTexture: texture_2d_array<f32>;
@@ -178,11 +192,7 @@ struct VOut {
   @builtin(instance_index) iIdx: u32,
 ) -> VOut {
   let inst = instances[iIdx];
-  let skinMat =
-    weights.x * skinMatrices[joints.x] +
-    weights.y * skinMatrices[joints.y] +
-    weights.z * skinMatrices[joints.z] +
-    weights.w * skinMatrices[joints.w];
+  let skinMat = skinMatrixFor(joints, weights);
   let worldPos = inst.modelMatrix * (skinMat * vec4<f32>(pos, 1.0));
   var o: VOut;
   o.pos  = scene.viewProjection * worldPos;
@@ -228,10 +238,23 @@ struct HighlightParams {
   patternColor: vec4<f32>,
   params:       vec4<f32>,   // .x = outlineWidth (model space) .y = patternMode .z = freq .w = scroll speed
   screen:       vec4<f32>,   // .xy = render-target size (px) .z = time (s)
+  boil:         vec4<f32>,   // line boil: .x = wobble (0 = off) .y = wobbles per unit .z = redraws per second
 }
+
+// LINE BOIL — outline thickness scale at a model-space point: 1 ± wobble · smooth noise, re-rolled boilFps times a
+// second (hand-drawn lines re-drawn each animation frame). b = (wobble, wobbleFreq, boilFps, _); wobble 0 → exactly 1.
+fn boilScale(p: vec3<f32>, b: vec4<f32>, t: f32) -> f32 {
+  if (b.x <= 0.0) { return 1.0; }
+  let frame = floor(t * max(b.z, 0.0));
+  let f = max(b.y, 0.001);
+  let n = sin(dot(p, vec3<f32>(1.7, 9.2, 3.1)) * f + frame * 2.39) * sin(dot(p, vec3<f32>(8.3, 2.8, 5.6)) * f * 0.73 + frame * 1.37);
+  return max(0.0, 1.0 + b.x * n);
+}
+
 @group(0) @binding(0) var<storage, read> instances:    array<MeshInstance>;
 @group(0) @binding(1) var<uniform>       scene:        SceneUniforms;
 @group(1) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
+${SKIN_BLEND_WGSL}
 @group(2) @binding(0) var<uniform>       params:       HighlightParams;
 
 @vertex fn vs(
@@ -242,14 +265,10 @@ struct HighlightParams {
   @builtin(instance_index) iIdx: u32,
 ) -> @builtin(position) vec4<f32> {
   let inst = instances[iIdx];
-  let skinMat =
-    weights.x * skinMatrices[joints.x] +
-    weights.y * skinMatrices[joints.y] +
-    weights.z * skinMatrices[joints.z] +
-    weights.w * skinMatrices[joints.w];
+  let skinMat = skinMatrixFor(joints, weights);
   let skinnedPos  = (skinMat * vec4<f32>(pos, 1.0)).xyz;
   let skinnedNorm = normalize((skinMat * vec4<f32>(normal, 0.0)).xyz);
-  let expanded    = skinnedPos + skinnedNorm * params.params.x;
+  let expanded    = skinnedPos + skinnedNorm * (params.params.x * boilScale(pos, params.boil, params.screen.z));   // bind-pose pos → the wobble sticks to the body
   let worldPos    = inst.modelMatrix * vec4<f32>(expanded, 1.0);
   return scene.viewProjection * worldPos;
 }

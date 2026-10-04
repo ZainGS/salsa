@@ -1,5 +1,11 @@
 # World Borders — Void Grid, Terrain Apron, Tiled Expansion & Planet Mode
 
+> **Status (2026-10-04): Phases A–C BUILT, D not built.** A void grid + edge glow (`src/world/voidgrid.ts`; `voidGrid` /
+> `borderGlow`, default **false** since visual-polish 1a; Neon Cyber keeps them), B terrain apron (`src/world/apron.ts`,
+> `terrainApron`, default false), C flat multi-tile world (`worldMode: 'tiled'`, `tileRadius`, `src/world/tiled.ts`, with
+> streaming / HLOD on top: spatial-streaming.md, performance-plan P10 / P17 / P19). **Not built:** D1 tiny-planet dome,
+> D2 sphere / Goldberg tiling. See [../STATUS-2026-10-04.md](../STATUS-2026-10-04.md).
+>
 > **Deliverable of this pass:** this SPEC only. **No engine changes yet** — the phases below are built one at a
 > time, each approved from a screenshot before the next. Save as `docs/specs/world-borders.md` (+ a backlog line
 > + a memory pointer). Builds on the existing world stack ([[world-generation]], [[city-detail]]).

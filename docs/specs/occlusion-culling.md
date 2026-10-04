@@ -1,6 +1,28 @@
 # Occlusion Culling — plan + is it worth it?
 
+> **STATUS 2026-10-01 (performance-plan.md §P11):**
+> - **Phase 0 MEASURED.** Play third person at street level, diorama + tiled 3×3:
+>   - Perfect per-mesh occlusion would remove ~48–50 % of the main-pass triangles in the diorama and 72–74 % in the tiled world.
+>   - A box test against the building walls alone gets 20–24 %.
+>   - Looking at the ground, only ~1.5 % (the ground is the only "occluder").
+>   - The view still reaches through a wall to the far plane, so facing one changes little without occlusion.
+> - **Phase 1 tightening BUILT, default on:** `Renderer3D.rangeCulling`, sub-mesh cull ranges, bit-identical.
+>   - Heavy merged chunks and whole streamed-tile layers draw only their 256-triangle runs inside the view and inside each near cascade.
+>   - Main pass −14 to −40 %, near cascade −25 to −52 %.
+> - **A CPU software occlusion cull BUILT, default OFF:** `Renderer3D.occlusionCulling`, `src/renderer/3d/occlusion-culler.ts`.
+>   - It is a hybrid of Phase 3 with building-wall occluders, run in the same frame, so there is no latency.
+>   - Conservative by construction; 0 wrongly culled meshes over 112 checked frames of fast turns and Play walking.
+>   - It drops 15–27 % of main-pass triangles and 27–40 % of draw calls.
+>   - It costs 1–4 ms CPU a frame (tiled: ~10 k occluder polygons) for no measurable GPU change, since the main pass is pixel-bound (P6). So it stays opt-in.
+> - **Recommendation:** occlusion pays only with a GPU-driven path (Phase 4: Hi-Z from the SSAO depth prepass + a compute cull feeding indirect draws), or for walk mode via the Phase 2 PVS. Neither is built.
+> - **Update 2026-10-04:** the GPU-driven half IS built and ON by default — performance-plan §P15 (compute cull →
+>   `drawIndexedIndirect` in render bundles, `Renderer3D.gpuDriven`, `sm.setGpuDriven3D` / `setGpuCullingMode3D`,
+>   `src/renderer/3d/gpu-driven.ts`, `gpu-scene.ts`). Only its **Phase D Hi-Z occlusion stage is not built**; the Phase 2
+>   street-canyon PVS is not built either. The CPU occlusion cull above stays built and off. Index:
+>   [../STATUS-2026-10-04.md](../STATUS-2026-10-04.md).
+
 > **Deliverable of this pass:** this SPEC only (analysis + phased plan + a go/no-go per view mode). Nothing built.
+> *(Superseded by the STATUS block above: Phases 0–1 + a CPU Phase-3 hybrid are built.)*
 > Save as `docs/specs/occlusion-culling.md` (+ backlog line + memory pointer). Companion: [[city-lod]] (zoom-gated
 > detail cull), [[spatial-streaming]] (view-driven geometry disposal), [[street-level-mode]] (the future first-person
 > view that MOST wants this), [[depth-precision]] (reversed-Z, relevant if we build Hi-Z).

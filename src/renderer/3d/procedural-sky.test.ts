@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateSkyColor, bakeSkyEquirect, normalizeSkyParams, DEFAULT_SKY, type ProceduralSkyParams } from './procedural-sky';
+import { evaluateSkyColor, bakeSkyEquirect, normalizeSkyParams, skyIrradiance, ambientMatchedSkyIntensity, DEFAULT_SKY, type ProceduralSkyParams } from './procedural-sky';
 
 // A sun pointing straight up so the disk lands at the +Y pole (easy to target in the bake's top row).
 const SUN_UP: [number, number, number] = [0, 1, 0];
@@ -80,5 +80,28 @@ describe('bakeSkyEquirect', () => {
         const withSun = sumOf(DEFAULT_SKY);
         const noSun = sumOf({ ...DEFAULT_SKY, sunColor: [0, 0, 0], sunHalo: 0 });
         expect(withSun).toBeGreaterThan(noSun);   // the disk/halo add brightness toward the sun
+    });
+});
+
+describe('skyIrradiance / ambientMatchedSkyIntensity (city sky-lighting white-out fix)', () => {
+    const flat = (v: number): ProceduralSkyParams => ({ ...DEFAULT_SKY, zenith: [v, v, v], horizon: [v, v, v], ground: [v, v, v], sunColor: [0, 0, 0], sunHalo: 0 });
+    it('a uniform sky of radiance L gives PI*L irradiance (the SH-IBL units the shader applies without 1/PI)', () => {
+        const e = skyIrradiance(flat(0.5), SUN_UP, [0, 1, 0], 64, 32);
+        for (const c of e) expect(c).toBeCloseTo(Math.PI * 0.5, 1);
+    });
+    it('matches a flat ambient: intensity x irradiance == the ambient luminance (uniform sky)', () => {
+        const k = ambientMatchedSkyIntensity(flat(0.8), SUN_UP, [0.4, 0.4, 0.4]);
+        expect(k * Math.PI * 0.8).toBeCloseTo(0.4, 2);
+        expect(k).toBeLessThan(0.2);   // the old city path passed ~0.9 here -> ~3x over-bright fill
+    });
+    it('gain scales the match and maxUp caps the up-facing fill', () => {
+        const sky = flat(0.8);
+        const k1 = ambientMatchedSkyIntensity(sky, SUN_UP, [0.5, 0.5, 0.5]);
+        expect(ambientMatchedSkyIntensity(sky, SUN_UP, [0.5, 0.5, 0.5], { gain: 1.5 })).toBeCloseTo(k1 * 1.5, 5);
+        const kc = ambientMatchedSkyIntensity(sky, SUN_UP, [0.5, 0.5, 0.5], { gain: 3, maxUp: 0.6 });
+        expect(kc * skyIrradiance(sky, SUN_UP, [0, 1, 0])[1]).toBeCloseTo(0.6, 3);
+    });
+    it('a black sky returns 0 (no divide-by-zero)', () => {
+        expect(ambientMatchedSkyIntensity(flat(0), SUN_UP, [0.3, 0.3, 0.3])).toBe(0);
     });
 });

@@ -5,6 +5,8 @@
  * coalescing, and restore for a single raster texture.
  */
 
+import { bumpGpuPixelEpoch } from '../gpu-pixel-epoch';
+
 export class RasterSnapshotManager {
   private device: GPUDevice;
   private snapshots: Array<{ w: number; h: number; data: Uint8Array }> = [];
@@ -39,6 +41,11 @@ export class RasterSnapshotManager {
    * already have broken undo). Omit it (fills, filters, clears, resizes) for the full-canvas readback.
    */
   public async pushSnapshot(texture: GPUTexture, dirtyRect?: { x: number; y: number; w: number; h: number }): Promise<void> {
+    bumpGpuPixelEpoch();   // every push follows an edit, coalesced or not (device-lost shadow accuracy)
+    return this._push(texture, dirtyRect);
+  }
+
+  private async _push(texture: GPUTexture, dirtyRect?: { x: number; y: number; w: number; h: number }): Promise<void> {
     const now = Date.now();
     if (now - this.lastSnapshotMs < this.COALESCE_MS) {
       if (this.debug) console.log('RasterSnapshotManager: coalesced');
@@ -198,13 +205,14 @@ export class RasterSnapshotManager {
 
   /** Seed with a blank texture so the first stroke is undoable. */
   public async initialize(texture: GPUTexture): Promise<void> {
-    await this.pushSnapshot(texture);
+    await this._push(texture);   // seeding the stack is not an edit (no epoch bump)
     if (this.snapshots.length > 0) this.snapIndex = 0;
   }
 
   // ── Restore ───────────────────────────────────────────────────────
 
   private async restore(texture: GPUTexture, snap: { w: number; h: number; data: Uint8Array }): Promise<void> {
+    bumpGpuPixelEpoch();   // undo / redo rewrite the pixels
     const w = snap.w;
     const h = snap.h;
     const bytesPerPixel = 4;

@@ -110,8 +110,10 @@ export function crateCanonicalGeometry(worldPerMetre: number): MeshGeometry {
     return a.geometry();
 }
 
-/** Per-crate instance transforms for a stack at `base` (foot centre) — one instance of the canonical box each. */
-export function crateInstanceTransforms(base: V3, params: Partial<CrateParams>, worldPerMetre: number): InstanceXform[] {
+/** Per-crate instance transforms for a stack at `base` (foot centre) — one instance of the canonical box each.
+ *  `baseYaw` aligns the stack to its context (the road / shopfront) — the per-crate wobble is added on top. Pass a
+ *  POSITION-HASH `params.seed`, or every stack in the city comes out identical (the default seed is 1). */
+export function crateInstanceTransforms(base: V3, params: Partial<CrateParams>, worldPerMetre: number, baseYaw = 0): InstanceXform[] {
     const p = resolveCrateParams(params);
     const e = p.sizeM * 0.5 * worldPerMetre;           // placed half-edge (world units)
     const s = p.sizeM / CRATE_CANON_M;                 // uniform scale from the canonical box
@@ -119,7 +121,7 @@ export function crateInstanceTransforms(base: V3, params: Partial<CrateParams>, 
     let y = base[1];
     for (let i = 0; i < p.count; i++) {
         const jx = (h(p.seed, i) - 0.5) * e, jz = (h(p.seed, i + 40) - 0.5) * e, yaw = (h(p.seed, i + 80) - 0.5) * 0.5;
-        out.push({ x: base[0] + jx, y: y + e, z: base[2] + jz, ry: yaw, s });
+        out.push({ x: base[0] + jx, y: y + e, z: base[2] + jz, ry: baseYaw + yaw, s });
         y += e * 2 * 0.98;
     }
     return out;

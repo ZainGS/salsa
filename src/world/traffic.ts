@@ -1,19 +1,27 @@
 // ── World generation — traffic (the moving-city sim, v1) ────────────────────────────────────────
-// Computes MOVER SPECS: cars driving the long straight road runs (left-hand traffic, both directions), a
-// moving train on the viaduct, and a few walking pedestrians. Each mover = its own tiny geometry built at the
-// ORIGIN oriented along its route; the WorldManager spawns them as individual meshes and slides them along
-// `a → b` every frame (wrapping), lifting Y with the terrain. Pure + deterministic; the per-frame ticking
-// lives bridge-side (a first taste of the future src/game sim).
+// Computes MOVER SPECS: cars + buses and walkers + cyclists ROUTED over the intersection graph (route-sim.ts — cars
+// turn at junctions and stop at red lights, walkers keep to the pavements and cross on the zebras), a moving train
+// on the viaduct, clouds / weather / birds / ducks. Each mover = archetype geometry built at the ORIGIN along +X
+// (shared per archetype → instanced draws); the WorldManager spawns them and the WorldTraffic ticker drives them
+// every frame, lifting Y with the terrain. Pure + deterministic; the per-frame ticking lives bridge-side.
 
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { Accum3D } from './meshbuild';
-import { makeVehicleAcc, emitVehicle, vehicleLayers, VEH_TAXI, type VehicleType } from './vehicle';
-import { hash2, pointInPolygon } from './util';
-import { railwayLine, skywayPath } from './railway';
-import { inShotengai } from './shotengai';
-import { terraceStep, cellLevelAt, inRamp } from './elevation';
+import { makeVehicleAcc, emitVehicle, vehicleLayers, vehicleHalfLength, VEH_TAXI, type VehicleType, type VehicleAcc } from './vehicle';
+import { twinAccum, withFarTwin, PROP_TWIN_M } from './lod-accum';
+import { hash2 } from './util';
+import * as RW from './railway';
+import { terraceStep } from './elevation';
 import { duckFlotillaLayers, duckGarpPool, DUCK_COLORWAYS } from './ducks';
 import { pickSkin } from './garp';
+import { cityMetresPerUnit } from './types';
+import { roadNet } from './route-sim';
+import { pavementLift } from './street-slots';
+import { cloudCard } from './sky';
+import { footfallField, umbrellaFor, crowdLayer } from './pedestrians';
+import { walkerParts, personLook, archetypeIndex, type PersonLook, type PedColor } from './mannequin';
+import { railConsists, railTrackInfo, type RailStationIn, type TrainRunPlan, type TrainRunState } from './train';
+import { localConsist } from './local-line-build';
 
 type V3 = [number, number, number];
 
@@ -45,53 +53,51 @@ export interface MoverSpec {
      *  `count` times and the ticker places each car at its OWN arc-length along the route (`spacing` world units
      *  apart) with the LOCAL heading there — so the consist bends around a curve instead of rotating as one rigid
      *  body (the back car no longer swings off the outside of a turn). */
-    cars?: { count: number; spacing: number };
+    cars?: {
+        count: number; spacing: number;
+        /** Per-car layer VARIANTS (the EMU: cab / mid / pantograph cars) — car c uses `variants[pick[c]]` instead of
+         *  `layers`; `flip[c]` turns the car 180° (the rear cab faces backward). */
+        variants?: LayoutPreviewLayer[][]; pick?: number[]; flip?: boolean[];
+    };
+    /** RAIL RUN (railway-upgrade R2.2): the consist runs a station-stop schedule (train.ts stepTrainRun — accelerate,
+     *  cruise, brake to a stop centred at each station, dwell with the doors open, reverse at the termini) instead of
+     *  a pingPong shuttle. Arc positions are world units from `a` along a→b. */
+    run?: {
+        plan: TrainRunPlan; start: TrainRunState;
+        /** railway-upgrade R3.2 — the AT-GRADE local consist: rail-top Y per path point (the ticker lifts + pitches each
+         *  car on its bogies), the short car's bogie half-spacing + door slide (world units), and the marker the level
+         *  crossings read their train from. */
+        heights?: number[]; bogieHalf?: number; doorSlide?: number; local?: boolean;
+    };
+    /** ROUTED mover (cars / walkers over the road graph — route-sim.ts): the starting directed `edge`, pavement
+     *  `side` (walkers; +1 = left of travel), start fraction `t` along the first leg, a stable `id` for the hash-driven
+     *  turn choices, and the vehicle half-length (cars stop their FRONT at the stop line). Overrides a/b/t0/lane. */
+    route?: { mode: 'car' | 'walk'; edge: number; side: 1 | -1; t: number; id: number; halfLen: number; bus?: boolean };
+    /** Uniform scale of every mesh of this mover (walker height variety on shared geometry). */
+    scale?: number;
+    /** LEG SWING (no shader): the `…-legL` / `…-legR` layers are built in hip-pivot space; the ticker places them at
+     *  (0, pivotY, ±pivotZ) in the mover frame and rotates them about local Z by ±amp·sin(phase), the phase advancing
+     *  one stride per `stride` world units walked. `arm` (optional): the `…-armL` / `…-armR` layers are built in
+     *  shoulder-pivot space and swing OPPOSITE their same-side leg by `amp`× the leg angle (natural arm swing); the
+     *  `…-handL` / `…-handR` skin layers swing with them. `knee` (optional): the `…-shinL` / `…-shinR` (+ `…-shoeL` /
+     *  `…-shoeR`) layers are built in KNEE-pivot space — the ticker hangs them at the thigh's knee (x, y from the hip) and
+     *  bends the knee through the cycle (`flex` peak radians: folded in swing, nearly straight at heel strike, a little
+     *  give on loading), sinking the body so the lower foot (heel / toe points, from the knee) stays on the ground —
+     *  the walking bob falls out of the leg geometry. `pedal`: a cyclist — the knee follows the crank, no ground
+     *  contact / bob. All in world units. */
+    gait?: {
+        pivotY: number; pivotZ: number; stride: number; amp: number; arm?: { y: number; z: number; amp: number };
+        knee?: { x: number; y: number; heel: [number, number]; toe: [number, number]; flex: number; pedal?: boolean };
+    };
 }
+
+/** Frame-cost caps on the routed movers (the static crowd carries the density beyond these). */
+export const MAX_CARS = 64, MAX_WALKERS = 240;
 
 const CARBODY: [number, number, number][] = [[0.86, 0.86, 0.88], [0.22, 0.24, 0.28], [0.68, 0.22, 0.20], [0.22, 0.38, 0.58], [0.90, 0.78, 0.30]];
 const DARK: [number, number, number] = [0.10, 0.11, 0.13];
-const TRAIN: [number, number, number] = [0.28, 0.50, 0.72];
-const TRAIN_DK: [number, number, number] = [0.12, 0.13, 0.16];
-const CLOTHES: [number, number, number][] = [[0.82, 0.30, 0.28], [0.24, 0.38, 0.62], [0.92, 0.86, 0.78], [0.28, 0.50, 0.38]];
-const SKIN: [number, number, number] = [0.92, 0.78, 0.66];
 
-/** Merge the per-cell road segments into maximal straight RUNS (junction-variety breaks some lines).
- *  ONE scan over the roads (was two — one per orientation), grouped by ROUNDED NUMERIC lane coordinate:
- *  Math.round(c·1e4)/1e4 reproduces the old parseFloat(c.toFixed(4)) key + quantized centreline without a
- *  string alloc + parse per road. Emit order (all vertical runs, then horizontal, each in road-scan group
- *  order) matches the old two-sweep output exactly. */
-function roadRuns(graph: WorldGraph): { a: V2; b: V2 }[] {
-    type Span = { lo: number; hi: number };
-    const vGroups = new Map<number, Span[]>(), hGroups = new Map<number, Span[]>();
-    for (const r of graph.roads) {
-        if (r.klass === 'alley' || r.klass === 'ring') continue;
-        const vertical = Math.abs(r.a[0] - r.b[0]) < 1e-6;
-        const groups = vertical ? vGroups : hGroups;
-        const key = Math.round((vertical ? r.a[0] : r.a[1]) * 1e4);
-        const u0 = vertical ? r.a[1] : r.a[0], u1 = vertical ? r.b[1] : r.b[0];
-        const span: Span = { lo: Math.min(u0, u1), hi: Math.max(u0, u1) };
-        const g = groups.get(key);
-        if (g) g.push(span); else groups.set(key, [span]);
-    }
-    const runs: { a: V2; b: V2 }[] = [];
-    const emit = (groups: Map<number, Span[]>, vertical: boolean): void => {
-        for (const [key, segs] of groups) {
-            segs.sort((x, y) => x.lo - y.lo);
-            const c = key / 1e4;   // the quantized lane coordinate (same value the old parseFloat produced)
-            let cur: Span | null = null;
-            const flush = (): void => { if (cur) runs.push(vertical ? { a: [c, cur.lo], b: [c, cur.hi] } : { a: [cur.lo, c], b: [cur.hi, c] }); };
-            for (const sg of segs) {
-                if (cur && sg.lo <= cur.hi + 1e-4) cur.hi = Math.max(cur.hi, sg.hi);
-                else { flush(); cur = { lo: sg.lo, hi: sg.hi }; }
-            }
-            flush();
-        }
-    };
-    emit(vGroups, true); emit(hGroups, false);
-    return runs;
-}
-
-/** All movers for a graph: ~2 cars per long run (both directions, left-hand lanes), 1 train, a few walkers. */
+/** All movers for a graph: routed cars + buses + walkers + cyclists, the train, the sky / weather / wildlife. */
 export function computeTraffic(graph: WorldGraph): MoverSpec[] {
     const p = graph.params, gy = p.groundY, s = p.radius / 10;
     // Walking crowd scales with pedestrianDensity, but CAPPED (×4) — walkers are per-frame MOVERS (unlike the cheap
@@ -106,136 +112,173 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
     const geoCache = new Map<string, LayoutPreviewLayer[]>();
     const arch = (key: string, build: () => LayoutPreviewLayer[]): LayoutPreviewLayer[] => {
         let l = geoCache.get(key);
-        if (!l) { l = build().map(L => ({ ...L, instanceKey: `${key}:${L.name}` })); geoCache.set(key, l); }
+        if (!l) { l = build().map(L => ({ ...L, instanceKey: `${key}:${L.name}${L.nearTwin ? ':' + L.nearTwin.role : ''}` })); geoCache.set(key, l); }   // P9: near / far twins never share a pool entry
         return l;
     };
 
-    const key = (r: { a: V2; b: V2 }): number => hash2(r.a[0] * 13.7 + r.b[1] * 3.1, r.a[1] * 7.3 + r.b[0], p.seed);
-    // Keep movers OFF the water: cars + walkers ride these runs end-to-end, so a run that crosses a canal or runs
-    // out past the diorama border into the sea would put traffic on the water. Trim each run to its LONGEST
-    // contiguous on-LAND span (border + canal aware) before anything spawns; runs with no usable land span drop out.
-    const border = graph.border, bridges = graph.bridges;
-    // A bridge DECK is a real carriageway even though the cell under it reads as canal water — treat it as passable
-    // so traffic CROSSES canals on the bridges instead of the run being trimmed off at the water's edge.
-    const onBridge = (x: number, z: number): boolean => { for (const deck of bridges) if (pointInPolygon([x, z], deck)) return true; return false; };
-    const onLand = (x: number, z: number): boolean =>
-        onBridge(x, z) || (cellLevelAt(graph, x, z) >= 0 && (border.length < 3 || pointInPolygon([x, z], border)));
-    const trimRun = (run: { a: V2; b: V2 }): { a: V2; b: V2 } | null => {
-        const N = 28, dx = run.b[0] - run.a[0], dz = run.b[1] - run.a[1];
-        let curLo = -1, bestLo = -1, bestHi = -1, curLvl = 0;
-        for (let i = 0; i <= N; i++) {
-            const t = i / N;
-            const px = run.a[0] + dx * t, pz = run.a[1] + dz * t;
-            if (onLand(px, pz)) {
-                // Split the run at a TERRACE LEVEL CHANGE that has NO RAMP. A road climbing into a higher block steps
-                // up a retaining wall; where a road RAMP bridges that step the car climbs it (the ramp slopes the
-                // carriageway + the height field), so the run stays whole there. Elsewhere the run splits so a car
-                // stops at the kerb instead of dropping off the cliff. (Bridge decks + ramps inherit the current
-                // level so a canal or a ramped crossing is NOT split.)
-                const lvl = (onBridge(px, pz) || inRamp(graph.ramps, px, pz)) ? curLvl : cellLevelAt(graph, px, pz);
-                if (curLo < 0 || lvl !== curLvl) { curLo = i; curLvl = lvl; }
-                if (i - curLo > bestHi - bestLo) { bestLo = curLo; bestHi = i; }
-            } else curLo = -1;
-        }
-        if (bestLo < 0 || bestHi <= bestLo) return null;
-        const t0 = (bestLo + 0.5) / N, t1 = (bestHi - 0.5) / N;   // inset half a step so the ends sit fully on land
-        if (t1 <= t0) return null;
-        return { a: [run.a[0] + dx * t0, run.a[1] + dz * t0], b: [run.a[0] + dx * t1, run.a[1] + dz * t1] };
+    const weather = p.weather ?? 'clear';
+    const wcache = new Map<string, ReturnType<typeof buildWalkerArchetype>>();
+    const walkerArchetype = (look: PersonLook, u: number, umb: PedColor | null, bike: boolean, lookKey: string): ReturnType<typeof buildWalkerArchetype> => {
+        const k = `${lookKey}:${umb}:${bike}:${u}`;
+        let w = wcache.get(k); if (!w) { w = buildWalkerArchetype(look, u, umb, bike); wcache.set(k, w); } return w;
     };
-    const runs = roadRuns(graph)
-        .map(trimRun).filter((r): r is { a: V2; b: V2 } => r !== null)
-        .filter(r => Math.hypot(r.b[0] - r.a[0], r.b[1] - r.a[1]) > 2.2 * s)
-        .sort((r1, r2) => key(r1) - key(r2)).slice(0, 24);
 
-    runs.forEach((run, ri) => {
-        const d = nrm2([run.b[0] - run.a[0], run.b[1] - run.a[1]]);
-        const lane = p.streetWidth * 0.22;
-        // Cars keep off the pedestrian shotengai — drop car slots on runs that pass through the corridor.
-        let throughSg = false;
-        for (let k = 0; k <= 4; k++) { const t = k / 4; if (inShotengai(graph, run.a[0] + (run.b[0] - run.a[0]) * t, run.a[1] + (run.b[1] - run.a[1]) * t)) { throughSg = true; break; } }
-        for (const rev of [false, true]) {                       // both directions — up to 2 cars per direction
-            const nCars = throughSg ? 0 : H(ri, rev ? 1 : 0, 0xca11) < 0.12 ? 0 : H(ri, rev ? 1 : 0, 0xbe02) < 0.45 ? 2 : 1;
-            // Left-hand traffic: the SAME +lane for both directions — the offset is applied in each mover's
-            // own route frame (which flips with direction), so +lane lands on opposite world sides.
-            // SPAWN SPACING: every vehicle in this lane (cars + the bus) takes an EVENLY SPACED slot with a
-            // small jitter, so no two vehicles can spawn on top of each other.
-            const hasBus = !rev && !throughSg && ri % 3 === 0;
-            const nSlots = nCars + (hasBus ? 1 : 0);
-            if (nSlots === 0) continue;
-            const base = H(ri, rev ? 3 : 2, 0x77aa);
-            for (let k = 0; k < nSlots; k++) {
-                const t0 = (base + k / nSlots + (H(ri, 60 + k + (rev ? 8 : 0), 0x2f11) - 0.5) * (0.25 / nSlots) + 1) % 1;
-                if (hasBus && k === nSlots - 1) {
-                    // The BUS: slower, pauses at two "stops" along the route (route service reads real).
-                    out.push({
-                        kind: 'car', a: run.a, b: run.b, t0, speed: 0.3 * s, lane, baseY: gy,
-                        stops: [0.28, 0.72], faceRoute: true, layers: arch('bus', () => busLayers(s)),
-                    });
-                } else {
-                    const colorIdx = (H(ri, k * 2 + (rev ? 7 : 6), 0x90ce) * CARBODY.length) | 0;
-                    // Vehicle mix: ~9% checker TAXIS, ~21% old-school long CLASSICS, the rest modern sedans.
-                    const vt = H(ri, k * 3 + (rev ? 21 : 20), 0x5a7c);
-                    const type: VehicleType = vt < 0.09 ? 'taxi' : vt < 0.30 ? 'classic' : 'sedan';
-                    const key = type === 'taxi' ? 'taxi' : type + colorIdx;   // share geometry per (type,colour)
-                    out.push({
-                        kind: 'car', a: rev ? run.b : run.a, b: rev ? run.a : run.b,
-                        t0, speed: (0.42 + H(ri, k * 2 + (rev ? 5 : 4), 0x1f2d) * 0.22) * s, lane, baseY: gy,
-                        faceRoute: true, layers: arch(key, () => carLayers(colorIdx, s, type)),
-                    });
-                }
+    // ── CARS + BUSES route over the intersection graph (route-sim.ts) ─────────────────────────────────────
+    // Spawned on evenly spaced slots along the passable car edges (deterministic per seed); the ticker drives each
+    // along its lane, picks straight / left / right at every junction and stops at red lights + stop signs. Count
+    // scales with the road network (≈ one car per 1.9·s of carriageway, both directions), capped for frame cost.
+    const net = roadNet(graph);
+    const night = !!p.nightMode;
+    if ((p.traffic ?? true) && net.carEdges.length) {
+        const totalLen = net.carEdges.reduce((n, e) => n + net.edges[e].len, 0);
+        // visual-polish #16: `trafficDensity` (× the count; absent = 1, the original) also lifts the cap with it (to 2×).
+        const carMul = Math.min(Math.max(0, p.trafficDensity ?? 1), 3);
+        const nCars = Math.min(Math.round(MAX_CARS * Math.min(2, Math.max(1, carMul))), Math.round(totalLen / (1.9 * s) * carMul * (night ? 0.7 : 1)));
+        const used = new Set<number>();
+        const arterials = net.carEdges.filter(e => net.edges[e].arterial);
+        for (let k = 0; k < nCars; k++) {
+            const isBus = k % 9 === 4 && arterials.length > 0;
+            const pool = isBus ? arterials : net.carEdges;
+            let edge = pool[(H(k, 1, 0xca11) * pool.length) | 0];
+            for (let tries = 0; tries < 6 && used.has(edge); tries++) edge = pool[(H(k, 2 + tries, 0xca12) * pool.length) | 0];
+            if (used.has(edge)) continue;   // one spawn per directed edge → no two cars born on top of each other
+            used.add(edge);
+            const t = 0.15 + H(k, 9, 0x77aa) * 0.5;
+            if (isBus) {
+                out.push({
+                    kind: 'car', a: net.edges[edge].a, b: net.edges[edge].b, t0: 0, speed: 0.3 * s, lane: 0, baseY: gy, faceRoute: true,
+                    route: { mode: 'car', edge, side: 1, t, id: k, halfLen: 0.33 * s, bus: true },
+                    layers: arch('bus', () => [...busLayers(s, p.propTwins), ...headPoolLayers(s, 0.3)]),
+                });
+                continue;
+            }
+            const colorIdx = (H(k, 3, 0x90ce) * CARBODY.length) | 0;
+            // Vehicle mix (Round 4 lofted bodies): ~9% TAXIS, ~11% 80s CLASSICS, ~15% HATCHES, ~12% KEI wagons,
+            // ~7% kei VANS, the rest 90s 4-door SEDANS (the P5 street-car staple).
+            const vt = H(k, 4, 0x5a7c);
+            const type: VehicleType = vt < 0.09 ? 'taxi' : vt < 0.20 ? 'classic' : vt < 0.35 ? 'hatch' : vt < 0.47 ? 'kei' : vt < 0.54 ? 'van' : 'sedan';
+            const key = type === 'taxi' ? 'taxi' : type + colorIdx;   // share geometry per (type,colour)
+            out.push({
+                kind: 'car', a: net.edges[edge].a, b: net.edges[edge].b, t0: 0,
+                speed: (0.42 + H(k, 5, 0x1f2d) * 0.22) * s, lane: 0, baseY: gy, faceRoute: true,
+                route: { mode: 'car', edge, side: 1, t, id: k, halfLen: vehicleHalfLength(type, s) },
+                layers: arch(key, () => [...carLayers(colorIdx, s, type, p.propTwins), ...headPoolLayers(s, vehicleHalfLength(type, s) / s)]),
+            });
+        }
+    }
+
+    // ── WALKERS + CYCLISTS route over the pavements (both sides of every walkable road) ───────────────────
+    // Spawn density follows the FOOTFALL field (station / shops / junctions busier; thinner at night). Each keeps to its
+    // pavement, turns corners, crosses on the zebras and waits for the green man at signalled junctions.
+    if (net.walkEdges.length) {
+        const field = footfallField(graph);
+        const u = 1 / cityMetresPerUnit(p.radius);
+        const cap = Math.round(MAX_WALKERS * walkMul / 4 + 60);
+        let nW = 0, nBikes = 0;
+        const umbAll = (i: number): PedColor | null => umbrellaFor(weather, H(i, 71, 0x0b0b), H(i, 72, 0x0b0c));
+        // Wanted walkers per road from the footfall field, then ONE global scale to the cap — so the cap thins the
+        // whole city evenly instead of filling the first roads in scan order and leaving the rest empty.
+        const fwd = net.walkEdges.filter(e => net.edges[e].forward);   // one pass per road; each spawn picks a direction + side
+        const wants = fwd.map(e => {
+            const E = net.edges[e], mid: V2 = [(E.a[0] + E.b[0]) * 0.5, (E.a[1] + E.b[1]) * 0.5];
+            return E.len / (1.05 * s) * walkMul * (night ? 0.6 : 1) * Math.min(2.2, field(mid[0], mid[1]));
+        });
+        const wantTotal = wants.reduce((n, v) => n + v, 0), scaleW = wantTotal > cap ? cap / wantTotal : 1;
+        for (let wi = 0; wi < fwd.length; wi++) {
+            const e = fwd[wi], E = net.edges[e];
+            const want = wants[wi] * scaleW;
+            const n = Math.floor(want) + (H(e, 1, 0x3b31) < want - Math.floor(want) ? 1 : 0);
+            for (let j = 0; j < n && nW < cap; j++, nW++) {
+                const i = e * 7 + j;
+                const dir = H(i, 2, 0x44d1) < 0.5 ? e : E.rev, side: 1 | -1 = H(i, 3, 0x44d2) < 0.5 ? 1 : -1;
+                const robot = (p.holograms ?? false) && H(i, 4, 0x0b07) < 0.2;
+                const bike = !robot && nBikes < Math.round(10 * walkMul) && H(i, 5, 0xb1ce) < 0.08;
+                if (bike) nBikes++;
+                const look = WALKER_LOOKS[(H(i, 6, 0x24fa) * WALKER_LOOKS.length) | 0];
+                const umb = bike || robot ? null : umbAll(i);
+                const key = robot ? 'robot' : `${look.key}${umb ? ':' + umb : ''}${bike ? ':bike' : ''}`;
+                const built = robot ? null : walkerArchetype(look.look, u, umb, bike, look.key);
+                out.push({
+                    kind: 'walker', a: E.a, b: E.b, t0: 0,
+                    speed: (bike ? 0.22 + H(i, 7, 0x51f7) * 0.06 : 0.075 + H(i, 7, 0x51f7) * 0.03) * s,
+                    lane: 0, baseY: gy + pavementLift(p), faceRoute: true,
+                    route: { mode: 'walk', edge: dir, side, t: H(i, 8, 0x0be5), id: 5000 + i, halfLen: 0 },
+                    scale: 0.94 + H(i, 9, 0x5ca1) * 0.12,
+                    gait: built ? walkerGait(built, u, bike) : undefined,
+                    layers: arch(key, () => robot ? robotLayers(s) : built!.layers),
+                });
             }
         }
-        // WALKERS strolling the same runs — several per run, on BOTH SIDEWALKS. They keep to the pavement (lane ≥
-        // half the carriageway + a margin) so they never stroll down the driving lane and hold a car up; a little
-        // near-kerb / mid-pavement variety keeps the crowd from marching in a single file.
-        for (let wi = 0; wi < Math.round(5 * walkMul); wi++) {
-            if (H(ri, 9 + wi, 0x3b31) > 0.82) continue;
-            const nearKerb = H(ri, 30 + wi, 0x77e1) < 0.35;
-            const side = wi % 2 === 0 ? 1 : -1;
-            out.push({
-                kind: 'walker', a: run.a, b: run.b, t0: H(ri, 11 + wi, 0x0be5), speed: (0.1 + H(ri, 40 + wi, 0x51f7) * 0.06) * s,
-                lane: (p.streetWidth * 0.5 + (nearKerb ? 0.03 : 0.07) * s) * side, baseY: gy,
-                layers: (() => { const ci = (H(ri, 13 + wi, 0x24fa) * CLOTHES.length) | 0, rb = (p.holograms ?? false) && H(ri, 90 + wi, 0x0b07) < 0.28; return arch(`walker${ci}${rb ? 'r' : ''}`, () => walkerLayers(ci, s, rb)); })(),
-            });
-        }
-    });
+    }
 
-    // Shotengai strollers — the pedestrian street is BUSY (ping-pong up and down the corridor).
+    // Shotengai strollers — the pedestrian street is BUSY (they shuttle up and down the corridor; the ticker eases
+    // their heading and pauses them for a beat at each end instead of flipping 180° on the spot).
     const sg = graph.shotengai;
     if (sg) {
-        for (let i = 0; i < Math.round(7 * walkMul); i++) {
+        const u = 1 / cityMetresPerUnit(p.radius);
+        for (let i = 0; i < Math.round(9 * walkMul); i++) {
+            const look = WALKER_LOOKS[(H(i, 54, 0x33af) * WALKER_LOOKS.length) | 0];
+            const umb = umbrellaFor(weather, H(i, 56, 0x0b0b), H(i, 57, 0x0b0c));
+            const built = walkerArchetype(look.look, u, umb, false, look.key);
             out.push({
-                kind: 'walker', a: sg.spine[0], b: sg.spine[1], t0: H(i, 52, 0x1c44), speed: (0.08 + H(i, 53, 0x6d02) * 0.05) * s,
-                lane: (H(i, 51, 0x9ab3) - 0.5) * sg.width * 0.62, baseY: gy, pingPong: true, margin: 0.04,
-                layers: (() => { const ci = (H(i, 54, 0x33af) * CLOTHES.length) | 0, rb = (p.holograms ?? false) && H(i, 55, 0x77c2) < 0.28; return arch(`walker${ci}${rb ? 'r' : ''}`, () => walkerLayers(ci, s, rb)); })(),
+                kind: 'walker', a: sg.spine[0], b: sg.spine[1], t0: H(i, 52, 0x1c44), speed: (0.07 + H(i, 53, 0x6d02) * 0.03) * s,
+                lane: (H(i, 51, 0x9ab3) - 0.5) * sg.width * 0.62, baseY: gy + pavementLift(p), pingPong: true, margin: 0.04, faceRoute: true,
+                scale: 0.94 + H(i, 58, 0x5ca1) * 0.12,
+                gait: walkerGait(built, u, false),
+                layers: arch(`${look.key}${umb ? ':' + umb : ''}`, () => built.layers),
             });
         }
     }
 
-    // The moving train — a SHUTTLE now: it slows into the terminus and heads back (no more falling off the end).
-    // ARTICULATED: one car geometry, cloned TRAIN_CARS times; the ticker places each car at its own arc-length.
-    if (p.railway ?? true) {
-        const { rx, z0, z1, deckY } = railwayLine(p);
-        const spanLen = Math.abs(z1 - z0) || 1;
-        const spacing = (2 * TRAIN_CAR_L + TRAIN_CAR_GAP) * s;
-        const halfTrain = TRAIN_CARS * spacing * 0.5;   // half the consist (keeps the end cars on the span)
+    // The moving trains (railway-upgrade R1.5 / R2.2): a real EMU consist per track (opposite directions on a double
+    // track) running a station-stop schedule. ARTICULATED: each car is its own clone (cab / mid / pantograph variants)
+    // placed at its own arc length by the ticker. Car geometry + the run live in train.ts (shared with the parked train).
+    // railStations(p) comes with the structure build (R2.1); until then the run is terminus-to-terminus.
+    const stationsOf = (RW as unknown as { railStations?: (q: typeof p) => RailStationIn[] }).railStations;
+    for (const c of (p.railway ?? true) ? railConsists(p, railTrackInfo(p, RW.railwayLine(p), typeof stationsOf === 'function' ? stationsOf(p) : [])) : []) {
         out.push({
-            kind: 'train', a: [rx, z0], b: [rx, z1], t0: 0.3, speed: 1.0 * s, lane: 0, baseY: 0,
-            pingPong: true, margin: Math.min(0.4, halfTrain / spanLen),
-            layers: trainLayers(deckY, s), cars: { count: TRAIN_CARS, spacing },
+            kind: 'train', a: c.path[0], b: c.path[c.path.length - 1], path: c.path, t0: 0, speed: c.plan.cruise, lane: 0, baseY: 0,
+            layers: c.variants[0], cars: { count: c.count, spacing: c.spacing, variants: c.variants, pick: c.pick, flip: c.flip },
+            run: { plan: c.plan, start: c.start },
         });
     }
+    // The at-grade LOCAL LINE's short consist (railway-upgrade R3.2/R3.3; `localLine`, off by default): terminus to
+    // terminus with the dwell, lifted onto its rails per car (heights) — the level crossings close for it.
+    const lc = localConsist(graph);
+    if (lc) out.push({
+        kind: 'train', a: lc.path[0], b: lc.path[lc.path.length - 1], path: lc.path, t0: 0, speed: lc.plan.cruise, lane: 0, baseY: 0,
+        layers: lc.variants[0], cars: { count: lc.count, spacing: lc.spacing, variants: lc.variants, pick: lc.pick, flip: lc.flip },
+        run: { plan: lc.plan, start: lc.start, heights: lc.heights, bogieHalf: lc.bogieHalf, doorSlide: lc.doorSlide, local: true },
+    });
 
     // CLOUDS — slow seeded formations drifting across the sky, wrapping well past the border.
     // `cloudDensity` scales the count (≈3 sparse … ≈18 overcast); RAIN/SNOW force a heavy overcast deck.
-    const weather = p.weather ?? 'clear';
     const overcast = weather !== 'clear';
-    if (p.clouds ?? true) {
+    if ((p.clouds ?? true) && !overcast && p.paintedClouds && p.domeClouds) {
+        // visual-polish #9: the sky dome paints these clouds (anime cumulus at infinity — never far-clipped or sorted).
+    } else if ((p.clouds ?? true) && !overcast && p.paintedClouds) {
+        // PAINTED SKY (persona-polish E1): instead of hundreds of small white puffs, a FEW BIG soft painted clouds high
+        // up and well out from the city — where an eye-level view actually sees sky (15-40 deg up), drifting slowly on
+        // long chords. Crossed soft cards (paintedCloudLayers) + sunlit rim cards; the look's glow walk lights them.
+        const R = p.radius, density = p.cloudDensity ?? 0.55;
+        const n = Math.max(3, Math.round(4 + density * 10));
+        for (let i = 0; i < n; i++) {
+            const side = i % 2 ? 1 : -1;
+            const zLane = side * R * (1.3 + H(i, 61, 0x40de) * 1.3);
+            const alt = R * (1.1 + H(i, 62, 0x2e1a) * 0.6);
+            const shape = i % 5;
+            out.push({
+                kind: 'cloud', a: [-R * 3.4, zLane], b: [R * 3.4, zLane], t0: H(i, 63, 0x7b26),
+                speed: (0.02 + H(i, 64, 0x1949) * 0.02) * s, lane: 0, baseY: p.groundY + alt,
+                layers: arch(`cloudpaint${shape}${side}`, () => paintedCloudLayers(shape, p.seed, R, side as 1 | -1)),
+            });
+        }
+    } else if (p.clouds ?? true) {
         const R = p.radius, density = p.cloudDensity ?? 0.55;
         // Clear = sparse puffies by the slider; RAIN = a genuinely heavy STORM DECK (30–44 dark clouds);
         // snow = a solid pale winter blanket. Overcast lanes overlap (×0.55 spacing jitter) so the deck closes.
         const nClouds = weather === 'rain' ? Math.round(60 + density * 28)
-            : weather === 'snow' ? Math.round(44 + density * 20)
+            : weather === 'snow' || weather === 'overcast' ? Math.round(44 + density * 20)
                 : Math.max(2, Math.round((6 + density * 30) * 10));   // clear: 10× denser sky (density 1.0 → ~360 clouds)
         for (let i = 0; i < nClouds; i++) {
             const zLane = -R * 0.95 + (i + 0.5) * (2 * R * 0.95 / nClouds) + (H(i, 61, 0x40dd) - 0.5) * R * (overcast ? 0.55 : 0.2);
@@ -283,7 +326,7 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
 
     // FALLING WEATHER — a 5×5 grid of fall clusters (kind 'rain' = the generic fall-and-wrap mover): RAIN =
     // fast thin streaks, SNOW = slow drifting flakes. Deterministic, cheap, reads as weather.
-    if (overcast) {
+    if (weather === 'rain' || weather === 'snow') {   // (an 'overcast' deck has no precipitation)
         const R = p.radius, grid = 5, snow = weather === 'snow';
         for (let gx = 0; gx < grid; gx++) for (let gz = 0; gz < grid; gz++) {
             const i = gx * grid + gz;
@@ -407,7 +450,7 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
 
         // The SKY-TRAIN — follows the multi-segment skyway polyline, weaving across the city and STRAIGHT
         // THROUGH the megatower's portal. Built along +X; the ticker yaws it to each segment's heading.
-        const sky = skywayPath(graph);
+        const sky = RW.skywayPath(graph);
         if (sky) {
             let total = 0; for (let i = 0; i < sky.pts.length - 1; i++) total += Math.hypot(sky.pts[i + 1][0] - sky.pts[i][0], sky.pts[i + 1][1] - sky.pts[i][1]);
             const spacing = (2 * SKY_CAR_L + SKY_CAR_GAP) * s;
@@ -478,44 +521,109 @@ function holoFishLayers(idx: number, s: number): LayoutPreviewLayer[] {
     return [{ name: 'world:traffic-holo', color: NEON[idx % NEON.length], y: 0, geometry: acc.geometry(), emissive: 1.4, opacity: 0.72 }];
 }
 
-/** A puffy cloud formation at the origin: 3–6 overlapping soft blobs, seeded shape per cloud.
- *  Rain = dark grey storm deck · snow = pale winter grey. */
-function cloudLayers(idx: number, seed: number, s: number, weather: 'clear' | 'rain' | 'snow' = 'clear'): LayoutPreviewLayer[] {
+/** A puffy cloud formation at the origin: 3–6 overlapping SOFT puffs (smooth ellipsoids with a flattened base,
+ *  so each cloud shades as one painted volume that picks up the sun's colour — polish-round-3 T1.3; they were
+ *  faceted octahedron blobs). Seeded shape per cloud. Rain = dark grey storm deck · snow / overcast = pale grey. */
+function cloudLayers(idx: number, seed: number, s: number, weather: 'clear' | 'rain' | 'snow' | 'overcast' = 'clear'): LayoutPreviewLayer[] {
     const acc = new Accum3D();
     const H = (a: number, b: number): number => hash2(idx * 13.7 + a, b * 7.1, (seed ^ 0xc10d) >>> 0);
     const n = 3 + (H(1, 1) * 4) | 0;
     const big = weather === 'clear' ? 1 : 1.45;   // storm/winter clouds are fat, flat slabs that merge into a deck
     const spread = (0.35 + H(2, 2) * 0.5) * s * big;
+    const X: V3 = [1, 0, 0], Y: V3 = [0, 1, 0], Z: V3 = [0, 0, 1];
     for (let k = 0; k < n; k++) {
         const ox = (H(k, 3) - 0.5) * spread * 2, oz = (H(k, 4) - 0.5) * spread * (weather === 'clear' ? 0.8 : 1.2), oy = (H(k, 5) - 0.3) * 0.06 * s;
-        const r = (0.14 + H(k, 6) * 0.16) * s * big;
-        acc.blob([ox, oy, oz], r * 1.5, r * (weather === 'clear' ? 0.55 : 0.42), r, 0.25, idx * 31 + k * 7);
+        // (clear puffs are ~0.7x the old blob radius: smooth ellipsoids fill their whole footprint, so the same sizes
+        //  closed into one solid deck seen from below)
+        const r = (0.14 + H(k, 6) * 0.16) * s * big * (weather === 'clear' ? 0.7 : 1);
+        // central puffs stand taller (a cumulus crown); every puff shares a flat base
+        const crown = 1 - Math.min(1, Math.abs(ox) / Math.max(1e-6, spread)) * 0.5;
+        const top = r * (weather === 'clear' ? 0.62 : 0.42) * crown;
+        acc.ellipsoid([ox, oy, oz], X, Y, Z, r * 1.5, top, r * 0.16, r, 8, 5);
     }
-    // Rain = DARK slate storm cloud; snow = pale winter grey; clear = white puffies.
-    const color: [number, number, number] = weather === 'rain' ? [0.40, 0.42, 0.48] : weather === 'snow' ? [0.80, 0.82, 0.86] : [0.97, 0.97, 1.0];
+    const color: [number, number, number] = weather === 'rain' ? [0.40, 0.42, 0.48] : weather === 'snow' ? [0.80, 0.82, 0.86]
+        : weather === 'overcast' ? [0.76, 0.78, 0.82] : [0.97, 0.97, 1.0];
     return [{
         name: 'world:traffic-cloud', color, y: 0,
-        geometry: acc.geometry(), emissive: weather === 'rain' ? 0.2 : weather === 'snow' ? 0.55 : 0.75, opacity: weather === 'clear' ? 0.88 : 0.95,
+        geometry: acc.geometry(), emissive: weather === 'rain' ? 0.2 : weather === 'clear' ? 0.75 : 0.55, opacity: weather === 'clear' ? 0.88 : 0.95,
+        noFog: 'hardEdge',   // fog-horizon follow-up: no fog-coloured blobs past Far under Hard fog edge (soft fog: as before)
     }];
 }
 
-const nrm2 = (d: V2): V2 => { const l = Math.hypot(d[0], d[1]) || 1; return [d[0] / l, d[1] / l]; };
+/** A BIG PAINTED high cloud (persona-polish E1) at the origin, ~1-2 R across: 2-3 masses, each a few overlapping
+ *  soft cards (lumpy silhouette) + a raised RIM card for the sunlit crown. Movers only translate, so the cards are
+ *  built FACING THE CITY from their lane side (`side` = sign of the lane z) and tilted ~30 deg to face a viewer below —
+ *  an ellipse from anywhere in the city (no crossed-card stars). Transparent + radialFade like the horizon banks;
+ *  excluded from the auto-frame. The glow walk tints body (sky) and rim (sun) — see WorldManager paintedClouds. */
+function paintedCloudLayers(idx: number, seed: number, R: number, side: 1 | -1): LayoutPreviewLayer[] {
+    const body = new Accum3D(), rim = new Accum3D();
+    const H = (a: number, b: number): number => hash2(idx * 11.3 + a, b * 5.9, (seed ^ 0xc10e) >>> 0);
+    const tilt = 0.5 + H(9, 9) * 0.15;                       // ~29-37 deg
+    const tan: V3 = [-side, 0, 0], up: V3 = [0, Math.cos(tilt), -side * Math.sin(tilt)], back: V3 = [0, 0, side];
+    const masses = 2 + ((H(1, 1) * 2) | 0);
+    const span = R * (0.7 + H(2, 2) * 0.5);
+    for (let k = 0; k < masses; k++) {
+        const t = (k / (masses - 1) - 0.5) * 2;
+        const crown = 1 - Math.abs(t) * 0.4;
+        const rx = R * (0.5 + H(k, 3) * 0.3) * crown, ry = rx * (0.4 + H(k, 4) * 0.14);
+        const c: V3 = [t * span * 0.7, (H(k, 5) - 0.3) * ry * 0.4, (H(k, 6) - 0.5) * R * 0.15];
+        cloudCard(body, c, tan, back, rx, ry, ry * 0.75, 0, up);
+        cloudCard(body, c, tan, back, rx * 0.82, ry * 0.82, ry * 0.62, 0, up);   // concentric core (crisper painted edge)
+        // two lumps riding on the mass (offset sideways + up) break the ellipse into a cumulus crown
+        for (const sx of [-1, 1]) {
+            const lx = sx * rx * (0.35 + H(k, 7 + sx) * 0.2), ly = ry * (0.25 + H(k, 10 + sx) * 0.25);
+            cloudCard(body, [c[0] + lx, c[1] + up[1] * ly, c[2] + up[2] * ly], tan, back, rx * 0.55, ry * 0.8, ry * 0.6, 0, up);
+        }
+        cloudCard(rim, [c[0], c[1] + up[1] * ry * 0.45, c[2] + up[2] * ry * 0.45], tan, back, rx * 0.85, ry * 0.85, ry * 0.6, -R * 0.02, up);
+    }
+    // Body first, rim second: transparent meshes draw in list order, so the sunlit crown blends OVER the body.
+    return [
+        { name: 'world:traffic-cloud', color: [0.96, 0.95, 0.97], y: 0, geometry: body.geometry(), emissive: 0.5, opacity: 0.92, radialFade: true, excludeFromFrame: true, noFog: 'hardEdge' },
+        { name: 'world:traffic-cloud-rim', color: [1.0, 0.98, 0.95], y: 0, geometry: rim.geometry(), emissive: 0.5, opacity: 0.72, radialFade: true, excludeFromFrame: true, noFog: 'hardEdge' },
+    ];
+}
 
 /** A car at the origin, nose ALONG +X (faceRoute yaws it to its route). Upgraded silhouette + round wheels +
  *  chrome + HEAD/TAIL LIGHTS (glow hard at night via the glow walk) — see vehicle.ts. `type` picks the shape:
  *  a modern `sedan`, an old-school long-hood `classic`, or a yellow checker `taxi`. */
-function carLayers(colorIdx: number, s: number, type: VehicleType = 'sedan'): LayoutPreviewLayer[] {
-    const acc = makeVehicleAcc();
+function carLayers(colorIdx: number, s: number, type: VehicleType = 'sedan', twins?: boolean): LayoutPreviewLayer[] {
+    const acc = moverAcc(s, twins);
     emitVehicle(acc, [0, 0, 0], [1, 0, 0], [0, 0, 1], s, type);
     const bodyColor = type === 'taxi' ? VEH_TAXI : CARBODY[colorIdx];
-    return vehicleLayers(acc, type === 'taxi' ? 'world:traffic-taxi' : 'world:traffic-car', bodyColor);
+    return moverTwins(vehicleLayers(acc, type === 'taxi' ? 'world:traffic-taxi' : 'world:traffic-car', bodyColor), acc, s);
+}
+
+/** P9 MOVER DETAIL TIERS: a traffic car's trim (tyres, rubber, grille) and chrome also build a cheap FAR TWIN
+ *  (lod-accum.ts), swapped at PROP_TWIN_M.carTrim like the parked cars'; WorldManager.cityDistanceTiers also gives
+ *  the trim / chrome / lenses the small-props draw distance. World param `propTwins: false` = the pre-P9 movers. */
+function moverAcc(s: number, twins: boolean | undefined): VehicleAcc {
+    const acc = makeVehicleAcc(), u = 1 / cityMetresPerUnit(s * 10);
+    acc.trim = twinAccum(PROP_TWIN_M.carTrim, u, twins); acc.chrome = twinAccum(PROP_TWIN_M.carTrim, u, twins);
+    return acc;
+}
+/** Split a mover's trim / chrome layers into near / far twins. A mover is not chunked, so both twins get the SAME
+ *  precomputed box (the near geometry's): their swap decisions then agree exactly. */
+function moverTwins(layers: LayoutPreviewLayer[], acc: VehicleAcc, s: number): LayoutPreviewLayer[] {
+    const u = 1 / cityMetresPerUnit(s * 10), out: LayoutPreviewLayer[] = [];
+    for (const L of layers) {
+        const src = L.name === 'world:veh-trim' ? acc.trim : L.name === 'world:veh-chrome' ? acc.chrome : null;
+        const pair = src ? withFarTwin(L, src, L.name, PROP_TWIN_M.carTrim, u) : [L];
+        if (pair.length === 2) { const b = boundsOf(pair[0].geometry.vertices); (pair[0].geometry as { bounds?: Float32Array }).bounds = b; (pair[1].geometry as { bounds?: Float32Array }).bounds = Float32Array.from(b); }
+        out.push(...pair);
+    }
+    return out;
+}
+function boundsOf(v: Float32Array): Float32Array {
+    const b = Float32Array.of(Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity);
+    for (let i = 0; i < v.length; i += 12) for (let k = 0; k < 3; k++) { if (v[i + k] < b[k]) b[k] = v[i + k]; if (v[i + k] > b[k + 3]) b[k + 3] = v[i + k]; }
+    return b;
 }
 
 /** A BUS at the origin, nose ALONG +X (faceRoute): upgraded single-deck body + window band + lights (vehicle.ts). */
-function busLayers(s: number): LayoutPreviewLayer[] {
-    const acc = makeVehicleAcc();
+function busLayers(s: number, twins?: boolean): LayoutPreviewLayer[] {
+    const acc = moverAcc(s, twins);
     emitVehicle(acc, [0, 0, 0], [1, 0, 0], [0, 0, 1], s, 'bus');
-    return vehicleLayers(acc, 'world:traffic-bus', [0.36, 0.62, 0.50]);
+    return moverTwins(vehicleLayers(acc, 'world:traffic-bus', [0.36, 0.62, 0.50]), acc, s);
 }
 
 /** A TOY AIRLINER at the origin ALONG +X (faceRoute yaws it): plump rounded fuselage, swept mint low wings,
@@ -580,40 +688,80 @@ function petalLayers(idx: number, seed: number, s: number): LayoutPreviewLayer[]
     return [{ name: 'world:traffic-petal', color: [0.96, 0.74, 0.82], y: 0, geometry: acc.geometry(), opacity: 0.9 }];
 }
 
-/** A walker at the origin (clothing prism + skin head) + a hidden CHAT EMOTE bubble above the head — the
- *  encounter system toggles its visibility when two walkers stop to talk. `robot` (cyber suite) swaps in a
- *  chrome chassis, a boxy head and a glowing cyan visor — they stroll (and chat!) among the humans. */
-function walkerLayers(clothIdx: number, s: number, robot = false): LayoutPreviewLayer[] {
+/** ~16 walker LOOKS drawn from the weighted mannequin archetypes (salarymen / uniforms / casual / elders …). A small
+ *  fixed pool so every walker of a look SHARES its part geometries (instanced draws); per-walker height scale +
+ *  routes supply the rest of the variety. */
+const WALKER_LOOKS: { key: string; look: PersonLook }[] = Array.from({ length: 20 }, (_, i) => {
+    const arch = archetypeIndex((i + 0.5) / 20);
+    return { key: `wk${i}`, look: personLook(arch, 101 + i * 37) };
+});
+
+type WalkerArchetype = { layers: LayoutPreviewLayer[]; pivotY: number; pivotZ: number; armY: number; armZ: number; amp: number; arms: boolean; knee: NonNullable<MoverSpec['gait']>['knee'] };
+/** A walker's GAIT from its archetype: legs swing about the hip (smaller steps in a skirt / yukata), FREE arms swing
+ *  opposite about the shoulder (0.8× the leg angle); cyclists pedal (bigger, slower cycle) and hold the bars. */
+function walkerGait(b: WalkerArchetype, u: number, bike: boolean): NonNullable<MoverSpec['gait']> {
+    return {
+        pivotY: b.pivotY, pivotZ: b.pivotZ, stride: (bike ? 0.9 : 0.36 * (b.amp / 0.42)) * u, amp: bike ? 0.55 : b.amp,
+        ...(b.arms && !bike ? { arm: { y: b.armY, z: b.armZ, amp: 0.8 } } : {}),
+        ...(b.knee ? { knee: bike ? { ...b.knee, flex: 0.9, pedal: true } : b.knee } : {}),
+    };
+}
+
+/** A walker archetype at the origin facing +X: mannequin body parts (rigid), the two swinging LEGS (hip-pivot space,
+ *  cloned L/R by name), the FREE ARMS (shoulder-pivot space — a phone / umbrella / briefcase hand stays rigid in the
+ *  body), and the hidden CHAT EMOTE bubble the encounter system toggles. All names start `world:traffic-walker`
+ *  (the tier-1 LOD + night rules + the flat crowd shading key on that). */
+function buildWalkerArchetype(look: PersonLook, u: number, umbrella: PedColor | null, bike: boolean): WalkerArchetype {
+    const parts = walkerParts(look, u, umbrella, bike);
+    const layers: LayoutPreviewLayer[] = [];
+    for (const b of parts.body) if (!b.acc.empty) layers.push({ ...crowdLayer(`world:traffic-walker-${b.part}`, b.pc), y: 0, geometry: b.acc.geometry() });
+    layers.push({ ...crowdLayer('world:traffic-walker-legL', parts.leg.pc), y: 0, geometry: parts.leg.accL.geometry() });
+    layers.push({ ...crowdLayer('world:traffic-walker-legR', parts.leg.pc), y: 0, geometry: parts.leg.accR.geometry() });
+    if (parts.shin) {
+        layers.push({ ...crowdLayer('world:traffic-walker-shinL', parts.leg.pc), y: 0, geometry: parts.shin.accL.geometry() });
+        layers.push({ ...crowdLayer('world:traffic-walker-shinR', parts.leg.pc), y: 0, geometry: parts.shin.accR.geometry() });
+    }
+    if (parts.shoe) {
+        layers.push({ ...crowdLayer('world:traffic-walker-shoeL', parts.shoe.pc), y: 0, geometry: parts.shoe.accL.geometry() });
+        layers.push({ ...crowdLayer('world:traffic-walker-shoeR', parts.shoe.pc), y: 0, geometry: parts.shoe.accR.geometry() });
+    }
+    if (parts.arm.accL) layers.push({ ...crowdLayer('world:traffic-walker-armL', parts.arm.pc), y: 0, geometry: parts.arm.accL.geometry() });
+    if (parts.arm.accR) layers.push({ ...crowdLayer('world:traffic-walker-armR', parts.arm.pc), y: 0, geometry: parts.arm.accR.geometry() });
+    if (parts.hand.accL) layers.push({ ...crowdLayer('world:traffic-walker-handL', 'skin'), y: 0, geometry: parts.hand.accL.geometry() });
+    if (parts.hand.accR) layers.push({ ...crowdLayer('world:traffic-walker-handR', 'skin'), y: 0, geometry: parts.hand.accR.geometry() });
+    const emote = new Accum3D(), top = look.heightM * u;
+    emote.blob([0, top + 0.022 * u * 15, 0], 0.011 * u * 15, 0.008 * u * 15, 0.006 * u * 15, 0, 0);          // speech bubble
+    emote.blob([0.004 * u * 15, top + 0.011 * u * 15, 0], 0.0022 * u * 15, 0.0022 * u * 15, 0.002 * u * 15, 0, 0);   // tail dot
+    layers.push({ name: 'world:traffic-emote', color: [0.98, 0.97, 0.92], y: 0, geometry: emote.geometry(), emissive: 0.9 });
+    const kn = parts.knee, flex = 1.0 * (parts.amp / 0.4);
+    return {
+        layers, pivotY: parts.pivotY * u, pivotZ: parts.pivotZ * u, armY: parts.armY * u, armZ: parts.armZ * u, amp: parts.amp, arms: !!(parts.arm.accL || parts.arm.accR),
+        knee: kn ? { x: kn.x * u, y: kn.y * u, heel: [kn.heel[0] * u, kn.heel[1] * u], toe: [kn.toe[0] * u, kn.toe[1] * u], flex } : undefined,
+    };
+}
+
+/** The cyber-suite ROBOT walker: chrome chassis, boxy head, glowing cyan visor (no legs — it hovers-walks). */
+function robotLayers(s: number): LayoutPreviewLayer[] {
     const body = new Accum3D(), head = new Accum3D(), emote = new Accum3D(), visor = new Accum3D();
-    // Real human height (~1.6 m); matches the static crowd in pedestrians.ts (was 0.042·s ≈ 0.85 m, half-scale).
     const bh = 0.088 * s;
-    body.prism([0, 0, 0], 0.0092 * s, 0.0073 * s, bh, robot ? 4 : 5);
-    if (robot) {
-        head.obox([0, bh + 0.009 * s, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.0078 * s, 0.0082 * s, 0.0078 * s);
-        visor.obox([0, bh + 0.011 * s, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.0082 * s, 0.0019 * s, 0.0082 * s);   // glowing eye band
-    } else head.blob([0, bh + 0.009 * s, 0], 0.0088 * s, 0.0098 * s, 0.0088 * s, 0, 0);
-    emote.blob([0, bh + 0.032 * s, 0], 0.011 * s, 0.008 * s, 0.006 * s, 0, 0);        // speech bubble
-    emote.blob([0.004 * s, bh + 0.021 * s, 0], 0.0022 * s, 0.0022 * s, 0.002 * s, 0, 0);   // bubble tail dot
+    body.prism([0, 0, 0], 0.0092 * s, 0.0073 * s, bh, 4);
+    head.obox([0, bh + 0.009 * s, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.0078 * s, 0.0082 * s, 0.0078 * s);
+    visor.obox([0, bh + 0.011 * s, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.0082 * s, 0.0019 * s, 0.0082 * s);   // glowing eye band
+    emote.blob([0, bh + 0.032 * s, 0], 0.011 * s, 0.008 * s, 0.006 * s, 0, 0);
+    emote.blob([0.004 * s, bh + 0.021 * s, 0], 0.0022 * s, 0.0022 * s, 0.002 * s, 0, 0);
     return [
-        { name: 'world:traffic-walker', color: robot ? [0.72, 0.75, 0.80] : CLOTHES[clothIdx], y: 0, geometry: body.geometry() },
-        { name: 'world:traffic-walker-skin', color: robot ? [0.60, 0.63, 0.68] : SKIN, y: 0, geometry: head.geometry() },
-        ...(robot ? [{ name: 'world:traffic-robot-visor', color: [0.3, 0.95, 1.0] as [number, number, number], y: 0, geometry: visor.geometry(), emissive: 1.3 }] : []),
+        { name: 'world:traffic-walker-robot', color: [0.72, 0.75, 0.80], y: 0, geometry: body.geometry() },
+        { name: 'world:traffic-walker-robothead', color: [0.60, 0.63, 0.68], y: 0, geometry: head.geometry() },
+        { name: 'world:traffic-robot-visor', color: [0.3, 0.95, 1.0], y: 0, geometry: visor.geometry(), emissive: 1.3 },
         { name: 'world:traffic-emote', color: [0.98, 0.97, 0.92], y: 0, geometry: emote.geometry(), emissive: 0.9 },
     ];
 }
 
-/** ONE train car at the origin ALONG +X, deck height BAKED (the viaduct is level). The consist is articulated:
- *  the ticker clones this car `TRAIN_CARS` times and places each at its own arc-length, yawed to the local track
- *  heading — so the back cars follow the rails around a curve instead of clipping off the outside. */
-export const TRAIN_CARS = 4, TRAIN_CAR_L = 0.32, TRAIN_CAR_GAP = 0.02;
-function trainLayers(deckY: number, s: number): LayoutPreviewLayer[] {
-    const body = new Accum3D(), win = new Accum3D();
-    const xA: V3 = [1, 0, 0], up: V3 = [0, 1, 0], zA: V3 = [0, 0, 1];
-    const carL = TRAIN_CAR_L * s, cy = deckY + 0.052 * s, w = 0.06 * s;
-    body.obox([0, cy, 0], xA, up, zA, carL, 0.042 * s, w * 0.82);
-    win.obox([0, cy + 0.012 * s, 0], xA, up, zA, carL * 0.92, 0.015 * s, w * 0.86);
-    return [
-        { name: 'world:traffic-train', color: TRAIN, y: 0, geometry: body.geometry() },
-        { name: 'world:traffic-train-win', color: TRAIN_DK, y: 0, geometry: win.geometry(), emissive: 0.7 },
-    ];
+/** A HEADLIGHT POOL on the road ahead of a car (built along +X like the car): a soft radial-fade disc that the
+ *  night-glow walk (`headlight` regex) cranks after dark; the ticker hides it by day. `fwd` = the car's half-length. */
+function headPoolLayers(s: number, fwd: number): LayoutPreviewLayer[] {
+    const a = new Accum3D();
+    a.disc([(fwd + 0.13) * s, 0.005 * s, 0], [0, 1, 0], 0.14 * s, 14);
+    return [{ name: 'world:traffic-headlight-pool', color: [1.0, 0.93, 0.74], y: 0, geometry: a.geometry(), emissive: 1.2, opacity: 0.42, radialFade: true }];
 }
+

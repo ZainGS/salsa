@@ -21,9 +21,9 @@ import { emitStalk, resolveStalk, type StalkAccum, type StalkSpec } from './stal
 import { buildRunners, resolveRunner, wallHost, type Phyllotaxy, type RunnerAccum, type RunnerSource, type RunnerSpec } from './runner';
 import { emitConifer, resolveConifer } from './conifer';
 import {
-    emitBranch, emitCanopy, emitHedgeShell, leafBudget, resolveBranch,
-    DEFAULT_CANOPY, DEFAULT_HEDGE_SHELL, DEFAULT_LEAF, MAX_LEAVES_PER_PLANT,
-    type BranchSpec, type CanopySpec, type HedgeShellSpec, type LeafGeom,
+    emitBranch, emitCanopy, emitClumpCrown, emitHedgeShell, emitSprigCrown, leafBudget, resolveBranch,
+    DEFAULT_CANOPY, DEFAULT_HEDGE_SHELL, DEFAULT_LEAF, DEFAULT_SPRIG_CROWN, DEFAULT_CLUMP_CROWN, MAX_CLUMP_CARDS_PER_PLANT, MAX_LEAVES_PER_PLANT, MAX_SPRIG_CARDS_PER_PLANT,
+    type BranchSpec, type CanopySpec, type HedgeShellSpec, type LeafGeom, type SprigCrownSpec, type ClumpCrownSpec,
 } from './branch';
 import {
     plantingArrangement, MAX_PLANTS_PER_VESSEL, MAX_VESSEL_LEAVES,
@@ -171,6 +171,16 @@ export interface FoliageParams {
     hedgeRound?: number;
     /** Distance LOD for the woody archetypes: 0 near/full · 1 mid · 2 far (fewer limbs AND leaves). */
     branchLod?: number;
+    /** `bush` · `shrub` · `small-tree` in `card` render only. `'blade'` (default) = swept leaves in cluster
+     *  volumes beyond each tip; `'sprig'` = a SPRIG CROWN (branch.ts `emitSprigCrown`): fine twiglets lined
+     *  with many small alpha-cut leaf cards — the close-up tree look; `'clump'` = a CLUMP CROWN (branch.ts
+     *  `emitClumpCrown`): a few dense leaf-cluster cards per clump at the branch ends with SPHERISED normals —
+     *  the soft painterly crown the city's street trees use (polish-round-3 T4). */
+    leafStyle?: 'blade' | 'sprig' | 'clump';
+    /** `leafStyle: 'sprig'` tuning — card size, twig spray shape (omitted = {@link DEFAULT_SPRIG_CROWN}). */
+    sprig?: Partial<SprigCrownSpec>;
+    /** `leafStyle: 'clump'` tuning — clump size / density / normal bend (omitted = {@link DEFAULT_CLUMP_CROWN}). */
+    clump?: Partial<ClumpCrownSpec>;
     // ── VESSEL archetypes only (`potted` · `planter` · `window-box`, §4 vessel types, phase P4v). These
     //    are ARRANGEMENTS: a vessel + soil + a small composition of identifiable plants (focal · filler ·
     //    trailing), not a vessel + one green ball. All OPTIONAL — omitted = the vessel's own recipe. ──
@@ -605,6 +615,11 @@ export function buildFoliage(partial: Partial<FoliageParams> = {}): { layers: La
     const dens = Math.max(0, Math.min(1, p.density));
     const s = Math.max(0.2, p.size), w = Math.max(0.3, p.width);
     const card = p.render === 'card';
+    // Sprig crown: woody (not hedge) + card render + asked for. Its leaves are alpha-cut CARDS, not swept blades.
+    const cardCrownType = card && (p.type === 'bush' || p.type === 'shrub' || p.type === 'small-tree');
+    const sprigCrown = cardCrownType && p.leafStyle === 'sprig';
+    // Clump crown (T4): the same woody types, leaves as a few dense cluster cards per clump, spherised normals.
+    const clumpCrown = cardCrownType && p.leafStyle === 'clump';
     const spillK = Math.max(0, Math.min(1, p.spill ?? 0.5));   // vessel types: how far the trailing plants hang
     /** Hang depth (m) for a vessel's trailing plants. ★ `spill: 0` means NO trailing plants at all. */
     const spillOf = (base: number, span: number): number => (spillK <= 0 ? 0 : base + spillK * span);
@@ -646,7 +661,22 @@ export function buildFoliage(partial: Partial<FoliageParams> = {}): { layers: La
             // irregular envelope + gaps. Same type names, so existing scenes and saves upgrade on reload.
             const rec = woodySpecFor(p.type, p, s, dens, card);
             const bres = emitBranch(A.trunk, rec.branch, { base: [0, 0, 0] }, rnd);
-            const cres = emitCanopy(A.leaf, A.tip, bres.tips, rec.canopy, rnd, [0, 0, 0], leafBudget(MAX_LEAVES_PER_PLANT));
+            // SPRIG crown (tree scale): the leaves live ON twiglets grown from the skeleton — see branch.ts §3.6b.
+            const cres = clumpCrown
+                ? emitClumpCrown(A.leaf, A.tip, bres, {
+                    ...DEFAULT_CLUMP_CROWN,
+                    ...(p.leafGaps !== undefined ? { gapChance: Math.max(0, p.leafGaps) * 0.3 } : {}),
+                    ...p.clump,
+                    lodLevel: Math.max(0, Math.round(p.branchLod ?? 0)),
+                }, rnd, [0, 0, 0], leafBudget(MAX_CLUMP_CARDS_PER_PLANT))
+                : sprigCrown
+                ? emitSprigCrown(A.trunk, A.leaf, A.tip, bres, {
+                    ...DEFAULT_SPRIG_CROWN,
+                    ...(p.leafGaps !== undefined ? { gapChance: Math.max(0, p.leafGaps) * 0.5 } : {}),
+                    ...p.sprig,
+                    lodLevel: Math.max(0, Math.round(p.branchLod ?? 0)),
+                }, rnd, [0, 0, 0], leafBudget(MAX_SPRIG_CARDS_PER_PLANT))
+                : emitCanopy(A.leaf, A.tip, bres.tips, rec.canopy, rnd, [0, 0, 0], leafBudget(MAX_LEAVES_PER_PLANT));
             meta.height = Math.max(0.05, Math.max(bres.height, cres.height));
             const rad = Math.max(0.05, Math.max(bres.radius, cres.radius));
             meta.footprint = box(rad, rad);
@@ -778,7 +808,8 @@ export function buildFoliage(partial: Partial<FoliageParams> = {}): { layers: La
     // A woody type's LIMBS are always real swept tubes, but its LEAVES are only real swept blades in
     // `card` (quality) mode — in `chunky` mode they are still low-poly blobs, which must keep the old
     // blob-era shading. So `real` is render-dependent for exactly these four types.
-    const woodyReal = woody && card;
+    // …except a SPRIG crown, whose leaves are alpha-cut cards (the leafCard silhouette IS the leaf there).
+    const woodyReal = woody && card && !sprigCrown && !clumpCrown;
     // A VESSEL type (P4v) is an arrangement of the P1–P4 primitives, so its foliage is real swept
     // geometry in both render modes (`chunky` only swaps the shrub canopy's leaves for blobs).
     const vessel = VESSEL_TYPES.has(p.type);
@@ -827,11 +858,19 @@ export function buildFoliage(partial: Partial<FoliageParams> = {}): { layers: La
     // Clinging leaves therefore barely twitch while the hanging tips swing — without the per-vertex
     // attachment attribute a shader change would have cost.
     const clung = runner ? 0.06 : 1;      // per-layer sway scale for ATTACHED geometry
-    const leafT = blade ? 0.75 : runner ? 0.8 : (woodyReal || vessel || conifer) ? 0.72 : 0.55;
-    const tipT = blade ? 0.88 : runner ? 0.9 : (woodyReal || vessel || conifer) ? 0.86 : 0.7;
+    const thinLeaf = woodyReal || sprigCrown || vessel || conifer;   // single-leaf-thick geometry transmits most
+    // A CLUMP crown is a VOLUME, not one leaf thick: its spherised normals put the whole shadow side in the
+    // back-lambert lobe, so full leaf translucency would light the dark half up — "a little" is 0.3/0.4.
+    const leafT = clumpCrown ? 0.3 : blade ? 0.75 : runner ? 0.8 : thinLeaf ? 0.72 : 0.55;
+    const tipT = clumpCrown ? 0.4 : blade ? 0.88 : runner ? 0.9 : thinLeaf ? 0.86 : 0.7;
     const tipSway = woody && p.type !== 'hedge' ? 1.35 : 1.15;   // floppy outer twig masses (P4)
-    if (!A.leaf.empty) out.push({ name: 'foliage:leaf', color: p.foliageColor, y: 0, geometry: A.leaf.geometry(), emissive: E, leafCard: leafFlag, renderStyle: cel, rim: p.celShade, wind: wind(clung), foliageShade: shade(p.tipColor, leafT) });
-    if (!A.tip.empty) out.push({ name: 'foliage:tip', color: p.tipColor, y: 0, geometry: A.tip.geometry(), emissive: E * 1.1, leafCard: leafFlag, renderStyle: cel, rim: p.celShade, wind: wind(tipSway * clung), foliageShade: shade(p.tipColor, tipT) });
+    // ★ A SPRIG crown's cards sit ON twiglets that ride the trunk layer (×0.45). At ×1 / ×1.35 the leaves would
+    // slide off their own twigs in a breeze (the same shear the P4 note above fixed for the limbs), so they sway
+    // only a little more than the wood carrying them — the flutter reads, the attachment holds.
+    // A CLUMP crown's clumps cover the twig ends they sit on, so they take the same gentle ×0.6 / ×0.75.
+    const [leafSway, tipSwayK] = (sprigCrown || clumpCrown) ? [0.6, 0.75] : [clung, tipSway * clung];
+    if (!A.leaf.empty) out.push({ name: 'foliage:leaf', color: p.foliageColor, y: 0, geometry: A.leaf.geometry(), emissive: E, leafCard: leafFlag, renderStyle: cel, rim: p.celShade, wind: wind(leafSway), foliageShade: shade(p.tipColor, leafT) });
+    if (!A.tip.empty) out.push({ name: 'foliage:tip', color: p.tipColor, y: 0, geometry: A.tip.geometry(), emissive: E * 1.1, leafCard: leafFlag, renderStyle: cel, rim: p.celShade, wind: wind(tipSwayK), foliageShade: shade(p.tipColor, tipT) });
     // ── RUNNER layers (P3): the woody climbing stem — pale and clearly visible wherever the leaves are
     //    sparse — plus the FREE / HANGING half of each channel, which is where all the motion lives.
     const stemCol = p.stemColor ?? (runner ? RUNNER_RECIPES[p.type as RunnerType].stem : p.trunkColor);

@@ -109,6 +109,68 @@ export function evaluateSkyColor(
   return [r * sky.intensity, g * sky.intensity, b * sky.intensity];
 }
 
+/**
+ * Cosine-weighted IRRADIANCE the baked sky delivers to a surface with normal `n` — the value the SH-IBL diffuse path
+ * (`evalSHIrradiance`) approximates, in the SAME units: for a uniform sky of radiance 1 it returns PI, and the mesh
+ * shader multiplies it straight onto albedo (no 1/PI). Colours are clamped to 0..1 like the sRGB bake. Hosts use it
+ * to NORMALISE a bake's `intensity` against a flat ambient they already tuned (world-manager's city sky lighting).
+ */
+export function skyIrradiance(
+  sky: ProceduralSkyParams,
+  sunDir: readonly [number, number, number],
+  n: readonly [number, number, number],
+  width = 32,
+  height = 16,
+): [number, number, number] {
+  const nl = Math.hypot(n[0], n[1], n[2]) || 1;
+  const nx0 = n[0] / nl, ny0 = n[1] / nl, nz0 = n[2] / nl;
+  const out: [number, number, number] = [0, 0, 0];
+  for (let py = 0; py < height; py++) {
+    const theta = Math.PI * (py + 0.5) / height;
+    const sinT = Math.sin(theta), cosT = Math.cos(theta);
+    const dw = sinT * (Math.PI / height) * (2 * Math.PI / width);
+    for (let px = 0; px < width; px++) {
+      const phi = 2 * Math.PI * (px + 0.5) / width;
+      const dx = sinT * Math.sin(phi), dy = cosT, dz = sinT * Math.cos(phi);
+      const cosN = dx * nx0 + dy * ny0 + dz * nz0;
+      if (cosN <= 0) continue;
+      const c = evaluateSkyColor([dx, dy, dz], sky, sunDir);
+      const w = cosN * dw;
+      out[0] += clamp01(c[0]) * w; out[1] += clamp01(c[1]) * w; out[2] += clamp01(c[2]) * w;
+    }
+  }
+  return out;
+}
+
+const lum = (c: readonly [number, number, number]): number => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+
+/**
+ * The bake `intensity` at which sky IBL delivers the SAME fill energy as a flat ambient of `ambient` (colour ×
+ * intensity, i.e. what the shader's no-IBL path multiplies onto albedo). Energy is matched on the mean luminance of
+ * an UP-facing and the (azimuth-averaged) SIDE-facing irradiance, so the sky REDISTRIBUTES the tuned fill — tops a
+ * little brighter, walls a little dimmer, both sky-tinted — instead of ADDING PI-times more (the raw SH irradiance
+ * is PI x radiance and the shader applies it without 1/PI, so an un-normalised bake of a pale day sky at
+ * intensity ~1 lit matte surfaces ~3x brighter than the flat ambient: the white-out city bug).
+ */
+export function ambientMatchedSkyIntensity(
+  sky: ProceduralSkyParams,
+  sunDir: readonly [number, number, number],
+  ambient: readonly [number, number, number],
+  opts: { gain?: number; maxUp?: number } = {},
+): number {
+  const up = lum(skyIrradiance(sky, sunDir, [0, 1, 0]));
+  let side = 0;
+  for (const d of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]] as const) side += lum(skyIrradiance(sky, sunDir, d)) * 0.25;
+  const e = 0.5 * (up + side);
+  const target = lum(ambient);
+  if (!(e > 1e-5) || !(target >= 0)) return 0;
+  // gain: how much brighter than the flat fill the sky may light (1 = same energy). maxUp: a CEILING on the up-facing
+  // fill luminance, so a bright sky can never push pale ground past the tone range (bloom then clips it white).
+  let k = (target / e) * Math.max(0, opts.gain ?? 1);
+  if (opts.maxUp != null && up * k > opts.maxUp) k = Math.max(0, opts.maxUp) / up;
+  return k;
+}
+
 /** Structural RGBA image (compatible with the fields `_computeSHCoeffs` reads off an `ImageData`). */
 export interface EquirectPixels {
   width: number;

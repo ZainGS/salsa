@@ -7,6 +7,7 @@
  * Vertex format: same as GizmoRenderer (position vec3 + color vec4, 28 bytes).
  */
 
+import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { GIZMO_VERTEX_SHADER, GIZMO_FRAGMENT_SHADER, GIZMO_VERTEX_STRIDE, GIZMO_UNIFORM_SIZE } from './shaders/gizmo-shaders';
 import type { Camera3D } from './camera-3d';
 import type { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
@@ -21,7 +22,7 @@ const VERT_HALF = 0.007; // world-space billboard half-size
 export class WeightPaintVertexOverlayRenderer {
   private readonly device: GPUDevice;
   private readonly _bgl: GPUBindGroupLayout;
-  private readonly _pipe: GPURenderPipeline;
+  private readonly _pipe: PipelineHandle<GPURenderPipeline>;   // P2: non-blocking cache handle
   private readonly _uniBuf: GPUBuffer;
 
   private _vtxBuf: GPUBuffer | null = null;
@@ -42,7 +43,8 @@ export class WeightPaintVertexOverlayRenderer {
     });
     const layout = device.createPipelineLayout({ bindGroupLayouts: [this._bgl] });
 
-    this._pipe = device.createRenderPipeline({
+    this._pipe = GPUPipelineCache.for(device).render({
+      label: 'WeightPaintOverlay',
       layout,
       vertex: {
         module: vertMod, entryPoint: 'vs_main',
@@ -147,7 +149,9 @@ export class WeightPaintVertexOverlayRenderer {
       layout: this._bgl,
       entries: [{ binding: 0, resource: { buffer: this._uniBuf } }],
     });
-    pass.setPipeline(this._pipe);
+    const pipe = this._pipe.get();
+    if (!pipe) return;   // P2: still compiling
+    pass.setPipeline(pipe);
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._vtxBuf);
     pass.draw(triV.length / 7);

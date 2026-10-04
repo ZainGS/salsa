@@ -7,55 +7,66 @@
 // the camera auto-frame (it extends well past the city). See docs/specs/world-borders.md.
 
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
-import { makeRng, pointInPolygon, hash2 } from './util';
+import { cityMetresPerUnit } from './types';
+import { makeRng, pointInPolygon, hash2, valueNoise2D } from './util';
 import { Accum3D } from './meshbuild';
-import { addTree, addRock } from './biome';
-import { polysToGeometry } from './preview';
+import { addRock } from './biome';
+import { buildCityFoliage, type TreePlacement } from './city-foliage';
+import { groundTess, emitGround } from './ground-mesh';
 
-const FOLIAGE_COLOR: [number, number, number] = [0.28, 0.50, 0.26];  // forest leaf green
-const TRUNK_COLOR:   [number, number, number] = [0.36, 0.26, 0.17];
-const ROCK_COLOR:    [number, number, number] = [0.55, 0.55, 0.58];
+const ROCK_COLOR: [number, number, number] = [0.55, 0.55, 0.58];
+
+/** Grass / earth shades as a GRADIENT (deep forest floor → meadow → dry grass → dirt). Neighbouring cells take
+ *  neighbouring shades (they're quantised from a SMOOTH noise), so the ground grades from one to the next in
+ *  small steps instead of the old random checkerboard of five unrelated colours. */
+const SHADES: [number, number, number][] = [
+    [0.34, 0.47, 0.26],   // deep forest-floor green
+    [0.38, 0.51, 0.28],
+    [0.42, 0.55, 0.30],   // meadow green
+    [0.47, 0.57, 0.32],
+    [0.50, 0.56, 0.33],   // pale dry grass
+    [0.52, 0.50, 0.31],   // dry earth
+];
 
 export function buildApron(graph: WorldGraph): LayoutPreviewLayer[] {
     const p = graph.params;
     if (!p.terrainApron) return [];
-    const R = p.radius, gy = p.groundY, scale = R / 10;
+    const R = p.radius, gy = p.groundY;
     const apronR = R * (p.apronRadius ?? 2.5);
     const density = p.natureDensity ?? 0.6;
     const border = graph.border;
     const inCity = (x: number, z: number): boolean => pointInPolygon([x, z], border);
+    const mpu = cityMetresPerUnit(R);
 
-    // ── Nature ground ring — small cells (dense verts so the drape onto terrain stays smooth), kept to the
-    //    annulus OUTSIDE the border and within apronR. To kill the repetitive-texture look, each cell is binned
-    //    by TWO-SCALE value noise into one of several grass/earth SHADES (meadow / dry / dark / dirt), so the
-    //    ground reads as varied country instead of one flat tiled green. Each shade is its own merged layer. ──
-    const SHADES: [number, number, number][] = [
-        [0.44, 0.56, 0.31],   // meadow green
-        [0.50, 0.58, 0.34],   // pale dry grass
-        [0.34, 0.47, 0.26],   // deep forest-floor green
-        [0.52, 0.47, 0.30],   // dirt / dry earth
-        [0.40, 0.54, 0.29],   // mid green
+    // ── Nature ground ring (S15). Small cells with JITTERED shared corners (so no straight grid lines survive),
+    //    each shaded from a two-octave smooth noise quantised into the gradient above → soft organic bands of
+    //    colour, with the procedural TURF material on top hiding what edges remain. Split on the ground lattice
+    //    like the city ground, so the trees (lifted by the same field at their base) stand exactly on it. ──
+    const cell = R * 0.08, n = Math.ceil(apronR / cell);
+    const sN = (p.seed ^ 0x1f83) >>> 0, sM = (p.seed ^ 0x77c5) >>> 0;
+    const corner = (i: number, j: number): V2 => [
+        i * cell + (hash2(i, j, sN) - 0.5) * cell * 0.45,
+        j * cell + (hash2(i, j, sM) - 0.5) * cell * 0.45,
     ];
-    const cell = R * 0.11, hc = cell * 0.5;
     const shadeQuads: V2[][][] = SHADES.map(() => []);
-    const big = R * 0.55, small = R * 0.16;   // two noise scales → large patches broken by finer mottle
-    const n = Math.ceil(apronR / cell);
-    for (let ix = -n; ix <= n; ix++) {
-        for (let iz = -n; iz <= n; iz++) {
-            const cx = ix * cell, cz = iz * cell;
+    for (let ix = -n; ix < n; ix++) {
+        for (let iz = -n; iz < n; iz++) {
+            const cx = (ix + 0.5) * cell, cz = (iz + 0.5) * cell;
             const r = Math.hypot(cx, cz);
-            if (r > apronR || r < R * 0.6) continue;        // ring only (skip the far corners + the city interior)
-            if (inCity(cx, cz)) continue;                    // the city map owns everything inside the border
-            const nb = hash2(Math.floor(cx / big), Math.floor(cz / big), (p.seed ^ 0x1f83) >>> 0);
-            const ns = hash2(Math.floor(cx / small), Math.floor(cz / small), (p.seed ^ 0x77c5) >>> 0);
-            const si = Math.min(SHADES.length - 1, Math.floor((nb * 0.7 + ns * 0.3) * SHADES.length));
-            shadeQuads[si].push([[cx - hc, cz - hc], [cx + hc, cz - hc], [cx + hc, cz + hc], [cx - hc, cz + hc]]);
+            if (r > apronR || r < R * 0.6) continue;         // ring only (skip the far corners + the city interior)
+            if (inCity(cx, cz)) continue;                     // the city map owns everything inside the border
+            const v = 0.7 * valueNoise2D(cx / (R * 0.55), cz / (R * 0.55), sN) + 0.3 * valueNoise2D(cx / (R * 0.18), cz / (R * 0.18), sM);
+            const si = Math.max(0, Math.min(SHADES.length - 1, Math.floor(((v - 0.2) / 0.6) * SHADES.length)));
+            shadeQuads[si].push([corner(ix, iz), corner(ix + 1, iz), corner(ix + 1, iz + 1), corner(ix, iz + 1)]);
         }
     }
 
     // ── Scatter: forest CLUMPS (low-freq hash patches) with dense trees, sparse LONE trees in the open fields,
     //    and a few rocks. Deterministic; fades out near the far edge so the country dissolves, not cuts off. ──
-    const foliage = new Accum3D(), trunk = new Accum3D(), rock = new Accum3D();
+    // ★ E8: the trees are the REAL instanced city trees (city-foliage.ts — branch-generated, carded, wind), not the
+    //   legacy cones + octahedra, so the forest outside the border matches the trees inside it.
+    const trees: TreePlacement[] = [];
+    const rock = new Accum3D();
     const clumpSize = R * 0.6, step = R * 0.1;
     const nT = Math.ceil(apronR / step);
     for (let ix = -nT; ix <= nT; ix++) {
@@ -71,27 +82,30 @@ export function buildApron(graph: WorldGraph): LayoutPreviewLayer[] {
             const inForest = clump < 0.42 * (0.5 + density);
             const chance = (inForest ? 0.72 : 0.05 * density) * edgeFade;
             if (local < chance) {
-                const tr = makeRng((p.seed ^ (ix * 131 + iz * 17) ^ 0xa1) >>> 0);
-                addTree(foliage, trunk, [x, gy, z], tr, scale * (inForest ? 1.0 : 0.85));
+                const k = hash2(ix * 3 + 1, iz * 5 + 7, (p.seed ^ 0xa1) >>> 0);
+                // Forest = conifer-heavy woodland; open fields = broadleaf with the odd bush.
+                const kind = inForest ? (k < 0.55 ? 'conifer' : 'broadleaf') : (k < 0.8 ? 'broadleaf' : 'bush');
+                trees.push({ pos: [x, z], y: gy, kind, scale: inForest ? 1.05 : 0.9 });
             } else if (hash2(ix * 5 + 1, iz * 11 + 2, (p.seed ^ 0x3d5c) >>> 0) < 0.02 * edgeFade) {
-                addRock(rock, [x, gy, z], makeRng((p.seed ^ (ix * 91 + iz * 7)) >>> 0), scale);
+                addRock(rock, [x, gy, z], makeRng((p.seed ^ (ix * 91 + iz * 7)) >>> 0), R / 10);
             }
         }
     }
 
     const layers: LayoutPreviewLayer[] = [];
-    // One layer per grass/earth shade; a subtle, per-shade-varied speckle adds micro-texture without an obvious tile.
+    const t = groundTess(graph);
+    // One layer per shade, all on the TURF material (tinted) so the mow/clump noise runs continuously across.
     for (let si = 0; si < SHADES.length; si++) {
         const q = shadeQuads[si];
         if (!q.length) continue;
         const c = SHADES[si];
-        layers.push({ name: `world:apron-ground-${si}`, color: c, y: gy, geometry: polysToGeometry(q, gy),
-            pattern: { color: [c[0] * 0.72, c[1] * 0.78, c[2] * 0.68], freq: 22 + si * 9, scale: 0.45, angle: si * 0.7, mode: 'dots' }, excludeFromFrame: true });
+        layers.push({ name: `world:apron-ground-${si}`, color: c, y: gy, drape: 'smooth', geometry: emitGround(t, q, { y: gy, levels: false }),
+            ground: { surface: 'grass', tint: c, metersPerUnit: mpu }, excludeFromFrame: true });
     }
-    // Foliage/trunks/rocks carry an 'apron-' name token so _addStaged does NOT bake their elevation — they LIFT
-    // uniformly onto the terrain like the city's trees (base + canopy share x,z).
-    if (!trunk.empty)   layers.push({ name: 'world:apron-trunks', color: TRUNK_COLOR, y: gy, geometry: trunk.geometry(), excludeFromFrame: true });
-    if (!foliage.empty) layers.push({ name: 'world:apron-foliage', color: FOLIAGE_COLOR, y: gy, geometry: foliage.geometry(), pattern: { color: [0.20, 0.40, 0.19], freq: 7, scale: 0.55, mode: 'dots' }, excludeFromFrame: true });
-    if (!rock.empty)    layers.push({ name: 'world:apron-rocks', color: ROCK_COLOR, y: gy, geometry: rock.geometry(), excludeFromFrame: true });
+    // Same variant pool + seed + leaf tint as the city's trees → the geometry cache ('wld:tree:…') is shared.
+    for (const L of buildCityFoliage(trees, mpu, p.seed, { leafColor: p.leafColor, leafColorVar: p.leafColorVar })) {
+        layers.push({ ...L, excludeFromFrame: true });
+    }
+    if (!rock.empty) layers.push({ name: 'world:apron-rocks', color: ROCK_COLOR, y: gy, geometry: rock.geometry(), excludeFromFrame: true });
     return layers;
 }

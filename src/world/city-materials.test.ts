@@ -44,7 +44,7 @@ describe('one material family per mesh — they all share the same four instance
     const lost = clashes.reduce((n, c) => n + c.tris, 0);
     expect(clashes.map((c) => `${c.name} claims [${c.fams.join(' + ')}] over ${Math.round(c.tris)} tris`),
       `${Math.round(lost)} triangles are rendering as the wrong material`).toEqual([]);
-  });
+  }, 20000);   // the first whole-city build pays the cold module warm-up (~1.7 s alone, > 5 s under the full parallel suite)
 
   it('holds with detailed buildings OFF too — the classifier sees a different layer set', () => {
     // Flipping detailedBuildings changes which layers exist at all, so the invariant has to be checked on
@@ -53,7 +53,14 @@ describe('one material family per mesh — they all share the same four instance
       .filter((L) => familiesOn(L).length > 1)
       .map((L) => `${L.name} claims [${familiesOn(L).join(' + ')}]`);
     expect(clashes).toEqual([]);
-  });
+  }, 20000);   // whole-city build: > 5 s under the full parallel suite
+
+  it('holds with the railway ARCADE viaduct too (railway-upgrade R3.1 — its bay fills are a different layer set)', () => {
+    const clashes = cityLayers({ railViaduct: 'arcade' } as Partial<LayoutParams>)
+      .filter((L) => familiesOn(L).length > 1)
+      .map((L) => `${L.name} claims [${familiesOn(L).join(' + ')}]`);
+    expect(clashes).toEqual([]);
+  }, 20000);
 
   it('the authored `grid` pattern on roof equipment and window trim SURVIVES', () => {
     // The specific detail the classifier ate. If a future rule reintroduces the clash these go empty
@@ -61,7 +68,7 @@ describe('one material family per mesh — they all share the same four instance
     const patterned = cityLayers().filter((L) => L.pattern && /equip|trim/.test(L.name));
     expect(patterned.length, 'roof-equip / trim lost their pattern').toBeGreaterThan(0);
     for (const L of patterned) expect(L.metal, `${L.name} took metal over its pattern`).toBeUndefined();
-  });
+  }, 20000);   // whole-city build: > 5 s under the full parallel suite
 });
 
 describe('material coverage — a flat-shaded city is the thing being fixed', () => {
@@ -73,10 +80,11 @@ describe('material coverage — a flat-shaded city is the thing being fixed', ()
     for (const L of layers) {
       const t = L.geometry.indices.length / 3 * (L.instances?.length ?? 1);
       total += t;
-      const shaded = familiesOn(L).length > 0 || L.glass || L.wind || L.leafCard || (L.emissive ?? 0) > 0;
+      // `reflect` = the car-paint / satin-trim PBR route (raised metalness + gloss) — a real material, not flat.
+      const shaded = familiesOn(L).length > 0 || L.glass || L.wind || L.leafCard || L.reflect || (L.emissive ?? 0) > 0;
       if (!shaded) flat += t;
     }
     expect(total).toBeGreaterThan(1e6);
     expect(flat / total, `${(flat / total * 100).toFixed(1)}% of the city is flat colour`).toBeLessThan(0.05);
-  });
+  }, 20000);   // whole-city build: > 5 s under the full parallel suite
 });

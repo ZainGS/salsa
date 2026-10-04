@@ -1,3 +1,4 @@
+// Draws the hover/selection outline around individual 3D meshes (stencil mask + expanded shell).
 /**
  * MeshHighlightPass — per-mesh silhouette outline for hover and selection.
  *
@@ -23,10 +24,12 @@
  * issues when both are drawn in the same render pass.
  */
 
+import { PipelineSet, PIPELINE_PRIORITY, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { HIGHLIGHT_SHADER, STENCIL_WRITE_SHADER, SKINNED_HIGHLIGHT_SHADER, SKINNED_STENCIL_WRITE_SHADER } from './shaders/highlight-shaders';
 import { MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE } from './pipeline-3d';
+import { packedVertexBuffers } from './vertex-pack';
 
-const PARAMS_SIZE = 64; // color vec4 + patternColor vec4 + params vec4 + screen vec4
+const PARAMS_SIZE = 80; // color vec4 + patternColor vec4 + params vec4 + screen vec4 + boil vec4
 
 /** Look of one outline slot. `patternMode` 0 = flat (no pattern, the classic hover/select ring). 1 = scrolling
  *  stripes, 2 = dots, 3 = checker. `glow` >1 brightens the band (catches bloom). `width` is model-space. */
@@ -43,6 +46,35 @@ export interface HighlightStyle {
    *  top — so overlapping objects' outlines visually MERGE instead of the nearer one occluding the farther. Default
    *  false = depth-sorted (an object behind another is behind its outline; in front is in front). */
   merge?: boolean;
+  /** LINE BOIL (film-look-and-toon-shadows.md §D) — hand-drawn outlines: the band's thickness varies along the line
+   *  by up to ±`wobble` (0..1, 0 = off = today's even line) and the pattern REDRAWS `boilFps` times a second (8–12 =
+   *  classic animation "boil"; 0 = uneven but still). `wobbleFreq` = how many wobbles per model unit (default 10). */
+  wobble?: number;
+  wobbleFreq?: number;
+  boilFps?: number;
+  /** SPRITES only (docs/specs/sprite-alpha-outlines.md) — the outline's shape for a textured sprite:
+   *  'image' (default) = around the picture's shape (when the image has transparency) · 'square' = the classic outline
+   *  around the quad (see-through parts stay see-through) · 'card' = a SOLID card: the quad's see-through parts are
+   *  filled with this outline's look and the rings go around the square. Ignored by every other mesh. */
+  spriteShape?: SpriteOutlineShape;
+  /** @deprecated Use `spriteShape` — `alphaShape: false` still means 'square' (it shipped briefly on 2026-09-29). */
+  alphaShape?: boolean;
+}
+/** A sprite outline's shape (HighlightStyle.spriteShape). */
+export type SpriteOutlineShape = 'image' | 'square' | 'card';
+/** Whether a style's outline changes over time (scrolling pattern or boiling line) — keep frames flowing. */
+export function outlineAnimates(s: HighlightStyle): boolean {
+  return s.speed !== 0 || ((s.wobble ?? 0) > 0 && (s.boilFps ?? 10) > 0);
+}
+
+/** The layers of a STACKED outline (Mesh3D.outline + outlineRings), inner → outer, each with its CUMULATIVE shell
+ *  width: a ring's own `width` is its band thickness, so its shell = everything inside it + that. Drawn inner-first
+ *  with the draw-once stencil, each ring fills only the band beyond the rings inside it. Pure. */
+export function outlineLayers(main: HighlightStyle, rings: readonly HighlightStyle[] | null | undefined): HighlightStyle[] {
+  const out: HighlightStyle[] = [main];
+  let w = main.width;
+  for (const r of rings ?? []) { w += Math.max(0, r.width); out.push({ ...r, width: w }); }
+  return out;
 }
 
 export interface HighlightMeshEntry {
@@ -52,18 +84,33 @@ export interface HighlightMeshEntry {
   firstIndex:  number;
   baseVertex:  number;
   instanceIdx: number;
+  /** P22: a packed pool allocation (32-byte vertices, 16-bit indices: vertex-pack.ts) — drawn with the stride-32 twins. */
+  pk?:         boolean;
 }
 
 export class MeshHighlightPass {
   private device: GPUDevice;
-  private _outlinePipeline: GPURenderPipeline;
-  private _stencilPipeline: GPURenderPipeline;
+  // P2: every pipeline is a non-blocking cache handle; ready() gates each draw method (all-or-nothing).
+  private readonly _pipes: PipelineSet;
+  private _outlinePipeline: PipelineHandle<GPURenderPipeline>;
+  private _stencilPipeline: PipelineHandle<GPURenderPipeline>;
   // "Merge" (on-top) variants: depthCompare 'always' so the outline + its silhouette mask ignore depth. Built
   // alongside the depth-tested ones from the same shader modules/layouts (see _buildDepthVariants).
-  private _stencilPipelineOnTop: GPURenderPipeline | null = null;
-  private _outlinePipelineOnTop: GPURenderPipeline | null = null;
-  private _skinnedStencilPipelineOnTop: GPURenderPipeline | null = null;
-  private _skinnedOutlinePipelineOnTop: GPURenderPipeline | null = null;
+  private _stencilPipelineOnTop: PipelineHandle<GPURenderPipeline> | null = null;
+  private _outlinePipelineOnTop: PipelineHandle<GPURenderPipeline> | null = null;
+  // PERSISTENT-outline variants that draw each band pixel ONCE (stencil passOp 'replace' — see _mkOutline) + the
+  // matching SHELL-CLEAR pipelines that reset those band pixels after (so later outlines / highlights aren't blocked).
+  private _customOutlinePipeline: PipelineHandle<GPURenderPipeline> | null = null;
+  private _shellClearPipeline: PipelineHandle<GPURenderPipeline> | null = null;
+  /** P22: regular pipeline → its stride-32 twin (packed pool allocations). */
+  private readonly _pkOf = new Map<PipelineHandle<GPURenderPipeline>, PipelineHandle<GPURenderPipeline>>();
+  /** `h`'s pipeline for entry `e` — its packed twin for a packed entry; null while compiling. */
+  private _pipeFor(h: PipelineHandle<GPURenderPipeline>, e: HighlightMeshEntry): GPURenderPipeline | null {
+    return (e.pk ? (this._pkOf.get(h) ?? null) : h)?.get() ?? null;
+  }
+  private _skinnedShellClearPipeline: PipelineHandle<GPURenderPipeline> | null = null;
+  private _skinnedStencilPipelineOnTop: PipelineHandle<GPURenderPipeline> | null = null;
+  private _skinnedOutlinePipelineOnTop: PipelineHandle<GPURenderPipeline> | null = null;
   private _paramsBGL: GPUBindGroupLayout;
 
   // Two separate buffers so both can be enqueued before the pass begins
@@ -81,8 +128,8 @@ export class MeshHighlightPass {
   // SKINNED (armature-rigged) outline pipelines + a SEPARATE param pool. Built only when a skin bind-group layout
   // is supplied. The pool must be separate from the regular one: drawMeshes and drawSkinnedMeshes both write the
   // pool starting at index 0 in the SAME submit, so a shared pool would collide (last write wins for both).
-  private _skinnedStencilPipeline: GPURenderPipeline | null = null;
-  private _skinnedOutlinePipeline: GPURenderPipeline | null = null;
+  private _skinnedStencilPipeline: PipelineHandle<GPURenderPipeline> | null = null;
+  private _skinnedOutlinePipeline: PipelineHandle<GPURenderPipeline> | null = null;
   private _customBufsSk: GPUBuffer[] = [];
   private _customBGsSk:  GPUBindGroup[] = [];
 
@@ -94,6 +141,7 @@ export class MeshHighlightPass {
     textureBGL?: GPUBindGroupLayout,
   ) {
     this.device = device;
+    this._pipes = new PipelineSet(device, PIPELINE_PRIORITY.COMMON);   // P2: hover/select outlines are used by every 3D scene
 
     // ── Params bind group layout (hover/select color + width) ──────
     this._paramsBGL = device.createBindGroupLayout({
@@ -129,7 +177,8 @@ export class MeshHighlightPass {
       bindGroupLayouts: [meshBGL],
     });
 
-    this._stencilPipeline = device.createRenderPipeline({
+    this._stencilPipeline = this._pipes.render({
+      label: 'HighlightStencil',
       layout: stencilLayout,
       vertex: {
         module: stencilMod,
@@ -181,7 +230,8 @@ export class MeshHighlightPass {
       bindGroupLayouts: [meshBGL, this._paramsBGL],
     });
 
-    this._outlinePipeline = device.createRenderPipeline({
+    this._outlinePipeline = this._pipes.render({
+      label: 'HighlightOutline',
       layout: outlineLayout,
       vertex: {
         module: outlineMod,
@@ -235,6 +285,19 @@ export class MeshHighlightPass {
     this._outlinePipelineOnTop = this._mkOutline(outlineLayout, outlineMod, 'vs',
       [{ shaderLocation: 0, offset: 0, format: 'float32x3' }, { shaderLocation: 1, offset: 12, format: 'float32x3' }] as GPUVertexAttribute[],
       MESH3D_VERTEX_STRIDE, swapChainFormat, 'always');
+    {
+      const posNrm = [{ shaderLocation: 0, offset: 0, format: 'float32x3' }, { shaderLocation: 1, offset: 12, format: 'float32x3' }] as GPUVertexAttribute[];
+      // Depth-sorted persistent outline: like _outlinePipeline (writes depth so the later skinned pass is occluded)
+      // but draw-once. _outlinePipeline itself stays as-is for the hover/select slots.
+      this._customOutlinePipeline = this._mkOutline(outlineLayout, outlineMod, 'vs', posNrm, MESH3D_VERTEX_STRIDE, swapChainFormat, 'less-equal', true);
+      this._shellClearPipeline = this._mkShellClear(outlineLayout, outlineMod, 'vs', posNrm, MESH3D_VERTEX_STRIDE, swapChainFormat);
+    }
+    // P22: the stride-32 twins of the regular (pool) pipelines, for packed allocations (they read position / normal only)
+    for (const h of [this._stencilPipeline, this._outlinePipeline, this._stencilPipelineOnTop, this._outlinePipelineOnTop, this._customOutlinePipeline, this._shellClearPipeline]) {
+      if (!h) continue;
+      const d = h.descriptor(), bufs = packedVertexBuffers(d.vertex.buffers);
+      if (bufs) this._pkOf.set(h, this._pipes.render({ ...d, label: (d.label ?? 'Highlight') + ' #packed', vertex: { ...d.vertex, buffers: bufs } }));
+    }
 
     // ── SKINNED outline pipelines (armature-rigged meshes) ─────────────
     // Same two-pipeline stencil technique, but the vertex shaders skin the position/normal first (group 1 = the
@@ -258,14 +321,15 @@ export class MeshHighlightPass {
       this._skinnedOutlinePipeline      = this._mkOutline(skOutlineLayout, skOutlineMod, 'vs',        skOutlineAttrs, SKINNED_MESH3D_VERTEX_STRIDE, swapChainFormat, 'less-equal');
       this._skinnedStencilPipelineOnTop = this._mkStencil(skStencilLayout, skStencilMod, 'vs_stencil', skStencilAttrs, SKINNED_MESH3D_VERTEX_STRIDE, swapChainFormat, 'always');
       this._skinnedOutlinePipelineOnTop = this._mkOutline(skOutlineLayout, skOutlineMod, 'vs',        skOutlineAttrs, SKINNED_MESH3D_VERTEX_STRIDE, swapChainFormat, 'always');
+      this._skinnedShellClearPipeline   = this._mkShellClear(skOutlineLayout, skOutlineMod, 'vs',     skOutlineAttrs, SKINNED_MESH3D_VERTEX_STRIDE, swapChainFormat);
     }
   }
 
   /** Build a stencil-write pipeline (marks a mesh footprint into the stencil buffer, no colour). `depthCompare`
    *  'less-equal' marks only VISIBLE parts (depth-sorted outline); 'always' marks the full projected silhouette
    *  (on-top / "merge" outline). */
-  private _mkStencil(layout: GPUPipelineLayout, module: GPUShaderModule, vsEntry: string, attrs: GPUVertexAttribute[], stride: number, format: GPUTextureFormat, depthCompare: GPUCompareFunction): GPURenderPipeline {
-    return this.device.createRenderPipeline({
+  private _mkStencil(layout: GPUPipelineLayout, module: GPUShaderModule, vsEntry: string, attrs: GPUVertexAttribute[], stride: number, format: GPUTextureFormat, depthCompare: GPUCompareFunction): PipelineHandle<GPURenderPipeline> {
+    return this._pipes.render({
       layout,
       vertex: { module, entryPoint: vsEntry, buffers: [{ arrayStride: stride, attributes: attrs }] },
       fragment: { module, entryPoint: 'fs_stencil', targets: [{ format, writeMask: 0 }] },
@@ -280,8 +344,8 @@ export class MeshHighlightPass {
 
   /** Build an outline-draw pipeline (expanded shell, drawn where stencil != 1 → the rim). `depthCompare` matches
    *  the paired stencil pipeline: 'less-equal' = depth-sorted, 'always' = on-top ("merge"). */
-  private _mkOutline(layout: GPUPipelineLayout, module: GPUShaderModule, vsEntry: string, attrs: GPUVertexAttribute[], stride: number, format: GPUTextureFormat, depthCompare: GPUCompareFunction): GPURenderPipeline {
-    return this.device.createRenderPipeline({
+  private _mkOutline(layout: GPUPipelineLayout, module: GPUShaderModule, vsEntry: string, attrs: GPUVertexAttribute[], stride: number, format: GPUTextureFormat, depthCompare: GPUCompareFunction, depthWrite = false): PipelineHandle<GPURenderPipeline> {
+    return this._pipes.render({
       layout,
       vertex: { module, entryPoint: vsEntry, buffers: [{ arrayStride: stride, attributes: attrs }] },
       fragment: { module, entryPoint: 'fs', targets: [{
@@ -300,10 +364,31 @@ export class MeshHighlightPass {
         // z-fight, showing as translucent/ghosted streaks. With write off, overlapping opaque shells resolve to the
         // topmost cleanly. (Only the depth-SORTED REGULAR outline writes depth — inline above — because it's drawn
         // BEFORE the skinned pass and must occlude it.)
-        depthWriteEnabled: false,
+        depthWriteEnabled: depthWrite,
         depthCompare,
-        stencilFront: { compare: 'not-equal', failOp: 'keep', depthFailOp: 'keep', passOp: 'keep' },
-        stencilBack:  { compare: 'not-equal', failOp: 'keep', depthFailOp: 'keep', passOp: 'keep' },
+        // DRAW-ONCE: a band pixel that passes writes the reference (1), so every later shell over the same pixel fails
+        // `not-equal 1`. Without it, a character's overlapping part shells (sleeve over torso, both trouser legs, hair
+        // over shoulders) each blended the band again — with a translucent colour that stacked into uneven grey/white
+        // layers instead of one solid band (2026-09-28). The shell-clear pass resets these pixels afterwards.
+        stencilFront: { compare: 'not-equal', failOp: 'keep', depthFailOp: 'keep', passOp: 'replace' },
+        stencilBack:  { compare: 'not-equal', failOp: 'keep', depthFailOp: 'keep', passOp: 'replace' },
+      },
+    });
+  }
+
+  /** The SHELL-CLEAR pipeline: the outline's expanded shell again, no colour, stencil ALWAYS → reference (0), depth
+   *  ignored — resets every stencil pixel a draw-once outline wrote. Same VS/FS as the outline, so it covers exactly
+   *  the fragments the outline could have written. */
+  private _mkShellClear(layout: GPUPipelineLayout, module: GPUShaderModule, vsEntry: string, attrs: GPUVertexAttribute[], stride: number, format: GPUTextureFormat): PipelineHandle<GPURenderPipeline> {
+    return this._pipes.render({
+      layout,
+      vertex: { module, entryPoint: vsEntry, buffers: [{ arrayStride: stride, attributes: attrs }] },
+      fragment: { module, entryPoint: 'fs', targets: [{ format, writeMask: 0 }] },
+      primitive: { topology: 'triangle-list', cullMode: 'back' },
+      depthStencil: {
+        format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always',
+        stencilFront: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'replace' },
+        stencilBack:  { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'replace' },
       },
     });
   }
@@ -321,6 +406,7 @@ export class MeshHighlightPass {
       pc[0], pc[1], pc[2], style.glow,                          // patternColor + glow
       style.width, style.patternMode, style.freq, style.speed, // params
       resX, resY, time, 0,                                     // screen
+      style.wobble ?? 0, style.wobbleFreq ?? 10, style.boilFps ?? 10, 0,   // boil (0 wobble = even line)
     ]);
     this.device.queue.writeBuffer(buf, 0, data);
   }
@@ -334,7 +420,7 @@ export class MeshHighlightPass {
     }
   }
 
-  /** Pack one HighlightStyle into the 16-float HighlightParams layout (same as writeParams). */
+  /** Pack one HighlightStyle into the 20-float HighlightParams layout (same as writeParams). */
   private _packStyle(style: HighlightStyle, resX: number, resY: number, time: number): Float32Array {
     const c = style.color, pc = style.patternColor;
     return new Float32Array([
@@ -342,6 +428,7 @@ export class MeshHighlightPass {
       pc[0], pc[1], pc[2], style.glow,
       style.width, style.patternMode, style.freq, style.speed,
       resX, resY, time, 0,
+      style.wobble ?? 0, style.wobbleFreq ?? 10, style.boilFps ?? 10, 0,   // boil (0 wobble = even line)
     ]);
   }
 
@@ -364,42 +451,74 @@ export class MeshHighlightPass {
   drawCustom(
     pass:          GPURenderPassEncoder,
     meshBindGroup: GPUBindGroup,
-    entries:       { entry: HighlightMeshEntry; paramIndex: number; onTop?: boolean }[],
+    entries:       { entry: HighlightMeshEntry; paramIndices: number[]; onTop?: boolean }[],
   ): void {
-    if (entries.length === 0) return;
-    for (const { entry: e, paramIndex, onTop } of entries) {
-      const bg = this._customBGs[paramIndex];
-      if (!bg) continue;
+    // Per-DRAW readiness (bug-hunt 2026-10-01 D-R4): only the pipelines THIS method draws with — one failed variant
+    // (e.g. skinned) used to disable every hover/select outline for the session via the all-or-nothing ready().
+    if (entries.length === 0 || !MeshHighlightPass._readyAll(this._stencilPipelineOnTop, this._outlinePipelineOnTop,
+      this._customOutlinePipeline ?? this._outlinePipeline, this._shellClearPipeline)) return;   // stencil steps must pair up
+    for (const { entry: e, paramIndices, onTop } of entries) {
+      // One param slot per LAYER (the outline + any stacked rings, inner → outer, cumulative shell widths).
+      const bgs = paramIndices.map((i) => this._customBGs[i]).filter((b): b is GPUBindGroup => !!b);
+      if (bgs.length === 0) continue;
       // Mask ALWAYS uses the depth-independent stencil so the full silhouette is marked (a partially-occluded mesh
       // then gets a clean rim, not a filled shell). Only the OUTLINE draw's depth mode follows the merge flag.
-      const stencilPipe = this._stencilPipelineOnTop!;
-      const outlinePipe = onTop ? this._outlinePipelineOnTop! : this._outlinePipeline;
+      const stencilPipe = this._pipeFor(this._stencilPipelineOnTop!, e);
+      const outlinePipe = this._pipeFor(onTop ? this._outlinePipelineOnTop! : (this._customOutlinePipeline ?? this._outlinePipeline), e);
+      const clearPipe = this._shellClearPipeline ? this._pipeFor(this._shellClearPipeline, e) : null;
+      if (!stencilPipe || !outlinePipe || (this._shellClearPipeline && !clearPipe)) continue;   // (P22: a packed twin still compiling)
+      const ixf: GPUIndexFormat = e.pk ? 'uint16' : 'uint32';
       // 1. stencil write (ref=1) — mark this mesh's footprint
       pass.setPipeline(stencilPipe);
       pass.setBindGroup(0, meshBindGroup);
       pass.setStencilReference(1);
       pass.setVertexBuffer(0, e.vertex);
-      pass.setIndexBuffer(e.index, 'uint32');
+      pass.setIndexBuffer(e.index, ixf);
       pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
-      // 2. outline draw (ref=1) with THIS mesh's params — ring where stencil=0
+      // 2. outline draw (ref=1), one pass per layer INNER → OUTER. Draw-once stencil: each layer's (wider) shell only
+      //    fills pixels no inner layer took → stacked rings (a red outline, then a white ring around it).
       pass.setPipeline(outlinePipe);
       pass.setBindGroup(0, meshBindGroup);
-      pass.setBindGroup(1, bg);
       pass.setStencilReference(1);
       pass.setVertexBuffer(0, e.vertex);
-      pass.setIndexBuffer(e.index, 'uint32');
-      pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
+      pass.setIndexBuffer(e.index, ixf);
+      for (const bg of bgs) {
+        pass.setBindGroup(1, bg);
+        pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
+      }
+      // 3a. shell clear (ref=0) — reset the band pixels every layer marked
+      if (clearPipe) {
+        pass.setPipeline(clearPipe);
+        pass.setBindGroup(0, meshBindGroup);
+        pass.setStencilReference(0);
+        pass.setVertexBuffer(0, e.vertex);
+        pass.setIndexBuffer(e.index, ixf);
+        for (const bg of bgs) {
+          pass.setBindGroup(1, bg);
+          pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
+        }
+      }
       // 3. stencil clear (ref=0) — reset for the next mesh
       pass.setPipeline(stencilPipe);
       pass.setBindGroup(0, meshBindGroup);
       pass.setStencilReference(0);
       pass.setVertexBuffer(0, e.vertex);
-      pass.setIndexBuffer(e.index, 'uint32');
+      pass.setIndexBuffer(e.index, ixf);
       pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
     }
   }
 
   /** True when the skinned outline pipelines are available (a skin BGL was supplied at construction). */
+  /** P2: true once every highlight pipeline compiled (requests pending ones). Draws are skipped until then. */
+  ready(): boolean { return this._pipes.ready(); }
+
+  /** True when every given (non-null) pipeline is compiled — requests any that aren't. Null = not used. */
+  private static _readyAll(...hs: (PipelineHandle<GPURenderPipeline> | null)[]): boolean {
+    let ok = true;
+    for (const h of hs) if (h && !h.get()) ok = false;
+    return ok;
+  }
+
   get supportsSkinned(): boolean { return this._skinnedOutlinePipeline !== null; }
 
   /** Draw ONE outline around a GROUP of skinned parts (a character = body + hair + clothes, all sharing a skeleton)
@@ -414,13 +533,15 @@ export class MeshHighlightPass {
     pass:          GPURenderPassEncoder,
     skinnedMeshBG: GPUBindGroup,
     parts:         { vb: GPUBuffer; ib: GPUBuffer; indexCount: number; instanceSlot: number; skinBG: GPUBindGroup; texBG: GPUBindGroup }[],
-    paramIndex:    number,
+    paramIndices:  number[],
     onTop:         boolean,
   ): void {
     if (parts.length === 0 || !this._skinnedStencilPipelineOnTop || !this._skinnedOutlinePipeline) return;
-    const bg = this._customBGsSk[paramIndex];
-    if (!bg) return;
-    const outlinePipe = onTop ? this._skinnedOutlinePipelineOnTop! : this._skinnedOutlinePipeline;
+    if (!MeshHighlightPass._readyAll(this._skinnedStencilPipelineOnTop, onTop ? this._skinnedOutlinePipelineOnTop : this._skinnedOutlinePipeline,
+      this._skinnedShellClearPipeline)) return;   // per-draw readiness (D-R4)
+    const bgs = paramIndices.map((i) => this._customBGsSk[i]).filter((b): b is GPUBindGroup => !!b);   // layers inner → outer
+    if (bgs.length === 0) return;
+    const outlinePipe = (onTop ? this._skinnedOutlinePipelineOnTop! : this._skinnedOutlinePipeline).get()!;
     const drawPart = (p: { vb: GPUBuffer; ib: GPUBuffer; indexCount: number; instanceSlot: number; skinBG: GPUBindGroup; texBG: GPUBindGroup }) => {
       pass.setBindGroup(1, p.skinBG);
       pass.setVertexBuffer(0, p.vb);
@@ -429,18 +550,25 @@ export class MeshHighlightPass {
     };
     // 1. stencil-write ALL parts (depth-independent → union silhouette). The stencil pipeline alpha-tests via the
     //    part's diffuse texture (group 2), so alpha-cutout hair marks its VISIBLE shape, not the full card quad.
-    pass.setPipeline(this._skinnedStencilPipelineOnTop);
+    pass.setPipeline(this._skinnedStencilPipelineOnTop.get()!);
     pass.setBindGroup(0, skinnedMeshBG);
     pass.setStencilReference(1);
     for (const p of parts) { pass.setBindGroup(2, p.texBG); drawPart(p); }
-    // 2. outline-draw ALL parts (single rim where stencil != 1)
+    // 2. outline-draw ALL parts, one pass per LAYER inner → outer (draw-once: overlapping part shells don't stack, and
+    //    each outer ring only fills beyond the rings inside it)
     pass.setPipeline(outlinePipe);
     pass.setBindGroup(0, skinnedMeshBG);
-    pass.setBindGroup(2, bg);
     pass.setStencilReference(1);
-    for (const p of parts) drawPart(p);
+    for (const bg of bgs) { pass.setBindGroup(2, bg); for (const p of parts) drawPart(p); }
+    // 2b. shell clear — reset the band pixels every layer marked
+    if (this._skinnedShellClearPipeline) {
+      pass.setPipeline(this._skinnedShellClearPipeline.get()!);
+      pass.setBindGroup(0, skinnedMeshBG);
+      pass.setStencilReference(0);
+      for (const bg of bgs) { pass.setBindGroup(2, bg); for (const p of parts) drawPart(p); }
+    }
     // 3. clear the stencil for ALL parts (same alpha-tested stencil pipeline → group 2 = texture again)
-    pass.setPipeline(this._skinnedStencilPipelineOnTop);
+    pass.setPipeline(this._skinnedStencilPipelineOnTop.get()!);
     pass.setBindGroup(0, skinnedMeshBG);
     pass.setStencilReference(0);
     for (const p of parts) { pass.setBindGroup(2, p.texBG); drawPart(p); }
@@ -460,40 +588,39 @@ export class MeshHighlightPass {
     slot:          'hover' | 'select',
     entries:       HighlightMeshEntry[],
   ): void {
-    if (entries.length === 0) return;
+    if (entries.length === 0 || !MeshHighlightPass._readyAll(this._stencilPipeline, this._outlinePipeline)) return;   // P2 + D-R4: per-draw readiness
 
     const paramsBG = slot === 'hover' ? this._hoverBG : this._selectBG;
 
+    // (P22: a packed entry draws with the stride-32 twin + 16-bit indices; one whose twins are still compiling is left out)
+    const drawAll = (h: PipelineHandle<GPURenderPipeline>): void => {
+      let cur: GPURenderPipeline | null = null;
+      for (const e of entries) {
+        if (e.pk && (!this._pipeFor(this._stencilPipeline, e) || !this._pipeFor(this._outlinePipeline, e))) continue;
+        const p = this._pipeFor(h, e);
+        if (!p) continue;
+        if (p !== cur) { pass.setPipeline(p); cur = p; }
+        pass.setVertexBuffer(0, e.vertex);
+        pass.setIndexBuffer(e.index, e.pk ? 'uint16' : 'uint32');
+        pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
+      }
+    };
+
     // Step 1: write stencil=1 for the mesh footprint
-    pass.setPipeline(this._stencilPipeline);
     pass.setBindGroup(0, meshBindGroup);
     pass.setStencilReference(1);
-    for (const e of entries) {
-      pass.setVertexBuffer(0, e.vertex);
-      pass.setIndexBuffer(e.index, 'uint32');
-      pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
-    }
+    drawAll(this._stencilPipeline);
 
     // Step 2: draw expanded outline where stencil!=1 (outside silhouette)
-    pass.setPipeline(this._outlinePipeline);
     pass.setBindGroup(0, meshBindGroup);
     pass.setBindGroup(1, paramsBG);
     pass.setStencilReference(1);
-    for (const e of entries) {
-      pass.setVertexBuffer(0, e.vertex);
-      pass.setIndexBuffer(e.index, 'uint32');
-      pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
-    }
+    drawAll(this._outlinePipeline);
 
     // Step 3: clear stencil back to 0 so the next slot starts clean
-    pass.setPipeline(this._stencilPipeline);
     pass.setBindGroup(0, meshBindGroup);
     pass.setStencilReference(0);
-    for (const e of entries) {
-      pass.setVertexBuffer(0, e.vertex);
-      pass.setIndexBuffer(e.index, 'uint32');
-      pass.drawIndexed(e.indexCount, 1, e.firstIndex, e.baseVertex, e.instanceIdx);
-    }
+    drawAll(this._stencilPipeline);
   }
 
   destroy(): void {
@@ -505,3 +632,5 @@ export class MeshHighlightPass {
     this._customBufsSk.length = 0; this._customBGsSk.length = 0;
   }
 }
+
+// TODO: collision test marker (Planetarium) — safe to remove.

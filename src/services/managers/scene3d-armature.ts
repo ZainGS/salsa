@@ -36,6 +36,7 @@ import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solv
 import { solveAllConstraints } from '../../renderer/3d/constraint-solver';
 import { solveSpringBones, resetSpringState } from '../../renderer/3d/spring-bone-solver';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
+import { constrainCharacterScale, geometryMinY } from '../../game/character-scale';
 import type { UndoManager3D } from './undo-manager-3d';
 import type { Scene3DCharacter } from './scene3d-character';
 import type { Scene3DWeightPaint } from './scene3d-weight-paint';
@@ -84,6 +85,8 @@ export interface Scene3DArmatureHost {
 
     // Shared manager fields the tangle READS.
     readonly cityModeActive: boolean;
+    /** Round 8: 3D Play mode is running — every editor pointer path (hover pick, click-select, gizmo) is off. */
+    readonly isPlaying: boolean;
     readonly autoKey3D: boolean;
     readonly flaRestTransforms: Map<string, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>;
 
@@ -111,6 +114,10 @@ export interface Scene3DArmatureHost {
     ensureIdleCallback(): void;
     springsActiveFor(skelId: string, now: number): boolean;
     syncFocusBgLiveLoop(): void;
+    /** SIM LOD (src/world/sim-lod.ts): reset a system's per-frame counters; should this skeleton's springs solve
+     *  this frame (NEAR band only; exempt: the player, the selection, posing, scripts, previews)? Absent = always. */
+    simLodBegin?(system: string): void;
+    simLodSpringsDue?(skelId: string): boolean;
 }
 
 export class Scene3DArmature {
@@ -191,6 +198,8 @@ export class Scene3DArmature {
     // The per-frame spring solve registered by enableOrbitControls / torn down by disableOrbitControls.
     private _springSolveCallback: (() => boolean) | null = null;
     private _springLastTime = 0;
+    /** SIM LOD: skeletons whose springs were suspended (far / off screen / fogged) — reset when they resume. */
+    private readonly _springsSuspended = new Set<string>();
 
     // ── (f) bone placement ───────────────────────────────────────────────────────────────────────────
     private _bonePlacementMode = false;
@@ -213,6 +222,8 @@ export class Scene3DArmature {
     private _selectedGroupId: string | null = null;
     private _selectedThinWrapper: MeshGroup3D | null = null;
     private _thinWrapperXformSig = '';
+    /** Rest-geometry lowest Y (the soles) per vertex buffer, for the feet-anchored character scale (constrainScale). */
+    private readonly _restMinYCache = new WeakMap<object, number | null>();
     private _wrapperMeshCache: Mesh3D[] | null = null;
     private _wrapperMeshCacheBase: Mesh3D[] | null = null;
     private _thinWrapperTransformSyncs: ((container: MeshGroup3D) => void)[] = [];
@@ -354,7 +365,7 @@ export class Scene3DArmature {
             this.syncIllustrationCamera(pan.x, pan.y, zoom, canvas.width, canvas.height);
             return false; // keep running every frame
         };
-        renderer.addPreRenderCallback(this._autoSyncCallback);
+        renderer.addPreRenderCallback(this._autoSyncCallback, 'illustrationCameraSync');
         // Fire once immediately so any render already queued before this call
         // (e.g. from document load) gets the correct camera on its first frame.
         this._autoSyncCallback();
@@ -515,7 +526,7 @@ export class Scene3DArmature {
             if (hadMomentum) this.ctx.scheduleRender();
             return hadMomentum;
         };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._orbitUpdateCallback);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._orbitUpdateCallback, 'orbit');
 
         // Per-frame IK solve: FK pass → FABRIK → final worldMatrices.
         // Only active when bone overlay is explicit and skeleton has enabled IK chains.
@@ -540,7 +551,7 @@ export class Scene3DArmature {
             skel.matricesDirty = true;
             return false;
         };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._ikSolveCallback);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._ikSolveCallback, 'ik+constraints');
 
         // Per-frame PROCEDURAL IDLE: breathing / weight-shift / sway on a standing character. Registered BEFORE the
         // spring solve so hair + chains react to the idle motion (secondary motion). NOTE the callback is created +
@@ -556,15 +567,20 @@ export class Scene3DArmature {
             const dt = this._springLastTime > 0 ? (now - this._springLastTime) / 1000 : 1 / 60;
             this._springLastTime = now;
             let moving = false;
+            this.host.simLodBegin?.('springs');
             for (const skel of this.getAllSkeletons()) {
                 if (!skel.data.springChains?.some(c => c.enabled)) continue;
                 if (!this._springsActiveFor(skel.id, now)) continue;   // idle characters don't simulate (crowd perf)
+                // SIM LOD: springs solve only near the camera and on screen. A suspended skeleton is RESET when it comes
+                // back (its spring state restarts from the current pose — no catch-up spike; see resetSpringState).
+                if (this.host.simLodSpringsDue && !this.host.simLodSpringsDue(skel.id)) { this._springsSuspended.add(skel.id); continue; }
+                if (this._springsSuspended.delete(skel.id)) resetSpringState(skel);
                 if (solveSpringBones(skel, dt)) moving = true;
             }
             if (!moving) this._springLastTime = 0;   // settled → reset the clock so the next nudge starts fresh
             return moving;
         };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._springSolveCallback);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._springSolveCallback, 'springBones');
 
         // If bone overlay was already shown before orbit was set up, create the gizmo now.
         if (this._boneOverlayExplicit) {
@@ -591,7 +607,7 @@ export class Scene3DArmature {
         );
         this._viewGizmo.draw();
         this._viewGizmoFrameCb = () => { this._viewGizmo?.draw(); return false; };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._viewGizmoFrameCb);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._viewGizmoFrameCb, 'viewGizmo');
     }
 
     setViewGizmoPosition(position: import('../../renderer/3d/view-gizmo').ViewGizmoPosition): void {
@@ -866,6 +882,7 @@ export class Scene3DArmature {
             e.preventDefault();
             e.stopPropagation();
             // Scroll up = zoom in = larger zoom = smaller orthoSize. Proportional per notch.
+            if (Math.abs(e.deltaY) < 0.5) return;   // deltaY 0 (horizontal tilt / trackpad jitter) is not a zoom step
             const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
             this._meshEditZoom = Math.max(1e-3, Math.min(1e4, this._meshEditZoom * factor));
             this.ctx.scheduleRender();
@@ -979,6 +996,13 @@ export class Scene3DArmature {
         }
         const skel = this.getSkeleton(skeletonId);
         if (!skel) return;
+        // Frame/isolate THIS skeleton's character. The host passes the mesh that was selected when the panel opened —
+        // which is the wrong character once the user picks a different skeleton in the list (the camera + isolation
+        // stayed on the first character, which could even leave the chosen one hidden). Use the passed mesh only if it
+        // belongs to this skeleton; otherwise its own body.
+        const prevSkelId = this._boneOverlaySkeletonId;
+        meshId = this._meshForSkeleton(skeletonId, meshId) ?? meshId;
+        if (prevSkelId && prevSkelId !== skeletonId && meshId) this._retargetArmatureCharacter(meshId);
         // Mark as explicit so _syncBoneOverlay won't clobber it when the mesh
         // selection changes (e.g. after emitSceneGraphChanged fires).
         this.ctx.interactionService.suppressBoxSelect = true;
@@ -1071,6 +1095,35 @@ export class Scene3DArmature {
             this.frameMesh(meshId, 1.33);
         }
         this.ctx.scheduleRender();
+    }
+
+    /** The mesh to frame for a skeleton: `preferred` if it rides this skeleton, else the skeleton's procedural body,
+     *  else any skinned mesh bound to it. */
+    private _meshForSkeleton(skeletonId: string, preferred?: string): string | undefined {
+        const rides = (m: Mesh3D | null | undefined) => !!m && (m as { skeletonId?: string | null }).skeletonId === skeletonId;
+        if (preferred && rides(this.getMesh(preferred))) return preferred;
+        const all = this.getAllMeshes().filter(rides);
+        return (all.find(m => (m as { isProceduralBody?: boolean }).isProceduralBody) ?? all[0])?.id;
+    }
+
+    /** Switching to another character's skeleton while already in armature mode: put the previous character's facing
+     *  back, isolate + face-front the new one, and re-aim the orbit pivot at it (keeping the current zoom/angle). */
+    private _retargetArmatureCharacter(meshId: string): void {
+        if (this._armatureSavedMeshRotation && this._armatureSavedMeshRotation.meshId !== meshId) {
+            const s = this._armatureSavedMeshRotation, prev = this.getMesh(s.meshId);
+            if (prev) { prev.setRotation3D(s.rx, s.ry, s.rz); prev.updateLocalMatrix(); }
+            this._armatureSavedMeshRotation = null;
+        }
+        if (this._isolatedMeshId) this.isolateMesh3D(meshId);
+        this._zeroMeshRotationForArmature(meshId);
+        const c = this.getMeshCenter(meshId);
+        if (!c) return;
+        const cam = this.renderer3D.getCamera();
+        cam.setTarget(c[0], c[1], c[2]);
+        this._orbitController?.syncFromCamera();
+        this._armatureOrbitCenter = [c[0], c[1], c[2]];
+        this._armatureOrthoX = 0; this._armatureOrthoY = 0;
+        cam.orthoOffsetX = 0; cam.orthoOffsetY = 0;
     }
 
     private _zeroMeshRotationForArmature(meshId: string): void {
@@ -1569,6 +1622,19 @@ export class Scene3DArmature {
                     }
                 }
             },
+            // Character scale (2026-10-04): a procedural body scales UNIFORMLY from its FEET (its origin sits at the
+            // hips), and a part riding its skeleton keeps its transform (its TRS is unused — the skin carries the body's).
+            constrainScale: (mesh: Mesh3D, init: { x: number; y: number; z: number; sx: number; sy: number; sz: number }, corner: boolean) => {
+                if (!mesh.isProceduralBody && !mesh.transformViaSkeleton) return;
+                const g = mesh.geometry;
+                let lo: number | null = null;
+                if (g?.vertices?.length) {
+                    const c = this._restMinYCache.get(g.vertices);
+                    lo = c !== undefined ? c : geometryMinY(g.vertices, FLOATS_PER_VERT);
+                    if (c === undefined) this._restMinYCache.set(g.vertices, lo);
+                }
+                constrainCharacterScale(mesh, init, lo, { corner });
+            },
             onGizmoDragStart: (axis: GizmoAxis) => {
                 this.renderer3D.setDraggingAxis(axis);
             },
@@ -1580,6 +1646,7 @@ export class Scene3DArmature {
             },
             isInMeshEditMode: () => this._isMeshEditModeFn?.() ?? false,
             isBoneOverlayActive: () => this._boneOverlayExplicit,
+            isInputSuppressed: () => this.host.isPlaying,
             // Per-mesh click-select suppression (Package-Creator paint target — see InteractionService).
             isPickSuppressed: (meshId: string) => this.ctx.interactionService.pickSuppressed3D?.(meshId) ?? false,
             getArrayGizmoData: () => this.renderer3D.getArrayGizmoData(),
@@ -1754,6 +1821,8 @@ export class Scene3DArmature {
 
         // Sync hover axis from controller to renderer each frame
         const syncCallback = () => {
+            // Play mode (Round 8): editor gizmo state isn't drawn — skip the per-frame selection scan + array gizmo.
+            if (this.host.isPlaying) { if (this.renderer3D.getArrayGizmoData()) this.renderer3D.setArrayGizmoData(null); return false; }
             // Self-heal the canvas binding (same as the orbit controller): enableTransformControls may have run
             // before the canvas was ready (fresh load) or the canvas was swapped — re-attach so 3D select + gizmo
             // dragging aren't silently dead until re-enable.
@@ -1894,7 +1963,7 @@ export class Scene3DArmature {
             return false;
         };
         this._transformSyncCallback = syncCallback;
-        this.ctx.webgpuRenderer.addPreRenderCallback(syncCallback);
+        this.ctx.webgpuRenderer.addPreRenderCallback(syncCallback, 'transformGizmoSync');
 
         const canvas = this.ctx.webgpuRenderer.getCanvas();
         if (canvas) {
@@ -1910,6 +1979,9 @@ export class Scene3DArmature {
 
             // Canvas hover: update joint hover highlight; drive drag-to-move when dragging.
             const onMouseMove = (e: MouseEvent) => {
+                // Play mode (Round 8): no hover pick (a full-scene raycast per mouse move under pointer-lock, and
+                // the hover silhouette pass it feeds), no joint hover, no drags.
+                if (this.host.isPlaying) return;
                 const el = canvas as HTMLCanvasElement;
                 const rect = el.getBoundingClientRect();
                 const scaleX = el.width  / rect.width;
@@ -2189,6 +2261,9 @@ export class Scene3DArmature {
 
             // Joint click / bone placement click
             const onMouseDown = (e: MouseEvent) => {
+                // Plain LEFT click only (2026-09-29): Alt+left orbits here (altOrbitOnly), middle pans, right is
+                // look / pan — none may pick a joint, select a mesh or place a bone (they all did).
+                if (e.button !== 0 || e.altKey || this.host.isPlaying) return;
                 const el2 = canvas as HTMLCanvasElement;
                 const rect2 = el2.getBoundingClientRect();
                 const px2 = (e.clientX - rect2.left) * (el2.width  / rect2.width);

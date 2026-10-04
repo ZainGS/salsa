@@ -1,0 +1,13 @@
+{
+  "name": "salsa-lint-tools",
+  "private": true,
+  "description": "Isolated ESLint toolchain for Salsa. typescript-eslint needs the TypeScript 5.x/6.0 JS API, which the repo's TypeScript 7 (native) no longer ships, so lint gets its own node_modules with typescript 5.9. Installed by `npm run lint:install`; see docs/dev/checks-and-ci.md.",
+  "type": "module",
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^17.13.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.71.0"
+  }
+}

@@ -125,12 +125,15 @@ export function clipSegmentToConvex(a: V2, b: V2, poly: V2[]): [V2, V2] | null {
 /** Pick a building's STREET FRONTAGE edge: among the near-longest edges, prefer the one facing AWAY from `ref`
  *  (the block centre → the street side), with a small deterministic jitter so identical lots don't all pick the
  *  same edge. Fixes "every building faces the same direction". */
-export function frontageEdge(foot: V2[], ref: V2 | null, jitterSeed: number): { a: V2; b: V2; len: number } {
+export function frontageEdge(foot: V2[], ref: V2 | null, jitterSeed: number, allow?: (i: number) => boolean): { a: V2; b: V2; len: number } {
+    // `allow` (optional) restricts the candidates — e.g. never a canal-facing edge; ignored if it allows none.
+    const ok = allow && foot.some((_, i) => allow(i)) ? allow : null;
     let maxLen = 0;
-    for (let i = 0; i < foot.length; i++) maxLen = Math.max(maxLen, dist(foot[i], foot[(i + 1) % foot.length]));
+    for (let i = 0; i < foot.length; i++) if (!ok || ok(i)) maxLen = Math.max(maxLen, dist(foot[i], foot[(i + 1) % foot.length]));
     let best = { a: foot[0], b: foot[1 % foot.length], len: 0 };
     let bestScore = -Infinity;
     for (let i = 0; i < foot.length; i++) {
+        if (ok && !ok(i)) continue;
         const a = foot[i], b = foot[(i + 1) % foot.length], len = dist(a, b);
         if (len < maxLen * 0.72) continue;   // only the long-ish edges are candidate frontages
         const mid: V2 = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];

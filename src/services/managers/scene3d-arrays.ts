@@ -380,6 +380,6 @@ export class Scene3DArrays {
 
       return false;
     };
-    this.ctx.webgpuRenderer.addPreRenderCallback(this._syncCb);
+    this.ctx.webgpuRenderer.addPreRenderCallback(this._syncCb, 'arrays');
   }
 }

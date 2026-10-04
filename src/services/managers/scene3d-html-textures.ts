@@ -155,6 +155,9 @@ export class Scene3DHtmlTextures {
     return this._textures.has(meshId);
   }
 
+  /** How many HTML textures are live. */
+  get count(): number { return this._textures.size; }
+
   /** Destroy every owned HTML texture (used on manager teardown). Safe to call more than once. */
   dispose(): void {
     for (const ht of this._textures.values()) ht.destroy();

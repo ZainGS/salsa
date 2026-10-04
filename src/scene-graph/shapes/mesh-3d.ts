@@ -100,6 +100,18 @@ export interface Mesh3DConfig {
 }
 
 export class Mesh3D extends Shape {
+  /** Step 2: bumped whenever ANY mesh's source or modifier geometry is replaced / invalidated (setGeometry, a
+   *  primitive rebuild, invalidateModifierCache). Caches of per-mesh geometry figures (the stats HUD's scene totals)
+   *  key on it together with the scene structure version. */
+  static geometryEpoch = 0;
+  /** P16: bumped with geometryEpoch, for THIS mesh only (the Play collision snapshot trusts a member's footprint while
+   *  its own geometry version is unchanged, instead of re-reading every member whenever any mesh got geometry). */
+  geometryVersion = 0;
+  /** @internal Renderer3D pipeline-prewarm bookkeeping (step 2): the prewarm generation that classified this mesh and
+   *  its material variant bits. setMaterial resets it. Not scene state. */
+  _pwGen = 0;
+  /** @internal See _pwGen. */
+  _pwCode = 0;
   private _meshPrimitive: MeshPrimitive;
   private _geometry!: MeshGeometry;
   /** Cached modifier-evaluated geometry. Null when stale; recomputed on first geometry access. */
@@ -123,6 +135,61 @@ export class Mesh3D extends Shape {
    *  keyed on the geometry object reference, so replacing geometry still triggers a fresh scan — but IN-PLACE
    *  vertex mutation will not, which is why this stays opt-in rather than the default. */
   public cheapBounds = false;
+  /** P6 (performance-plan.md): RENDERER-PRIVATE slot — the renderer's world-AABB cache entry for this mesh, held here
+   *  so the per-frame cull skips a map lookup. Owned and validated by Renderer3D (never read it elsewhere). */
+  public _r3Aabb: unknown = null;
+  /** P11 (performance-plan.md): RENDERER-PRIVATE — whether this mesh's name matches the occluder pattern, cached per
+   *  pattern object (Renderer3D._beginOcclusion). */
+  public _r3Occl: RegExp | null = null;
+  public _r3IsOccl = false;
+  /** P11: RENDERER-PRIVATE — the sub-mesh cull-range cache (renderer/3d/cull-ranges.ts), owned by Renderer3D. */
+  public _r3Ranges: unknown = null;
+  /** P9 (performance-plan.md): RENDERER-PRIVATE — the hierarchical cull cluster this mesh belongs to and the matrix
+   *  version it joined with (renderer/3d/cull-clusters.ts). Owned and validated by Renderer3D. */
+  public _hcC: import('../../renderer/3d/cull-clusters').CullCluster | null = null;
+  public _hcVer = -1;
+  public _hcTris = 0;
+  public _hcB = -1;
+  /** P9: renderer-private copies of this mesh's geometry-pool allocation and instance slot, valid while `_r3o` is
+   *  that renderer and `_r3g` its map generation (saves two string-keyed Map lookups per mesh per frame). */
+  public _r3o: unknown = null;
+  public _r3g = -1;
+  public _r3GA: unknown = undefined;
+  public _r3Slot = -1;
+  /** P9: renderer-private frame stamp of the last full draw-list visit (a twin re-seeds its swap state after a gap). */
+  public _hcSeen = -1;
+  /** P15 (renderer/3d/gpu-scene.ts): RENDERER-PRIVATE — this mesh's GPU-driven main-pass record (owner, index) and the
+   *  frame stamps of the last draw-list visit / of the CPU path's "drawn" verdict (forced records). */
+  public _gdOwner: unknown = null;
+  public _gdRec = -1;
+  public _gdSeen = -1;
+  public _gdVis = -1;
+  public _gdCand = -1;
+  public _gdMatF = -1;
+  public _gdTaken = -1;
+  public _gdGStamp = -1;
+  public _gdGList: unknown[] | null = null;
+  /** P15: the values the record was last written from (compared in the draw-list loop while this mesh is cache-hot). */
+  public _gdKA: unknown = undefined;
+  public _gdKS = -2;
+  public _gdKM = -1;
+  public _gdKD = NaN;
+  public _gdKB = NaN;
+  public _gdKF = false;
+  /** P15 Phase B: the twin parameters the record was written from (role, distances, flags) + the frame stamp of the
+   *  last visit past the hierarchical cull (seeds a new record's GD_CTL_VISITED). */
+  public _gdKR = 0;
+  public _gdKT = 0;
+  public _gdKT2 = 0;
+  public _gdKX = 0;
+  public _gdVisit = -1;
+  /** P15 Phase C: the shadowFeatureSize the record was written with. */
+  public _gdKSh = NaN;
+  /** P15 sub-bundles: the spatial cell the draw rank placed this mesh in (Renderer3D.rankCellM; 0 = none). */
+  public _r3RankCell = 0;
+  /** Step 8 (renderer/3d/shader-variants.ts): RENDERER-PRIVATE — the shader-variant key read back from this mesh's
+   *  instance slot at its last write (the exact material flags, or -1 = the uber-shader). */
+  public _r3VF = -1;
   /** Ray-pickable? Set false for pure DECORATION that is never individually selected (the whole procedural
    *  city — buildings/props/movers). The picker skips these BEFORE the expensive per-mesh BVH build, so hover/
    *  click over a ~700-mesh city costs nothing (previously each pick rebuilt every mesh's BVH after a regen —
@@ -141,6 +208,77 @@ export class Mesh3D extends Shape {
    *  the shadow map) buys nothing visible. Set it for instanced content big enough to read — the city's
    *  trees, which otherwise cast no shadow at all. */
   public castsInstancedShadow = false;
+  /** PROCEDURAL-GROUND uv-scale sample (world/chunking.ts): when a city ground layer is split into spatial chunks,
+   *  every chunk carries the UNSPLIT layer's sample triangles here, and the renderer derives the world-units-per-uv
+   *  from them instead of from this mesh's own geometry — so all chunks get the identical scale (no seam). Runtime
+   *  only (city meshes are never serialized). */
+  public groundUvSample: MeshGeometry | null = null;
+  /** DISTANCE LOD (polish-round-3 R6.1): world-unit distance from the CAMERA to this mesh's world AABB (for an
+   *  ArrayGroup source: to the group's box) past which the renderer stops drawing it — main pass and shadow alike.
+   *  0 = no limit. Hysteretic: hides past `drawDistance`, shows again inside 0.9 × it (`lodHidden` holds the state).
+   *  Perspective only (an ortho camera's distance is not its zoom). Set by the city on its fine-detail layers;
+   *  runtime only (never serialized). */
+  public drawDistance = 0;
+  /** P7: fraction (0..1) of the renderer's AERIAL bias (`Renderer3D.distanceLodBias`, the camera's distance to the
+   *  city volume) added to `drawDistance`. 1 = the R6.1 rule (aerial overviews keep this detail: facade texture,
+   *  trees); 0 = plain camera distance (sub-metre clutter — crowds, cans, sign lettering, wires, small street
+   *  furniture — is only a pixel or two from the air, so it drops by true distance there too). Street level is
+   *  unaffected (the bias is ~0 there). Runtime only (never serialized). */
+  public drawDistanceBias = 1;
+  /** Renderer-owned hysteresis state for `drawDistance` (true = currently beyond it, not drawn). */
+  public lodHidden = false;
+  /** E2 NEAR/FAR TWIN role (persona-polish-plan.md E2): 0 = none · 1 = NEAR twin (drawn only while the camera is
+   *  within `lodTwinDist` of this mesh's box — the chipped edges) · 2 = FAR twin (drawn otherwise — the clean piece).
+   *  Both twins of a chunk share the same box, the same threshold and the same hysteresis rule, so exactly one of them
+   *  draws. Distance LOD off / ortho → far twins only. Runtime only (never serialized).
+   *  P9 three-tier families (the static crowd): 3 = MID (drawn between `lodTwinDist` and `lodTwinDist2`; also the
+   *  one drawn with distance LOD off) · 4 = XFAR (drawn past `lodTwinDist2`; never with distance LOD off). */
+  public lodTwinRole: 0 | 1 | 2 | 3 | 4 = 0;
+  /** E2: twin threshold in world units (scaled by the renderer's lens / quality scale, not by the aerial bias). */
+  public lodTwinDist = 0;
+  /** Renderer-owned E2 twin hysteresis state: true = the camera is currently NEAR (near twin drawn, far twin hidden). */
+  public lodTwinNear = false;
+  /** P8: this twin is the SOURCE (instance 0) of an instanced twin pair — the far tree crowns (Renderer3D.groupTwins
+   *  switches it with its ArrayGroup). Runtime only. */
+  public lodTwinInstanced = false;
+  /** P9: the second threshold of a three-tier family (roles 3 / 4), world units. */
+  public lodTwinDist2 = 0;
+  /** Renderer-owned P9 hysteresis state for `lodTwinDist2`: true = the camera is within it (mid drawn, xfar hidden). */
+  public lodTwinNear2 = true;
+  /** P9: the FAR twin is a degraded copy of the near one (the prop far twins), so distance LOD off draws the NEAR
+   *  twin instead (the pre-twin look). */
+  public lodTwinOffNear = false;
+  /** P12 EXTERNALLY DRIVEN twin (the instanced crowd, world-crowd.ts): the owner writes `lodTwinNear` / `lodTwinNear2`
+   *  itself (it knows which tier of a cell is resident); the renderer only applies them (twinDraws) — it never updates,
+   *  re-seeds or LOD-off-resets them. On an ArrayGroup source it drives the whole group. Runtime only. */
+  public lodTwinExternal = false;
+  /** P12: this mesh exists only as an ArrayGroup SOURCE (the instanced crowd's per-cell variant groups — every person is
+   *  a copy): it owns the group's instance slot + material but is never drawn itself (no camera / shadow / outline list),
+   *  never collided with. Runtime only. */
+  public arraySourceOnly = false;
+  /** P8 SHADOW LOD: the size (world units) of this mesh's smallest shadow-relevant feature — a pole's width, a
+   *  person's footprint. A shadow map whose texel is coarser than `Renderer3D.SHADOW_LOD_TEXELS` × this cannot resolve
+   *  the shadow, so the renderer leaves the mesh out of that map's caster list (the far map and each near cascade
+   *  separately). 0 = always cast. Set by the city's distance tiers; runtime only (never serialized). */
+  public shadowFeatureSize = 0;
+  /** FOG HORIZON class (docs/specs/fog-horizon.md; stamped by the city from its distance tiers): 0 = building shell or
+   *  anything untiered (always drawn) · 1 = building attachment (signs, awnings, facade trim, rooftop equipment) ·
+   *  2 = everything else (props, trees, cars, crowd, street furniture, paving). With "Buildings only in fog" on (and
+   *  Hard edge + linear fog) classes 2 and, unless attachments are included, 1 stop drawing past the fog's Far.
+   *  Runtime only (never serialized). */
+  public fogClass: 0 | 1 | 2 = 0;
+  /** Step 3 (fog class 'overlay'): a class-2 mesh that is CULLED past the fog's Far like any class 2 but does NOT
+   *  dissolve over the fade band (road paint, road wear, gutters, storefronts: they lie on a building-class surface that
+   *  fogs normally, so they keep its look up to Far, where both are pure fog colour). Runtime only. */
+  public fogNoFade = false;
+  /** Renderer-owned: true while the fog-horizon CPU cull drops this mesh (its whole box past the fog's Far; updated
+   *  whenever the draw-list build reaches the fog test, like `lodHidden`). Read by CPU work that only matters for a
+   *  drawn mesh (the walkers' pose gate). Runtime only (never serialized). */
+  public fogHidden = false;
+  /** P17 HLOD cross-fade (material-3d.ts flags2 bit 5): the screen-door coverage 0..1 while a streamed HLOD tile
+   *  dissolves in / out over its tier swap; -1 = not fading (drawn whole). Set by the city each frame of a fade (with
+   *  materialDirty: the slot rewrite carries it). Runtime only (never serialized). */
+  public hlodFade = -1;
 
   // GPU buffer handles (set by the 3D renderer when uploading)
   public gpuVertexBuffer: GPUBuffer | null = null;
@@ -182,6 +320,15 @@ export class Mesh3D extends Shape {
 
   /** True for the anime "face decal" quad (eye/expression overlay skinned to the head joint). */
   public isFaceDecal = false;
+
+  /** FACE KIT (face-features.ts): a face-features overlay (brows / mouth / nose / blush / hair shadow). Also
+   *  isFaceDecal (same persistence + style exclusions). The renderer draws it AFTER the opaque skinned parts with a
+   *  MULTIPLY blend (its texture is a premultiplied multiplier over the lit skin), no depth write, no shadow. */
+  public isFaceFeatures = false;
+  /** FACE KIT: pull this mesh's depth toward the camera by this many LOCAL units in the skinned VS (flags2 bit 6,
+   *  instance float 30) — the screen position is unchanged, so brows draw through the hair fringe in front of them
+   *  but not through anything further away. 0 = off (every other mesh). */
+  public faceDepthPull = 0;
 
   /** True for a procedural hair mesh (skinned to the head joint; rebuilt from HairParams). */
   public isHair = false;
@@ -245,6 +392,10 @@ export class Mesh3D extends Shape {
    *  HighlightStyle (color/width/patternMode/patternColor/freq/speed/glow + thicknessPx). Serialized here; the
    *  renderer's runtime outline cache is mirrored from this by Scene3DManager on set + restore. */
   public outline: import('../../renderer/3d/mesh-highlight-pass').HighlightStyle | null = null;
+  /** Extra outline RINGS stacked OUTSIDE `outline`, inner → outer (e.g. a red outline, then a white ring around it).
+   *  Each ring's `width` is ITS OWN band thickness (added onto everything inside it). Drawn only while `outline` is
+   *  set; null/empty = a single outline (the original behaviour). Persisted with the mesh. */
+  public outlineRings: import('../../renderer/3d/mesh-highlight-pass').HighlightStyle[] | null = null;
 
   /** GARP (docs/specs/city-props-garp.md §2): when set (and material.garpTex is true), this mesh's per-instance
    *  textureIndex is forced to this DEDICATED-GARP-atlas layer instead of the diffuse-atlas lookup. Session-local
@@ -268,6 +419,9 @@ export class Mesh3D extends Shape {
    * Set to null to revert to the normal key.
    */
   private _geometryKeyOverride: string | null = null;
+  /** P6: memo of `custom:${id}` for geometryKey (re-derived if the id ever changes). */
+  private _customKeyId: string | null = null;
+  private _customKey = '';
 
   /**
    * Per-vertex RGBA color data compiled from editMesh. Populated by syncFromEditMesh();
@@ -348,6 +502,10 @@ export class Mesh3D extends Shape {
   // ── Getters ────────────────────────────────────────────────────
 
   get meshPrimitive(): MeshPrimitive { return this._meshPrimitive; }
+  /** A sprite's quad size [width, height] (model units), or null for any other primitive. */
+  get spriteSize(): [number, number] | null {
+    return this._meshPrimitive === 'sprite' ? [this._meshConfig.width ?? 1, this._meshConfig.height ?? 1] : null;
+  }
 
   /** CINEMATIC CAMERA: this node is a placeable camera (its transform = the camera pose). See cinematic-cameras.md. */
   get isCamera(): boolean { return this._meshConfig.isCamera === true; }
@@ -368,7 +526,12 @@ export class Mesh3D extends Shape {
   get indexCount(): number { return this._geometry.indices.length; }
   get triangleCount(): number { return this._geometry.indices.length / 3; }
   /** Eight world-space OBB corners (bit-indexed: bit0=X, bit1=Y, bit2=Z; 0=min,1=max). */
-  get obbCorners(): [number, number, number][] | null { return this._obbCorners; }
+  get obbCorners(): [number, number, number][] | null { if (this._bbStale) this.calculateBoundingBox(); return this._obbCorners; }
+  /** cheapBounds meshes defer the per-transform bounds refresh until something READS the bounds (see
+   *  updateLocalMatrix) — city movers are re-posed every frame, but their OBB / 2D box is almost never read. */
+  private _bbStale = false;
+  override get boundingBox() { if (this._bbStale) this.calculateBoundingBox(); return this._boundingBox; }
+  override set boundingBox(value: { x: number; y: number; width: number; height: number; vertices?: [number, number][] }) { this._bbStale = false; this._boundingBox = value; }
   /** Same corners in object (geometry) space — unaffected by transform. */
   get obbLocalCorners(): [number, number, number][] | null { return this._obbLocalCorners; }
 
@@ -400,6 +563,7 @@ export class Mesh3D extends Shape {
 
   /** Invalidate the modifier-evaluated geometry cache. Call after changing modifiers or source geometry. */
   invalidateModifierCache(): void {
+    Mesh3D.geometryEpoch++; this.geometryVersion++;
     this._modifiedGeom = null;
     this.gpuDirty = true;
     this.stateDirty = true;
@@ -446,7 +610,13 @@ export class Mesh3D extends Shape {
   get geometryKey(): string {
     if (this.modifiers.length > 0) return `modifier:${this.id}`;
     if (this._geometryKeyOverride !== null) return this._geometryKeyOverride;
-    if (this._meshPrimitive === 'custom') return `custom:${this.id}`;
+    if (this._meshPrimitive === 'custom') {
+      // P6 (performance-plan.md): cached — the renderer reads this per draw entry per frame (run batching, pool
+      // lookups), and the template string was a fresh allocation every time (~80 MB/10 s of garbage in a city).
+      const id = this.id;
+      if (this._customKeyId !== id) { this._customKeyId = id; this._customKey = `custom:${id}`; }
+      return this._customKey;
+    }
     const c = this._meshConfig;
     switch (this._meshPrimitive) {
       case 'box':
@@ -514,6 +684,7 @@ export class Mesh3D extends Shape {
   }
 
   setMaterial(mat: Partial<Material3D>): void {
+    this._pwGen = 0;   // re-classify for the pipeline prewarm
     Object.assign(this._material, mat);
     this.gpuDirty = true;
     this.stateDirty = true;
@@ -537,6 +708,7 @@ export class Mesh3D extends Shape {
     // without needing a separate GLB buffer.
     this._meshConfig.geometry = this._geometry;
     this._meshPrimitive = 'custom';
+    Mesh3D.geometryEpoch++; this.geometryVersion++;
     this._modifiedGeom = null; // source changed — invalidate modifier cache
     this.gpuDirty = true;
     this.stateDirty = true;
@@ -601,6 +773,7 @@ export class Mesh3D extends Shape {
         // Keep existing geometry
         break;
     }
+    Mesh3D.geometryEpoch++; this.geometryVersion++;
     this._modifiedGeom = null; // source changed — invalidate modifier cache
     this.gpuDirty = true;
     this.stateDirty = true;
@@ -644,10 +817,14 @@ export class Mesh3D extends Shape {
     super.updateLocalMatrix();
     // Keep the world AABB in sync whenever the transform changes so the
     // selection box always reflects the current mesh position/rotation/scale.
+    // ★ T7.3: cheapBounds meshes (per-frame city movers) mark the bounds STALE instead — recomputed lazily on the
+    // next read (boundingBox / obbCorners). The renderer's frustum cull uses its own cached AABB, not these.
+    if (this.cheapBounds) { this._bbStale = true; return; }
     this.calculateBoundingBox();
   }
 
   calculateBoundingBox(): void {
+    this._bbStale = false;
     const geom = this.geometry; // use modifier-evaluated geometry for accurate bounds
     if (!geom || geom.vertices.length === 0) {
       this._boundingBox = { x: this._x - 0.5, y: this._y - 0.5, width: 1, height: 1 };
@@ -778,6 +955,7 @@ export class Mesh3D extends Shape {
       textureLibraryId: this.textureLibraryId,
       normalMapLibraryId: this.normalMapLibraryId,
       ...(this.outline ? { outline: this.outline } : {}),
+      ...(this.outlineRings?.length ? { outlineRings: this.outlineRings } : {}),
       // Multi-material slots (audit 2026-09-28 P8) — were never serialized, so per-slot materials reset on reload.
       ...(this.submeshes.length > 0 ? { submeshes: this.submeshes } : {}),
       glbMeshIndex: this.glbMeshIndex ?? undefined,

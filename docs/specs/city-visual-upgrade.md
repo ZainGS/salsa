@@ -1,5 +1,13 @@
 # City Visual Upgrade — the "Neverness to Everness" anime-city look
 
+> **Status (2026-10-04): largely BUILT through other specs** — [city-quality-upgrade.md](city-quality-upgrade.md),
+> [visual-polish-next.md](visual-polish-next.md), [fog-horizon.md](fog-horizon.md) and [../ui/city-quality.md](../ui/city-quality.md)
+> (CityLook, scene presets). Phase 1 atmosphere (height fog, aerial perspective, procedural sky + IBL, sky dome) built;
+> Phase 2 lighting (SSAO, SSR, contact shadows, coloured shadows) built; Phase 3 grade (split-tone, LGG, wide bloom) built,
+> **god rays / lens flare not built**; Phase 4 skyline variety partly (district archetypes, district palette, curtain-wall
+> towers; no hero-tower / glass-fraction params); Phase 5 nature built (instanced trees, wind); Phase 6 street detail
+> largely built; City Edit Mode pulse exists. Browser-unverified in places. See [../STATUS-2026-10-04.md](../STATUS-2026-10-04.md).
+>
 > **Deliverable of this pass:** this SPEC only. Built later, one phase at a time, screenshot-tuned. Save as
 > `docs/specs/city-visual-upgrade.md` (+ backlog line + memory pointer). Builds on the whole city stack
 > ([[world-generation]], [[city-detail]], [[render-styles]], [[post-processing]], [[world-borders]]).

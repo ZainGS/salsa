@@ -65,6 +65,11 @@ All of this scaffolding **already exists** in `text-effect-engine.ts` (`captureE
 
 ## 2. Why it was disabled — the exact bug (found)
 
+> **Status (2026-10-04): historical — the DPR bug is FIXED** in LiveText (`live-text.ts` sizes the texture per axis from
+> the parent canvas, `dprX = canvas.width / cr.width`) and the HTML path is enabled whenever
+> `TextEffectEngine.htmlInCanvasAvailable()` is true. Left: a live Canary test, and `text-effect-engine.ts` still has a
+> helper returning `window.devicePixelRatio` (check nothing sizes with it).
+
 `LiveTextNode.updateTexture()` ([live-text.ts:509-516](../../src/scene-graph/shapes/live-text.ts#L509)) says the path was removed because the copy extent could exceed the texture and crash. The root cause is a **DPR mismatch** in `captureElement()` ([text-effect-engine.ts:331-359](../../src/renderer/raster/effects/text-effect-engine.ts#L331)):
 
 ```ts

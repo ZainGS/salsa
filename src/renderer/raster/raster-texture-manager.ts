@@ -50,6 +50,14 @@ export class RasterTextureManager {
       .dispatch(tex, this.width, this.height, cx, cy, radius, colorArr, mode, eraseHard, canvasWidth, canvasHeight);
   }
 
+  /** Device-lost recovery (docs/ui/device-recovery.md): forget every GPU object (they died with the device). The next
+   *  ensureTexture() allocates a BLANK texture on the new device (no copy from the dead one). */
+  resetForNewDevice(): void {
+    this.texture = undefined; this.width = 0; this.height = 0;
+    this.stagingBuffer = undefined; this.stagingSize = 0;
+    this.snapshotMgr = undefined; this.legacyBrush = undefined;
+  }
+
   ensureTexture(w: number, h: number) {
     if (this.texture && this.width === w && this.height === h) return this.texture;
 

@@ -1,6 +1,11 @@
 # Creator Suite — apps-in-one-app over the shared asset spine
 
 **Date:** 2026-09-17 · **Status: SPEC ONLY — architecture/roadmap; individual apps have their own specs.**
+**Status (2026-10-04): engine side PARTLY built** (see §6.3 "largely built"): the creator registry + schemas
+(`creator-registry.ts`, `sm.creatorTypes3D` / `createCreator3D`, 10 prop types), the asset spine L1–L3 (+ 5 providers;
+[shared-asset-library.md](shared-asset-library.md)), and the per-app engines (Character Creator, animation library,
+packaging, CD, UI kit). **Not built:** `ShellUIManager.launchSlot` (still throws "Phase 6"), an `sm.creator` enter/exit
+facade, the unified Library panel / app switcher (host).
 **Origin:** the product vision is a **Shell that launches specialized creators** (Characters, Animations, Materials,
 Effects, Items, Worlds, Behaviors, …) that all read and write **one account-global asset library**, so anything
 authored in any creator drops into any Illustration. This spec is the *map*: what the apps are, what each authors, what

@@ -40,6 +40,11 @@ export interface ManagerContext {
   // the whole tree + allocating a fresh array every call. Never changes on transforms or mouse-move.
   sceneStructureVersion(): number;
 
+  // QUIET structural change: bump sceneStructureVersion (mesh-list caches re-walk) + schedule a render WITHOUT the
+  // host-facing onSceneGraphChanged event (outliner / connector re-binding). For engine-internal churn inside an
+  // excluded container — the live crowd's per-person meshes (world-live-crowd.ts). Optional (test hosts).
+  bumpSceneStructure?(): void;
+
   // Selection helpers (delegates back to ShapeManager's core)
   setSelectedNode(nodeId: string): void;
 }

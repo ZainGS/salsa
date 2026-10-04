@@ -12,6 +12,15 @@
  * and the canonical 26-joint hierarchy are refinements (see docs/specs/character-creation-pipeline.md).
  */
 
+import { seamBlendWeights } from './skin-seam-blend';
+import { smoothHipWeights } from './hip-weight-smooth';
+/** Pelvis → thigh weight smoothing passes / step (hip-weight-smooth.ts; swept 4–30 passes, 16 × 0.6 was best). */
+const HIP_SMOOTH_ITERS = 16, HIP_SMOOTH_LAMBDA = 0.6;
+/** New (seam-blended) bodies: the mid-thigh ring's lower-leg share (classic 0.25). A quarter of the knee's rotation that
+ *  high up caved the back of the thigh in on a deep run bend and the trousers folded open there (fit round 2: live run
+ *  frames' knee / thigh skin through the trousers roughly halved at 0.1; 0 was no better). */
+const MID_THIGH_KNEE_SHARE = 0.1;
+import { relaxedStance, armPose, WAVE_ARM, waveBody } from './pose-authoring';
 import type { GltfSkinnedResult, GltfSkinningData } from '../../renderer/3d/gltf-importer';
 import type { MeshGeometry } from '../../renderer/3d/mesh-generators';
 
@@ -43,7 +52,36 @@ export interface BodyParams {
   /** Butt size — scales the radial bulge of the buttock cheeks (0 = flat, 1 = neutral, >1 = fuller). The
    *  cheeks gain width + back-projection together (a 3D dome), and the bigger butt auto-hangs more. */
   buttSize: number;
+  /** JOINT SMOOTHNESS (0..1) — blends the skin weights across seams where neighbouring rings are bound to bones that
+   *  share nothing (the crushed-armpit fold). 0 = the classic weights, bit-identical; ~0.5 = the measured sweet spot.
+   *  Optional: saved characters have no field → 0 → unchanged. New bodies get 0.5 (createProceduralBody3D).
+   *  See skin-seam-blend.ts + docs/specs/character-skin-weights.md. */
+  seamBlend?: number;
+  /** ANIME FACE NORMALS (0..1, visual-polish item 10) — replaces the head's faceted geometric normals with a smooth
+   *  ellipsoid proxy around the head, bent toward the face's forward axis on the front (the common anime-face trick).
+   *  The low-poly face then shades as one flat skin plane with at most a soft, curved terminator on the far cheek —
+   *  no dark wedges across the nose or cheeks — in every render style (PBR, Gouraud, Cel, Cel HD, toon shadows), because
+   *  it is just the vertex normal. Only the head (fading out over the jaw → neck) changes: the body keeps its form
+   *  shading. Positions, UVs, weights and triangle winding are untouched.
+   *  Optional: saved characters have no field → 0 → their classic shading, bit-identical. New bodies get
+   *  NEW_BODY_FACE_NORMALS (createProceduralBody3D / createProceduralCharacter3D). See faceNormalProxy below. */
+  faceNormals?: number;
+  /** ANIME HEAD SHAPE (0..1, 2026-10-04) — 0 = the classic head (a straight taper from the brow to a pointed jaw, which
+   *  reads as a wide flat diamond from the front); 1 = the anime head: elliptical rings, a rounder cranium, full cheeks
+   *  and a soft V-line jaw into a small rounded chin, a smaller nose / lower face. Same topology (the face kit, eyes and
+   *  hair fit it unchanged). Optional: saved characters have no field → 0 → their classic head, bit-identical. New bodies
+   *  get NEW_BODY_HEAD_SHAPE. See buildAnimeHead. */
+  headShape?: number;
 }
+
+/** Joint smoothness given to NEWLY created procedural bodies (saved ones keep theirs — absent = 0 = classic). */
+export const NEW_BODY_SEAM_BLEND = 0.5;
+/** Anime face normals given to NEWLY created procedural bodies (saved ones keep theirs — absent = 0 = classic). */
+export const NEW_BODY_FACE_NORMALS = 1;
+/** Anime head shape given to NEWLY created procedural bodies (saved ones keep theirs — absent = 0 = classic). */
+export const NEW_BODY_HEAD_SHAPE = 1;
+/** The new-body defaults merged UNDER a caller's params (the caller's own fields win). */
+export const NEW_BODY_DEFAULTS: Readonly<Partial<BodyParams>> = { seamBlend: NEW_BODY_SEAM_BLEND, faceNormals: NEW_BODY_FACE_NORMALS, headShape: NEW_BODY_HEAD_SHAPE };
 
 // Defaults lean DOLLCORE out of the box: long thin legs, slim limbs, a smaller torso, and a
 // slightly oversized head — the silhouette IS the brand. Sliders let users dial back to neutral.
@@ -52,6 +90,7 @@ export interface BodyParams {
 export const DEFAULT_BODY_PARAMS: BodyParams = {
   height: 1, limbThick: 0.85, torsoThick: 0.9, headSize: 1.25, legLength: 1.4, torsoLength: 1,
   bust: 1, waist: 1, hipWidth: 1, hipFront: 1, shoulderWidth: 1, buttSize: 1,
+  seamBlend: 0,   // classic weights by default — see NEW_BODY_SEAM_BLEND for what new bodies get
 };
 
 type V3 = [number, number, number];
@@ -139,14 +178,22 @@ function pushVert(ac: Accum, p: V3, n: V3, u: number, v: number, ja: number, wa:
  * arm/leg into ONE continuous tube — connected topology, for free, with no risk. Keeps the first
  * occurrence's normal/uv/weights and remaps the index buffer; drops triangles that collapse.
  * (Limb↔torso shoulders/hips and the cap spheres still overlap — that's the "pass 2" stitch.)
+ *
+ * SIDE-KEYED: a vert bound to a LEFT joint (…_L) never welds to one bound to a RIGHT joint (…_R). The two legs are
+ * exact mirrors, and the inner calves reach the midline, so for some params (e.g. hipFront ≈ 0.636–0.660) a mirrored
+ * L/R calf-ring pair both land within eps of x = 0 and got FUSED into one vertex — stitching the right shin's faces
+ * onto a left-shin vert, which stretched into a pale triangular web between the shins as soon as the legs moved
+ * (Walk/Run). A sweep of hipFront 0.30–1.20 × other params found that cross-side merge was the ONLY weld ever
+ * happening, so keying by side changes nothing else (bodies that were fine stay bit-identical).
  */
+const JOINT_SIDE: string[] = JOINTS.map(j => j.name.endsWith('_L') ? 'L' : j.name.endsWith('_R') ? 'R' : 'C');
 function weldAccum(ac: Accum, eps = 1e-4): Accum {
   const q = (x: number) => Math.round(x / eps);
   const map = new Map<string, number>();
   const remap = new Int32Array(ac.count);
   const out: Accum = { pos: [], nrm: [], uv: [], j0: [], w0: [], j1: [], w1: [], idx: [], count: 0, island: [0, 0, 1, 1] };
   for (let i = 0; i < ac.count; i++) {
-    const key = `${q(ac.pos[i*3])},${q(ac.pos[i*3+1])},${q(ac.pos[i*3+2])}`;
+    const key = `${JOINT_SIDE[ac.j0[i]] ?? 'C'}|${q(ac.pos[i*3])},${q(ac.pos[i*3+1])},${q(ac.pos[i*3+2])}`;
     let ni = map.get(key);
     if (ni === undefined) {
       ni = out.count++;
@@ -390,6 +437,100 @@ function capRing(ac: Accum, loop: number[], apex: V3, joint: number): void {
   const ai = ac.count;
   pushVert(ac, apex, norm(sub(apex, c)), 0.5, 1, joint, 1, 0, 0);
   for (let k = 0; k < loop.length; k++) ac.idx.push(loop[k], loop[(k+1)%loop.length], ai);
+}
+
+// Head rings. Classic: [dy, r] (circles). Anime: [dy at the sides / back, extra drop at the front centre (× sin² of the
+// ring angle over the front half), rx, rzFront, rzBack]. Head units (radii × hs); dy × H about the head joint.
+const CLASSIC_HEAD_RINGS: readonly (readonly [number, number])[] = [[-0.060, 0.040], [-0.028, 0.050], [-0.006, 0.066],
+  [0.026, 0.082], [0.040, 0.085], [0.078, 0.090], [0.112, 0.082], [0.142, 0.058], [0.162, 0.030]];
+const ANIME_HEAD_RINGS: readonly (readonly [number, number, number, number, number])[] = [
+  [-0.040, 0.016, 0.046, 0.042, 0.040],   // h0 jaw base / under the jaw — ≈ the neck front, no undercut
+  [-0.020, 0.026, 0.060, 0.058, 0.050],   // h1 jaw line — high at the ears, curving down to the chin (V-line)
+  [-0.004, 0.000, 0.076, 0.063, 0.066],   // h2 mouth — the cheeks stay full
+  [ 0.022, 0.000, 0.085, 0.071, 0.081],   // h3 nose / cheeks
+  [ 0.040, 0.000, 0.088, 0.073, 0.085],   // h4 under the eyes (cheekbones)
+  [ 0.078, 0.000, 0.091, 0.075, 0.092],   // h5 brow — widest
+  [ 0.112, 0.000, 0.088, 0.071, 0.090],   // h6 forehead  ┐
+  [ 0.142, 0.000, 0.070, 0.057, 0.073],   // h7 upper     ├ a round cranium
+  [ 0.162, 0.000, 0.044, 0.036, 0.047],   // h8 crown     ┘
+];
+/** The anime head's jaw rings (h0 = under the jaw, h1 = the jaw line) at a vertex: local y (× H about the head joint)
+ *  of each ring at the vertex's azimuth. sinFront = sin of the ring angle (1 = the front centre, ≤ 0 = the back half). */
+function animeJawRingsDy(sinFront: number, k: number): [number, number] {
+  const s2 = sinFront > 0 ? sinFront * sinFront : 0;
+  const dy = (ri: number) => CLASSIC_HEAD_RINGS[ri][0] + (ANIME_HEAD_RINGS[ri][0] - CLASSIC_HEAD_RINGS[ri][0]) * k - ANIME_HEAD_RINGS[ri][1] * k * s2;
+  return [dy(0), dy(1)];
+}
+
+/**
+ * ANIME HEAD (BodyParams.headShape, 2026-10-04). The classic head is a stack of CIRCULAR rings whose radii taper linearly
+ * from the brow to a point under the chin, which reads from the front as a wide flat diamond with a spike jaw. This one
+ * keeps the exact topology (9 rings × RING + a crown cap, same UVs and head weights, so the eye decal, the face-kit
+ * raycast, the hair head map and the clothing read it unchanged) but shapes it for an anime face:
+ *   • ELLIPTICAL rings: a flatter face front (rzFront < rx) and a fuller back of the skull (rzBack);
+ *   • a rounder cranium (the upper rings follow a sphere, not a cone);
+ *   • cheeks that stay full down to the mouth, then a SOFT V-LINE: the jaw rings rise from the chin toward the ears
+ *     (a sin² profile around the front half), so the outline curves into a small rounded chin;
+ *   • a smaller nose and lower face; no gonial corner (that is what read as a square / spiky jaw);
+ *   • the under-jaw plane runs back to the neck front with no undercut behind it (the classic undercut made the
+ *     grey crease where the neck meets the face).
+ * `k` (0..1] blends from the classic shape to the anime one (the slider in the panel); positions only.
+ */
+function buildAnimeHead(ac: Accum, neckRing: number[], head: V3, H: number, hs: number, k: number, joint: number): void {
+  const L = (a: number, b: number) => a + (b - a) * k;
+  const CL = CLASSIC_HEAD_RINGS, AN = ANIME_HEAD_RINGS;
+  const UVV = [0.00, 0.10, 0.22, 0.34, 0.42, 0.54, 0.68, 0.82, 0.93];
+  const rings: number[][] = [];
+  for (let ri = 0; ri < CL.length; ri++) {
+    const [cdy, cr] = CL[ri], [ady, drop, arx, arzF, arzB] = AN[ri];
+    const dy = L(cdy, ady), rx = L(cr, arx) * hs, rzF = L(cr, arzF) * hs, rzB = L(cr, arzB) * hs, dr = drop * k;
+    const out: number[] = [];
+    for (let c = 0; c < RING; c++) {
+      const ang = (c / RING) * Math.PI * 2, ca = Math.cos(ang), sa = Math.sin(ang);
+      const rz = sa > 0 ? rzF : rzB;
+      const y = head[1] + (dy - (sa > 0 ? dr * sa * sa : 0)) * H;
+      const p: V3 = [head[0] + rx * ca, y, head[2] + rz * sa];
+      out.push(ac.count);
+      pushVert(ac, p, norm([ca / Math.max(rx, 1e-6), 0, sa / Math.max(rz, 1e-6)]), c / RING, UVV[ri], joint, 1, 0, 0);
+    }
+    rings.push(out);
+  }
+  bandRings(ac, neckRing, rings[0]);
+  for (let ri = 0; ri + 1 < rings.length; ri++) bandRings(ac, rings[ri], rings[ri + 1]);
+  capRing(ac, rings[8], [head[0], head[1] + L(0.172, 0.174) * H, head[2]], joint);
+
+  const FRONT = COL_F;
+  // Profile pushes on the front column(s) — classic weighted (1 − k), anime weighted k.
+  const push = (rg: number[], dz: number, dy: number, spread: number): void => {
+    for (let o = -spread; o <= spread; o++) {
+      const col = (FRONT + o + RING) % RING;
+      const f = spread === 0 ? 1 : Math.cos((o / (spread + 1)) * Math.PI * 0.5);
+      ac.pos[rg[col]*3 + 1] += dy * f * hs;
+      ac.pos[rg[col]*3 + 2] += dz * f * hs;
+    }
+  };
+  const [h0, h1, h2, h3, h4, h5, h6] = rings;
+  const c = 1 - k;
+  if (c > 0) {
+    push(h0, -0.014 * c, 0, 3); push(h1, 0.026 * c, -0.012 * c, 3); push(h2, 0.016 * c, 0, 3);
+    push(h3, 0.020 * c, 0, 0); push(h4, 0.004 * c, -0.012 * c, 0); push(h5, -0.004 * c, 0, 0); push(h6, -0.004 * c, 0, 0);
+    for (const o of [-5, -4, 4, 5]) {   // the classic gonial corner, fading out
+      const col = (FRONT + o + RING) % RING;
+      for (const [rg, dn, tuck] of [[h0, 0.004, 0.006], [h1, 0.007, 0.005]] as const) {
+        ac.pos[rg[col]*3 + 1] -= dn * c * hs;
+        const x = ac.pos[rg[col]*3] - head[0], z = ac.pos[rg[col]*3 + 2] - head[2], rl = Math.hypot(x, z) || 1;
+        ac.pos[rg[col]*3]     -= (x/rl) * tuck * c * hs;
+        ac.pos[rg[col]*3 + 2] -= (z/rl) * tuck * c * hs;
+      }
+    }
+  }
+  push(h0, -0.003 * k, 0, 3);            // the under-jaw: a gentle tuck (stays at the neck front)
+  push(h1, 0.008 * k, 0, 2);             // CHIN: a little forward, rounded (spread over 5 cols, not one spike vertex)
+  push(h2, 0.008 * k, 0, 3);             // mouth: on the chin → nose curve
+  push(h3, 0.013 * k, 0, 0);             // NOSE: small (the classic one stood 0.020 proud)
+  push(h4, 0.003 * k, -0.010 * k, 0);    // nose top: flat
+  push(h5, -0.002 * k, 0, 0);            // brow, then straight up the forehead
+  push(h6, -0.002 * k, 0, 0);
 }
 
 /**
@@ -726,6 +867,25 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
     const shD: V3 = [sh[0], sh[1] - armDrop, sh[2]];
     const loD: V3 = [lo[0], lo[1] - armDrop, lo[2]];
     const haD: V3 = [ha[0], ha[1] - armDrop, ha[2]];
+    // DELTOID STAYS OUTBOARD OF THE SOCKET. The deltoid ring sits 13% down the upper arm, but the socket is part of the
+    // TORSO: Torso Thickness / Shoulder Width push it outward while the shoulder joint (and so the arm) stays put. Past
+    // about torsoThick 1.0 / shoulderWidth 1.2 the socket centre ended up OUTBOARD of the deltoid, so the arm tube
+    // started by folding back inside the torso. That fold is what tore the shirt (2026-10-03): a sleeve is these rings
+    // offset outward, so it folded into flaps over the shoulder, and the shirt's side seam under the arm, whose nearest
+    // skin was now the buried arm, took the arm's weights and opened a slit when the arm hung down. So the deltoid is
+    // kept at least DELTOID_CLEAR (of the upper-arm length) past the socket centre. Default bodies (socket ≈ 8% down)
+    // are unchanged; only ring positions move (joints, radii and weights are untouched). clothing-side-seam.test.ts.
+    // On a very wide torso the deltoid can end up past the bicep ring's usual 48%; the bicep then moves out with it
+    // (BICEP_GAP behind), still well short of the elbow. Default bodies: deltoid 0.13, bicep 0.48, both unchanged.
+    const DELTOID_T = 0.13, DELTOID_CLEAR = 0.045, DELTOID_T_MAX = 0.75, BICEP_T = 0.48, BICEP_GAP = 0.2;
+    const upperLen = len(sub(loD, shD)) || 1;
+    let scF: V3 = [0, 0, 0];   // the socket centre AFTER filletShoulder (it moves the socket verts too)
+    for (const vi of loop) scF = [scF[0]+ac.pos[vi*3], scF[1]+ac.pos[vi*3+1], scF[2]+ac.pos[vi*3+2]];
+    scF = scl(scF, 1/loop.length);
+    const toSocket = sub(scF, shD);
+    const socketT = (toSocket[0]*dir[0] + toSocket[1]*dir[1] + toSocket[2]*dir[2]) / upperLen;
+    const deltoidT = Math.min(DELTOID_T_MAX, Math.max(DELTOID_T, socketT + DELTOID_CLEAR));
+    const bicepT = Math.max(BICEP_T, deltoidT + BICEP_GAP);
     const armRes = stitchLimb(ac, loop, au, av, [
       // The arm grows DIRECTLY off the shared shoulder/socket verts (firstFlush — NO separate "collar lip"
       // ring): the socket verts then belong to BOTH the torso and the arm, so their normals blend and the
@@ -733,8 +893,8 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
       // matches an even circle, so the first ring bridges onto it cleanly. j2/w2 = secondary joint blend for
       // smooth deformation. Radii give the arm its SHAPE: deltoid cap → bicep → elbow PINCH → forearm → wrist.
       // Centres use the DROPPED arm axis (shD/loD/haD) so a thick arm sits level with the shoulder.
-      { c: lerp(shD, loD, 0.13),     r: deltoidR, j: J('shoulder_'+sd.s), uv: 0.04, j2: J('clavicle_'+sd.s), w2: 0.3 }, // deltoid — FIRST ring, straight off the socket (clavicle blend softens the torso↔arm weight seam)
-      { c: lerp(shD, loD, 0.48),     r: 0.048*lt, j: J('shoulder_'+sd.s), uv: 0.38, j2: J('lowerarm_'+sd.s), w2: 0.20 }, // bicep / tricep — the upper-arm muscle belly
+      { c: lerp(shD, loD, deltoidT), r: deltoidR, j: J('shoulder_'+sd.s), uv: 0.04, j2: J('clavicle_'+sd.s), w2: 0.3 }, // deltoid — FIRST ring, straight off the socket (clavicle blend softens the torso↔arm weight seam)
+      { c: lerp(shD, loD, bicepT),   r: 0.048*lt, j: J('shoulder_'+sd.s), uv: 0.38, j2: J('lowerarm_'+sd.s), w2: 0.20 }, // bicep / tricep — the upper-arm muscle belly
       { c: loD,                      r: 0.034*lt, j: J('lowerarm_'+sd.s), uv: 0.58, j2: J('shoulder_'+sd.s), w2: 0.35 }, // elbow — SLIM pinch (the contrast that makes the bicep + forearm read)
       { c: lerp(loD, haD, 0.30),     r: 0.044*lt, j: J('lowerarm_'+sd.s), uv: 0.75, j2: J('hand_'+sd.s),     w2: 0.20 }, // forearm — flexor bulge (clear, like the calf), upper forearm
       { c: haD,                      r: 0.027*lt, j: J('hand_'+sd.s),     uv: 0.92, j2: J('lowerarm_'+sd.s), w2: 0.30 }, // wrist — slim
@@ -779,6 +939,10 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
   //    profile: jaw break → CHIN point → curve up over the mouth to the NOSE (forward-most) → a
   //    short straight-IN segment at the nose-top → then straight UP into the round skull. ──
   ac.island = IS.head;
+  // ANIME HEAD (BodyParams.headShape > 0, new bodies): same topology, reshaped — see buildAnimeHead. 0 / absent = the
+  // classic head below, bit-identical (saved bodies).
+  if ((p.headShape ?? 0) > 0) buildAnimeHead(ac, ring[NR-1], yAt(head, 0), H, hs, Math.min(1, p.headShape!), J('head'));
+  else {
   const hr = (dy: number, r: number, uvV: number) => addRing(ac, yAt(head, dy), fu, fv, r*hs, J('head'), uvV);
   const h0 = hr(-0.060, 0.040, 0.00);  // jaw base — ≈ neck width (smooth, no lump)
   const h1 = hr(-0.028, 0.050, 0.10);  // chin
@@ -828,6 +992,7 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
       ac.pos[rg[col]*3 + 2] -= (z/rl) * tuck * hs;
     }
   }
+  }   // classic head
 
   // ── legs: pants split from the pelvis-bottom ring (shared crotch verts join the two legs) ──
   const pb = ring[0], pby = rdefs[0].c[1];
@@ -858,7 +1023,7 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
       // SHAPE (not a straight taper): full upper thigh → slim knee → calf bulge → slim ankle.
       { c: legBase,                 r: 0.090*lt, j: J('upperleg_'+s), uv: 0,    j2: J('hips'),         w2: 0.45 }, // thigh top — FULL (gives the butt mass to sit on), eases out of the pelvis
       { c: lerp(legBase, ll, 0.18), r: 0.085*lt, j: J('upperleg_'+s), uv: 0.13, j2: J('hips'),         w2: 0.25 }, // upper thigh (GATHER ring) — the wide pelvis narrows gradually into the THIGH MUSCLE
-      { c: lerp(legBase, ll, 0.5),  r: 0.075*lt, j: J('upperleg_'+s), uv: 0.32, j2: J('lowerleg_'+s), w2: 0.25 }, // mid thigh — FULL thigh, then tapers to the knee
+      { c: lerp(legBase, ll, 0.5),  r: 0.075*lt, j: J('upperleg_'+s), uv: 0.32, j2: J('lowerleg_'+s), w2: (p.seamBlend ?? 0) > 0 ? MID_THIGH_KNEE_SHARE : 0.25 }, // (new bodies: less knee share up here — fit round 2) // mid thigh — FULL thigh, then tapers to the knee
       { c: ll,                      r: 0.044*lt, j: J('lowerleg_'+s), uv: 0.55, j2: J('upperleg_'+s), w2: 0.35 }, // knee — SLIM (the pinch that makes the now-fuller thigh + calf read)
       { c: lerp(ll, ft, 0.32),      r: 0.060*lt, j: J('lowerleg_'+s), uv: 0.72, j2: J('foot_'+s),     w2: 0.20 }, // calf — CLEAR muscle bulge (much fuller than the knee), upper shin
       { c: ft,                      r: 0.033*lt, j: J('foot_'+s),     uv: 0.92, j2: J('lowerleg_'+s), w2: 0.30 }, // ankle — slim
@@ -1029,6 +1194,127 @@ function localPositions(p: BodyParams): V3[] {
   });
 }
 
+/**
+ * ANIME FACE NORMALS (BodyParams.faceNormals): the head's normals become a smooth proxy — the gradient of the head's
+ * bounding ellipsoid, then bent toward the forward axis (+Z) on the front so the face reads as one flat plane — blended
+ * over the geometric normals by `amount`. The blend fades in from the jaw base (0 at the neck seam, so the neck stays
+ * continuous) to full by the chin, and is weighted by each vertex's head skin weight. Mutates `ac.nrm` only.
+ */
+function faceNormalProxy(ac: Accum, headIdx: number, amount: number, anime?: AnimeJawFrame): void {
+  const n = ac.count;
+  const headW = (i: number) => (ac.j0[i] === headIdx ? ac.w0[i] : 0) + (ac.j1[i] === headIdx ? ac.w1[i] : 0);
+  let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+  for (let i = 0; i < n; i++) {
+    if (headW(i) < 0.5) continue;
+    const x = ac.pos[i*3], y = ac.pos[i*3+1], z = ac.pos[i*3+2];
+    x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); z0 = Math.min(z0, z); z1 = Math.max(z1, z);
+  }
+  if (!(x1 > x0) || !(y1 > y0) || !(z1 > z0)) return;
+  const cx = (x0 + x1) * 0.5, cy = (y0 + y1) * 0.5, cz = (z0 + z1) * 0.5;
+  const rx = (x1 - x0) * 0.5, ry = (y1 - y0) * 0.5, rz = (z1 - z0) * 0.5, hY = y1 - y0;
+  // How far the FRONT's normals are pulled onto the forward axis (0 = the plain ellipsoid, 1 = one flat plane). Strong:
+  // a 3-band cel ramp turns any normal spread across the face into a hard terminator, so the face proper is nearly one
+  // plane and the curvature (and so any shadow edge) lives at the sides of the face, under the hair — the anime look.
+  const FLATTEN = 0.9;
+  const JAW_FADE = 0.2;        // fraction of the head height over which the proxy fades in above the jaw base
+  for (let i = 0; i < n; i++) {
+    const w = headW(i);
+    if (w <= 0) continue;
+    const x = ac.pos[i*3], y = ac.pos[i*3+1], z = ac.pos[i*3+2];
+    let ex = (x - cx) / (rx * rx), ey = (y - cy) / (ry * ry), ez = (z - cz) / (rz * rz);
+    let el = Math.hypot(ex, ey, ez);
+    if (el < 1e-9) continue;
+    ex /= el; ey /= el; ez /= el;
+    const fz = Math.min(1, Math.max(0, (ez - 0.05) / 0.45)), f = FLATTEN * fz * fz * (3 - 2 * fz);   // front + cheeks (smoothstep on ez)
+    ex *= 1 - f; ey *= 1 - f; ez += (1 - ez) * f;                      // flatten the front toward the forward plane
+    el = Math.hypot(ex, ey, ez); ex /= el; ey /= el; ez /= el;
+    // Fade-in over the jaw. Classic: the lowest JAW_FADE of the head. Anime head: across the UNDER-JAW band, h0 (0) →
+    // the jaw line h1 (full) at this vertex's azimuth, so the whole face down to the chin is one lit plane and the cel
+    // terminator runs along the V of the jaw (the anime chin shadow), not across the chin.
+    let t: number;
+    if (anime) {
+      const [d0, d1] = animeJawAt(anime, x, z);
+      t = Math.min(1, Math.max(0, ((y - d0) / Math.max(1e-6, d1 - d0) - 0.3) / 0.7));
+    } else t = Math.min(1, Math.max(0, (y - y0) / (hY * JAW_FADE)));
+    const k = amount * Math.min(1, w) * t * t * (3 - 2 * t);          // smoothstep fade-in over the jaw
+    if (k <= 0) continue;
+    let nx = ac.nrm[i*3] + (ex - ac.nrm[i*3]) * k, ny = ac.nrm[i*3+1] + (ey - ac.nrm[i*3+1]) * k, nz = ac.nrm[i*3+2] + (ez - ac.nrm[i*3+2]) * k;
+    const l = Math.hypot(nx, ny, nz);
+    if (l < 1e-6) continue;
+    nx /= l; ny /= l; nz /= l;
+    ac.nrm[i*3] = nx; ac.nrm[i*3+1] = ny; ac.nrm[i*3+2] = nz;
+  }
+  if (anime) animeNeckShade(ac, anime, amount);
+}
+
+/** Where the anime head sits (generateBodyResult → faceNormalProxy): the head joint, the scales and the shape blend. */
+interface AnimeJawFrame { hx: number; hy: number; hz: number; H: number; hs: number; k: number; neckIdx: number }
+
+/** World y of the anime head's under-jaw ring (h0) and jaw line (h1) at the azimuth of (x, z). */
+function animeJawAt(f: AnimeJawFrame, x: number, z: number): [number, number] {
+  const dx = x - f.hx, dz = z - f.hz, r = Math.hypot(dx, dz);
+  const [d0, d1] = animeJawRingsDy(r > 1e-9 ? dz / r : 0, f.k);
+  return [f.hy + d0 * f.H, f.hy + d1 * f.H];
+}
+
+/**
+ * NECK SHADOW (anime head + face normals). The face is one flat lit plane, so the classic neck read as a grey band under
+ * it (the jaw undercut + the neck's own up-tilted normals, which also made the lower neck BRIGHTER than the face). Here
+ * the normals just below the jaw tip DOWN (into shadow for any light from above), fading back to the plain normal
+ * further down the neck — deeper at the front centre than at the sides, so the shadow edge is a soft V that mirrors the
+ * jaw (the anime chin shadow) — and the rest of the neck never tilts UP (so it is never lit brighter than the face).
+ * Normals only (positions / weights untouched), body verts within the neck's radius only.
+ */
+function animeNeckShade(ac: Accum, f: AnimeJawFrame, amount: number): void {
+  const n = ac.count, a = amount * f.k;
+  if (a <= 0) return;
+  const maxR = 0.075 * f.hs;                       // about the jaw base's half-width: the neck, not the shoulders / arms
+  const ss = (e0: number, e1: number, x: number) => { const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); };
+  for (let i = 0; i < n; i++) {
+    const x = ac.pos[i*3], y = ac.pos[i*3+1], z = ac.pos[i*3+2];
+    const dx = x - f.hx, dz = z - f.hz, r = Math.hypot(dx, dz);
+    if (r > maxR || y > f.hy) continue;
+    const [y0, y1] = animeJawAt(f, x, z);
+    if (y > y1 + 1e-6) continue;                   // above the jaw line: the face proxy's
+    const sf = r > 1e-9 ? dz / r : 0, front = sf > 0 ? sf * sf : 0;
+    let w: number;
+    if (y > y0) {
+      // The UNDER-JAW band (h0 → h1): full shade at the under-jaw ring, handing over to the face plane at the jaw line
+      // (the face proxy only starts 30% up this band, so the two never fight).
+      w = a * (1 - ss(0.2, 0.75, (y - y0) / Math.max(1e-6, y1 - y0)));
+    } else {
+      const depth = (y0 - y) / f.H;                // below the jaw base, in body units (dy)
+      // How far down the neck the shadow reaches (dy): a V, deep at the front centre, just the jaw edge at the sides.
+      // The neck has few rings (the first one sits about 0.045 below the jaw base), so the front reaches past it.
+      const span = 0.028 + 0.055 * front;
+      w = a * (1 - ss(span * 0.35, span, depth));
+    }
+    let nx = ac.nrm[i*3], ny = ac.nrm[i*3+1], nz = ac.nrm[i*3+2];
+    if (w > 0) {
+      // Down AND forward/outward (about 45 degrees): in shadow for a key light from above, but NOT grazing to the camera
+      // — a straight-down normal is edge-on from the front, so the Fresnel rim light lit it as a white band.
+      const ox = r > 1e-9 ? dx / r : 0, oz = r > 1e-9 ? dz / r : 0;
+      const D: V3 = norm([ox * 0.95, -0.9, oz * 0.95]);
+      nx += (D[0] - nx) * w; ny += (D[1] - ny) * w; nz += (D[2] - nz) * w;
+    }
+    const neckW = (ac.j0[i] === f.neckIdx ? ac.w0[i] : 0) + (ac.j1[i] === f.neckIdx ? ac.w1[i] : 0);
+    // The neck: neck-weighted, or the neck-base ring (chest-weighted here; seamBlendWeights later makes it 50/50).
+    if (neckW >= 0.45 || (y0 - y) < 0.15 * f.H) {
+      if (ny > 0) ny *= 1 - a;                     // the lit neck: horizontal at most, never brighter than the face plane
+      // ...and its FRONT half flattened toward the face's forward plane (like the face proxy): the neck then shades as one
+      // calm plane no brighter than the face, and its sides are not grazing (no Fresnel-rim glow down the neck).
+      const fl = a * 0.8 * ss(-0.2, 0.6, sf) * (1 - w);
+      if (fl > 0) { nx -= nx * fl; ny -= ny * fl; nz += (1 - nz) * fl; }
+      // A slight downward tilt everywhere on the neck: it sits under the chin, so for any key light from above (noon
+      // included) it reads a step darker than the face, never brighter — still facing the camera (no rim glow).
+      ny = Math.min(ny, -0.2 * a);
+    } else if (w <= 0) continue;
+    const l = Math.hypot(nx, ny, nz);
+    if (l < 1e-6) continue;
+    ac.nrm[i*3] = nx / l; ac.nrm[i*3+1] = ny / l; ac.nrm[i*3+2] = nz / l;
+  }
+}
+
 /** Generate a procedural humanoid body as a GltfSkinnedResult. */
 export function generateBodyResult(partial?: Partial<BodyParams>): GltfSkinnedResult & { armSurface: ArmSurface; legSurface: ArmSurface; torsoSurface: ArmRing[] } {
   const p = { ...DEFAULT_BODY_PARAMS, ...partial };
@@ -1108,6 +1394,14 @@ export function generateBodyResult(partial?: Partial<BodyParams>): GltfSkinnedRe
     if (nx*rx + ny*ry + nz*rz < 0) { ac.idx[i+1] = c; ac.idx[i+2] = b; }  // inward-wound → flip CCW
   }
 
+  // ── anime face normals (opt-in; AFTER the winding pass, which uses the geometric normals as its reference) ──
+  if ((p.faceNormals ?? 0) > 0) {
+    const hk = Math.min(1, Math.max(0, p.headShape ?? 0)), hj = wp[NAME_TO_IDX.get('head')!];
+    const jaw: AnimeJawFrame | undefined = hk > 0
+      ? { hx: hj[0], hy: hj[1], hz: hj[2], H, hs: p.headSize * H, k: hk, neckIdx: NAME_TO_IDX.get('neck')! } : undefined;
+    faceNormalProxy(ac, NAME_TO_IDX.get('head')!, Math.min(1, p.faceNormals!), jaw);
+  }
+
   // ── interleave 12-float geometry [px,py,pz, nx,ny,nz, u,v, tx,ty,tz,tw] ──
   // MUST be 12-float (FLOATS_PER_VERT): the 3D mesh + skinned pipelines read a fixed vertex
   // stride, so an 8-float buffer is misread as garbage (exploded mesh). No normal map here, so
@@ -1130,14 +1424,20 @@ export function generateBodyResult(partial?: Partial<BodyParams>): GltfSkinnedRe
     format: '12float',
   };
 
-  // ── skinning arrays ──
-  const jointIndices = new Uint8Array(vcount * 4);
-  const jointWeights = new Float32Array(vcount * 4);
-  for (let i = 0; i < vcount; i++) {
-    const o = i * 4;
-    jointIndices[o] = ac.j0[i]; jointIndices[o+1] = ac.j1[i];
-    jointWeights[o] = ac.w0[i]; jointWeights[o+1] = ac.w1[i];
-  }
+  // ── skinning arrays ── (seamBlend 0 = the classic 2-influence packing, bit-identical; >0 blends weight seams into
+  // up to 4 influences so the socket/deltoid band stops folding — audit C1 Phase 1)
+  const seamed = seamBlendWeights(
+    vcount, ac.idx, ac.j0, ac.w0, ac.j1, ac.w1, JOINTS.length, p.seamBlend ?? 0);
+  // Pelvis → thigh weight smoothing (clothing fit round 2, hip-weight-smooth.ts): seam-blended (new) bodies only, so a
+  // classic (seamBlend 0) body stays bit-identical. Spreads a raised thigh's rotation over the hip rings instead of
+  // the one pelvis-bottom → thigh-top band (hip-region stretched + folded tris over the leg ROM poses 409 → 94).
+  const { jointIndices, jointWeights } = (p.seamBlend ?? 0) > 0
+    ? smoothHipWeights({
+        vcount, indices: ac.idx, jointIndices: seamed.jointIndices, jointWeights: seamed.jointWeights, positions: ac.pos, stride: 3,
+        jointCount: JOINTS.length, hips: NAME_TO_IDX.get('hips')!, thighL: NAME_TO_IDX.get('upperleg_L')!, thighR: NAME_TO_IDX.get('upperleg_R')!,
+        sockY: wp[NAME_TO_IDX.get('upperleg_L')!][1], kneeY: wp[NAME_TO_IDX.get('lowerleg_L')!][1], hipsY: wp[NAME_TO_IDX.get('hips')!][1],
+      }, HIP_SMOOTH_ITERS, HIP_SMOOTH_LAMBDA)
+    : seamed;
 
   // ── skeleton arrays (identity rotations → inverse-bind is just translate(-worldPos)) ──
   const jc = JOINTS.length;
@@ -1182,37 +1482,23 @@ export function generateBodyResult(partial?: Partial<BodyParams>): GltfSkinnedRe
 }
 
 // ── Preset poses ────────────────────────────────────────────────────────────────
-// joint-name → local rotation quaternion [x,y,z,w], applied on top of the rest pose. Reference
-// the generator's joint names. ⚠ The ANGLES below are first-guesses (rotation axis/direction is
-// easy to get wrong without seeing it) — verify in-app and tweak this table. The apply-by-name
-// system (applyBodyPose3D) is the durable part; the numbers are just data.
+// joint-name → local rotation quaternion [x,y,z,w], applied on top of the rest pose. Arm poses are authored in
+// human terms (raise / forward / twist / elbow / wrist) via pose-authoring.ts — the old hand-typed quats were wrong in
+// ways only visible when rendered. Check any change with the pose preview report (pose-preview.test.ts).
 type Quat = [number, number, number, number];
 function qz(deg: number): Quat { const r = (deg*Math.PI)/360; return [0, 0, Math.sin(r), Math.cos(r)]; } // arms down/up (frontal)
-function qx(deg: number): Quat { const r = (deg*Math.PI)/360; return [Math.sin(r), 0, 0, Math.cos(r)]; } // tilt fwd/back
-function qy(deg: number): Quat { const r = (deg*Math.PI)/360; return [0, Math.sin(r), 0, Math.cos(r)]; } // swing fwd/back (elbow)
-function qmul(a: Quat, b: Quat): Quat { // a*b (applies b first, then a)
-  return [
-    a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1],
-    a[3]*b[1]-a[0]*b[2]+a[1]*b[3]+a[2]*b[0],
-    a[3]*b[2]+a[0]*b[1]-a[1]*b[0]+a[2]*b[3],
-    a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2],
-  ];
-}
 
+const toList = (r: Record<string, Quat>): { joint: string; q: Quat }[] => Object.entries(r).map(([joint, q]) => ({ joint, q }));
 export const BODY_POSES: Record<string, { joint: string; q: Quat }[]> = {
   'T-pose':  [],
   'A-pose':  [
     { joint: 'shoulder_L', q: qz(-50) },
     { joint: 'shoulder_R', q: qz(50)  },
   ],
-  // Natural relaxed stance: arms hang DOWN at the sides (hands by the thighs, NOT held out in front).
-  // Mostly-vertical shoulder (qz ±77, ~13° out from straight-down so they clear the hips) and a very soft
-  // elbow. No forward tilt — the old qx(-5) read as "arms rotated too far forward".
-  'Relaxed': [
-    { joint: 'shoulder_L', q: qz(-77) }, { joint: 'shoulder_R', q: qz(77) },
-    { joint: 'lowerarm_L', q: qy(-10) }, { joint: 'lowerarm_R', q: qy(10) }, // very soft elbow
-  ],
-  'Wave':    [
-    { joint: 'shoulder_R', q: qz(-120) }, { joint: 'lowerarm_R', q: qz(-25) },
-  ],
+  // Natural relaxed stance — see pose-authoring.relaxedStance (arms ~20° out, soft asymmetric elbows, forearms
+  // turned in, dropped shoulders). Rewritten 2026-09-28 from the old dead-straight qz(±77)/qy(±10) mannequin arms.
+  'Relaxed': toList(relaxedStance()),
+  // Right hand up in a wave: upper arm out a bit above horizontal, forearm UP (the old qz(-120) swung the whole arm
+  // past vertical, across the top of the head).
+  'Wave':    toList({ ...relaxedStance(), ...waveBody(), ...armPose(WAVE_ARM, 'R') }),
 };

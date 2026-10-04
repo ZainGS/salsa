@@ -15,8 +15,8 @@ import { Accum3D } from './meshbuild';
 import { mulberry } from './building-geom';
 import type { V3 } from './curve-frame';
 import {
-    emitBranch, emitCanopy, emitLeafCluster, emitHedgeShell, leafBudget, resolveBranch,
-    DEFAULT_CANOPY, DEFAULT_HEDGE_SHELL, DEFAULT_LEAF,
+    emitBranch, emitCanopy, emitClumpCrown, emitLeafCluster, emitHedgeShell, emitSprigCrown, leafBudget, resolveBranch,
+    DEFAULT_CANOPY, DEFAULT_CLUMP_CROWN, DEFAULT_HEDGE_SHELL, DEFAULT_LEAF, DEFAULT_SPRIG_CROWN, CLUMP_CARD_U0, MAX_CLUMP_CARDS_PER_PLANT,
     BRANCH_LOD_SCALE, LEAF_LOD_SCALE, MAX_LIMBS_PER_PLANT, MAX_LEAVES_PER_PLANT,
     type BranchSpec, type CanopySpec, type HedgeShellSpec,
 } from './branch';
@@ -476,6 +476,199 @@ describe('the four rebuilt WOODY archetypes (§4, P4)', () => {
                     expect(Math.abs(p[2]), type).toBeLessThanOrEqual(hz + 1e-6);
                 }
             }
+        }
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('emitSprigCrown — small leaf cards grown ON twigs (§3.6b)', () => {
+    /** A street-tree-sized skeleton (the `small-tree` recipe numbers at 7 m). */
+    const TREE = (): BranchSpec => resolveBranch({
+        levels: 3, splitCount: 3, splitCountVar: 1, splitAngle: 0.5, lengthDecay: 0.62, radiusDecay: 0.58,
+        length: 3.5, startRadius: 0.26, tipTaper: 0.6, gnarl: 0.4, wander: 0.42, upBias: 0.6, attachStart: 0.42,
+        segments: 5, sides: 5,
+    });
+    function crown(seed = 3) {
+        const wood = new Accum3D(), leaf = new Accum3D(), tip = new Accum3D();
+        const rnd = mulberry(seed);
+        const b = emitBranch(wood, TREE(), { base: [0, 0, 0] }, rnd);
+        const r = emitSprigCrown(wood, leaf, tip, b, DEFAULT_SPRIG_CROWN, rnd, [0, 0, 0], leafBudget(4200));
+        return { wood, leaf, tip, b, r };
+    }
+    /** Cards come out as 4 vertices each: base-left, base-right, top-right, top-left. */
+    const cards = (a: Accum3D): V3[][] => {
+        const p = points(a.geometry()), out: V3[][] = [];
+        for (let i = 0; i + 4 <= p.length; i += 4) out.push(p.slice(i, i + 4));
+        return out;
+    };
+    const segDist = (p: V3, a: V3, b: V3): number => {
+        const ab: V3 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        const L2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2] || 1e-12;
+        const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / L2));
+        return Math.hypot(p[0] - a[0] - ab[0] * t, p[1] - a[1] - ab[1] * t, p[2] - a[2] - ab[2] * t);
+    };
+
+    it('grows MANY SMALL cards (not a few half-metre leaves)', () => {
+        const { leaf, tip, r } = crown();
+        expect(r.cards).toBeGreaterThan(1200);
+        expect(tris(leaf.geometry()) + tris(tip.geometry())).toBe(r.cards * 2);   // 2 tris per card
+        for (const c of [...cards(leaf), ...cards(tip)]) {
+            const edge = Math.hypot(c[3][0] - c[0][0], c[3][1] - c[0][1], c[3][2] - c[0][2]);
+            expect(edge).toBeLessThan(DEFAULT_SPRIG_CROWN.cardSize * (1 + DEFAULT_SPRIG_CROWN.cardSizeVar) + 1e-6);
+        }
+    });
+
+    it('★ every card is ATTACHED — its stem sits on a twiglet or a limb, never floating beside one', () => {
+        const { wood, leaf, tip, b } = crown();
+        // Wood the leaves may hang from: every limb spine (sampled) + every twiglet ribbon (appended after the
+        // limb tubes as 4-vertex quads; its centreline runs base-midpoint → end-midpoint).
+        const segs: [V3, V3][] = [];
+        for (const sp of b.spines) {
+            let prev = sp.a;
+            for (let i = 1; i <= 12; i++) {
+                const t = i / 12, it = 1 - t;
+                const q: V3 = [0, 1, 2].map((k) => it * it * sp.a[k] + 2 * it * t * sp.c[k] + t * t * sp.e[k]) as V3;
+                segs.push([prev, q]); prev = q;
+            }
+        }
+        const limbVerts = new Accum3D();
+        emitBranch(limbVerts, TREE(), { base: [0, 0, 0] }, mulberry(3));
+        const wp = points(wood.geometry()).slice(limbVerts.vertCount);
+        const mid = (a: V3, c: V3): V3 => [(a[0] + c[0]) / 2, (a[1] + c[1]) / 2, (a[2] + c[2]) / 2];
+        for (let i = 0; i + 4 <= wp.length; i += 4) segs.push([mid(wp[i], wp[i + 1]), mid(wp[i + 2], wp[i + 3])]);
+        let worst = 0;
+        for (const c of [...cards(leaf), ...cards(tip)]) {
+            const base = mid(c[0], c[1]);
+            let d = Infinity;
+            for (const [s0, s1] of segs) d = Math.min(d, segDist(base, s0, s1));
+            worst = Math.max(worst, d);
+        }
+        // The stem is 12% of a card up from its base edge: ≤ ~3 cm off the wood it hangs from.
+        expect(worst).toBeLessThan(0.04);
+    });
+
+    it('is deterministic, and the crown fills OUT past the bare skeleton', () => {
+        const a = crown(5), c = crown(5);
+        expect(Array.from(a.leaf.geometry().vertices)).toEqual(Array.from(c.leaf.geometry().vertices));
+        expect(a.r.radius).toBeGreaterThan(a.b.radius);
+    });
+
+    it('LOD: fewer, larger cards — the crown keeps its coverage', () => {
+        const run = (lod: number) => {
+            const wood = new Accum3D(), leaf = new Accum3D(), rnd = mulberry(2);
+            const b = emitBranch(wood, { ...TREE(), lodLevel: lod }, { base: [0, 0, 0] }, rnd);
+            return emitSprigCrown(wood, leaf, null, b, { ...DEFAULT_SPRIG_CROWN, lodLevel: lod }, rnd, [0, 0, 0], leafBudget(4200));
+        };
+        const near = run(0), mid = run(1);
+        expect(mid.cards).toBeLessThan(near.cards);
+        expect(mid.cards).toBeGreaterThan(near.cards * 0.2);
+    });
+
+    it("`leafStyle: 'sprig'` routes a card-render small-tree through it: alpha-cut leafCard layers", () => {
+        const { layers } = buildFoliage({ type: 'small-tree', render: 'card', size: 7, leafStyle: 'sprig', seed: 4 });
+        const leafy = layers.filter((L) => /leaf|tip/.test(L.name));
+        expect(leafy.length).toBeGreaterThan(0);
+        for (const L of leafy) expect(L.leafCard, `${L.name} not alpha-cut`).toBe(true);
+        // …and the default (blade) path is untouched: real swept leaves are never alpha-cut.
+        const blade = buildFoliage({ type: 'small-tree', render: 'card', size: 7, seed: 4 }).layers.filter((L) => /leaf|tip/.test(L.name));
+        for (const L of blade) expect(L.leafCard).toBe(false);
+    });
+});
+
+describe('emitClumpCrown — a few dense cluster cards per clump, spherised normals (§3.6c, polish-round-3 T4)', () => {
+    const TREE = (over: Partial<BranchSpec> = {}): BranchSpec => resolveBranch({
+        levels: 3, splitCount: 3, splitCountVar: 1, splitAngle: 0.5, lengthDecay: 0.62, radiusDecay: 0.58,
+        length: 3.5, startRadius: 0.26, tipTaper: 0.6, gnarl: 0.4, wander: 0.42, upBias: 0.6, attachStart: 0.42,
+        segments: 5, sides: 5, ...over,
+    });
+    function crown(seed = 3, lod = 0) {
+        const wood = new Accum3D(), leaf = new Accum3D(), tip = new Accum3D();
+        const rnd = mulberry(seed);
+        const b = emitBranch(wood, TREE({ lodLevel: lod }), { base: [0, 0, 0] }, rnd);
+        const r = emitClumpCrown(leaf, tip, b, { ...DEFAULT_CLUMP_CROWN, lodLevel: lod }, rnd, [0, 0, 0], leafBudget(MAX_CLUMP_CARDS_PER_PLANT));
+        return { wood, leaf, tip, b, r };
+    }
+    /** Interleaved vertex attributes: position, normal, uv. */
+    const verts = (a: Accum3D): { p: V3; n: V3; uv: [number, number] }[] => {
+        const v = a.geometry().vertices, out: { p: V3; n: V3; uv: [number, number] }[] = [];
+        for (let i = 0; i + FLOATS <= v.length; i += FLOATS) out.push({ p: [v[i], v[i + 1], v[i + 2]], n: [v[i + 3], v[i + 4], v[i + 5]], uv: [v[i + 6], v[i + 7]] });
+        return out;
+    };
+
+    it('a MODERATE number of LARGE cards (not thousands of small ones), 2 tris each', () => {
+        const { leaf, tip, r } = crown();
+        expect(r.clumps).toBeGreaterThan(10);
+        expect(r.cards).toBe(r.clumps * DEFAULT_CLUMP_CROWN.cardsPerClump);
+        expect(r.cards).toBeLessThan(1200);                                          // the sprig crown's is > 1 200
+        expect(tris(leaf.geometry()) + tris(tip.geometry())).toBe(r.cards * 2);
+        // Cards are clump-sized: the edge is ~ cardScale × the fitted clump radius, tens of centimetres, not 0.1 m.
+        const all = [...verts(leaf), ...verts(tip)];
+        const edge = Math.hypot(all[1].p[0] - all[0].p[0], all[1].p[1] - all[0].p[1], all[1].p[2] - all[0].p[2]);
+        expect(edge).toBeGreaterThan(0.4);
+    });
+
+    it('marks every card as a CLUMP card through its UV range (u in [2, 3]) — no material flag bit needed', () => {
+        const { leaf, tip } = crown();
+        for (const v of [...verts(leaf), ...verts(tip)]) {
+            expect(v.uv[0]).toBeGreaterThanOrEqual(CLUMP_CARD_U0);
+            expect(v.uv[0]).toBeLessThanOrEqual(CLUMP_CARD_U0 + 1);
+            expect(v.uv[1]).toBeGreaterThanOrEqual(0);
+            expect(v.uv[1]).toBeLessThanOrEqual(1);
+        }
+    });
+
+    it('★ SPHERISED normals: they point OUT of the crown (one soft volume), not every which way', () => {
+        const { leaf, tip } = crown();
+        const all = [...verts(leaf), ...verts(tip)];
+        const c = all.reduce((a, v) => [a[0] + v.p[0], a[1] + v.p[1], a[2] + v.p[2]] as V3, [0, 0, 0] as V3).map((x) => x / all.length);
+        let sum = 0;
+        for (const v of all) {
+            const d: V3 = [v.p[0] - c[0], v.p[1] - c[1], v.p[2] - c[2]];
+            const L = Math.hypot(d[0], d[1], d[2]) || 1;
+            sum += (v.n[0] * d[0] + v.n[1] * d[1] + v.n[2] * d[2]) / L;
+        }
+        // Random card normals (what a card cloud has without the bend) average ~0 here; flipped-outward ~0.5.
+        expect(sum / all.length).toBeGreaterThan(0.6);
+    });
+
+    it('clumps sit AT the branch ends: every card is near a terminal limb', () => {
+        const { leaf, tip, b, r } = crown();
+        const ends = b.spines.filter((sp) => sp.terminal).flatMap((sp) => [0.4, 0.7, 1].map((t) => {
+            const it = 1 - t;
+            return [0, 1, 2].map((k) => it * it * sp.a[k] + 2 * it * t * sp.c[k] + t * t * sp.e[k]) as V3;
+        }));
+        let worst = 0;
+        for (const v of [...verts(leaf), ...verts(tip)]) {
+            let d = Infinity;
+            for (const e of ends) d = Math.min(d, Math.hypot(v.p[0] - e[0], v.p[1] - e[1], v.p[2] - e[2]));
+            worst = Math.max(worst, d);
+        }
+        expect(worst).toBeLessThan(r.clumpRadius * 2.6);
+    });
+
+    it('is deterministic, and fills OUT past the bare skeleton', () => {
+        const a = crown(5), c = crown(5);
+        expect(Array.from(a.leaf.geometry().vertices)).toEqual(Array.from(c.leaf.geometry().vertices));
+        expect(a.r.radius).toBeGreaterThan(a.b.radius);
+    });
+
+    it('LOD: a thinned skeleton grows fewer, BIGGER clumps — the crown keeps its coverage', () => {
+        const near = crown(3, 0), mid = crown(3, 1);
+        expect(mid.r.cards).toBeLessThan(near.r.cards);
+        expect(mid.r.clumpRadius).toBeGreaterThanOrEqual(near.r.clumpRadius);
+        // Coverage ~ Σ card area: the mid crown keeps a good share of the near one's.
+        const area = (x: ReturnType<typeof crown>) => x.r.cards * x.r.clumpRadius * x.r.clumpRadius;
+        expect(area(mid)).toBeGreaterThan(area(near) * 0.6);
+    });
+
+    it("`leafStyle: 'clump'` routes a card-render small-tree through it: alpha-cut, gently translucent leaf layers", () => {
+        const { layers } = buildFoliage({ type: 'small-tree', render: 'card', size: 7, leafStyle: 'clump', seed: 4 });
+        const leafy = layers.filter((L) => /leaf|tip/.test(L.name));
+        expect(leafy.length).toBeGreaterThan(0);
+        for (const L of leafy) {
+            expect(L.leafCard, `${L.name} not alpha-cut`).toBe(true);
+            // A crown VOLUME: "a little" translucency, well under the single-leaf-thick sprig's 0.72+.
+            expect(L.foliageShade!.translucency).toBeLessThan(0.5);
         }
     });
 });

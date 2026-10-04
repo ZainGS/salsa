@@ -196,6 +196,14 @@ export class DocumentPersistence {
    *  saveNow() bypasses it (a deliberate user/host save). */
   private busyPredicate: (() => boolean) | null = null;
   public setBusyPredicate(fn: (() => boolean) | null): void { this.busyPredicate = fn; }
+  /** A counter that moves whenever a busy period STARTS (e.g. the GPU device-loss count). A save whose gather spanned
+   *  a whole busy period (the device was lost AND recovered while it read back pixels, so later layers may have been
+   *  read from the new device's still-blank textures) is not written; it is deferred like a busy one. */
+  private busyEpoch: (() => number) | null = null;
+  public setBusyEpochProvider(fn: (() => number) | null): void { this.busyEpoch = fn; }
+  /** Called when an explicit save (saveNow) has to wait for the editor to go idle — for a host notice. */
+  private onDeferred: (() => void) | null = null;
+  public setDeferredCallback(fn: (() => void) | null): void { this.onDeferred = fn; }
 
   constructor(config?: Partial<AutoSaveConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -241,7 +249,7 @@ export class DocumentPersistence {
     this.attachFlushListeners();
     this.autoSaveTimer = setInterval(() => {
       if (this.busyPredicate?.()) return;   // e.g. Play mode active — don't persist a transient animation frame
-      this.triggerSave();
+      void this.triggerSave();
     }, this.config.intervalMs);
   }
 
@@ -285,7 +293,7 @@ export class DocumentPersistence {
       clearTimeout(this.strokeDebounceTimer);
     }
     this.strokeDebounceTimer = setTimeout(() => {
-      this.triggerSave();
+      void this.triggerSave();
       this.strokeDebounceTimer = null;
     }, this.config.strokeDebounceMs);
   }
@@ -302,9 +310,48 @@ export class DocumentPersistence {
     return this.executeSave();
   }
 
-  /** Force an immediate save (bypasses debounce and the busy predicate — but NOT suspend()/setSaveBlocked()). */
+  /** Force an immediate save (bypasses the debounce — but NOT suspend()/setSaveBlocked()). While the busy predicate
+   *  holds (Play / UI preview / Player mode) the save is DEFERRED until it clears and then runs once, so it persists
+   *  the restored EDITOR state instead of the in-game frame (bug-hunt 2026-10-01 D-P2). Deferring was chosen over
+   *  serializing the pre-Play state while playing: the in-game state is spread over transforms, visibility, loco
+   *  poses, script hides, the camera and UI vars, and rebuilding the editor view of all of it would duplicate every
+   *  Stop restore path (any one missed silently persists corruption). Stop already restores all of it, so saving
+   *  right after Stop reuses that one tested path. Calls made during one busy period share the same deferred save. */
   public async saveNow(): Promise<boolean> {
+    if (this.busyPredicate?.()) {
+      if (!this.deferred) { try { this.onDeferred?.(); } catch { /* host callback */ } }
+      return this.deferUntilIdle();
+    }
     return this.executeSave();
+  }
+
+  /** Poll interval for a deferred explicit save (see saveNow). */
+  private static readonly DEFER_POLL_MS = 250;
+  private deferred: { promise: Promise<boolean>; resolve: (ok: boolean) => void; timer: ReturnType<typeof setInterval> } | null = null;
+
+  /** One shared save that runs as soon as the busy predicate clears (D-P2). */
+  private deferUntilIdle(): Promise<boolean> {
+    if (this.deferred) return this.deferred.promise;
+    let resolve!: (ok: boolean) => void;
+    const promise = new Promise<boolean>((r) => { resolve = r; });
+    const timer = setInterval(() => {
+      if (this.busyPredicate?.()) return;
+      const d = this.deferred;
+      if (!d) return;
+      clearInterval(d.timer);
+      this.deferred = null;   // BEFORE the save — a new busy period during it gets its own deferral
+      this.executeSave().then(d.resolve, () => d.resolve(false));
+    }, DocumentPersistence.DEFER_POLL_MS);
+    this.deferred = { promise, resolve, timer };
+    return promise;
+  }
+
+  private cancelDeferred(): void {
+    const d = this.deferred;
+    if (!d) return;
+    clearInterval(d.timer);
+    this.deferred = null;
+    d.resolve(false);
   }
 
   // ── Load guard ────────────────────────────────────────────────────
@@ -343,20 +390,28 @@ export class DocumentPersistence {
       console.warn('[DocumentPersistence] Save skipped — saving is blocked:', this.saveBlockedReason);
       return false;
     }
-    const run = this.runSave();
+    let busyAfterGather = false;
+    const run = this.runSave(() => { busyAfterGather = true; });
     this.inFlight = run;
-    try { return await run; }
+    let ok: boolean;
+    try { ok = await run; }
     finally { if (this.inFlight === run) this.inFlight = null; }
+    // Play (etc.) started while the state was being gathered (the gather awaits pixel export before reading the 3D
+    // scene) → nothing was written; save again once it ends (D-P2). Outside inFlight, so no self-wait.
+    return busyAfterGather ? this.deferUntilIdle() : ok;
   }
 
-  private async runSave(): Promise<boolean> {
+  private async runSave(onBusy: () => void): Promise<boolean> {
     if (!this.getDocumentState || !isOPFSAvailable()) return false;
 
     this.isSaving = true;
     this.onSaveStart?.();
 
     try {
+      const epoch0 = this.busyEpoch?.();
       const payload = await this.getDocumentState();
+      if (this.busyPredicate?.()) { onBusy(); return false; }   // in-game frame — never write it (D-P2)
+      if (this.busyEpoch && this.busyEpoch() !== epoch0) { onBusy(); return false; }   // a busy period came and went mid-gather
       await withDocLock(payload.manifest.docId, () => this.writeToOPFS(payload));
       payload._onWriteComplete?.();
       this.onSaveComplete?.(true);
@@ -707,6 +762,7 @@ export class DocumentPersistence {
 
   public destroy(): void {
     this.stopAutoSave();
+    this.cancelDeferred();
     if (this.strokeDebounceTimer !== null) {
       clearTimeout(this.strokeDebounceTimer);
     }

@@ -48,6 +48,51 @@ export interface OrbitControllerConfig {
   freeLookNav?: boolean;
 }
 
+/** Result of one wheel-dolly step: the new orbit radius + how far to PUSH the orbit target forward along the view
+ *  (dolly-through). See {@link wheelDollyStep}. */
+export interface WheelDollyResult { radius: number; push: number }
+
+/**
+ * One wheel-dolly step (T7.1). Classic mode (`dollyThrough` false) = the old behaviour: radius × (1 ± zoomSpeed),
+ * clamped to [minRadius, maxRadius] — multiplicative, so each step toward the target covers LESS distance and the
+ * zoom asymptotically "slows down" as you approach the pivot (fine for inspecting one object).
+ * DOLLY-THROUGH (free 3D / City): the camera advance per step is `max(radius, floor) × zoomSpeed` — multiplicative
+ * while far (fast across big distances), CONSTANT once within `floor` of the pivot, where the pivot itself is pushed
+ * forward (`push`) so the camera keeps flying at the same rate instead of stalling. The camera never slows down and
+ * there's no near limit; the far limit is `maxRadius` (set huge for an effectively unbounded free view).
+ */
+export function wheelDollyStep(radius: number, delta: 1 | -1, zoomSpeed: number, minRadius: number, maxRadius: number,
+    dollyThrough: boolean, floor: number): WheelDollyResult {
+    if (delta > 0 || !dollyThrough) {
+        const r = radius * (1 + delta * zoomSpeed);
+        return { radius: Math.max(minRadius, Math.min(maxRadius, r)), push: 0 };
+    }
+    const f = Math.max(minRadius, floor);
+    const advance = Math.max(radius, f) * zoomSpeed;          // camera travel this step (never shrinks below f × speed)
+    const newR = Math.max(f, radius - advance);               // shrink the orbit radius down to the floor…
+    const push = advance - (radius - newR);                   // …and carry the rest by moving the pivot forward
+    return { radius: Math.min(maxRadius, newR), push: Math.max(0, push) };
+}
+
+/** Convert one wheel event into whole dolly steps (+ = out, − = in), accumulating small deltas on `st._wheelAcc`.
+ *  deltaMode 1 = lines (×33 px), 2 = pages (×400 px). |delta| < 0.5 px is ignored entirely (jitter / a pure
+ *  horizontal scroll), and the accumulator resets when the direction flips. One mouse notch (~100 px) = 1 step; a
+ *  single event is capped at 3 steps so a flick doesn't teleport the camera. */
+export function wheelSteps(st: { _wheelAcc: number }, deltaY: number, deltaMode = 0): number {
+  const px = deltaY * (deltaMode === 1 ? 33 : deltaMode === 2 ? 400 : 1);
+  if (!Number.isFinite(px) || Math.abs(px) < 0.5) return 0;
+  if (st._wheelAcc !== 0 && Math.sign(st._wheelAcc) !== Math.sign(px)) st._wheelAcc = 0;
+  st._wheelAcc += px;
+  const NOTCH = 100;
+  let n = Math.trunc(st._wheelAcc / NOTCH);
+  // A discrete mouse notch (|px| ≥ ~50 in one event) always gives at least one step, like before.
+  if (n === 0 && Math.abs(px) >= 50) n = Math.sign(px);
+  n = Math.max(-3, Math.min(3, n));
+  st._wheelAcc -= n * NOTCH;
+  if (Math.sign(st._wheelAcc) !== Math.sign(px)) st._wheelAcc = 0;   // an overshooting notch doesn't bank a reverse step
+  return n;
+}
+
 export class OrbitController {
   readonly camera: Camera3D;
 
@@ -68,6 +113,13 @@ export class OrbitController {
   dampingFactor: number;
 
   enabled = true;
+  /** T7.1 DOLLY-THROUGH wheel (free 3D / City): constant-rate zoom that pushes the pivot forward instead of
+   *  stalling at it (see {@link wheelDollyStep}). Off = the classic multiplicative, pivot-clamped dolly. */
+  dollyThrough = false;
+  /** Radius below which a dolly-through step stops shrinking the orbit and pushes the pivot instead. The host sets
+   *  it from the framed content (Scene3DManager: 10% of the content radius); 0 = auto (5% of the camera's
+   *  `sceneRadius`; ≥ minRadius). */
+  dollyFloor = 0;
   altOrbitOnly: boolean;
   /** Unity-style flythrough scheme (free3D + Scene). See OrbitControllerConfig.freeLookNav. */
   freeLookNav: boolean;
@@ -260,9 +312,29 @@ export class OrbitController {
     if (this.camera.mode === 'orthographic') return;
     if (this.altOrbitOnly && !e.altKey) return;
     e.preventDefault();
-    const delta = e.deltaY > 0 ? 1 : -1;
-    this.radius *= (1 + delta * this.zoomSpeed);
-    this.radius = Math.max(this.minRadius, Math.min(this.maxRadius, this.radius));
+    // ★ Only a real VERTICAL scroll dollies. The old `deltaY > 0 ? 1 : -1` turned every deltaY === 0 event —
+    //   horizontal tilt / trackpad sideways jitter / inertial tails, which some devices stream continuously while
+    //   the cursor is over the canvas — into a zoom-IN step; with the endless dolly-through (T7.1) that flew the
+    //   free-3D camera forward forever. Small trackpad deltas ACCUMULATE into whole steps (one mouse notch ≈ 100).
+    const steps = wheelSteps(this, e.deltaY, e.deltaMode);
+    for (let i = 0; i < Math.abs(steps); i++) this.dolly(steps > 0 ? 1 : -1);
+  }
+  /** Accumulated sub-step wheel delta (trackpads send many small deltas); see {@link wheelSteps}. */
+  _wheelAcc = 0;
+
+  /** One wheel-dolly step (+1 = out, −1 = in) — the wheel handler's body, public so hosts/tests can drive it. */
+  dolly(delta: 1 | -1): void {
+    const floor = this.dollyFloor > 0 ? this.dollyFloor : Math.max(this.minRadius, (this.camera.sceneRadius || 10) * 0.05);
+    const r = wheelDollyStep(this.radius, delta, this.zoomSpeed, this.minRadius, this.maxRadius, this.dollyThrough, floor);
+    if (r.push > 0) {
+      // Dolly-through: move the pivot forward along the view ray (the camera follows at the new radius).
+      const t = this.camera.target, p = this.camera.position;
+      let fx = t[0] - p[0], fy = t[1] - p[1], fz = t[2] - p[2];
+      const len = Math.hypot(fx, fy, fz) || 1;
+      fx /= len; fy /= len; fz /= len;
+      this.camera.setTarget(t[0] + fx * r.push, t[1] + fy * r.push, t[2] + fz * r.push);
+    }
+    this.radius = r.radius;
     this.applySpherical();
     this.onChange?.();   // wheel dolly has no momentum → must request a frame or the zoom won't draw until a mouse-move
   }

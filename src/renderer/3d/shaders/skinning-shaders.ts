@@ -19,6 +19,7 @@
  * reused directly — they only reference groups 0 and 1 (textures).
  */
 
+import { SKIN_BLEND_WGSL } from '../dual-quat-skin';
 import { STYLE_WGSL_FUNCTIONS } from './style-shaders';
 
 // ── Shared WGSL snippets ────────────────────────────────────────────────────
@@ -59,6 +60,7 @@ struct SceneUniforms {
   lightCounts:      vec4<f32>,
   pointLights:      array<vec4<f32>, 32>,
   skinRampParams:   vec4<f32>,   // skin toon-ramp: .x=bands .y=softness .z=shadowFloor .w=tint rgb packed 8:8:8
+  styleParams:      vec4<f32>,   // render-style knobs: .x = Sketch paper amount
 };
 `;
 
@@ -126,11 +128,7 @@ const SKINNED_VS_BODY = /* wgsl */`
   let inst = u_instances[idx];
 
   // Linear Blend Skinning: blend 4 joint matrices
-  let skinMat =
-    in.weights.x * skinMatrices[in.joints.x] +
-    in.weights.y * skinMatrices[in.joints.y] +
-    in.weights.z * skinMatrices[in.joints.z] +
-    in.weights.w * skinMatrices[in.joints.w];
+  let skinMat = skinMatrixFor(in.joints, in.weights);
 
   let skinnedPos4   = skinMat * vec4<f32>(in.position, 1.0);
   let skinnedNorm   = (skinMat * vec4<f32>(in.normal, 0.0)).xyz;
@@ -139,7 +137,16 @@ const SKINNED_VS_BODY = /* wgsl */`
   let worldPos4   = inst.modelMatrix * skinnedPos4;
   let worldNormal = normalize((inst.normalMatrix * vec4<f32>(skinnedNorm, 0.0)).xyz);
 
-  var clipPos = scene.viewProjection * worldPos4;
+  // FACE KIT depth pull (flags2 bit 6, amount = normalMatrix column 3 .z in local units, scaled by the skin + model
+  // matrix): slide the vertex toward the eye along its own view ray, so the screen position is unchanged but the depth
+  // is nearer, and the brow overlay draws through the hair fringe just in front of it. Ortho = the constant forward.
+  var clipSrc = worldPos4;
+  if ((u32(inst.normalMatrix[3].x) & 64u) != 0u) {
+    let pullScale = length((skinMat * vec4<f32>(1.0, 0.0, 0.0, 0.0)).xyz) * length(inst.modelMatrix[0].xyz);
+    let toEye = select(normalize(scene.cameraPosition.xyz - worldPos4.xyz), -normalize(vec3<f32>(scene.viewProjection[0].z, scene.viewProjection[1].z, scene.viewProjection[2].z)), scene.cameraPosition.w > 0.5);
+    clipSrc = vec4<f32>(worldPos4.xyz + toEye * (inst.normalMatrix[3].z * pullScale), 1.0);
+  }
+  var clipPos = scene.viewProjection * clipSrc;
 
   let jitter   = scene.ps1Config.x;
   let gridSize = scene.ps1Config.y;
@@ -164,7 +171,7 @@ const SKINNED_VS_BODY = /* wgsl */`
   let spec = pow(max(dot(worldNormal, H), 0.0), max(shininess, 1.0));
   lit += inst.specularColor.rgb * scene.lightColor.rgb * spec;
   lit += inst.emissiveColor.rgb;
-  let colorDepth = scene.ps1Config.w;
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = quantizeColor(lit, colorDepth); }
 
   // TBN
@@ -214,6 +221,7 @@ ${SKINNED_INPUT_WGSL}
 @group(0) @binding(0) var<storage, read> u_instances: array<MeshInstance>;
 @group(0) @binding(1) var<uniform>       scene:       SceneUniforms;
 @group(2) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
+${SKIN_BLEND_WGSL}
 
 @vertex
 fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32) -> VertexOutput {
@@ -236,6 +244,7 @@ ${SKINNED_INPUT_WGSL}
 @group(0) @binding(0) var<storage, read> u_instances: array<MeshInstance>;
 @group(0) @binding(1) var<uniform>       scene:       SceneUniforms;
 @group(1) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
+${SKIN_BLEND_WGSL}
 
 @vertex
 fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32) -> VertexOutput {
@@ -260,6 +269,7 @@ ${SKINNED_INPUT_WGSL}
 @group(0) @binding(0) var<storage, read> u_instances:   array<MeshInstance>;
 @group(0) @binding(1) var<uniform>       scene:         SceneUniforms;
 @group(1) @binding(0) var<storage, read> skinMatrices:  array<mat4x4<f32>>;
+${SKIN_BLEND_WGSL}
 @group(2) @binding(0) var<storage, read> vertexColors:  array<vec4<f32>>;
 
 @vertex
@@ -267,11 +277,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   let inst  = u_instances[idx];
   let vcol  = vertexColors[vertIdx];
 
-  let skinMat =
-    in.weights.x * skinMatrices[in.joints.x] +
-    in.weights.y * skinMatrices[in.joints.y] +
-    in.weights.z * skinMatrices[in.joints.z] +
-    in.weights.w * skinMatrices[in.joints.w];
+  let skinMat = skinMatrixFor(in.joints, in.weights);
 
   let skinnedPos4   = skinMat * vec4<f32>(in.position, 1.0);
   let skinnedNorm   = (skinMat * vec4<f32>(in.normal, 0.0)).xyz;
@@ -292,7 +298,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   let L = normalize(-scene.lightDirection.xyz);
   let NdotL = max(dot(worldNormal, L), 0.0);
   lit += vcol.rgb * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
-  let colorDepth = scene.ps1Config.w;
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = quantizeColor(lit, colorDepth); }
 
   let worldTangent3 = normalize((inst.normalMatrix * vec4<f32>(skinnedTanXYZ, 0.0)).xyz);
@@ -325,6 +331,7 @@ ${SKINNED_INPUT_WGSL}
 @group(0) @binding(0) var<storage, read> u_instances:   array<MeshInstance>;
 @group(0) @binding(1) var<uniform>       scene:         SceneUniforms;
 @group(1) @binding(0) var<storage, read> skinMatrices:  array<mat4x4<f32>>;
+${SKIN_BLEND_WGSL}
 @group(2) @binding(0) var<storage, read> vertexColors:  array<vec4<f32>>;
 
 @vertex
@@ -332,11 +339,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   let inst  = u_instances[idx];
   let vcol  = vertexColors[vertIdx];
 
-  let skinMat =
-    in.weights.x * skinMatrices[in.joints.x] +
-    in.weights.y * skinMatrices[in.joints.y] +
-    in.weights.z * skinMatrices[in.joints.z] +
-    in.weights.w * skinMatrices[in.joints.w];
+  let skinMat = skinMatrixFor(in.joints, in.weights);
 
   let skinnedPos4   = skinMat * vec4<f32>(in.position, 1.0);
   let skinnedNorm   = (skinMat * vec4<f32>(in.normal, 0.0)).xyz;

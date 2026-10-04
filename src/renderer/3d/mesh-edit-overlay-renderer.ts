@@ -18,6 +18,7 @@
  *   // overlay draws automatically each frame when data provider returns non-null
  */
 
+import { PipelineSet, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { GIZMO_VERTEX_SHADER, GIZMO_FRAGMENT_SHADER, GIZMO_VERTEX_STRIDE, GIZMO_UNIFORM_SIZE } from './shaders/gizmo-shaders';
 import type { Camera3D } from './camera-3d';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
@@ -73,9 +74,11 @@ export interface MeshEditDrawData {
 export class MeshEditOverlayRenderer {
   private readonly device: GPUDevice;
   private readonly _bgl:           GPUBindGroupLayout;
-  private readonly _triPipe:       GPURenderPipeline;
-  private readonly _linePipe:      GPURenderPipeline;
-  private readonly _lineRearPipe:  GPURenderPipeline;
+  // P2: non-blocking cache handles; draw() is skipped until all three compiled.
+  private readonly _pipes: PipelineSet;
+  private readonly _triPipe:       PipelineHandle<GPURenderPipeline>;
+  private readonly _linePipe:      PipelineHandle<GPURenderPipeline>;
+  private readonly _lineRearPipe:  PipelineHandle<GPURenderPipeline>;
   private readonly _uniBuf:    GPUBuffer;
 
   private _triBuf:  GPUBuffer | null = null;
@@ -97,6 +100,7 @@ export class MeshEditOverlayRenderer {
 
   constructor(device: GPUDevice, swapChainFormat: GPUTextureFormat) {
     this.device  = device;
+    this._pipes = new PipelineSet(device);
     this._uniBuf = device.createBuffer({
       size:  GIZMO_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -143,12 +147,12 @@ export class MeshEditOverlayRenderer {
       depthCompare: 'always',
     };
 
-    this._triPipe = device.createRenderPipeline({
+    this._triPipe = this._pipes.render({ label: 'MeshEditTri',
       layout, vertex: vertState, fragment: fragState, depthStencil,
       primitive: { topology: 'triangle-list', cullMode: 'none' },
     });
 
-    this._linePipe = device.createRenderPipeline({
+    this._linePipe = this._pipes.render({ label: 'MeshEditLine',
       layout, vertex: vertState, fragment: fragState, depthStencil,
       primitive: { topology: 'line-list', cullMode: 'none' },
     });
@@ -156,7 +160,7 @@ export class MeshEditOverlayRenderer {
     // Rear-edge pipeline: only fires where fragment depth > scene depth (edge is occluded).
     // Uses a diagonal stipple pattern to clearly distinguish hidden edges from visible ones.
     const rearFragMod = device.createShaderModule({ code: REAR_EDGE_FRAG_SHADER });
-    this._lineRearPipe = device.createRenderPipeline({
+    this._lineRearPipe = this._pipes.render({ label: 'MeshEditLineRear',
       layout,
       vertex: vertState,
       fragment: {
@@ -181,6 +185,7 @@ export class MeshEditOverlayRenderer {
   // ── Main draw call ────────────────────────────────────────────────────────
 
   draw(pass: GPURenderPassEncoder, data: MeshEditDrawData, camera: Camera3D): void {
+    if (!this._pipes.ready()) return;   // P2: overlay appears once its pipelines compiled
     const { mesh, selection, mode } = data;
     const em = mesh.editMesh;
     if (!em) return;
@@ -314,7 +319,7 @@ export class MeshEditOverlayRenderer {
       }
       this._triScratch.set(triV);
       this.device.queue.writeBuffer(this._triBuf, 0, this._triScratch, 0, triV.length);
-      pass.setPipeline(this._triPipe);
+      pass.setPipeline(this._triPipe.get()!);
       pass.setBindGroup(0, this._uniBG);   // cached — uniform buffer never recreated
       pass.setVertexBuffer(0, this._triBuf);
       pass.draw(triV.length / 7);
@@ -336,13 +341,13 @@ export class MeshEditOverlayRenderer {
       this.device.queue.writeBuffer(this._lineBuf, 0, this._lineScratch, 0, lineV.length);
 
       // Front/visible edges — always-on-top solid lines (existing behaviour).
-      pass.setPipeline(this._linePipe);
+      pass.setPipeline(this._linePipe.get()!);
       pass.setBindGroup(0, this._uniBG);   // cached — uniform buffer never recreated
       pass.setVertexBuffer(0, this._lineBuf);
       pass.draw(lineV.length / 7);
 
       // Rear/occluded edges — stippled dashes only where depth test fails.
-      pass.setPipeline(this._lineRearPipe);
+      pass.setPipeline(this._lineRearPipe.get()!);
       pass.setBindGroup(0, this._uniBG);
       pass.setVertexBuffer(0, this._lineBuf);
       pass.draw(lineV.length / 7);

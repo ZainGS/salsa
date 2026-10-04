@@ -54,6 +54,10 @@ export class InteractionService {
     isPanToolSelected: boolean = false;
     /** When true, the 2D box-select drag is suppressed (e.g. during 3D armature / weight paint mode). */
     suppressBoxSelect: boolean = false;
+    /** Round 8: true while 3D PLAY MODE runs (Scene3DManager enter/exitPlayMode3D). Every editor keyboard shortcut and
+     *  2D pointer interaction is off while it holds (the UI system's own hooks still run), and the editor overlays
+     *  (selection box / gizmo / bone overlay / snap viz / camera frustum / emitter icons) are not drawn. */
+    playActive: boolean = false;
     /**
      * 3D CLICK-PICK suppression predicate. While set, a left-click pick that lands on a mesh for
      * which this returns true is IGNORED by click-to-select (TransformController3D) — the click

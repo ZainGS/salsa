@@ -53,12 +53,35 @@ export interface StreamSource<H = unknown> {
      *  burn throughput on tiles that left the window before their build starts. Cap ≈ the worker pool size so the
      *  queue stays on the manager (nearest-first, re-prioritised each reconcile) instead of FIFO inside the pool. */
     readonly maxConcurrentBuilds?: number;
+    /** OPTIONAL (P10.D6): keys in a second concurrency class — CHEAP builds with their own in-flight cap
+     *  (`maxConcurrentCheap`, default = maxConcurrentBuilds). A full queue at its cap then never starves them (the
+     *  city's flat tiles used to wait seconds behind 2-4 s full builds while flying), and vice versa. Absent = one class. */
+    isCheapKey?(key: StreamKey): boolean;
+    readonly maxConcurrentCheap?: number;
+    /** OPTIONAL (P17): the FULL class's in-flight cap given how many cheap keys wait in the queue. A source whose cheap
+     *  tier must keep up with a fast camera (the city's HLOD skyline) lends it full-build slots while the backlog
+     *  lasts. Absent = maxConcurrentBuilds. */
+    fullCapFor?(cheapQueued: number): number;
+    /** OPTIONAL (P20): does the in-flight async build of `key` still hold its build slot? A source whose builds have a
+     *  worker phase and then a main-thread reassembly phase (the city) frees the slot for the next build when the
+     *  worker part is done. Absent = every in-flight key holds a slot until it resolves. */
+    holdsWorker?(key: StreamKey): boolean;
     /** Realise one chunk at full detail. May be SYNCHRONOUS (returns the handle) or ASYNCHRONOUS (returns a
      *  Promise — e.g. offloading generation to a Worker pool). The manager tracks in-flight async builds and
      *  discards a result whose chunk left the window before it resolved. Keep a synchronous call short. */
     build(key: StreamKey): H | Promise<H>;
-    /** Free one chunk — remove its geometry from the scene and drop any caches it owns. */
-    dispose(key: StreamKey, handle: H): void;
+    /** Free one chunk — remove its geometry from the scene and drop any caches it owns. `preview` = the handle is the
+     *  PREVIEW stand-in, not the key's own build (P10: the city used to cache a dropped flat preview as the FULL tile,
+     *  so a tile that left the window before its upgrade landed came back flat for good). */
+    dispose(key: StreamKey, handle: H, preview?: boolean): void;
+    /** OPTIONAL (performance-plan P10.B5): cancel the in-flight async build of a chunk that LEFT the target. Return
+     *  true when it was cancelled — the manager then frees its in-flight slot at once (the build's late result, if any,
+     *  is discarded by its dispatch token) instead of holding the slot for the seconds a stale build still runs. */
+    cancel?(key: StreamKey): boolean;
+    /** OPTIONAL (performance-plan P17): a tier swap of a chunk landed — `next` (the new key's first build) replaces the
+     *  held old-tier `prev`. Return true to take over `prev`'s disposal (the source dissolves the swap and calls its own
+     *  dispose once done); false / absent = `prev` is disposed now (the old behaviour). */
+    crossFade?(prevKey: StreamKey, prev: H, prevPreview: boolean, nextKey: StreamKey, next: H): boolean;
     /** Called after each async build slice (e.g. request a render). Optional. */
     onProgress?(): void;
     /** Called once the build queue drains (e.g. recache bounds / reframe). NOT called on the headless path
@@ -74,14 +97,21 @@ interface LiveChunk<H> { handle: H; full: boolean }
 /** The generic streaming loop: a live cache + a two-phase async build queue (preview → full) + the reconcile diff,
  *  driven by a StreamSource. Sources without `buildPreview` collapse to a single full-build pass (unchanged). */
 export class StreamManager<H = unknown> {
+    /** P10.D7 A/B: a chunk whose old-tier handle is held by a tier flip skips its preview (see reconcile). */
+    static heldAsPreview = true;
+    /** P17 A/B: a tier swap may be dissolved by the source (StreamSource.crossFade). false = the swap disposes at once. */
+    static crossFade = true;
     private readonly _live = new Map<StreamKey, LiveChunk<H>>();
     private _previewQueue: StreamKey[] = [];   // fast coarse builds (drained first → the window fills instantly)
     private _fullQueue: StreamKey[] = [];      // full-detail upgrades (drained after previews)
-    private readonly _inflight = new Set<StreamKey>();   // async full builds dispatched, awaiting resolve
+    // async full builds dispatched, awaiting resolve: key → dispatch TOKEN (bug-hunt 2026-10-01 D-W4 — a result from an
+    // older dispatch of the same key, e.g. one that outlived clear(), must not clear the newer entry or go live)
+    private readonly _inflight = new Map<StreamKey, number>();
+    private _inflightToken = 0;
     private _wanted = new Set<StreamKey>();     // the current target set — an async result for a key not here is discarded
     // Tier-flip hold (chunkId sources): newKey → the OLD tier's still-visible handle, disposed when newKey's first
     // build lands. Keeps a tile from blinking out for the frames between "reconcile re-keyed it" and "rebuilt".
-    private readonly _replacing = new Map<StreamKey, { key: StreamKey; handle: H }>();
+    private readonly _replacing = new Map<StreamKey, { key: StreamKey; handle: H; preview: boolean }>();
     private _alt = false;   // preview/full alternation cursor (neither pass may starve the other during a long pan)
     private _raf = 0;
 
@@ -111,15 +141,20 @@ export class StreamManager<H = unknown> {
             const nk = idToNew?.get(this.source.chunkId!(key));
             if (nk !== undefined && !this._replacing.has(nk)) {
                 this._live.delete(key);
-                this._replacing.set(nk, { key, handle: chunk.handle });
+                this._replacing.set(nk, { key, handle: chunk.handle, preview: !chunk.full });
                 continue;
             }
-            this.source.dispose(key, chunk.handle);
+            this.source.dispose(key, chunk.handle, !chunk.full);
             this._live.delete(key);
         }
         // Held handles whose replacement key left the target are orphans — dispose them now.
         for (const [nk, r] of [...this._replacing]) {
-            if (!want.has(nk)) { this.source.dispose(r.key, r.handle); this._replacing.delete(nk); }
+            if (!want.has(nk)) { this.source.dispose(r.key, r.handle, r.preview); this._replacing.delete(nk); }
+        }
+        // P10.B5: async builds of chunks that left the target — cancel them and free their slots (the cap would
+        // otherwise hold the freshly-wanted chunks back behind seconds of stale work after every pan).
+        if (this.source.cancel) for (const key of [...this._inflight.keys()]) {
+            if (!want.has(key) && this.source.cancel(key)) this._inflight.delete(key);
         }
         const canPreview = !!this.source.buildPreview;
         this._previewQueue = [];
@@ -128,7 +163,9 @@ export class StreamManager<H = unknown> {
             if (this._inflight.has(key)) continue;               // an async full build is already in progress
             const e = this._live.get(key);
             if (e) { if (!e.full) this._fullQueue.push(key); }   // preview shown → still needs the full upgrade
-            else if (canPreview && (this.source.canPreviewKey?.(key) ?? true)) this._previewQueue.push(key);
+            // P10.D7: a tier flip already HOLDS the chunk's old-tier geometry on screen (e.g. the flat tile a moving
+            // window just promoted to full) — that IS the stand-in, so building a preview of it again is pure waste.
+            else if (canPreview && !(StreamManager.heldAsPreview && this._replacing.has(key)) && (this.source.canPreviewKey?.(key) ?? true)) this._previewQueue.push(key);
             else this._fullQueue.push(key);                      // preview-ineligible or unsupported → straight to full
         }
         this._pump();
@@ -161,18 +198,39 @@ export class StreamManager<H = unknown> {
      *  additionally gated on the async in-flight cap — at the cap, the queue waits ON THE MANAGER (nearest-first,
      *  re-prioritised each reconcile) instead of flooding the worker pool with soon-stale FIFO work. */
     private _buildOne(): boolean {
-        const cap = this.source.maxConcurrentBuilds ?? Infinity;
-        const fullOk = this._fullQueue.length > 0 && this._inflight.size < cap;
+        const fi = this._nextDispatchable();
+        const fullOk = fi >= 0;
         const prevOk = this._previewQueue.length > 0;
         if (prevOk && fullOk) {
             this._alt = !this._alt;
             if (this._alt) this._buildPreview(this._previewQueue.shift()!);
-            else this._buildFull(this._fullQueue.shift()!);
+            else this._buildFull(this._fullQueue.splice(fi, 1)[0]);
             return true;
         }
         if (prevOk) { this._buildPreview(this._previewQueue.shift()!); return true; }
-        if (fullOk) { this._buildFull(this._fullQueue.shift()!); return true; }
+        if (fullOk) { this._buildFull(this._fullQueue.splice(fi, 1)[0]); return true; }
         return false;   // nothing buildable (empty, or fulls capped) — the rAF loop idles until inflight resolves
+    }
+
+    /** Index of the first full-queue key whose concurrency class has a free in-flight slot (nearest-first order is
+     *  kept within each class), or -1. One class (no `isCheapKey`) = the head, while in-flight < the cap. */
+    private _nextDispatchable(): number {
+        const q = this._fullQueue;
+        if (!q.length) return -1;
+        const cap = this.source.maxConcurrentBuilds ?? Infinity;
+        const isCheap = this.source.isCheapKey, holds = this.source.holdsWorker;
+        // P20: an in-flight key whose source says it no longer holds its slot (worker done, reassembling) is not counted
+        let busy = this._inflight.size;
+        if (holds) { busy = 0; for (const k of this._inflight.keys()) if (holds.call(this.source, k)) busy++; }
+        if (!isCheap) return busy < cap ? 0 : -1;
+        let cheapIn = 0;
+        for (const k of this._inflight.keys()) if (isCheap.call(this.source, k) && (!holds || holds.call(this.source, k))) cheapIn++;
+        let fullCap = cap;
+        if (this.source.fullCapFor) { let cq = 0; for (const k of q) if (isCheap.call(this.source, k)) cq++; fullCap = this.source.fullCapFor(cq); }
+        const fullFree = busy - cheapIn < fullCap, cheapFree = cheapIn < (this.source.maxConcurrentCheap ?? cap);
+        if (!fullFree && !cheapFree) return -1;
+        for (let i = 0; i < q.length; i++) if (isCheap.call(this.source, q[i]) ? cheapFree : fullFree) return i;
+        return -1;
     }
 
     private _buildPreview(key: StreamKey): void {
@@ -194,11 +252,15 @@ export class StreamManager<H = unknown> {
         try { r = this.source.build(key); } catch { return; }   // unbuildable now (e.g. params gone) → reconcile retries
         if (r && typeof (r as { then?: unknown }).then === 'function') {
             // ASYNC (e.g. worker-generated): track it; the preview stays shown until it resolves.
-            this._inflight.add(key);
-            (r as Promise<H>).then(h => this._onFullDone(key, h), () => { this._inflight.delete(key); this._repumpIfIdle(); });
+            const token = ++this._inflightToken;
+            this._inflight.set(key, token);
+            (r as Promise<H>).then(h => this._onFullDone(key, h, token), () => {
+                if (this._inflight.get(key) === token) this._inflight.delete(key);   // an older dispatch never frees a newer one
+                this._repumpIfIdle();
+            });
         } else {
             // SYNC (unchanged path — headless / no-worker / non-city sources).
-            if (prev && !prev.full) this.source.dispose(key, prev.handle);
+            if (prev && !prev.full) this.source.dispose(key, prev.handle, true);
             this._live.set(key, { handle: r as H, full: true });
             this._completeReplace(key);
         }
@@ -207,11 +269,12 @@ export class StreamManager<H = unknown> {
     /** An async full build resolved. Discard it if the chunk left the window while building; else swap out the
      *  preview and mark it full. The pump's rAF loop stays alive while `_inflight` is non-empty, so it renders the
      *  new geometry on its next tick and fires onDrained once everything settles. */
-    private _onFullDone(key: StreamKey, h: H): void {
+    private _onFullDone(key: StreamKey, h: H, token: number): void {
+        if (this._inflight.get(key) !== token) { this.source.dispose(key, h); this._repumpIfIdle(); return; }   // stale generation (D-W4)
         this._inflight.delete(key);
         if (!this._wanted.has(key)) { this.source.dispose(key, h); this._repumpIfIdle(); return; }   // left the window mid-build → discard
         const prev = this._live.get(key);
-        if (prev && !prev.full) this.source.dispose(key, prev.handle);
+        if (prev && !prev.full) this.source.dispose(key, prev.handle, true);
         this._live.set(key, { handle: h, full: true });
         this._completeReplace(key);
         this.source.onProgress?.();
@@ -221,7 +284,11 @@ export class StreamManager<H = unknown> {
     /** A tier-flip replacement's first build just landed — dispose the held old-tier handle (the swap). */
     private _completeReplace(key: StreamKey): void {
         const r = this._replacing.get(key);
-        if (r) { this._replacing.delete(key); this.source.dispose(r.key, r.handle); }
+        if (!r) return;
+        this._replacing.delete(key);
+        const next = this._live.get(key);
+        if (StreamManager.crossFade && next && this.source.crossFade?.(r.key, r.handle, r.preview, key, next.handle)) return;   // P17: the source disposes it after the fade
+        this.source.dispose(r.key, r.handle, r.preview);
     }
 
     /** Kick the pump when work remains but no loop is running — the headless path has no rAF loop to resume the
@@ -240,13 +307,28 @@ export class StreamManager<H = unknown> {
         this._fullQueue = [];
         this._inflight.clear();     // pending async results still resolve → _onFullDone sees them un-wanted + disposes
         this._wanted.clear();
-        for (const [, r] of this._replacing) this.source.dispose(r.key, r.handle);
+        for (const [, r] of this._replacing) this.source.dispose(r.key, r.handle, r.preview);
         this._replacing.clear();
-        for (const [key, chunk] of this._live) this.source.dispose(key, chunk.handle);
+        for (const [key, chunk] of this._live) this.source.dispose(key, chunk.handle, !chunk.full);
         this._live.clear();
     }
 
     has(key: StreamKey): boolean { return this._live.has(key); }
+    /** True when `key` is live at its FULL build (not a preview stand-in). P19: a fast window keeps such tiles. */
+    isFull(key: StreamKey): boolean { return this._live.get(key)?.full === true; }
+    /** P19: true while `key`'s async build is in flight. */
+    isInflight(key: StreamKey): boolean { return this._inflight.has(key); }
+    /** P19: the chunk ids with something on screen — a live key (any tier, previews too) or a held old tier. Empty
+     *  for a source without chunkId. */
+    shownChunks(): Set<string> {
+        const s = new Set<string>(), id = this.source.chunkId;
+        if (!id) return s;
+        for (const k of this._live.keys()) s.add(id.call(this.source, k));
+        for (const r of this._replacing.values()) s.add(id.call(this.source, r.key));
+        return s;
+    }
+    /** The live chunks as [key, isFullBuild] (false = a preview stand-in still awaiting its upgrade). Diagnostics. */
+    liveEntries(): Array<[StreamKey, boolean]> { return [...this._live].map(([k, c]): [StreamKey, boolean] => [k, c.full]); }
     get liveCount(): number { return this._live.size; }
     get pending(): number { return this._pendingCount(); }
     /** Builds queued on the MAIN thread (previews + fulls awaiting a slot) — excludes async in-flight work, which

@@ -13,6 +13,14 @@ export interface LocomotionState {
   grounded: boolean;
   airborne: boolean;
   rising: boolean;       // vertical velocity > 0 (the ascending part of a jump)
+  // ── Round 8 extras (optional: a host-fed state without them animates as before) ──
+  sneaking?: boolean;    // the sneak gait is active (Ctrl / C)
+  airPhase?: number;     // 0 = take-off (rising at jumpSpeed) → 0.5 apex → 1 falling at jumpSpeed or faster
+  landImpact?: number;   // impact speed / jumpSpeed on the tick of landing (0 otherwise)
+  airTime?: number;      // seconds airborne
+  jumped?: boolean;      // this airborne phase started with a jump (not a walk off a ledge)
+  jumpWindup?: number;   // item 13: 0→1 progress of a ground jump's crouch before take-off (0 = not winding up)
+  jumpHeld?: boolean;    // jump variety: the jump button is still held (a released button = a TAP → the hop variant)
 }
 
 /** Clip names the avatar provides. Only `idle` + `walk` are required; the rest fall back sensibly when absent. */
@@ -20,8 +28,24 @@ export interface LocomotionClips {
   idle: string;
   walk: string;
   run?: string;
-  jump?: string;   // airborne + rising
-  fall?: string;   // airborne + descending
+  jump?: string;   // airborne + rising (the engine animator samples it by air phase when the state has one)
+  fall?: string;   // airborne + descending (the engine animator: a long fall)
+  sneak?: string;  // Round 8, engine animator only: the sneak gait (blended in by the crouch mix)
+  crouch?: string; // Round 8, engine animator only: the sneak idle
+  land?: string;   // Round 8, engine animator only: an ADDITIVE landing squash, played on touch-down
+  /** Jump VARIETY (engine animator only): two or more jump clips; each jump picks one at random (seeded, never the
+   *  same one twice running, weighted by standing / walking / running and tap / hold). Fewer than two = `jump` only. */
+  jumps?: string[];
+  /** Engine animator only: a slow-walk gait blended in BELOW the walk speed (shorter steps, less arm swing), so a
+   *  start, a stop or a half-tilted stick doesn't play the full walk in slow motion. */
+  stroll?: string;
+  /** Engine animator only (2026-10-04): a JOG gait between the walk and the run (walk → jog → run by speed), so a
+   *  middling speed plays a light jog instead of a half-walk / half-run mix, and a slow top speed stays a jog. */
+  jog?: string;
+  /** IDLE VARIETY (engine animator only, 2026-10-04): one-shot standing idles (look around, stretch, check the wrist,
+   *  weight shift, adjust glasses …) played now and then over `idle` while the character stands still — seeded, never
+   *  the same one twice running, cancelled at once by any movement. Empty / absent = the base idle only. */
+  idles?: string[];
 }
 
 export interface LocomotionClipConfig {

@@ -122,6 +122,18 @@ export class Camera3D {
   get autoNear(): boolean { return this._autoNear; }
   set autoNear(v: boolean) { this._autoNear = v; this.markProjDirty(); }
 
+  // TEMPORAL AA (engine-roadmap step 6, temporal-aa.ts): a sub-pixel offset in NDC added to the projection while the
+  // renderer draws the 3D scene (0, 0 = none, the default; the renderer clears it before the overlays draw).
+  private _jitterX = 0;
+  private _jitterY = 0;
+  /** The projection jitter in NDC units (x right, y up). Applied as clip.xy += jitter * clip.w (works for both modes). */
+  setProjectionJitter(x: number, y: number): void {
+    if (x === this._jitterX && y === this._jitterY) return;
+    this._jitterX = x; this._jitterY = y;
+    this.markProjDirty();
+  }
+  get projectionJitter(): [number, number] { return [this._jitterX, this._jitterY]; }
+
   // ── Convenience setters ────────────────────────────────────────
 
   setPosition(x: number, y: number, z: number): void {
@@ -178,6 +190,11 @@ export class Camera3D {
         // ox/oy shift the frustum in camera space without moving target, enabling armature pan.
         (mat4 as any).orthoZO?.(this._projMatrix, -hw + ox, hw + ox, -hh + oy, hh + oy, this._near, this._far)
           ?? mat4.ortho(this._projMatrix, -hw + ox, hw + ox, -hh + oy, hh + oy, this._near, this._far);
+      }
+      if (this._jitterX !== 0 || this._jitterY !== 0) {
+        // T(jx, jy) * P: each column's x / y row gains jitter * its w row (temporal AA sub-pixel offset).
+        const p = this._projMatrix;
+        for (let c = 0; c < 4; c++) { p[c * 4] += this._jitterX * p[c * 4 + 3]; p[c * 4 + 1] += this._jitterY * p[c * 4 + 3]; }
       }
       this._projDirty = false;
       this._vpDirty = true;

@@ -5,17 +5,25 @@
 // STREET LIGHTS with an arm over each intersection. Still merged per-colour (a few draws total).
 
 import { CITY_FLOOR_M, cityMetresPerUnit, metalScaleFor, type WorldGraph, type LayoutPreviewLayer, type Zone, type V2, type CornerStyle, type RoofStyle, type Lot } from './types';
+import { inCrossingZone, inLocalCorridor } from './local-line';
 import { makeRng, Rng, chamferPolygon, roundPolygon, centroid, polyArea, frontageEdge, hash2, graphLookups } from './util';
-import { Accum3D } from './meshbuild';
-import { newLampPostAccum, emitLampPost, lampPostLayers, resolveLampPostParams } from './lamp-post';
-import { buildBuilding, resolveBuildingParams, xformGeo, mergeGeos } from './building';
+import { Accum3D, partOf, scalePartsInto } from './meshbuild';
+import { twinAccum, withFarTwin, PROP_TWIN_M } from './lod-accum';
+import { newLampPostAccum, emitLampPost, lampPostLayers, resolveLampPostParams, lampHeadOffset } from './lamp-post';
+import { buildBuilding, resolveBuildingParams, xformGeo, mergeGeos, BUILDING_ARCHETYPES, faceUOffsets, FRONT_RANK } from './building';
 import type { BuildingParams, DoorStyle } from './building';
+import { offsetPolyEdges } from './building-geom';
+import type { EdgeKind } from './building-geom';
+import { setLotMeta, clearLotMeta } from './lot-meta';
+import type { CityPalette } from './palette';
 import { ZONE_COLOR } from './preview';
-import { cellLevelAt, makeElevation } from './elevation';
+import { cellLevelAt, makeElevation, rampLevelAt, makeWaterTest } from './elevation';
 import { pointInPolygon } from './util';
 import { regionAt } from './layout';
 import { inShotengai } from './shotengai';
-import { cityPalette, METAL_PAINTED, METAL_GALVANISED } from './palette';
+import { cityPalette, facadeFor, applyRoofVariety, METAL_PAINTED, METAL_GALVANISED } from './palette';
+import { advertGarpForLayerName, type AdvertCatalog } from './adverts';
+import { pickSignColors, signMoodFor } from './sign-style';
 
 type V3 = [number, number, number];
 
@@ -40,21 +48,199 @@ const nrm2 = (d: V2): V2 => { const l = Math.hypot(d[0], d[1]) || 1; return [d[0
 function scaleGeoY(geo: LayoutPreviewLayer['geometry'], k: number, dy: number): LayoutPreviewLayer['geometry'] {
     const v = new Float32Array(geo.vertices);
     for (let i = 0; i < v.length; i += 12) { v[i] *= k; v[i + 1] = v[i + 1] * k + dy; v[i + 2] *= k; }
-    return { vertices: v, indices: geo.indices, format: geo.format };
+    const out: LayoutPreviewLayer['geometry'] = { vertices: v, indices: geo.indices, format: geo.format };
+    scalePartsInto(geo, out, k, dy);   // P20: the building's prop parts follow the same scale + lift
+    return out;
 }
 
-/** Zone → a building archetype (with a little seeded variety). */
-function zoneArchetype(zone: Zone, rng: Rng): string {
-    if (zone === 'residential') return rng.chance(0.5) ? 'brick-townhouse' : 'apartment-balcony';
-    if (zone === 'commercial')  return rng.chance(0.5) ? 'retro-shophouse' : 'office-block';
-    return rng.chance(0.5) ? 'office-block' : 'glass-tower';   // civic
+/** Zone + DISTRICT + lot size → a building archetype (seeded). A Japanese street mix (B5): pencil zakkyo and
+ *  neon arcades downtown, izakaya / konbini / shophouses / machiya in the market streets, apaato / mansions /
+ *  detached houses in the residential quarters; Western brick is a rare accent. Narrow frontages favour the thin
+ *  types, wide ones the blocks. */
+function zoneArchetype(zone: Zone, rng: Rng, district: string = 'mixed', frontM = 10): string {
+    const pick = (opts: [string, number][]): string => {
+        let tot = 0; for (const [, w] of opts) tot += w;
+        let r = rng.next() * tot;
+        for (const [n, w] of opts) { r -= w; if (r <= 0) return n; }
+        return opts[opts.length - 1][0];
+    };
+    const narrow = frontM < 7, wide = frontM > 13;
+    if (zone === 'residential') {
+        if (district === 'downtown') return pick([['mansion', wide ? 5 : 3], ['zakkyo', narrow ? 4 : 2], ['apato', 1]]);
+        if (district === 'market') return pick([['machiya', narrow ? 4 : 2], ['apato', 3], ['jp-house', 2], ['izakaya', 1]]);
+        return pick([['jp-house', narrow ? 5 : 3], ['apato', wide ? 4 : 3], ['mansion', wide ? 4 : 1.5], ['machiya', 0.8], ['brick-townhouse', 0.3], ['suburban-house', 0.2]]);
+    }
+    if (zone === 'commercial') {
+        if (district === 'downtown') return pick([['zakkyo', narrow ? 6 : 3], ['neon-arcade', 3], ['office-block', wide ? 3 : 1], ['glass-tower', wide ? 1.5 : 0.3]]);
+        if (district === 'market') return pick([['izakaya', narrow ? 4 : 2.5], ['retro-shophouse', 3], ['konbini', wide ? 3 : 0.8], ['machiya', narrow ? 2 : 1], ['zakkyo', 1.2]]);
+        return pick([['retro-shophouse', 3], ['zakkyo', narrow ? 3 : 1.5], ['konbini', wide ? 3 : 1], ['izakaya', 1.5], ['office-block', wide ? 2 : 0.6], ['neon-arcade', 0.8]]);
+    }
+    // civic
+    if (district === 'residential') return pick([['mansion', 3], ['office-block', 2]]);
+    return pick([['office-block', 3], ['glass-tower', wide ? 2 : 0.6], ['mansion', 1]]);
 }
 
-type DetailGroup = { name: string; cell: string; color: [number, number, number]; emissive?: number; pattern?: LayoutPreviewLayer['pattern']; geos: LayoutPreviewLayer['geometry'][] };
+/** Storey range per archetype — the zone height picks a floor count, the archetype keeps it believable (a konbini
+ *  is one storey, an apaato two, a pencil building five to nine). Unlisted archetypes keep the zone height. */
+const FLOOR_RANGE: Record<string, [number, number]> = {
+    'konbini': [1, 1], 'apato': [2, 3], 'jp-house': [2, 2], 'machiya': [2, 2], 'izakaya': [2, 3], 'suburban-house': [2, 2],
+    'zakkyo': [4, 9], 'mansion': [4, 12], 'neon-arcade': [3, 6], 'retro-shophouse': [2, 4], 'brick-townhouse': [3, 4],
+};
+
+/** Western archetypes — the only ones that get stone window SURROUNDS (Japanese facades have thin aluminium
+ *  frames, drawn by the sash shader). */
+const WESTERN = new Set(['brick-townhouse', 'suburban-house', 'apartment-balcony']);
+
+/** Flat-roofed masonry archetypes that may pick up floor-band LEDGES + a CORNICE per lot (persona polish B4/D2). */
+const BANDED = new Set(['zakkyo', 'mansion', 'neon-arcade', 'retro-shophouse', 'office-block', 'apartment-balcony', 'mall']);
+
+/** City roof style → the building generator's roof (detailed path). Unlisted styles keep the archetype's. */
+const CITY_ROOF: Partial<Record<RoofStyle, BuildingParams['roofStyle']>> = { flat: 'flat', parapet: 'parapet', mansard: 'mansard', pointed: 'hip', helipad: 'flat' };
+
+/** Archetypes whose door style is part of their identity (never re-rolled by the city's joinery variety). */
+const OWN_DOOR = new Set(['konbini', 'izakaya', 'mansion', 'office-block', 'glass-tower', 'corporate-spire', 'mall']);
+
+const segDist = (p: V2, a: V2, b: V2): { d: number; q: V2 } => {
+    const dx = b[0] - a[0], dz = b[1] - a[1], l2 = dx * dx + dz * dz;
+    const t = l2 > 0 ? Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dz) / l2)) : 0;
+    const q: V2 = [a[0] + dx * t, a[1] + dz * t];
+    return { d: Math.hypot(p[0] - q[0], p[1] - q[1]), q };
+};
+
+/** What the ground does around a lot edge — the terrace level either side of the lot line, and whether the far
+ *  side is water. Lets classifyLotEdges tell a level street from one down a retaining wall, or a canal. */
+export interface LotTerrain { level(x: number, z: number): number; water(x: number, z: number): boolean }
+
+/** The terrain probe for a city graph (terrace level incl. ramps; canals, ponds + water lots). */
+export function lotTerrain(graph: WorldGraph): LotTerrain {
+    const isWater = makeWaterTest(graph);
+    const terr = !!graph.levels && (graph.params.terraces ?? true);
+    return {
+        level: (x, z) => terr ? (rampLevelAt(graph.ramps, x, z) ?? cellLevelAt(graph, x, z)) : 0,
+        water: isWater,
+    };
+}
+
+/** Classify each edge of a lot polygon (B2): 'street' when a road runs just outside it (its outward normal
+ *  points at the road), 'party' when the ground just outside is another building lot (a shared wall), else
+ *  'open' (courtyard / park / a wide alley). `isBuilt(pt)` = is this point inside a building lot.
+ *  With `terrain` (the city passes lotTerrain): an edge whose far side is WATER — a canal, a pond, a water lot, or a
+ *  road sunk in the canal trench — is 'water', whatever road runs there; and a street edge whose far side sits on
+ *  another terrace level (a retaining wall along the lot line) is 'drop'. (Both used to read as 'street': the
+ *  konbini whose door opened onto the canal railing a hand's width from its glass.) */
+export function classifyLotEdges(poly: V2[], roads: { a: V2; b: V2; width: number }[], half: number, s: number, isBuilt: (pt: V2) => boolean, terrain?: LotTerrain): EdgeKind[] {
+    const n = poly.length, out: EdgeKind[] = [];
+    let area = 0; for (let i = 0; i < n; i++) { const a = poly[i], b = poly[(i + 1) % n]; area += a[0] * b[1] - b[0] * a[1]; }
+    const sgn = area >= 0 ? 1 : -1;   // outward normal sign for this winding
+    const probe = 0.08 * s;           // ~1.2 m past the wall
+    for (let i = 0; i < n; i++) {
+        const a = poly[i], b = poly[(i + 1) % n];
+        const dx = b[0] - a[0], dz = b[1] - a[1], L = Math.hypot(dx, dz) || 1;
+        const on: V2 = [sgn * dz / L, -sgn * dx / L];
+        const mid: V2 = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+        if (terrain) {
+            // Water beyond the edge (probed at two depths so a thin strip of pavement before a canal still counts).
+            let wet = 0;
+            for (const t of [0.25, 0.5, 0.75]) for (const k of [0.6, 1.4]) if (terrain.water(a[0] + dx * t + on[0] * probe * k, a[1] + dz * t + on[1] * probe * k)) { wet++; break; }
+            if (wet >= 2) { out.push('water'); continue; }
+        }
+        let street = false;
+        for (const r of roads) {
+            const { d, q } = segDist(mid, r.a, r.b);
+            if (d > Math.max(half, r.width * 0.5) + 0.3 * s) continue;
+            const vx = q[0] - mid[0], vz = q[1] - mid[1], vl = Math.hypot(vx, vz);
+            if (vl < 1e-6 || (vx * on[0] + vz * on[1]) / vl > 0.6) { street = true; break; }
+        }
+        if (street) {
+            if (terrain) {
+                const inL = terrain.level(mid[0] - on[0] * probe, mid[1] - on[1] * probe);
+                const outL = terrain.level(mid[0] + on[0] * probe, mid[1] + on[1] * probe);
+                if (Math.abs(inL - outL) >= 0.5) { out.push('drop'); continue; }
+            }
+            out.push('street'); continue;
+        }
+        let hits = 0;
+        for (const t of [0.25, 0.5, 0.75]) {
+            const px = a[0] + dx * t + on[0] * probe, pz = a[1] + dz * t + on[1] * probe;
+            if (isBuilt([px, pz])) hits++;
+        }
+        out.push(hits >= 2 ? 'party' : 'open');
+    }
+    return out;
+}
+
+/** Corner styling (chamfer / round) applied ONLY at corners between two street edges — rounding a corner that
+ *  meets a party wall would open a wedge-shaped gap in the street wall. Returns the new polygon + edge kinds. */
+function applyCornerMasked(foot: V2[], kinds: EdgeKind[], lot: Lot, style: CornerStyle, rng: Rng, scale: number): { foot: V2[]; kinds: EdgeKind[] } {
+    let st: CornerStyle = style;
+    if (style === 'mixed') { const r = rng.next(); st = r < 0.5 ? 'sharp' : r < 0.78 ? 'chamfer' : 'round'; }
+    if (st === 'sharp') return { foot, kinds };
+    const amt = Math.min(Math.sqrt(Math.max(0, lot.area)) * 0.28, 0.12 * scale);
+    if (amt < 1e-4) return { foot, kinds };
+    const n = foot.length, of: V2[] = [], ok: EdgeKind[] = [];
+    for (let i = 0; i < n; i++) {
+        const ip = (i - 1 + n) % n, v = foot[i], pv = foot[ip], nv = foot[(i + 1) % n];
+        const pts: V2[] = [];
+        if (kinds[ip] === 'street' && kinds[i] === 'street') {
+            const lp = Math.hypot(pv[0] - v[0], pv[1] - v[1]), ln = Math.hypot(nv[0] - v[0], nv[1] - v[1]);
+            const r = Math.min(amt, lp * 0.4, ln * 0.4);
+            const p1: V2 = [v[0] + (pv[0] - v[0]) / lp * r, v[1] + (pv[1] - v[1]) / lp * r];
+            const p2: V2 = [v[0] + (nv[0] - v[0]) / ln * r, v[1] + (nv[1] - v[1]) / ln * r];
+            if (st === 'chamfer') pts.push(p1, p2);
+            else for (let k = 0; k <= 3; k++) { const t = k / 3, u = 1 - t; pts.push([u * u * p1[0] + 2 * u * t * v[0] + t * t * p2[0], u * u * p1[1] + 2 * u * t * v[1] + t * t * p2[1]]); }
+        } else pts.push(v);
+        for (let j = 0; j < pts.length; j++) { of.push(pts[j]); ok.push(j < pts.length - 1 ? 'street' : kinds[i]); }
+    }
+    return { foot: of, kinds: ok };
+}
+
+/** Walkable strip kept between a building and a WATER edge (canal railing) or a retaining-wall DROP (the fence on
+ *  its top), in metres — the lot line IS the wall / railing line there, so this is the path in front of the shop. */
+export const EDGE_WALK_M = 2.0;
+
+/** The lot's depth perpendicular to edge i (the farthest vertex from that edge's line) — caps a setback so a
+ *  small lot never inverts. */
+function depthFrom(poly: V2[], i: number): number {
+    const a = poly[i], b = poly[(i + 1) % poly.length], L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    let dmax = 0;
+    for (const q of poly) dmax = Math.max(dmax, Math.abs((b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0])) / L);
+    return dmax;
+}
+
+/** The lot footprint for a building (B1/B2): a FIXED metre setback on street edges only — enough to leave a ~2 m
+ *  pavement band whatever the layout already inset (`blockDist` = the lot edge's distance to its block edge) —
+ *  a hair off party walls (the 8 cm gap stops the two buildings' walls z-fighting) and a little off open sides.
+ *  WATER and DROP edges stand EDGE_WALK_M back from the lot line (the railing / wall-top fence stands on it),
+ *  capped at 30% of the lot's depth from that edge. */
+export function lotFootprint(poly: V2[], kinds: EdgeKind[], blockPoly: V2[] | null, s: number): V2[] {
+    const m = s / 15;   // 1 metre in city units (city-gen X*s = 15·X m)
+    const d = poly.map((a, i) => {
+        const b = poly[(i + 1) % poly.length];
+        if (kinds[i] === 'party') return -0.04 * m;
+        if (kinds[i] === 'open') return -0.15 * m;
+        if (kinds[i] === 'water' || kinds[i] === 'drop') return -Math.min(EDGE_WALK_M * m, depthFrom(poly, i) * 0.3);
+        let bd = Infinity;
+        if (blockPoly && blockPoly.length >= 3) {
+            const mid: V2 = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+            for (let k = 0; k < blockPoly.length; k++) bd = Math.min(bd, segDist(mid, blockPoly[k], blockPoly[(k + 1) % blockPoly.length]).d);
+        }
+        const already = isFinite(bd) ? bd / m : 2;           // metres of pavement the layout already left
+        return -Math.max(0.3, 2.2 - already) * m;
+    });
+    // offsetPolyEdges assumes CCW (+ = outward); flip the sign for a clockwise lot
+    let area = 0; for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i + 1) % poly.length]; area += a[0] * b[1] - b[0] * a[1]; }
+    return offsetPolyEdges(poly, area >= 0 ? d : d.map(x => -x));
+}
+
+type DetailGroup = { name: string; cell: string; color: [number, number, number]; emissive?: number; pattern?: LayoutPreviewLayer['pattern']; geos: LayoutPreviewLayer['geometry'][]; opacity?: number; twin?: NonNullable<LayoutPreviewLayer['nearTwin']> };
+/** Detail layers whose building-level OPACITY survives the city merge (every other layer is merged opaque, as before):
+ *  the clear pane in front of a C4 image-interior shop bay. */
+const KEEP_OPACITY = /shop-glass-pane/;
 // Instanced detail (juliet/trim/greenery) grouped by (CELL, geometry key). cell='' when detailGrid=0 → city-wide (few
 // groups, no cull). cell='<gx>_<gz>' when chunked → one ArrayGroup PER CELL so off-screen cells frustum-cull.
 type InstGroup = { name: string; cell: string; color: [number, number, number]; emissive?: number; pattern?: LayoutPreviewLayer['pattern']; geometry: LayoutPreviewLayer['geometry']; instances: { x: number; y: number; z: number; ry: number }[] };
 const colKey = (c: [number, number, number]): string => c.map(v => Math.round(v * 24)).join(',');
+const patKey = (pt: LayoutPreviewLayer['pattern']): string => pt ? `${pt.mode ?? ''}:${(pt.freq ?? 0).toFixed(4)}:${(pt.angle ?? 0).toFixed(2)}:${(pt.scale ?? 0).toFixed(3)}` : '-';
 
 // Per-building tint variants so buildings of the same archetype don't all render identically (esp. the near-white
 // stone trim). DISCRETE (not continuous jitter) so colour still quantizes into a small set → geometry keeps sharing
@@ -93,33 +279,32 @@ const WOOD_TRIM: [number, number, number][] = [
 
 /** Build a full procedural building fitted to `foot` (city-units) at ground `base`, height ~`h` units. Non-instanced
  *  layers merge into `merged` (by name+colour → bounded draws); INSTANCED detail accumulates city-wide into `inst`
- *  (by geometry key → one ArrayGroup covering every building's balconies/trim of that shape). */
-function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string, InstGroup>, lot: Lot, foot: V2[], base: number, h: number, scale: number, seed: number, rng: Rng, regionTint: number, cell: string, quoinStyle: 'alternating' | 'block' = 'alternating', frontRef: V2 | null = null): void {
+ *  (by geometry key → one ArrayGroup covering every building's balconies/trim of that shape). `kinds` = what each
+ *  `foot` edge faces (street / open / party — B2). Stamps lot.door/doorOut/builtH and the lot's meta side table. */
+function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string, InstGroup>, lot: Lot, foot: V2[], kinds: EdgeKind[], base: number, h: number, scale: number, seed: number, rng: Rng, regionTint: number, cell: string, quoinStyle: 'alternating' | 'block' = 'alternating', frontRef: V2 | null = null, district = 'mixed', pal: CityPalette | null = null, cityRoof: RoofStyle = 'mixed', adverts: AdvertCatalog | null = null, farTwins = false, adScreens = true, variety: { facade: boolean; roof: boolean; plant?: boolean } | null = null): void {
     const floorU = 0.2 * scale;                                  // a city floor's height in units
     const k = floorU / CITY_FLOOR_M;                             // metre → city-unit scale (so a 3 m floor = floorU units)
     const floors = Math.max(1, Math.min(40, Math.round(h / floorU)));
-    // ── PER-BUILDING DIMENSIONAL VARIETY (bug 4): a smooth skyline + a shared lot shape made every building in a
-    // block a near-clone. Drive floors + storey heights + massing off the per-lot SEED (position hashes → no rng
-    // draws, so idempotency is untouched) so neighbours read as different builds, not copies. ────────────────────
+    // ── PER-BUILDING DIMENSIONAL VARIETY (bug 4): drive floors + storey heights + massing off the per-lot SEED
+    // (position hashes → no rng draws, so idempotency is untouched) so neighbours read as different builds. ──
     const vh = (salt: number): number => hash2(lot.center[0] * 12.9 + salt * 3.1, lot.center[1] * 78.2 + salt * 1.7, (seed ^ 0x7f4a2c9d) >>> 0);
-    const vFloors = Math.max(1, Math.min(40, floors + Math.round((vh(1) - 0.5) * Math.max(2, floors * 0.4))));   // ±~20% floor spread
-    const vFloorH = CITY_FLOOR_M * (0.9 + vh(2) * 0.32);        // 2.7–3.6 m storeys → height varies even at equal floors
-    const vGroundH = CITY_FLOOR_M * (1.15 + vh(3) * 0.55);      // taller/shorter ground floor
+    // Street frontage in metres (the longest street edge) — narrow lots get the thin archetypes (B5).
+    let frontM = 0;
+    for (let i = 0; i < foot.length; i++) if (kinds[i] === 'street' || kinds[i] === 'drop') { const a = foot[i], b = foot[(i + 1) % foot.length]; frontM = Math.max(frontM, Math.hypot(b[0] - a[0], b[1] - a[1]) / k); }
+    const archetype = zoneArchetype(lot.zone, rng, district, frontM || 10);
+    const range = FLOOR_RANGE[archetype];
+    let vFloors = Math.max(1, Math.min(40, floors + Math.round((vh(1) - 0.5) * Math.max(2, floors * 0.4))));   // ±~20% floor spread
+    if (range) vFloors = Math.max(range[0], Math.min(range[1], vFloors));
+    // Japanese storeys are LOW (2.8–3.4 m): the old 2.7–3.6 m spread put window rows off any believable floor grid.
+    const vFloorH = CITY_FLOOR_M * (0.93 + vh(2) * 0.2);
+    const vGroundH = CITY_FLOOR_M * (1.1 + vh(3) * 0.4);
     const vSetback = (vFloors >= 12 && vh(6) > 0.5) ? 1 : 0;    // taller builds sometimes step back (office/tower only, per computeSections)
     const vSetbackInset = 1.0 + vh(7) * 1.4;
-    // Vary PLOT COVERAGE: shrink some footprints toward their own centre so a block mixes full-lot builds with
-    // set-back ones (universal — footprint drives massing even though corner styling is baked upstream).
-    const footInset = vh(8) * 0.14;
-    const fc = centroid(foot);
-    const footV: V2[] = footInset > 0.01 ? foot.map(pt => [pt[0] + (fc[0] - pt[0]) * footInset, pt[1] + (fc[1] - pt[1]) * footInset] as V2) : foot;
-    const footM: V2[] = footV.map(pt => [pt[0] / k, pt[1] / k]);  // (varied) lot shape in metres (× k later → exactly `footV`)
-    const frontRefM: V2 | undefined = frontRef ? [frontRef[0] / k, frontRef[1] / k] : undefined;   // block centroid in the same metre frame → orients the entrance toward the street
-    lot.builtH = (vGroundH + (vFloors - 1) * vFloorH) * k;        // real facade height (varied) → signage/awning/pedestrian dressing clamp to the TRUE top, not the pre-variety `h`
-    // ★ DOOR VARIETY. The city never set any door param, so every building fell through to the archetype
-    // default — one dark-slate leaf, one white frame, one brass handle, on every entrance in the city.
-    // Entrances are at eye level and read individually, so they are the worst thing to repeat. A real
-    // street mixes PAINTED joinery (the classic saturated front door), STAINED WOOD and dark METAL, each
-    // with its own hardware; the frame is usually either the building's own trim white or a stone tone.
+    // (The old random 0–14% plot-coverage shrink is GONE — buildings form a street wall now; the lot footprint
+    // already carries the fixed street setback, see lotFootprint.)
+    const footM: V2[] = foot.map(pt => [pt[0] / k, pt[1] / k]);   // lot shape in metres (× k later → exactly `foot`)
+    const frontRefM: V2 | undefined = frontRef ? [frontRef[0] / k, frontRef[1] / k] : undefined;   // block centroid in the same metre frame
+    // ★ DOOR VARIETY: a real street mixes PAINTED joinery, STAINED WOOD and dark METAL, each with its own hardware.
     const DOOR_FINISH: Array<{ leaf: [number, number, number]; handle: [number, number, number]; style: DoorStyle }> = [
         { leaf: [0.10, 0.24, 0.19], handle: [0.72, 0.63, 0.33], style: 'panel' },    // deep green + brass
         { leaf: [0.34, 0.09, 0.11], handle: [0.72, 0.63, 0.33], style: 'panel' },    // oxblood + brass
@@ -137,60 +322,126 @@ function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string
     ];
     const dfin = DOOR_FINISH[(hash2(lot.center[0] * 31.7, lot.center[1] * 17.3, (seed ^ 0x4d17) >>> 0) * DOOR_FINISH.length) | 0];
     const dframe = FRAME[(hash2(lot.center[1] * 11.9, lot.center[0] * 23.1, (seed ^ 0x91c3) >>> 0) * FRAME.length) | 0];
+    const arch = BUILDING_ARCHETYPES[archetype] ?? {};
+    const sash = !!arch.windowSash;
+    const shop = arch.storefront ?? true;
+    const tall = vFloors >= 5;
     const params: Partial<BuildingParams> = {
-        archetype: zoneArchetype(lot.zone, rng), floors: vFloors, floorHeight: vFloorH, groundFloorHeight: vGroundH,
+        archetype, floors: vFloors, floorHeight: vFloorH, groundFloorHeight: vGroundH,
         setbacks: vSetback, setbackInset: vSetbackInset, seed, quoinStyle,
-        julietBalconies: lot.zone === 'residential', windowTrim: true, storefront: lot.zone === 'commercial',
-        // A shopfront keeps its glazed commercial entrance; only non-shop entrances take a joinery finish.
-        doorStyle: lot.zone === 'commercial' ? 'glazed' : dfin.style,
+        // ★ No forced juliet balconies (B4) — they clashed with apartment balconies and aren't Japanese. Stone
+        // window SURROUNDS only on the Western archetypes; Japanese facades carry thin aluminium frames.
+        windowTrim: WESTERN.has(archetype),
+        // A shopfront keeps its glazed commercial entrance; identity doors (konbini / izakaya / lobby) stay.
+        doorStyle: OWN_DOOR.has(archetype) ? arch.doorStyle : shop ? 'glazed' : dfin.style,
         doorColor: dfin.leaf, doorHandleColor: dfin.handle, doorFrameColor: dframe,
+        // District dressing on the detailed path (B8): downtown shops get the big screens + rooftop billboards.
+        ...(district === 'downtown' && shop && tall && vh(11) < 0.35 ? { ledScreen: true } : {}),
+        ...((district === 'downtown' || district === 'market') && shop && vh(12) < 0.3 && (arch.roofStyle === 'parapet' || arch.roofStyle === 'flat') ? { rooftopSign: true } : {}),
+        ...(district === 'downtown' && archetype === 'retro-shophouse' ? { signStack: true } : {}),
+        // An EXPLICIT city roof style is honoured on the detailed path too (it used to be ignored); 'mixed' lets
+        // each archetype keep its own (kawara hips on houses / machiya, parapets on blocks — B9).
+        ...(cityRoof && cityRoof !== 'mixed' && CITY_ROOF[cityRoof] && vFloors <= 12 ? { roofStyle: CITY_ROOF[cityRoof] } : {}),
+        ...(cityRoof === 'helipad' && tall ? { helipad: true } : {}),
+        ...(adScreens ? {} : { adScreen: false }), ...(adverts ? { adverts } : {}),   // legacy LED screens on old saves (visual-polish #6); user signage images (docs/ui/garp.md §Adverts) — absent → procedural signs
+        ...(variety?.plant ? { roofPlant: 'clustered' as const } : {}),   // visual-polish #11 tail: the clustered roof plant
+        signDistrict: district,            // persona-polish C1: the district picks the sign WORDS (nightlife / food / quiet …)
+        // Persona polish B4/D2: FLOOR-BAND ledges + a CORNICE on part of the flat-roofed masonry stock (lot hashes,
+        // no rng draws) — horizontal rhythm instead of an unbroken window grid. Archetypes that already carry them keep them.
+        ...(BANDED.has(archetype) ? {
+            ledges: !!arch.ledges || vh(23) < 0.6,
+            cornice: !!arch.cornice || ((arch.roofStyle === 'parapet' || arch.roofStyle === 'flat') && vh(24) < 0.5),
+        } : {}),
     };
     // Per-building tint (base + trim + roof) BIASED to the region's palette: mostly the neighbourhood's own tint,
-    // with a minority rolling to an adjacent (clamped, so no cool↔warm wrap) tint for life — coherent districts,
-    // varied streets.
+    // with a minority rolling to an adjacent tint for life — coherent districts, varied streets.
     const resolved = resolveBuildingParams(params);
     const r = rng.next();
     const ti = r > 0.80 ? Math.min(TINTS.length - 1, regionTint + 1)
         : r > 0.60 ? Math.max(0, regionTint - 1)
         : regionTint;
     const tint = TINTS[ti];
-    // Trim / parapet / cornice / roof carry the tint at FULL strength — that's the prominent white crown the eye
-    // catches, so it needs the real range (grey / tan / dark stone). The base wall gets a GENTLER half-tint so
-    // masonry doesn't go muddy.
     const soft: Tint = { b: 0.5 + tint.b * 0.5, w: [tint.w[0] * 0.5, tint.w[1] * 0.5, tint.w[2] * 0.5] };
     resolved.baseColor = applyTint(resolved.baseColor, soft);
     resolved.roofColor = applyTint(resolved.roofColor, tint);
-    // Trim: mostly stone (tinted), but ~1 in 4 buildings gets a PAINTED trim/parapet — residential leans brick-red
-    // (the dark-red cornice look), others roll the full painted palette. Applied to cornice + window surrounds.
+    // B4 FACADE VARIETY: a per-lot material (tile / concrete / painted render / metal panel / brick — district weighted)
+    // + a MUTED swatch leaning to the region's tint, replacing the archetype's one material + warm tan. Neutral walls
+    // so the signs pop. Lot hashes only (no rng draws — the per-lot stream below is unchanged).
+    // visual-polish #11 DISTRICT PALETTE (LayoutParams.districtPalette): the wide value / hue grid instead of the muted
+    // swatches; ROOF VARIETY: a per-lot roof finish + some turf roof gardens. Lot hashes only (no rng draws).
+    const fac = facadeFor(archetype, district, vh(21), vh(22), ti, variety?.facade ? { h3: vh(25) } : null);
+    if (fac) { resolved.baseColor = fac.color; resolved.material = fac.material; }
+    if (variety?.roof) applyRoofVariety(resolved, district, vFloors, vh(26), vh(27));
     const paint = rng.next();
-    if (paint < 0.26) {
+    if (fac) {
+        // Muted trim (ledges / cornice / plinth) from the wall itself: a darker band on a pale wall, a paler one on a
+        // dark wall — never the saturated painted-cornice colours on these Japanese fronts. (The rng draw stays.)
+        const b = fac.color, lum = 0.2126 * b[0] + 0.7152 * b[1] + 0.0722 * b[2];
+        resolved.trimColor = lum > 0.62 ? [b[0] * 0.84, b[1] * 0.84, b[2] * 0.84] : [clamp01(b[0] * 1.16 + 0.05), clamp01(b[1] * 1.16 + 0.05), clamp01(b[2] * 1.16 + 0.05)];
+        resolved.windowTrimColor = resolved.trimColor;
+        if (paint < 0.26 && !sash && !(lot.zone === 'residential' && paint < 0.15)) rng.next();
+    } else if (paint < 0.26 && !sash) {
         const idx = (lot.zone === 'residential' && paint < 0.15) ? 0 : (rng.next() * PAINTED_TRIM.length) | 0;
         resolved.trimColor = PAINTED_TRIM[idx];
         resolved.windowTrimColor = PAINTED_TRIM[idx];
     } else {
-        resolved.trimColor = applyTint(resolved.trimColor, tint);          // baked cornice / parapet / pilasters / surrounds
-        resolved.windowTrimColor = applyTint(resolved.windowTrimColor, tint); // instanced per-window surrounds
+        resolved.trimColor = applyTint(resolved.trimColor, tint);
+        resolved.windowTrimColor = applyTint(resolved.windowTrimColor, tint);
     }
     // ★ Window surrounds → STAINED TIMBER (decoupled from the parapet trim colour), a warm wood tone per lot.
     resolved.windowTrimColor = WOOD_TRIM[(hash2(lot.center[0] * 7.7, lot.center[1] * 13.3, (seed ^ 0x3b19) >>> 0) * WOOD_TRIM.length) | 0];
-    const { layers } = buildBuilding(resolved, footM, frontRefM);
+    // Sign colours: the palette's NEON set when it has one (phantom / inaba …), else the archetype's own. Brand
+    // colours (konbini stripes, izakaya cream) are the archetype's identity and stay.
+    // ★ persona-polish B5: a CURATED sign palette per district mood (varied hue AND value, white + black lightboxes),
+    // the style palette's neon joining the pool tempered. A lot hash, no rng draw.
+    const neon = pal?.neon;
+    if (archetype !== 'konbini' && archetype !== 'izakaya') {
+        const key = (hash2(lot.center[0] * 5.3, lot.center[1] * 9.1, (seed ^ 0x6e0) >>> 0) * 4294967296) >>> 0;
+        [resolved.signColor, resolved.signColor2, resolved.signColor3] = pickSignColors(signMoodFor(district, archetype), key, neon && neon.length ? neon : null);
+    }
+    const { layers, meta } = buildBuilding(resolved, footM, frontRefM, kinds, { farTwins });
+    const litCol = pal?.windowLit?.[0];
+    const cp = cell ? cell + '|' : '';   // cell='' (detailGrid=0) → key identical to the city-wide baseline
     for (const L of layers) {
-        const cp = cell ? cell + '|' : '';   // cell='' (detailGrid=0) → key identical to the city-wide baseline
+        // warm lit-window colour from the palette (the shader derives office / TV tints itself)
+        const pattern = litCol && L.pattern?.mode === 'windows' && L.name === 'bldg:wall' ? { ...L.pattern, color: litCol } : L.pattern;
         if (L.instances && L.instances.length && L.instanceKey) {
             // INSTANCED: one canonical geometry (scaled, at origin) + this building's transforms → ArrayGroup per (cell,key).
             const key = `${cp}${L.name}|${L.instanceKey}|${colKey(L.color)}`;
             let g = inst.get(key);
-            if (!g) { g = { name: L.name, cell, color: L.color, emissive: L.emissive, pattern: L.pattern, geometry: scaleGeoY(L.geometry, k, 0), instances: [] }; inst.set(key, g); }
+            if (!g) { g = { name: L.name, cell, color: L.color, emissive: L.emissive, pattern, geometry: scaleGeoY(L.geometry, k, 0), instances: [] }; inst.set(key, g); }
             for (const t of L.instances) g.instances.push({ x: t.x * k, y: t.y * k + base, z: t.z * k, ry: t.ry });
         } else {
             // NON-instanced (walls/roof/doors/…): scale + drop to the lot, merge by (cell,name,colour).
             const geo = scaleGeoY(L.geometry, k, base);
-            const key = `${cp}${L.name}|${colKey(L.color)}`;
+            // ★ The PATTERN is part of the merge key: walls of two archetypes can quantize to the same colour but
+            // carry a different window pitch / facade code (tile vs siding, sash vs punched) — merged, the second
+            // building would render with the first one's windows (clipped cells, wrong material).
+            // P9: a near/far twin pair (roof plant) merges per role; `dist` is in metres → city units (× k).
+            const tw = L.nearTwin;
+            const key = `${cp}${L.name}|${colKey(L.color)}|${patKey(pattern)}${tw ? '|' + tw.role : ''}`;
             let g = merged.get(key);
-            if (!g) { g = { name: L.name, cell, color: L.color, emissive: L.emissive, pattern: L.pattern, geos: [] }; merged.set(key, g); }
+            if (!g) { g = { name: L.name, cell, color: L.color, emissive: L.emissive, pattern, geos: [], ...(L.opacity != null && KEEP_OPACITY.test(L.name) ? { opacity: L.opacity } : {}), ...(tw ? { twin: { ...tw, dist: tw.dist * k, gridTris: 0 } } : {}) }; merged.set(key, g); }
             g.geos.push(geo);
         }
     }
+    // ── stamp the lot from the building's OWN meta (B3): real height, entrance (the pedestrian door-visit sim needs
+    // lot.door on this path too), and the side table later composers read instead of re-deriving a frontage. ──
+    lot.builtH = meta.height * k;
+    const u2 = (q: V2): V2 => [q[0] * k, q[1] * k];
+    if (meta.door) { lot.door = u2(meta.door.pos); lot.doorOut = [meta.door.out[0], meta.door.out[1]]; }
+    setLotMeta(lot, {
+        detailed: true, shopfront: meta.shopfront,
+        door: lot.door ?? null, doorOut: lot.doorOut ?? meta.front.out,
+        front: { a: u2(meta.front.a), b: u2(meta.front.b), out: meta.front.out },
+        wireAnchors: meta.wireAnchors.map(w => [w[0] * k, w[1] * k + base, w[2] * k] as [number, number, number]),
+        signSlots: meta.signSlots.map(sl => ({ pos: [sl.pos[0] * k, sl.pos[1] * k + base, sl.pos[2] * k] as [number, number, number], out: sl.out, width: sl.width * k, ...(sl.k !== undefined ? { k: sl.k } : {}) })),
+        signColors: [[...resolved.signColor], [...resolved.signColor2], [...resolved.signColor3]] as [[number, number, number], [number, number, number], [number, number, number]],   // visual-polish #5 (night spill)
+        height: lot.builtH,
+        // D1 frontage dressing: the archetype + the real entrance opening + the building's own door dressing.
+        archetype, doorW: meta.door ? meta.door.width * k : 0, doorH: meta.door ? meta.door.height * k : 0, doorY: base,
+        ownNoren: !!resolved.noren, ownAwning: !!resolved.awning || !!resolved.canopy,
+    });
 }
 
 /** Build the streetscape (buildings + lamp posts + intersection street lights) for a graph. */
@@ -274,6 +525,26 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         const used = { construction: 0, parking: 0, gas: 0 };
         for (const cd of cands) if (used[cd.type] < caps[cd.type]) { used[cd.type]++; varietyByLot.set(cd.lot, cd.type); }
     }
+    // PARTY-WALL LOOKUP (B2): which ground is covered by another BUILDING lot — a coarse spatial hash over lot
+    // bboxes. Order-independent (variety claims come from the precomputed quota, not the loop's slot flips), so an
+    // edge's street / open / party class never depends on visit order or the active-region filter.
+    const builtLots = graph.lots.filter(l => l.poly.length >= 3 && (((l.slot === 'building' || l.variety) && !varietyByLot.has(l)) || l.slot === 'landmark'));
+    const bCell = Math.max(0.05, 0.5 * scale);
+    const bGrid = new Map<string, Lot[]>();
+    for (const l of builtLots) {
+        let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+        for (const q of l.poly) { x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); z0 = Math.min(z0, q[1]); z1 = Math.max(z1, q[1]); }
+        for (let gx = Math.floor(x0 / bCell); gx <= Math.floor(x1 / bCell); gx++) for (let gz = Math.floor(z0 / bCell); gz <= Math.floor(z1 / bCell); gz++) {
+            const key = gx + ',' + gz; const arr = bGrid.get(key); if (arr) arr.push(l); else bGrid.set(key, [l]);
+        }
+    }
+    const builtAt = (pt: V2, self: Lot): boolean => {
+        for (const l of bGrid.get(Math.floor(pt[0] / bCell) + ',' + Math.floor(pt[1] / bCell)) ?? []) if (l !== self && pointInPolygon(pt, l.poly)) return true;
+        return false;
+    };
+    const blockPolyById = new Map(graph.blocks.map(b => [b.id, b.poly]));
+    const terrain = lotTerrain(graph);   // water / retaining-wall edges (B1/B2, S13)
+    const PALD = cityPalette(p.seed, p.palette);   // neon / lit-window colours for the detailed buildings (P2)
     for (const lot of graph.lots) {
         // Variety-claimed lots (slot flipped to 'empty' on a PREVIOUS run) must still enter, so a re-run of
         // buildStreets on the same graph consumes the seeded RNG identically (selective-regen idempotency).
@@ -295,9 +566,18 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         }
         const h = buildingHeight(lot.zone, lotRng, scale) * hMul;
         lot.builtH = h;   // signage/awnings clamp their wall dressing to the real facade height
-        let foot = insetToward(lot.poly, lot.center, 0.12);   // shrink a touch → the sidewalk shows as a plot rim
+        clearLotMeta(lot);
+        // STREET WALL (B1/B2): classify every lot edge (street / open / party), set back ONLY the street edges by a
+        // fixed metre amount (a ~2 m pavement band), keep party edges on the lot line (so neighbours share a wall),
+        // and round / chamfer only street-street corners. Was: a uniform 12% shrink toward the centre (+ up to 14%
+        // more on the detailed path) → a 3–4 m gap between every pair of buildings and no street wall.
+        // (R3.2) a wall onto the local line's corridor reads as a PARTY wall: no fire escape / balcony hung over the track.
+        const kinds0 = classifyLotEdges(lot.poly, graph.roads, p.streetWidth * 0.5, scale, (pt) => builtAt(pt, lot) || (!!graph.localLine && inLocalCorridor(graph.localLine, pt[0], pt[1])), terrain);
+        let foot = lotFootprint(lot.poly, kinds0, blockPolyById.get(lot.block) ?? null, scale);
         if (foot.length < 3) continue;
-        foot = applyCorner(foot, lot, p.cornerStyle, lotRng, scale);
+        const cm = applyCornerMasked(foot, kinds0, lot, p.cornerStyle, lotRng, scale);
+        foot = cm.foot;
+        const kinds = cm.kinds;
         const lift = elev(lot.center[0], lot.center[1]);
         let minE = Infinity, maxE = -Infinity;
         for (const pt of foot) { const e = elev(pt[0], pt[1]); minE = Math.min(minE, e); maxE = Math.max(maxE, e); }
@@ -328,11 +608,22 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         if (lift - minE > 0.004 * scale) foundation.walls(foot, gy + minE - 0.012 * scale, lift - minE + 0.013 * scale);   // pad down to the terrain
         // DETAILED path (opt-in): a full procedural building fitted to this lot, instead of the basic box below.
         if (p.detailedBuildings) {
-            emitDetailedBuilding(detailedMerged, detailedInst, lot, foot, base, h, scale, Math.floor(lotRng.next() * 1e9), lotRng, regionTint(regionByBlock.get(lot.block) ?? -1), cellOf(lot.center), p.quoinStyle ?? 'alternating', blockC.get(lot.block) ?? null);
+            emitDetailedBuilding(detailedMerged, detailedInst, lot, foot, kinds, base, h, scale, Math.floor(lotRng.next() * 1e9), lotRng, regionTint(regionByBlock.get(lot.block) ?? -1), cellOf(lot.center), p.quoinStyle ?? 'alternating', blockC.get(lot.block) ?? null, district, PALD, p.roofStyle, p.adverts ?? null, p.propTwins !== false, p.adScreens !== false,
+                p.districtPalette || p.roofVariety || p.roofEquipment === 'clustered' ? { facade: !!p.districtPalette, roof: !!p.roofVariety, plant: p.roofEquipment === 'clustered' } : null);   // visual-polish #11 (+ tail: the roof plant)
+            // ALLEY CLUTTER (B8): the detailed path used to skip ALL district dressing. The building now carries its
+            // own AC / pipes / stairs / laundry / screens; the backstreet dumpster + crates go on an OPEN back edge
+            // (never into the neighbour behind a party wall).
+            if ((lot.zone === 'commercial' || district === 'downtown') && hash2(lot.center[0] * 313.1, lot.center[1] * 977.7, (p.seed ^ 0xa11e) >>> 0) < 0.3) {
+                let bi = -1, bl = 0;
+                for (let i = 0; i < foot.length; i++) { if (kinds[i] !== 'open') continue; const a = foot[i], b = foot[(i + 1) % foot.length], L = Math.hypot(b[0] - a[0], b[1] - a[1]); if (L > bl) { bl = L; bi = i; } }
+                if (bi >= 0 && bl > 0.08 * scale) addClutterAtEdge(alley, roofEquip, foot[bi], foot[(bi + 1) % foot.length], centroid(foot), base, scale);
+            }
             continue;
         }
         const winCell = 1 / winFreqByZone[lot.zone];
-        acc.wallsWin(foot, base, h, winCell, winCell);   // whole window cells per face — windows never clip
+        // whole window cells per face — windows never clip; + per-face whole-cell u offsets (L6: faces / buildings
+        // light different windows, and the offset band gives each building its own lit fraction in-shader)
+        acc.wallsWin(foot, base, h, winCell, winCell, { uOffset: faceUOffsets(Math.floor(hash2(lot.center[0] * 41.3, lot.center[1] * 29.9, p.seed) * 0x7fffffff), foot.length) });
         buildRoof(roofs, roofDark, roofMark, roofEquip, foot, base + h, lot.zone, p.roofStyle, lotRng, scale, h, p.rooftops ?? true);
         const ref = blockC.get(lot.block) ?? null, jit = hash2(lot.center[0] * 991, lot.center[1] * 761, p.seed) * 100;
         if ((p.facadeDetail ?? true) && lot.zone !== 'residential' && lotRng.chance(0.4)) addFacadeDetail(roofEquip, roofDark, foot, base, h, lotRng, scale, ref, jit);
@@ -342,7 +633,7 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         // Most buildings get a front DOOR + a small entrance STOOP (steps sized to the real drop to the
         // sidewalk). The stamped door anchor drives the door-visit sim (pedestrians entering buildings).
         if (lotRng.chance(0.72)) {
-            const ent = addEntrance(roofDark, foundation, foot, base, scale, ref, jit, (x, z) => gy + elev(x, z));
+            const ent = addEntrance(roofDark, foundation, foot, base, scale, ref, jit, (x, z) => gy + elev(x, z), kinds);
             if (ent) { lot.door = ent.door; lot.doorOut = ent.out; }
         }
         // District character: entertainment cores get big neon SCREENS high on tall buildings; residential gets
@@ -362,6 +653,7 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
     // Real banner lamp posts (lamp-post.ts) instead of the old prism+blob — pole/emissive head/windSway banner.
     const lampAcc = newLampPostAccum();
     const lampWpm = 1 / cityMetresPerUnit(p.radius);   // metres → world units for the metre-authored generator
+    lampAcc.metal = twinAccum(PROP_TWIN_M.lamp, lampWpm, p.propTwins);   // P9: the posts also build a cheap FAR TWIN
     const half = p.streetWidth * 0.5, curbOff = half + 0.02 * scale;   // just onto the sidewalk beside the curb
     // Don't plant furniture in a canal, in the pedestrianised shotengai, past the diorama border, or in a region the
     // active-region editor has switched off — mirrors furniture.ts's wet()/enabled() so all curb families agree.
@@ -372,7 +664,8 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         (!!keep && !keep(regionAt(graph, x, z) ?? -1));
 
     // Banner lamp posts along the ARTERIALS (the intersections get cantilever street lights below). Real 5 m posts
-    // from lamp-post.ts — a tapered pole, an emissive downlight, and (on ~60%) a pair of windSway fabric banners.
+    // from lamp-post.ts — a bevelled post with a base collar, a swept swan-neck arm to a bell over a glowing bowl, and
+    // (on ~60%) a pair of windSway fabric banners (T3.1).
     const spacing = 1.8 * scale;
     for (const road of graph.roads) {
         if (road.klass !== 'arterial') continue;
@@ -383,10 +676,14 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         for (let i = 0; i < n; i++) {
             const t = (i + 0.5) / n, x = road.a[0] + dx * t + ox, z = road.a[1] + dz * t + oz;
             if (overWater(x, z)) continue;
+            if (inCrossingZone(graph.localLine, x, z)) continue;   // (R3.2) never on a level crossing's barrier / stop-line stretch
             const hh = hash2(x * 13.1, z * 7.7, (p.seed ^ 0x1a3d) >>> 0);
             const lp = resolveLampPostParams({ style: 'modern', heightM: 5, banners: hh < 0.6 });
-            emitLampPost(lampAcc, [x, gy, z], inward, lp, lampWpm);
-            pools.disc([x, gy + 0.004 * scale, z], [0, 1, 0], 0.15 * scale, 16);   // ~2.2 m cast pool (soft rim via radialFade)
+            partOf([lampAcc.metal, lampAcc.glow], [x, gy, z], inward, () => emitLampPost(lampAcc, [x, gy, z], inward, lp, lampWpm));   // P20: one prop part (banners stay merged: wind)
+            // L10: the pool is centred UNDER THE HEAD (the swan-neck bell hangs ~0.6 m out along the inward normal) and
+            // sized to what a 5 m downlight throws (~7.5 m radius, 3.3x the old 2.2 m foot-of-pole disc). Ringed so it drapes.
+            const reachW = lampHeadOffset(lp).reachM * lampWpm;   // pool centred under the swan-neck bell
+            poolDisc(pools, x + inward[0] * reachW, gy + 0.004 * scale, z + inward[1] * reachW, 0.5 * scale, 24, 3);
         }
     }
 
@@ -401,10 +698,12 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
             const corner: V2 = [it.pos[0] + (d0[0] + pd[0]) * half, it.pos[1] + (d0[1] + pd[1]) * half];   // curb corner
             if (overWater(corner[0], corner[1])) continue;
             const armDir = nrm2([it.pos[0] - corner[0], it.pos[1] - corner[1]]);   // reach back over the crossing
-            // A 5.5 m pole on the curb corner with a ~2.4 m cantilever + downlight reaching over the junction.
+            // A 5.5 m pole on the curb corner with a curved ~2.4 m davit arm + cobra head reaching over the junction.
             const slp = resolveLampPostParams({ style: 'modern', heightM: 5.5, banners: false });
-            emitLampPost(lampAcc, [corner[0], gy, corner[1]], armDir, slp, lampWpm, { reachM: 2.4 });
-            pools.disc([it.pos[0], gy + 0.004 * scale, it.pos[1]], [0, 1, 0], 0.19 * scale, 18);   // ~2.8 m intersection pool
+            partOf([lampAcc.metal, lampAcc.glow], [corner[0], gy, corner[1]], armDir, () => emitLampPost(lampAcc, [corner[0], gy, corner[1]], armDir, slp, lampWpm, { reachM: 2.4 }));   // P20
+            // L10: centred under the cantilever head (2.4 m out over the junction), ~7.5 m radius.
+            const reachW = lampHeadOffset(slp, { reachM: 2.4 }).reachM * lampWpm;
+            poolDisc(pools, corner[0] + armDir[0] * reachW, gy + 0.004 * scale, corner[1] + armDir[1] * reachW, 0.5 * scale, 24, 3);
         }
     }
 
@@ -445,6 +744,9 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
     // grey and the variety added upstream is silently thrown away.
     const detailMat = (raw: string, color: [number, number, number], hasPattern: boolean): Partial<LayoutPreviewLayer> => {
         const n = raw.replace('bldg:', '');
+        // ADVERTS: a user-image sign face samples its GARP signage page (no pattern / metal — the image IS the look).
+        const ad = advertGarpForLayerName(n);
+        if (ad) return { garp: ad };
         // ★ PATTERN WINS. metalShade, foliageShade and `pattern` are the SAME four instance floats — a mesh
         // is exactly one of them. So handing metal to a layer that already carries a pattern does not layer
         // two effects, it silently deletes the pattern. The generator's `grid` on roof equipment is the
@@ -495,7 +797,12 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
     };
     for (const g of detailedMerged.values()) {
         if (!g.geos.length) continue;
-        layers.push({ name: `world:detail-${g.name.replace('bldg:', '')}${g.cell ? '#' + g.cell : ''}`, color: g.color, y: gy, geometry: mergeGeos(g.geos), emissive: g.emissive, pattern: g.pattern, ...detailMat(g.name, g.color, !!g.pattern) });
+        const geometry = mergeGeos(g.geos);
+        // P9 twins: gridTris = this (near) layer's triangles, so the pair chunks like the plain layer did (0 on the far twin).
+        // The key is per detail cell, so each pair grids exactly like its plain layer did (one shared grid over the
+        // whole city cut every cell's layer into extra pieces: +15 % draw calls in the diorama).
+        const twin = g.twin ? { ...g.twin, key: g.twin.key + (g.cell ? '#' + g.cell : ''), gridTris: g.twin.role === 'near' ? Math.floor(geometry.indices.length / 3) : 0 } : undefined;
+        layers.push({ name: `world:detail-${g.name.replace('bldg:', '')}${g.cell ? '#' + g.cell : ''}`, color: g.color, y: gy, geometry, emissive: g.emissive, pattern: g.pattern, ...(g.opacity != null ? { opacity: g.opacity } : {}), ...detailMat(g.name, g.color, !!g.pattern), ...(twin ? { nearTwin: twin } : {}) });
     }
     for (const g of detailedInst.values()) {
         if (!g.instances.length) continue;
@@ -534,7 +841,8 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
     // colour via the emissive/tint path); the layer tint is the default red — individual banners still read varied.
     for (const ll of lampPostLayers(lampAcc, [0.72, 0.16, 0.18], metalScale, { night: !!p.nightMode })) {
         const renamed = ll.name === 'world:lamp-pole' ? 'world:lightpoles' : ll.name === 'world:lamp-glow' ? 'world:lamplights' : 'world:lamp-banner';
-        layers.push({ ...ll, name: renamed });
+        if (renamed === 'world:lightpoles') layers.push(...withFarTwin({ ...ll, name: renamed }, lampAcc.metal, 'lamp', PROP_TWIN_M.lamp, lampWpm));
+        else layers.push({ ...ll, name: renamed });
     }
     // Lamp light POOLS: faint warm discs on the pavement under every light — near-invisible by day, the glow
     // walk cranks them at night so streets get pooled light instead of uniformly dark asphalt.
@@ -560,6 +868,43 @@ function addLaundry(laundry: Accum3D, at: V3, eW: V3, oW: V3, half: number, s: n
             [cx + eW[0] * w + oW[0] * 0.004 * s, lineY - hgt, cz + eW[2] * w + oW[2] * 0.004 * s],
             [cx - eW[0] * w + oW[0] * 0.004 * s, lineY - hgt, cz - eW[2] * w + oW[2] * 0.004 * s]);
     }
+}
+
+/** A lamp light POOL: a flat disc of `rings` concentric rings × `segs` (so it drapes over gently sloped ground
+ *  instead of cutting through it), radial UVs centred at (0.5,0.5) → the rim at the unit circle for radialFade. */
+function poolDisc(acc: Accum3D, cx: number, y: number, cz: number, r: number, segs: number, rings: number): void {
+    const n: V3 = [0, 1, 0];
+    const centre = acc.vertex([cx, y, cz], n, 0.5, 0.5);
+    let prev: number[] = [];
+    for (let k = 1; k <= rings; k++) {
+        const f = k / rings, ring: number[] = [];
+        for (let i = 0; i < segs; i++) {
+            const a = (i / segs) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+            ring.push(acc.vertex([cx + ca * r * f, y, cz + sa * r * f], n, 0.5 + 0.5 * ca * f, 0.5 + 0.5 * sa * f));
+        }
+        for (let i = 0; i < segs; i++) {
+            const m = (i + 1) % segs;
+            if (k === 1) acc.triangle(centre, ring[m], ring[i]);
+            else { acc.triangle(prev[i], ring[m], ring[i]); acc.triangle(prev[i], prev[m], ring[m]); }
+        }
+        prev = ring;
+    }
+}
+
+/** Backstreet clutter against an OPEN edge a→b of a detailed building: a dumpster + a crate stack just outside it. */
+function addClutterAtEdge(alley: Accum3D, equip: Accum3D, a: V2, b: V2, c: V2, gy: number, s: number): void {
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    const eDir: V2 = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+    let out: V2 = [-eDir[1], eDir[0]];
+    const mid: V2 = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    if ((mid[0] - c[0]) * out[0] + (mid[1] - c[1]) * out[1] < 0) out = [-out[0], -out[1]];
+    const rx = mid[0] + out[0] * 0.03 * s, rz = mid[1] + out[1] * 0.03 * s;
+    const eW: V3 = [eDir[0], 0, eDir[1]], up: V3 = [0, 1, 0], oW: V3 = [out[0], 0, out[1]];
+    equip.obox([rx, gy + 0.016 * s, rz], eW, up, oW, 0.022 * s, 0.016 * s, 0.013 * s);                    // dumpster body
+    equip.obox([rx, gy + 0.034 * s, rz], eW, up, oW, 0.023 * s, 0.003 * s, 0.014 * s);                    // lid
+    const bx = rx + eDir[0] * 0.05 * s, bz = rz + eDir[1] * 0.05 * s;                                      // crate stack beside it
+    alley.obox([bx, gy + 0.009 * s, bz], eW, up, oW, 0.011 * s, 0.009 * s, 0.011 * s);
+    alley.obox([bx + eDir[0] * 0.006 * s, gy + 0.027 * s, bz + eDir[1] * 0.006 * s], eW, up, oW, 0.009 * s, 0.008 * s, 0.009 * s);
 }
 
 /** Rear-face ALLEY CLUTTER: a dumpster (grey, into roofEquip) + a stack of crates behind the building. */
@@ -650,7 +995,7 @@ function addGasStation(dark: Accum3D, white: Accum3D, orange: Accum3D, foot: V2[
 }
 
 /** Massing height by zone (× city scale), with per-building jitter + an occasional tall tower for skyline variety. */
-function buildingHeight(zone: Zone, rng: Rng, scale: number): number {
+export function buildingHeight(zone: Zone, rng: Rng, scale: number): number {
     let h = zone === 'civic' ? 0.6 + rng.next() * 0.7 : zone === 'commercial' ? 0.35 + rng.next() * 0.55 : 0.2 + rng.next() * 0.32;
     if (zone !== 'residential' && rng.chance(0.14)) h *= 1.7 + rng.next() * 1.3;   // ~14% of non-residential are notably taller
     return h * scale;
@@ -674,9 +1019,9 @@ function insetToward(poly: V2[], c: V2, f: number): V2[] {
 /** The building's street frontage = its longest edge, with an OUTWARD (away-from-centre) normal. */
 /** The dressing frontage: a STREET-FACING near-longest edge picked with jitter (so identical lots don't all face
  *  the same way). `ref` = the block centroid (edges away from it face streets); outward = away from the lot. */
-function frontage(foot: V2[], ref: V2 | null = null, jitter = 0): { a: V2; b: V2; eDir: V2; outward: V2; len: number } | null {
+function frontage(foot: V2[], ref: V2 | null = null, jitter = 0, allow?: (i: number) => boolean): { a: V2; b: V2; eDir: V2; outward: V2; len: number } | null {
     if (foot.length < 3) return null;
-    const e = frontageEdge(foot, ref, jitter);
+    const e = frontageEdge(foot, ref, jitter, allow);
     const a = e.a, b = e.b, len = e.len;
     if (len < 1e-4) return null;
     const eDir: V2 = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
@@ -795,8 +1140,10 @@ function clutter(dark: Accum3D, equip: Accum3D, c: V2, topY: number, rng: Rng, s
  *  they never sink below it (the old fixed 3-step descent buried stoops under the map on uphill frontages).
  *  Returns the door anchor + outward direction so the caller can stamp the lot for the door-visit sim. */
 function addEntrance(dark: Accum3D, stone: Accum3D, foot: V2[], base: number, s: number, ref: V2 | null, jit: number,
-    groundAt: (x: number, z: number) => number): { door: V2; out: V2 } | null {
-    const fr = frontage(foot, ref, jit); if (!fr || fr.len < 0.12 * s) return null;
+    groundAt: (x: number, z: number) => number, kinds?: EdgeKind[]): { door: V2; out: V2 } | null {
+    // The door goes on the best KIND of edge present (FRONT_RANK: a level street first, never the canal side).
+    const best = kinds ? Math.min(...kinds.map(k => FRONT_RANK[k] ?? 2)) : 0;
+    const fr = frontage(foot, ref, jit, kinds ? (i) => (FRONT_RANK[kinds[i]] ?? 2) === best : undefined); if (!fr || fr.len < 0.12 * s) return null;
     const eW: V3 = [fr.eDir[0], 0, fr.eDir[1]], oW: V3 = [fr.outward[0], 0, fr.outward[1]], up: V3 = [0, 1, 0];
     const t = 0.26;   // off-centre door (shop doors read at the centre; stoops sit to one side)
     const dx = fr.a[0] + (fr.b[0] - fr.a[0]) * t, dz = fr.a[1] + (fr.b[1] - fr.a[1]) * t;
@@ -888,3 +1235,7 @@ function tower(roofs: Accum3D, dark: Accum3D, foot: V2[], c: V2, topY: number, r
     if (rng.chance(0.6)) roofs.pyramid(cur, y, (0.1 + rng.next() * 0.16) * s);
     else dark.prism([c[0], y, c[1]], 0.005 * s, 0.005 * s, (0.1 + rng.next() * 0.12) * s, 4);
 }
+
+// P17 HLOD (tile-hlod.ts) reads the per-lot archetype / storey / tint / roof rules so a merged distant tile matches the full build.
+export { zoneArchetype, FLOOR_RANGE, TINTS, applyTint, pickRoof };
+export type { Tint };

@@ -372,7 +372,7 @@ export class Scene3DKitbash {
                 return active;
             };
         }
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._spawnSpinCallback);
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._spawnSpinCallback, 'kitbashSpin');
     }
 
     // ── Private assembly helpers (kitbash-only; the shared ones live on the manager) ──

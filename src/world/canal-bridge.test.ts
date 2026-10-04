@@ -42,6 +42,20 @@ const inPoly = (pt: V2, poly: V2[]): boolean => {
   return hit;
 };
 
+/** "Is this point on any water triangle" with a bucket index — the water is split on the terrain lattice
+ *  (thousands of triangles), and the probes below test thousands of points. */
+const coverTest = (tris: V2[][]): ((pt: V2) => boolean) => {
+  const B = 0.5, buckets = new Map<string, V2[][]>();
+  for (const t of tris) {
+    const xs = t.map((q) => q[0]), zs = t.map((q) => q[1]);
+    for (let i = Math.floor(Math.min(...xs) / B); i <= Math.floor(Math.max(...xs) / B); i++)
+      for (let j = Math.floor(Math.min(...zs) / B); j <= Math.floor(Math.max(...zs) / B); j++) {
+        const k = `${i},${j}`; const arr = buckets.get(k); if (arr) arr.push(t); else buckets.set(k, [t]);
+      }
+  }
+  return (pt) => (buckets.get(`${Math.floor(pt[0] / B)},${Math.floor(pt[1] / B)}`) ?? []).some((t) => inPoly(pt, t));
+};
+
 /** The canal surface, recovered from the emitted layer's triangles as world-space polygons. */
 const waterTris = (g: WorldGraph): V2[][] => {
   const L = buildWater(g).find((x) => x.name === 'world:canal');
@@ -64,12 +78,12 @@ describe('the canal water covers the whole excavated trench', () => {
     for (const g of withCanals()) {
       const R = g.radius;
       const uncovered: string[] = [];
-      const tris = waterTris(g);
+      const tris = waterTris(g), covered = coverTest(tris);
       expect(tris.length, 'no canal geometry emitted').toBeGreaterThan(0);
       for (let x = -R + 0.11; x < R; x += 0.19) {
         for (let z = -R + 0.13; z < R; z += 0.19) {
           if (cellLevelAt(g, x, z) >= 0) continue;
-          if (!tris.some((t) => inPoly([x, z], t))) uncovered.push(`(${x.toFixed(2)}, ${z.toFixed(2)})`);
+          if (!covered([x, z])) uncovered.push(`(${x.toFixed(2)}, ${z.toFixed(2)})`);
         }
       }
       expect(uncovered.slice(0, 6), `seed ${g.params.seed}: ${uncovered.length} trench points have no water`).toEqual([]);
@@ -81,7 +95,7 @@ describe('the canal water covers the whole excavated trench', () => {
     // Water is allowed out to the trench edge (streetBandHalf past the cell), so probe well beyond that.
     for (const g of withCanals()) {
       const R = g.radius, slack = streetBandHalf(g.params) * 1.6;
-      const tris = waterTris(g);
+      const covered = coverTest(waterTris(g));
       let flooded = 0, dry = 0;
       for (let x = -R + 0.11; x < R; x += 0.19) {
         for (let z = -R + 0.13; z < R; z += 0.19) {
@@ -90,7 +104,7 @@ describe('the canal water covers the whole excavated trench', () => {
           if (cellLevelAt(g, x, z + slack) < 0 || cellLevelAt(g, x, z - slack) < 0) continue;
           if (cellLevelAt(g, x, z) < 0) continue;
           dry++;
-          if (tris.some((t) => inPoly([x, z], t))) flooded++;
+          if (covered([x, z])) flooded++;
         }
       }
       expect(dry, 'no dry land sampled').toBeGreaterThan(50);

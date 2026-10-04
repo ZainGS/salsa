@@ -1,5 +1,7 @@
 # Pipeline Warm-Up — eliminate the first-3D-mesh freeze
 
+> **Superseded by P2 (2026-09-30), `docs/specs/performance-plan.md`:** every pipeline is now a non-blocking `GPUPipelineCache` handle. Inside a live frame a pending pipeline skips its draw instead of compiling synchronously. The warm drains in priority order, capped at 2 concurrent. The status API is `sm.getPipelineWarmup3D()` (see `docs/ui/performance.md`). The text below describes the Phase-1 design.
+
 **Status:** Phase 1 DONE (2026-08-12, typecheck clean, 804 tests, +5 in `pipeline-warmup.test.ts`). Phase 2/3 deferred. **Owner spec.** Related: the §3.1 plain-shader change (uber-shader pattern-strip) and the lazy-pipeline deferral in `pipeline-3d.ts`.
 
 **Stage A / Part 1 shipped (2026-08-13, typecheck clean, 805 tests):** the 16 CORE pipelines are now deferred + async-warmed too. `Pipeline3D` runs `createPipelines()` in COLLECT mode (`_collectingCore`): each core site uses `_mkCore(assign, descriptor)` to record its descriptor instead of compiling. `ensureCore()` compiles them sync on first getter access (every core getter self-ensures → a draw can never read an uncompiled pipeline); `warmDeferredAsync()` now includes the core group (createRenderPipelineAsync). The constructor now compiles ZERO pipelines. So `warmDeferredAsync()` warms all 29 render pipelines (16 core + 13 deferred) off the main thread. Test updated (6 cases).

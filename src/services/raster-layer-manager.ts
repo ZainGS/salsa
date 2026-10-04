@@ -4,6 +4,7 @@ import { LayerBlendMode } from '../renderer/raster/core/raster-compositor';
 import { DitherConfig } from '../renderer/raster/effects/dither-engine';
 import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation } from '../animation';
 import { EventEmitter } from '../renderer/util/event-emitter';
+import { bumpGpuPixelEpoch } from '../renderer/raster/gpu-pixel-epoch';
 
 function makeId() { return 'r_' + Math.random().toString(36).slice(2,9); }
 
@@ -147,7 +148,7 @@ export class RasterLayerManager {
     const id = makeId();
     const manager = new RasterTextureManager(this.device);
     manager.ensureTexture(this.width, this.height);
-    manager.initializeWithBlankSnapshot?.();
+    void manager.initializeWithBlankSnapshot?.();
     const texture = manager.ensureTexture(this.width, this.height);
     const visible = opts.visible ?? true;
     const layer: RasterLayer = { id, name, visible, locked: false, blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false, lockTransparency: false, texture, manager, systemOwner: opts.systemOwner, packageOwnerId: opts.packageOwnerId };
@@ -183,7 +184,7 @@ export class RasterLayerManager {
     if (this.layers.find(l => l.id === id)) return;
     const manager = new RasterTextureManager(this.device);
     manager.ensureTexture(this.width, this.height);
-    manager.initializeWithBlankSnapshot?.();
+    void manager.initializeWithBlankSnapshot?.();
     const texture = manager.ensureTexture(this.width, this.height);
     const layer: RasterLayer = {
       id,
@@ -605,7 +606,7 @@ export class RasterLayerManager {
 
     const w = this.width, h = this.height;
 
-    l.manager.pushSnapshot?.();
+    void l.manager.pushSnapshot?.();
 
     const existingBlob = await l.manager.exportToBlob('image/png');
     const existingBitmap = await createImageBitmap(existingBlob);
@@ -633,6 +634,7 @@ export class RasterLayerManager {
     }
 
     const composited = await createImageBitmap(canvas);
+    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
     this.device.queue.copyExternalImageToTexture(
       { source: composited, flipY: false },
       { texture: l.texture },
@@ -686,7 +688,7 @@ export class RasterLayerManager {
     // wait for GPU work to finish before pushing snapshot
     await this.device.queue.onSubmittedWorkDone();
     // push snapshot so undo/redo reflects imported pixels
-    l.manager.pushSnapshot?.();
+    void l.manager.pushSnapshot?.();
     l.texture = l.manager.ensureTexture(rasterCanvas.width, rasterCanvas.height);
     // notify and select the layer
     this.notifyCompositionChanged();
@@ -704,7 +706,7 @@ export class RasterLayerManager {
     // wait for the GPU to finish copying
     await this.device.queue.onSubmittedWorkDone();
     // seed snapshot history for the new manager
-    manager.pushSnapshot?.();
+    void manager.pushSnapshot?.();
     const texture = manager.ensureTexture(rasterCanvas.width, rasterCanvas.height);
     const layer: RasterLayer = { id, name, visible: true, locked: false, blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false, lockTransparency: false, texture, manager };
     this.layers.push(layer);
@@ -757,7 +759,7 @@ export class RasterLayerManager {
   public pushSnapshotForLayer(id: string) {
     const l = this.layers.find(x => x.id === id);
     if (!l) return false;
-    l.manager.pushSnapshot?.();
+    void l.manager.pushSnapshot?.();
     return true;
   }
 
@@ -1119,6 +1121,18 @@ export class RasterLayerManager {
    * Export all layer pixel data as raw RGBA buffers.
    * Used by the persistence engine for fast binary saves.
    */
+  /** Device-lost recovery (docs/ui/device-recovery.md): every layer texture died with the device. Re-create each BLANK
+   *  on the new device so the layer stack stays valid; the document restore that follows re-uploads the pixels. */
+  public recreateTexturesForNewDevice(): void {
+    this._readbackBuf = null; this._readbackBufSize = 0;
+    for (const l of this.layers) {
+      if (!l.texture || !l.manager) continue;
+      l.manager.resetForNewDevice();
+      l.texture = l.manager.ensureTexture(this.width, this.height);
+    }
+    this.notifyCompositionChanged();
+  }
+
   public async exportLayerPixels(): Promise<Array<{ id: string; pixelData: ArrayBuffer }>> {
     const out: Array<{ id: string; pixelData: ArrayBuffer }> = [];
     for (const l of this.layers) {
@@ -1197,6 +1211,7 @@ export class RasterLayerManager {
     if (!cel?.texture) return false;
     const w = cel.texture.width;
     const h = cel.texture.height;
+    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
     this.device.queue.writeTexture(
       { texture: cel.texture },
       pixels,
@@ -1255,6 +1270,7 @@ export class RasterLayerManager {
     if (pixels.byteLength !== expectedBytes) {
       console.warn(`[RasterLayerManager] uploadPixelsToLayer size mismatch: layer="${layer.name}" texture=${w}x${h} (${expectedBytes}B) but pixels=${pixels.byteLength}B`);
     }
+    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
     this.device.queue.writeTexture(
       { texture: layer.texture },
       pixels,
@@ -1282,6 +1298,7 @@ export class RasterLayerManager {
 
     if (src.texture) {
       const enc = this.device.createCommandEncoder();
+      bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
       enc.copyTextureToTexture(
         { texture: src.texture },
         { texture: newTex },
@@ -1364,6 +1381,7 @@ export class RasterLayerManager {
     lowerBitmap.close();
 
     const mergedBitmap = await createImageBitmap(canvas as OffscreenCanvas);
+    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
     this.device.queue.copyExternalImageToTexture(
       { source: mergedBitmap, flipY: false },
       { texture: lower.texture },
@@ -1404,7 +1422,7 @@ export class RasterLayerManager {
     const w = this.width;
     const h = this.height;
 
-    l.manager.pushSnapshot?.();
+    void l.manager.pushSnapshot?.();
 
     const existingBlob = await l.manager.exportToBlob('image/png');
     const existingBitmap = await createImageBitmap(existingBlob);
@@ -1426,6 +1444,7 @@ export class RasterLayerManager {
     }
 
     const composited = await createImageBitmap(canvas);
+    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
     this.device.queue.copyExternalImageToTexture(
       { source: composited, flipY: false },
       { texture: l.texture },
@@ -1489,6 +1508,7 @@ export class RasterLayerManager {
       bitmap.close();
 
       const placed = await createImageBitmap(canvas as OffscreenCanvas);
+      bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
       this.device.queue.copyExternalImageToTexture(
         { source: placed, flipY: false },
         { texture: snap.layer.texture },
@@ -1534,6 +1554,7 @@ export class RasterLayerManager {
     ctx.drawImage(imageBitmap, dx, dy, dw, dh);
 
     const fitted = await createImageBitmap(canvas as OffscreenCanvas);
+    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
     this.device.queue.copyExternalImageToTexture(
       { source: fitted, flipY: false },
       { texture: tex },

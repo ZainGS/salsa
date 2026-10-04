@@ -43,6 +43,9 @@ const { meshId, skeletonId } = await shapeManager.createProceduralBody3D({
   hipFront: 1,      // pelvis FRONT projection (lower-belly depth) — INDEPENDENT of hipWidth
   shoulderWidth: 1, // shoulder width — scales the torso shoulder band AND the arm's deltoid cap together, so a wider shoulder keeps the arm seamlessly matched (no gap where the arm meets the shoulder)
   buttSize: 1,      // buttock fullness — 0 flat · 1 neutral · >1 fuller (radial cheek bulge: width + back-projection + auto-hang)
+  seamBlend: 0.5,   // JOINT SMOOTHNESS 0..1 — blends skin weights across the armpit/elbow seams so they stop folding when posed.
+                    //   0 = classic (every saved character); NEW bodies are created at 0.5. Slider range 0–1, step 0.05.
+                    //   See docs/specs/character-skin-weights.md for the measured before/after.
 });
 ```
 
@@ -58,6 +61,138 @@ const cur = shapeManager.getBodyParams3D(meshId);               // current param
 ```
 
 > **All six base proportions are editable post-create too** (height / limbThick / torsoThick / torsoLength / headSize / legLength) — `setBodyParams3D` regenerates the geometry **and the skeleton** in place. Apply them while the character is in **rest pose** (the creation stage), since it rebuilds the rest pose. So Frogmarks should keep *every* body slider live after Generate, not just the localized-shape ones.
+
+### Random character ✅ (new 2026-09-29 — the 🎲 "Generate" defaults)
+
+The engine now owns the NEW-random-character recipe (`src/services/managers/character-randomizer.ts`, seeded — same seed, same character). Use it for the Generate / 🎲 button instead of a host-side randomizer:
+
+```ts
+// One call (body = your body sliders; merges over the random waist/hipFront):
+const { meshId, nodeIds } = await shapeManager.createRandomCharacter3D({ seed, position: center, body: { height, legLength, limbThick, torsoThick, torsoLength, headSize } });
+// …or get the params, tweak/show them, then create:
+const p = shapeManager.randomCharacterParams3D(seed, bodySliders);   // { body, eyes, hair, top, bottom, shoes, socks, skinTone, rimLight: true }
+await shapeManager.createFullCharacter3D({ ...p, position: center });
+```
+
+Pinned defaults (the look signed off in polish-round-3 T6) — everything else (colours, hair style/tails, garment + shoe styles, socks) stays random:
+
+| Part | Random-character value |
+|---|---|
+| Eyes | width **0.37–0.43** (≈0.4), height **0.18–0.22** (≈0.2), **no bottom lash** (`lowerLash: false`) |
+| Hair | **one of the 8 anime lock STYLES** (`hairMode: 'locks'`, 2026-10-04: bob / long straight / side-swept / ponytail / twintails / short messy / bun / hime) with seeded per-character variation, the fringe above the eyes, flat colour (a root-to-tip gradient on about 30 %). Drawn from its own stream, so the clothes etc. of a seed are unchanged. See §2.6 *Hair styles*. (Was: cards, Cap Layers = 6.) |
+| Rim light | **on** (`createFullCharacter3D({ rimLight: true })` → `setCharacterRimLight3D`) |
+| Top | **Crop** (`hemHeight`) **−0.10 … 0** — never cropped; the belly stays covered |
+| Bottom | **Looseness** (`thickness`) **0.016 – 0.020** (was the 0.012 default) |
+
+`createFullCharacter3D` gained an optional `rimLight?: boolean` (omit = unchanged). Saved characters are untouched — their params persist and never pass through the randomizer. Guarded by `character-randomizer.test.ts` (500 seeds).
+
+**Persona-look defaults (2026-10-03, visual-polish item 10)** — added on top of the T6 table, for NEW characters only:
+
+| Part | Random-character value |
+|---|---|
+| Face shading | **anime face normals** — `BodyParams.faceNormals = 1` (every new procedural body: `NEW_BODY_DEFAULTS`, like the joint `seamBlend`). The face shades as one flat skin plane with at most a soft jaw / far-cheek shadow — no dark facet wedges across the nose and cheeks — in PBR, Gouraud, Cel, Cel HD and toon shadows. See [character-shading.md](character-shading.md#anime-face-shading--matte--hair-band--play-outlines-2026-10-03). |
+| Skin + cloth | **matte** (`matte: true` → `setCharacterMatte3D`): no specular on the skin or any garment, so no glossy plastic streaks in Cel HD. Hair keeps its sheen. |
+| Hair | the sheen drawn as **one highlight band** in Cel / Cel HD (`hair.sheenBand: true`). |
+| Bang hairline | `hairlineFront` **0.28 – 0.46** (was 0 – 0.40). Below ≈0.25 the cap cards hung over the eyes on ≈40 % of seeds; now ≥ 90 % of seeds keep the fringe above the eye line (asserted on the generated hair). |
+| Under-eye dots | **off** (`underDeco: false`). At face / Play distance the row of tiny accent dots read as stray white "°°°" specks on the cheeks (seeds 18, 32). The Eyes panel's Under-eye toggle still turns it on. |
+
+Every other field of a seed is unchanged (the hairline keeps its draw, the dots keep theirs). `createFullCharacter3D` gained
+`matte?: boolean` (omit = unchanged). **Chunky hair is not the random default:** with the random style ranges (no bangs, card
+cap) chunky mode reads as a smooth helmet / hood with "cat ear" side points, and with bangs it is a row of small teeth — the big
+solid P5 locks need the open hair-styles phases (B–E). Cards + the highlight band are the better default until then.
+**Saved characters load exactly as they were** — every one of these is a saved param / material field, absent on old saves
+(= the classic look); verified by a save → reload → pixel diff (0 for a new character; the old look matches a stripped save).
+
+> **Frogmarks:** `illustration.component.ts` `_randomizeCharacterInputs()` still has its own ranges (eye width 0.15–0.45 / height up to 0.7×width, 40 % bottom lash, Crop −0.10…0.85, no capLayers/thickness/rim). Replace `scene3dGenerateCharacter()`'s randomize + `createFullCharacter3D` with `createRandomCharacter3D` (or `randomCharacterParams3D`), keep the bias-from-reference-character nudges on top if wanted, and set `scene3dCharRimLight = true` in `_syncCharEquipState`.
+
+### In a city: real human size + spawned where you look ✅ (2026-10-01)
+
+The generator builds a body about 0.75–1.7 units tall (height slider 0.5–1). A city is built at `cityMetresPerUnit()`
+(about 15 m per unit), so a generated character used to be a 10–25 m giant there. Now, **while a city exists**:
+
+- **Size.** Every NEW procedural character (`createFullCharacter3D`, `createRandomCharacter3D`, `createProceduralBody3D`,
+  and a `character` asset-library instantiate) is scaled uniformly on its body transform to stand **1.7 m** tall,
+  whatever its height slider. Proportions (head size, leg length, …) are unchanged. The skeleton follows the body
+  transform and every overlay rides that skeleton in body space: face decal and eyes, hair (and its spring bones, which
+  scale with the joint), garments and charms. So the whole character is consistent, and regenerating a part later (a
+  hair or clothing slider, `setBodyParams3D`) keeps the size. It is an ordinary node scale: it is saved, and the gizmo
+  can still change it. The Play auto default player is unaffected (it scales itself per run).
+- **Spawn.** In a city, a default position (none, the origin, or `getIllustrationCenter3D()`, which is what Frogmarks
+  passes and means nothing in a free-3D city) becomes **the floor the camera is looking at**: the first floor-like
+  surface along the view ray. If the ray meets a facade first, the character stands on the pavement just in front of
+  it. Looking at the sky, it stands on the ground under the camera target. Characters and far decoration (the sky
+  clouds, the void grid) are never spawn surfaces. Any other explicit `position` is honoured as-is.
+  `sm.scene3d.resolveCharacterSpawn3D(position?)` returns that point.
+- **Live preview == result.** The ghost from `previewProceduralBody3D` uses the same rules: in a city it is drawn at
+  the same 1.7 m scale (the same factor, computed from the same rest-geometry height) and stands on the same floor point
+  a default-positioned Generate would use (`resolveCharacterSpawn3D`). It stays cheap on slider drags: the scale is one
+  pass over the vertices per preview call, and the view-ray floor cast is cached per camera pose (re-cast only when the
+  camera moved, at most every 120 ms while it moves). If the host commits with an explicit non-default `position`, the
+  character goes there instead (the preview can't know it). Clothing / hair / eye edits have no separate preview: they
+  regenerate live on the already-scaled body, so they are always at its size.
+- **Outside a city** nothing changes (the generated size, at `position`; the ghost at the camera's look-at point).
+- **Older giant characters** in a city save stay as they are. Scale the body down with the gizmo (every part follows).
+  As a Player they now frame correctly too (see play-mode.md §Third-person camera).
+
+> **Frogmarks:** no change is required. `scene3dGenerateCharacter()` already passes the illustration centre, which the
+> engine now resolves. Optionally, after Generate in a city, frame the new character (it is 1.7 m and may be small on
+> screen from an overview camera).
+
+Tests: `play-auto-player.test.ts` §"2026-10-01" (1.7 m in a city for height 0.5 and 1, the skeleton and parts follow, a
+hair regenerate keeps the scale, no city means unchanged, the spawn rules).
+
+**Feet on the floor (2026-10-04).** The body's origin sits at its HIPS (the legs extend below it), so placing the origin
+on the floor point used to bury the feet about 0.37 m into the street (Play hid it: the controller measures the feet).
+A new city character now stands its **soles** on the spawn point, and the ghost preview uses the same lift. A/B:
+`Scene3DManager.citySpawnFeetOnFloor = false`.
+
+### Scaling a character ✅ (2026-10-04)
+
+There are two size knobs, and they do different things:
+
+| | **Height** body param (`setBodyParams3D(id, { height })`) | **Scale** (`setCharacterScale3D(id, s)`) |
+|---|---|---|
+| What changes | Re-makes the body: geometry + skeleton rest pose, then refits clothes, hair, face kit, eyes, charms | One uniform node scale on the body. Nothing is regenerated |
+| Proportions | Same (height is a uniform factor; leg length / head size are their own sliders) | Same |
+| Cost | A full refit (debounced on a slider drag) | Instant |
+| Use it for | Designing the character | Fitting it to a scene: a city, a doll house, a kaiju |
+
+Both keep every part attached and aligned (verified at 0.5×, 1×, 2×, height 0.5 / 1.5 and a 1.7 m city fit: clothes,
+hair, glasses and face features stay in place; screenshots in the 2026-10-04 drive). Both keep the **feet on the
+ground**: the soles stay at the same world height (before this, a height edit or a gizmo scale grew the body about its
+hips, so it sank into or floated above the floor).
+
+Why the scale works with no regeneration: the body's transform drives its skeleton (`transformViaSkeleton`), and every
+overlay (face decal, eyes, face kit, hair, garments, charms) is skinned to that skeleton, so they all scale together.
+Spring bones scale their lengths, collider radii and gravity with the joint scale. The scale is an ordinary node scale,
+so it is **saved** with the body node and reloads identically (saved characters load unchanged).
+
+```ts
+sm.getCharacterScale3D(bodyId)
+// → { scale, height, heightMetres, restHeight, metresPerUnit, sceneMetresPerUnit } | null
+//   scale = the uniform factor (1 = the generated size); height = standing height in world units (rest pose, body only);
+//   heightMetres = height × metresPerUnit (the city's scale in a city, else 1 unit = 1 m);
+//   restHeight = the height at scale 1 (what the Height param gives); sceneMetresPerUnit = null outside a city.
+sm.setCharacterScale3D(bodyId, 2);          // the whole character 2×, feet planted, one undo step → true
+sm.setCharacterHeight3D(bodyId, 1.55);      // stand 1.55 m tall (metres); ('units') for world units → the new scale
+sm.fitCharacterToScene3D(bodyId);           // "Fit to city": 1.7 m at the scene's metre scale → the new scale
+sm.fitCharacterToScene3D(bodyId, 1.2);      // a 1.2 m child
+```
+
+- Clamped to 0.01–1000. Keeps any authored axis ratio (normally 1:1:1).
+- **In Play** it applies live: the camera re-frames, the eye height, collision capsule and stride follow (see play-mode.md
+  §Character size), and the new size is kept after Stop.
+- **Gizmo / S shortcut:** scaling a character body is always **uniform and from the feet** (an axis handle, a corner
+  handle or `S`+axis scales all three axes by the dragged factor). Selecting a part (hair, a garment) and scaling it does
+  nothing, since the part's own transform is not used. Undo works as for any gizmo move.
+- **Fit to city** outside a city uses 1 unit = 1 m (the default body is about 2.09 units = 2.09 m at height 1).
+
+> **Frogmarks:** character panel, **Size** group above Proportions: **Scale** slider (0.25–4) + number box, **Height (m)**
+> box and **Fit to city** (enabled when a city exists). Calls are guarded `(shapeManager as any).fn?.()`.
+
+Tests: `src/game/character-scale.test.ts` (feet-anchored scale, the gizmo constraint, the capsule + camera framing
+following the size, the scale through toJSON / the loader), `locomotion-animator.test.ts` §"character scale" (planted
+feet at 0.25×–3×).
 
 ### Save / load a whole character ✅ (portable preset)
 
@@ -239,7 +374,7 @@ const face = shapeManager.getFaceExpressions3D(bodyMeshId);
 //   `blink` now carries enabled / doubleProbability / doubleGap* too (persisted) — seed the toggle + sliders from it
 ```
 
-**Auto-blink panel (eye settings):** a **☑ Auto-blink** checkbox + **Frequency** (min/max s), **Blink speed** (`holdMs`), **Double-blink %** (`doubleProbability`), and **Double gap** (min/max ms). `setAutoBlink3D` **auto-creates a closed-eye blink frame** from the active eyes (`closed: true`) the first time you enable it on procedural eyes, so the user never has to draw/mark a blink state — the toggle just works. (Manual `setFaceBlinkExpression3D` is still there if someone wants a hand-drawn blink.)
+**Auto-blink panel (eye settings):** a **☑ Auto-blink** checkbox + **Frequency** (min/max s), **Blink speed** (`holdMs`), **Double-blink %** (`doubleProbability`), and **Double gap** (min/max ms). `setAutoBlink3D` **auto-creates a closed-eye blink frame** from the active eyes (`closed: true`) the first time you enable it on procedural eyes, so the user never has to draw/mark a blink state — the toggle just works. (Manual `setFaceBlinkExpression3D` is still there if someone wants a hand-drawn blink.) **The blink frame follows the open eyes** (2026-09-29): whenever the active state's eye settings change, or a different state becomes active, the closed-eye frame is re-drawn from them. So turning off the deco dots, changing the lash colour or moving the eyes carries into the blink. Before this, the blink was a one-time copy, and old settings flashed back during every blink. Characters saved before the fix repair themselves on load. To give the blink its own settings, use `setFaceBlinkConfig3D(id, { followOpenEyes: false })`. Hand-drawn blink frames are never changed.
 
 ### How it works (and what to expect)
 
@@ -279,13 +414,97 @@ const cur = shapeManager.getFaceExpressionParams3D(bodyMeshId, exprId); // param
 ### Limits (first cut)
 One image per state (no in-state animation — use multiple states + blink for life). Eyes are a flat overlay on the front of the head (great head-on and at moderate angles; extreme profile shows the flat plane). Brush radius maps screen-px→texel via the pane zoom (same as UV paint) and may want tuning against a live build. Procedural eyes are front-facing 2D art (no per-eye 3D refraction like the Blender reference) — by design, to stay simple and match the PS1/dollcore look.
 
+### 2.5b Face kit: brows, mouth, nose, hair shadow, blush ✅ (2026-10-03)
+
+The rest of an anime face, on top of the eyes: **eyebrows**, a **mouth** with simple expressions, a **nose** tick or shadow, the
+hair's hard **shadow across the forehead**, **blush** and soft **cheek shading**, plus an upper-lid shadow on the eyes. Everything
+is generated from parameters (no drawing) and follows the head through every pose. Engine: `face-features.ts` (pure) +
+`Scene3DCharacter` (meshes, textures, expressions). Spec: visual-polish-next.md item 2.
+
+**How it looks right in every style.** Two extra skinned overlays are raycast onto the head surface (so they hug the faceted face
+and use the body's own skin weights): a *skin layer* (shadow, nose, mouth, blush) and a *brow layer*. Their textures are colour
+**multipliers**, drawn with a **multiply blend** after the skin. They darken whatever the skin rendered — PBR, Cel, Cel HD, toon
+shadows, the skin ramp, ink — so a brow in shade is a brow in shade. Brows (and, when bangs hang over them, the eyes) are drawn
+**through the hair fringe** by a small depth pull toward the camera (flags2 bit 6); the screen position is unchanged, so nothing
+further in front is affected. Lines get bolder automatically when the face is small on screen (Play distance) and return to the
+close-up weight as you approach.
+
+```ts
+const p = sm.getDefaultFaceFeatures3D();             // seed the Face panel
+sm.setFaceFeatures3D(bodyMeshId, { browStyle: 'arched', browThickness: 0.7 });   // live patch; persists
+sm.getFaceFeatures3D(bodyMeshId);                    // a copy, or null (kit never turned on)
+sm.setFaceFeatures3D(bodyMeshId, { enabled: false }); // hide (params kept); the eyes go back to classic
+sm.getFaceFeatureOptions3D();                        // { browStyles, noseStyles, expressions } for dropdowns
+
+// Expressions (runtime; the RESTING one is the `expression` param)
+sm.setCharacterExpression3D(bodyMeshId, 'smile');                          // 'neutral' | 'smile' | 'open' | 'frown' | 'surprised' | 'default'
+sm.setCharacterExpression3D(bodyMeshId, { smile: 0.6, open: 0.3 }, { blendMs: 250 });   // a blend
+sm.setCharacterExpression3D(bodyMeshId, 'surprised', { holdMs: 1200 });   // then back to rest
+sm.getCharacterExpression3D(bodyMeshId);             // { name, weights }
+sm.pulseCharacterBrows3D(bodyMeshId, 0.5);           // a quick brow raise
+```
+
+| Group | Params (FaceFeatureParams) |
+|---|---|
+| Brows | `browStyle` soft / straight / arched / angled / short · `browThickness` 0–1 · `browLength` 0.5–1.5 · `browHeight` 0–1 · `browTilt` −1–1 · `browColor` ('' = follows the hair) · `browsThroughHair` |
+| Mouth | `mouthWidth` 0.2–0.9 (× eye spacing) · `mouthThickness` · `mouthHeight` (nose → chin) · `mouthColor` ('' = warm dark line) · `expression` (resting) |
+| Nose | `noseStyle` none / tick / shadow / dot / button · `noseSize` |
+| Shading | `blush` + `blushColor` + `blushLines` · `cheekShade` · `hairShadow` + `hairShadowDepth` · `eyeShade` (how much scene light reaches the eyes; 0 = classic full-bright) |
+| Eyes | `eyesThroughHair` (eyes visible through bangs; **default OFF since 2026-10-03**: bangs cover the eyes, and the brows hide with them. Frogmarks: Face → Shading → "Eyes over hair") — and on the eye params: `lidShadow` / `lidShadowColor` (EyeParams, optional) |
+| Life | `lifeBrowRaise` (chance a blink comes with a brow raise) · `lifeSmile` (an occasional short smile while idle) |
+| Render | `pixelResolution` (−1 = match the eyes' chunky look, 0 = crisp) |
+
+**Brow colour** follows the hair's root colour (darkened, and always darker than the skin so blond / white hair still gets
+readable brows). Custom brow / mouth colours are converted to multipliers for the current skin tone (a skin-tone change re-paints).
+
+**Life + clips.** Blinks sometimes come with a brow raise; now and then an idle character smiles for a second or two (only from a
+neutral rest). Clip face events gained `expression` / `weight` / `browRaise` (`ClipFaceEvent`); a clip's `restore` returns to the
+resting expression. The default clips use them (Wave smiles, Stretch yawns open, Scratch Head frowns a little, Talk Gesture
+alternates open / smile) — clips are baked at creation, so characters made earlier keep their old clips.
+
+**Random characters** (`randomCharacterParams3D` / `createRandomCharacter3D`, the T6 ranges) now carry a `face` set: random brow
+style / weight / height / tilt, mouth width, resting expression (mostly neutral), nose style, blush. It draws from its own
+seed-derived stream, so every other field of a seed is unchanged. `createFullCharacter3D({ face })`: omit → defaults, `false` →
+eyes only.
+
+**Persistence.** Only the params are saved (`faceRigs[].features`); the overlays regenerate on load. **Faces saved before the kit
+load exactly as before** (eyes only, classic full-bright eyes, no lid shadow) — the kit is opt-in for them: the Face panel's first
+change (any `setFaceFeatures3D` call) turns it on with the defaults. `.frogchar` presets carry the kit (`face.features`). Params
+are rounded to 1e-4 so a save reloads identically.
+
+**2026-10-03 face shading follow-up.** The big dark wedges across the nose and cheeks in Cel / Cel HD were the BODY's shading of
+the low-poly head, not the kit — fixed by the anime face normals ([character-shading.md](character-shading.md#anime-face-shading--matte--hair-band--play-outlines-2026-10-03)).
+The same fix removes the "bright pasted rectangle" on the forehead under a gappy fringe in Cel HD (seed 25): it was the lit cel band
+of a few forehead facets aimed at the light, framed by the hair-shadow polygon; with one flat face plane the forehead is the same
+tone as the rest of the face and the hair shadow reads as a band under the fringe. The `'shadow'` nose style's side shadow is
+shorter (0.75 instead of 1.5 nose sizes up the bridge, alpha 0.6) — on a flat face the long one read as a facet wedge again.
+
+**Limits.** Lip-sync is out of scope (mouth shapes are expression blends). The hair shadow follows the fringe's rest shape (not the
+spring-animated hair). Multiply can only darken, so a brow lighter than the skin clamps to the skin. Expression changes re-paint
+two canvases (≈ a few ms per frame during a 180 ms blend).
+
+**Anime head shape + chin shadow (2026-10-04).** New bodies get `BodyParams.headShape: 1` (in `NEW_BODY_DEFAULTS`; absent / 0 =
+the classic head, bit-identical, so saved characters are unchanged). The classic head was circular rings tapering in a straight
+line to a pointed jaw (a wide flat diamond with a spike chin from the front). The anime head keeps the **same topology** (rings,
+UVs, weights), so the eye decal, this face kit's raycast, the hair head map and the clothing read it unchanged, but it has
+elliptical rings (flatter face, fuller back of the skull), a rounder cranium, cheeks that stay full to the mouth, a **soft
+V-line** jaw (the jaw rings rise from the chin toward the ears) into a small rounded chin, a smaller nose and no gonial corner.
+`headShape` 0..1 blends between the two. With face normals on, the neck under it gets a shaped **chin shadow** instead of the
+old grey band (see [character-shading.md](character-shading.md#anime-head-chin-shadow--the-neck-2026-10-04)). Tested:
+face-features.test.ts "face kit placement on the anime head" (the overlay hugs the face, the mouth / nose / eye / brow rows land
+on the face front, centred). Before / after sheets: agent scratchpad `pupdrive/look2/after/cmp-*.png`.
+
+```ts
+sm.setBodyParams3D(bodyId, { headShape: 1 });   // 0 = classic head, 1 = anime head (new bodies); regenerates in place
+```
+
 ---
 
 ## 2.6 Procedural hair ✅ (available now)
 
 Generate **chunky low-poly hairstyles** from presets + sliders — same flow as the body and eyes. A style skins to the **head joint** (follows poses), uses a **root→tip gradient** (the reference's blue tips), and can **bake into a kitbash hair part**. v1 covers the reference-girl set (cap + bangs + parting + twintails/ponytail/pigtails). **UI hand-off doc (build the panel from this): [hair.md](./hair.md).** Engine design: [hair-generation.md](../specs/hair-generation.md).
 
-> **Status (2026-06-28):** live generator + sliders ✅, **persistence** ✅, **bake-to-part** ✅, **card mode** ✅ (Elden-Ring alpha-card hair), **Length / Curl / Layering** ✅ (Phase A — bob / long / hime / curly / wolf). **Named style presets** (Bob/Bun/Braid/etc.) are the 🔶 remaining piece (spec [hair-styles.md](../specs/hair-styles.md), phases B–E). See [hair.md](./hair.md) for the param→control mapping.
+> **Status (2026-10-04):** named anime **styles** ✅ (below). **(2026-06-28):** live generator + sliders ✅, **persistence** ✅, **bake-to-part** ✅, **card mode** ✅ (Elden-Ring alpha-card hair), **Length / Curl / Layering** ✅ (Phase A — bob / long / hime / curly / wolf). **Named style presets** (Bob/Bun/Braid/etc.) are the 🔶 remaining piece (spec [hair-styles.md](../specs/hair-styles.md), phases B–E). See [hair.md](./hair.md) for the param→control mapping.
 
 Panel (Edit Character → Hair): preset dropdown → sliders → live update; **Save as hair part**.
 ```ts
@@ -293,6 +512,78 @@ getHairPresetNames3D();                         // ['Twintails','Ponytail','Pigt
 setHairParams3D(bodyMeshId, params);            // build/update hair, live (per slider change)
 bakeHairToPart3D(bodyMeshId, name);             // → GLB + kitbash hair slot
 ```
+
+---
+
+### Hair styles: big anime locks ✅ (2026-10-04; [hair-styles.md](../specs/hair-styles.md) phases B–E)
+
+A third hair mode, `hairMode: 'locks'` (engine `src/services/managers/hair-locks.ts`): the hair is a few dozen big
+**shaped locks** (tapered lens-section ribbons with pointed or blunt tips) over a solid scalp shell that hugs the real
+skull, instead of alpha cards (ragged, noisy) or one dome (a helmet). Style parts:
+- the crown + back mass (1 or 2 layers of tips at different lengths);
+- the **fringe**: straight, side-swept, parted, choppy, or none (slicked back);
+- face-framing **side locks**;
+- **ponytail / twintails / low twins** (a bundle of locks on a spring-bone chain);
+- **gathered** (pulled-back) hair, a **bun**, an **ahoge**.
+
+It is opaque solid geometry, so it works in PBR, Gouraud, Cel, Cel HD, toon shadows and ink; the Cel / Cel HD highlight
+band (`sheenBand`) runs along the locks. 5k to 9k triangles per style. The body + clothing shrink-wrap and the face kit's
+fringe detection work as for the other modes. Eyes are visible by default; `eyesThroughHair` stays false, so a fringe
+pulled below the eyes hides them.
+
+```ts
+sm.getHairStyles3D();                          // [{ name: 'bob', label: 'Bob' }, 'long-straight', 'side-swept', 'ponytail', 'twintails', 'short-messy', 'bun', 'hime']
+sm.getHairStylePreset3D('hime', lockSeed?);    // full HairParams (hairMode 'locks', sheenBand on), or null
+sm.applyHairStyle3D(bodyId, 'ponytail');       // apply a style, keeping the hair colours; false for an unknown name
+sm.setHairParams3D(bodyId, { ...p, fringeStyle: 'swept', fringeHeight: 0.28 });   // then fine-tune live
+```
+
+| Param (locks mode) | Meaning | Range |
+|---|---|---|
+| `fringeStyle` | `straight`, `swept`, `parted`, `choppy`, `none` (slicked back) | |
+| `fringeHeight` | fringe tip line, × head ry above the head centre (about 0.3 = above the eyes; below about 0.15 covers them) | −0.2..0.6 |
+| `fringeCount`, `fringeSide` | bang locks; sweep direction / part position | 3..11; −1..1 |
+| `hairLength`, `sideLength` | back / side hem depth below the head centre (× ry): 0.3 nape, 0.75 bob, 3 mid-back | 0..4.5 |
+| `lockCount`, `lockWidth`, `lockThickness` | crown locks (fewer = chunkier), width overlap, depth | 8..24; 0.6..1.6; 0.1..0.6 |
+| `lockVolume` | stand-off from the skull | 0..0.3 |
+| `lockTaper` | 0 blunt cut (hime), 1 sharp points | 0..1 |
+| `lockLayers`, `lockFlick`, `lockJitter` | 1 or 2 tip layers; −1 curl under to +1 flick out; messiness | |
+| `tailLocks`, `gather`, `ahoge`, `lockSeed` | locks per tail; pull the hair into the tail / bun tie; antenna locks; variation seed | |
+| `lockCurl`, `lockCurlType`, `lockCurlFreq` | curl / wave on the hanging crown, side and tail locks: `wave` (S-waves) or `spiral` (ringlets); waves per head height | 0..1; ; 0.5..6 (2) |
+| `lockSpike` | shonen spikes: the crown locks jut out from the skull instead of hanging | 0..1 |
+| `hairPoof` | curly volume: a big round mass (the locks stand off and bulge out) | 0..1 |
+| `tailForm`, `drillTurns` | each tail as a `bundle` of locks, a 3-strand `braid` or a `drill` curl; drill coil turns | ; 2..7 (4) |
+| reused | `tailStyle`, `tailHeight`, `tailLength`, `tailThickness`, `tailSpread`, `tailCurl`, `tailTaper`, `sideLock*`, `bunStyle`, `bunSize`, `hairlineFront`, colours, `sheen`, `sheenBand` | |
+
+**More styles (2026-10-04, part 2):** `braid` (one low back braid), `twin-braids`, `wavy`, `curls` (spiral ringlets),
+`spiky`, `drills` (twin ojou drill curls) and `curly-volume` — 15 styles in all, every one 3.6k to 9.2k triangles, with
+the body + clothing collision, the face kit's fringe detection, and the eyes behind the hair by default (`eyesThroughHair`
+off). Random characters pick a style by weight (`HAIR_STYLE_WEIGHTS`: everyday styles common, drills / curly volume
+rarer). Spec: hair-styles.md "part 2".
+
+**Which controls apply (the "Styled hair shows controls that do nothing" fix).** Each hair build reads its own keys:
+`hair-control-modes.ts` exports `HAIR_CONTROL_MODES` (key → the modes that read it), `hairControlVisible(key, hairMode)`
+and `hairControlVisibleFor(key, params)` (also hides Sides / Flick / Messiness / Layers / Spikes while Styled hair is
+**gathered** into a tail or bun, since the gathered build replaces the loose crown). Show a control only when it returns
+true; a unit test perturbs every key in every mode against the generator.
+
+| Group | Styled (`locks`) | Chunky | Cards |
+|---|---|---|---|
+| Style picker + Vary, Fringe, Length + locks, Curl + volume, Tail form / drill turns / tail locks | ✓ | – | – |
+| Crown, Hairline, Buns (Styled: one bun at the back, size 0.15–1.2), Facial hair, Side locks, Tails (style / height / spread / length / thickness / end taper / curl), Colour, Sheen + Highlight band | ✓ | ✓ | ✓ |
+| Cap (V offset, thickness, volume, sweep, back length), Spiky cap, Buzz, Undercut, Length / Curl / Layering, Bangs, Start taper, Front drape, Chunkiness | – | ✓ | ✓ |
+| Tail tip (point / flare / blunt) | – | ✓ | – |
+| Card width / per clump / segments / strand density / alpha cutoff, Cardify cap, Cap layers, Detail | – | – | ✓ |
+
+- **Compatibility:** saved hair (`cards` / `chunky`) loads unchanged. The style fields are ignored outside `locks` mode
+  (unit-tested: identical geometry). Only new random characters, Frogmarks' Generate Hair, and choosing a style use it.
+- **Spring bones:** the tails are tagged per tail exactly like the classic tails, so the existing hair jiggle
+  (off by default) swings ponytails / twintails. Long loose locks are head-skinned (no jiggle yet). That is a later
+  pass: they need a rigid scalp part like the front drape (`DRAPE_SPRING_FROM`) or they peel off the head.
+- **Frogmarks:** Edit Character → Hair: **Hair type** (Styled / Chunky / Cards) first, then the **Style** picker +
+  **Vary**, then (Styled) Fringe, Length + locks, Curl + volume; every group below shows only the controls the chosen
+  build reads (the table above).
+- Screenshots: agent scratchpad `pupdrive/hair/` (`sheet-before-*.png`, `after-*.png`, `presets-*.png`, `styles.png`).
 
 ---
 
@@ -307,6 +598,75 @@ Instead of sliders, let the user **draw a front-view silhouette**; the engine so
 > **Built (2026-06-23 · shoes + baggy-stack 2026-06-28):** clothing is a **procedural generator** (presets + sliders → low-poly garments auto-rigged by joint-blend weights), matching the body/eyes/hair flow. **Three slots — Top · Bottom · Shoes** (footwear wraps the `foot_L/R` joints). Flat/gradient color. Garments **enclose the body, never clip** (directional fit + shrink-wrap + min-gap) and **deform with the body** when posed. NEW: pants **`stack`** (baggy/accordion) + the **§6b shoe-floor coupling** — baggy pants **pile ON the equipped shoe**, never clipping. Live, persisted, bake-to-part. **Build the panel from [clothing.md](./clothing.md)** (now incl. the **Shoes** tab + **Stack**); engine details in **[clothing-generation.md](../specs/clothing-generation.md)** + **[shoe-generation.md](../specs/shoe-generation.md)**.
 >
 > **Next (🔶):** procedural **hems/cuffs/trim** + **UV-paint** garments (prints/seams) + **draping**; then the **Clothing Designer** (design standalone on a mannequin → save as a preset → fit to any character — see clothing-generation.md §14).
+
+### Skirts & dresses follow the legs ✅ (new 2026-09-30, polish-round-3 R6.3)
+
+Skirts used to be skinned rigidly to the pelvis, so walking, running, climbing stairs or sitting pushed the thighs straight through the fabric. Measured over the default Walk and Run cycles plus a stride, lunge, stair step, high knee, sit and side step, the thighs went 47–53 mm into the old skirt. The skirt now swings with the legs.
+
+**What the user sees:** the front of the skirt drapes over the forward leg, and the back over the trailing leg. A knee or long dress hem follows the calves. The fabric stretches between the legs in a stride instead of the legs clipping through. Nothing to set up: every skirt does it, including skirts on saved characters, which rebuild from their params on load.
+
+**Knob (optional):** `legFollow` on the bottom params (skirt only). `1` is the default (and what a saved skirt without the field gets). `0` gives back the old rigid skirt, bit-identical.
+```ts
+sm.setClothingParams3D(bodyId, { ...sm.getClothingParams3D(bodyId, 'bottom'), legFollow: 0 });   // old rigid skirt
+```
+A UI slider isn't needed. If Frogmarks wants one, label it "Follow legs" (0–1).
+
+**Rest look is unchanged.** Only the ANIMATED deformation changes. The skirt is fitted exactly as before, then subdivided along its length. The new rings lie on the old surface: a test checks every vertex is within 2 mm of it.
+
+**How it works (two parts):**
+1. **Static leg weights** (`clothing-generator.ts` `applySkirtLegWeights`). This is the standard game technique. Below the waist, each skirt vertex blends from the pelvis onto both thighs:
+   - **Left or right:** set by where the vertex sits around the body. The front and back centre lines are 50/50; the sides follow their own leg.
+   - **Height:** the blend fades in from just above the hip joint and is fully leg-driven 40% down the thigh.
+   - **Knees:** below the knee, the hem takes part of the lower leg's weight. The back takes more of it, because a bending knee folds the calf into the back hem.
+2. **Pose-driven steer** (`skirt-steer.ts`, applied each frame by `Scene3DCharacter`). Fixed weights can't fix the centre lines. In a stride the two thighs rotate opposite ways, so a 50/50 vertex stays put and the forward thigh pokes through the front. So each frame one number is read from the skeleton: the difference in forward pitch between the two thighs. That number shifts the front panel's weights toward the forward thigh and the back panel's toward the trailing one.
+   - When the legs are level (rest, idle, sit, squat, side splits) the number is 0 and the weights are exactly the static ones.
+   - Cost: the weights are only rewritten when the number moves by 0.04. Each rewrite re-uploads one skinned vertex buffer of a few hundred vertices. The callback measured ~0.00 ms per frame in the browser.
+   - There are no new joints, no shader change and nothing persisted.
+
+**Measured** (`skirt-leg-follow.test.ts`; worst depth into leg capsules fitted to the body's skin, over vertices and triangle centroids; new character):
+
+| Skirt | Old rigid skirt: walk / run / worst | Now: walk / run / worst |
+|---|---|---|
+| Skirt (mid-thigh) | 0 / 10 / 53 mm | 0 / 0 / 0 mm |
+| Mini Skirt | 0 / 0 / 47 mm | 0 / 0 / 0 mm |
+| Knee-length dress | 51 / 51 / 51 mm | 0 / 0 / 0 mm |
+| Ankle-length dress | 48 / 45 / 51 mm | 0 / 23 / 23 mm |
+
+The clothing ROM gate (`clothing-regression.test.ts`) also improved for the Skirt, from poke 8% / 21 mm to 2.6% / 4.8 mm, with 0 excess tear. Its limit row was tightened.
+
+**Limits:**
+- **Stretch.** A skirt that follows both legs has to stretch between them. Up to 10–15% of a long dress's triangles stretch past 2× in a stride. That is fine on flat colours; a pattern will visibly stretch there. Almost no triangles fold (≤ 1.3%).
+- **Long dress, running.** One residual clip remains: when running in an ankle-length dress, the swinging leg's calf is folded back under the hem at the moment the thighs cross (23 mm, 2 frames per stride). A calf-driven steer was tried and not kept, because it made a high-knee pose worse.
+- **Saved (classic) characters** use linear skinning, which blends less cleanly. A knee dress still clips up to 17 mm running on those; walking is clean.
+- **No fabric physics.** There is no sway or inertia. VRM-style skirt spring bones would add that later: they need new skirt joints in the skeleton, the same way hair tails and charms add theirs.
+
+### Fit round 2: hide body under clothes, layer order, lining, skirt swing ✅ (2026-10-04)
+
+Engine details and measurements: [clothing-generation.md §16](../specs/clothing-generation.md).
+
+**What the user sees:**
+- Running in trousers no longer shows the knees or the front of the thighs through the fabric. A long skirt no longer shows the knee cap through its front panel.
+- The inside of a skirt (or of a top at the neck and sleeves) draws as fabric in shadow, not a white sheet.
+- A top's hem always sits over the skirt or trouser waistband.
+- Long hair rests on the shirt's back instead of sinking into it.
+- In Play, a skirt's hem trails behind when running, swings past centre and settles on a stop, and flares on a jump or a quick turn. It never pushes into the legs.
+
+**Two options for the character panel.** Both are already on for every character, so a panel doesn't need them to get the fixes:
+
+| Control | Call | Notes |
+|---|---|---|
+| **Hide body under clothes** (checkbox, default on) | `sm.getHideBodyUnderClothes3D(id)` / `sm.setHideBodyUnderClothes3D(id, on)` | Skin that the opaque clothes cover, and keep covering through a set of probe poses, isn't drawn. Turn it off for a see-through look. It is persisted on each garment (`hideBody`). It takes effect about ¼ s after the outfit stops changing, and the body draws in full until then. |
+| **Skirt swing** (slider 0–1.5, default 1; skirts only) | `sm.getSkirtSwing3D(id)` (null without a skirt) / `sm.setSkirtSwing3D(id, v)` | Play only. 0 = off. It is persisted as the bottom's `hemSwing`, with no garment rebuild. If the panel keeps its own copy of the bottom params, set `hemSwing` on it too. Otherwise the next slider change sends the old value back. |
+
+**Saved characters** regenerate sensibly; they are not byte-identical.
+- New characters' bodies get smoother hip and thigh weights, which changes skinning only. Joints, poses and animations still match.
+- Classic bodies are unchanged.
+- Every garment gets the mask, the lining and the layer order on load.
+- Skirts get the swing at 1.
+
+**Limits:**
+- The mask is conservative near openings. Skin within 5 cm of a hem, cuff or neckline is always drawn.
+- On a narrow torso with very wide shoulders (Torso 0.9, Shoulders ≥ 1.4), 1–4 skin verts still show deep in the front armpit crease. Hiding them would open a hole when the arms reach forward.
 
 The original two bespoke flows (kept as a **later** "tailor an exact piece" mode), by whether the garment changes the silhouette (spec §4):
 
@@ -379,6 +739,8 @@ Steps 1–7 are usable now (body + live editing, skin tone, eyes, hair, **proced
 |---|---|---|
 | Procedural base body | `createProceduralBody3D(params)` | ✅ prototype (dollcore defaults; rough mannequin) |
 | Body proportions sliders | (param wiring) | ✅ ready to wire (incl. bust/waist/**hipWidth + hipFront** (separate side-vs-front)/shoulderWidth/**buttSize**) |
+| **Joint smoothness** slider (`seamBlend`, 0–1) | `setBodyParams3D(id, { seamBlend })` | ✅ engine built 2026-09-28 — garments inherit it automatically |
+| **Joint blending** toggle (Linear / Dual quaternion) | `setSkinningMethod3D(bodyId, 'linear' \| 'dualQuat')`, `getSkinningMethod3D(bodyId)` | ✅ engine built 2026-09-28 — per character (body + clothes + hair switch together); new bodies = dual quaternion |
 | **Live body editing** (post-create, re-fits rigs) | `setBodyParams3D` / `getBodyParams3D` | ✅ |
 | **Skin tone** | `setSkinTone3D` / `getSkinTone3D` | ✅ (live + persisted) |
 | **Live ghost preview** | `previewProceduralBody3D` / `clearProceduralBodyPreview3D` | ✅ |
@@ -389,6 +751,7 @@ Steps 1–7 are usable now (body + live editing, skin tone, eyes, hair, **proced
 | ↳ Draw aids (auto-frame + guides) | `frameFace3D` / `setFaceDrawGuide3D` | ✅ |
 | ↳ **Procedural eyes (no drawing)** | `getDefaultEyeParams3D` / `setFaceExpressionProcedural3D` | ✅ (sliders → eyes, low-res look, aspect-correct, persisted) |
 | ↳ Eye gaze / look-at | `setFaceGaze3D` (or `gazeX`/`gazeY`) | ✅ (iris shifts, lid-clipped) |
+| ↳ **Face kit** (brows / mouth / nose / hair shadow / blush) | `setFaceFeatures3D` / `setCharacterExpression3D` | ✅ (§2.5b; params persist, old faces opt-in) |
 | **Procedural hair** | `setHairParams3D` / `bakeHairToPart3D` | ✅ live + persisted + bake (named presets 🔶) |
 | **Procedural clothing (top + bottom)** | `setClothingParams3D` / `bakeClothingToPart3D` | ✅ live + persisted + bake; enclose/no-clip fit ([clothing.md](./clothing.md)) |
 | ↳ Garment **trim + UV-paint** | (trim params + `enterUVPaintMode3D`) | ✅ (crisp trim band; per-piece UV islands; paint persists). Raised folded cuffs exist but are OFF (`ENABLE_CUFFS=false`) |

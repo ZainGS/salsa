@@ -1,3 +1,4 @@
+import { GPUPipelineCache, type PipelineHandle } from '../renderer/core/gpu-pipeline-cache';
 /**
  * OnionSkinRenderer — GPU compute shader that composites ghost frames
  * for onion skinning (animation workflow).
@@ -14,7 +15,7 @@ export interface OnionFrame {
 
 export class OnionSkinRenderer {
   private device: GPUDevice;
-  private pipeline: GPUComputePipeline | null = null;
+  private pipeline: PipelineHandle<GPUComputePipeline> | null = null;   // P2: non-blocking cache handle
   private bgl: GPUBindGroupLayout | null = null;
   private paramBuf: GPUBuffer;
 
@@ -45,6 +46,8 @@ export class OnionSkinRenderer {
     tint: [number, number, number],
   ): void {
     this.ensurePipeline();
+    const pipeline = this.pipeline!.get();
+    if (!pipeline) return;   // P2: still compiling → no ghost this frame (outputTexture is left as-is)
 
     // Upload params
     const data = new Float32Array([tint[0], tint[1], tint[2], opacity]);
@@ -64,7 +67,7 @@ export class OnionSkinRenderer {
     const h = writeTex.height;
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
-    pass.setPipeline(this.pipeline!);
+    pass.setPipeline(pipeline);
     pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
@@ -132,7 +135,8 @@ export class OnionSkinRenderer {
       ],
     });
 
-    this.pipeline = this.device.createComputePipeline({
+    this.pipeline = GPUPipelineCache.for(this.device).compute({
+      label: 'OnionSkinComposite',
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.bgl] }),
       compute: {
         module: this.device.createShaderModule({ code }),

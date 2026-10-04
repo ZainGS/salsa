@@ -1,0 +1,3 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`seam blend — joint smoothness (audit 2026-09-28 C1 Phase 1) > pins the classic output (so a later edit to the generator can't silently change saved characters) 1`] = `"9d147be35cee961d"`;

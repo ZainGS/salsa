@@ -17,7 +17,11 @@ export { buildRoadSigns, warningGarpPool, warningCanonicalGeometry, warningSkinK
 export { buildSignage } from './signage';
 export { buildAwnings } from './awnings';
 export { buildFurniture } from './furniture';
-export { buildRailway, railwayLine, buildSkyway, skywayPath } from './railway';
+export { buildRailway, railwayLine, railFrameAt, railTrackPath, railStations, railLayout, railReservations, RAIL_M, RAIL_TOP_M, buildSkyway, skywayPath } from './railway';
+export type { RailLine, RailFrame, RailStation, RailPier, RailStair, RailLayout } from './railway';
+export { buildMetro } from './metro';
+export { buildLocalLine, localTrack } from './local-line-build';   // railway-upgrade R3.2/R3.3 — the at-grade local line
+export { buildParkedTrain, emuCarLayers, emuCarTris, railConsists, railTrackInfo, railLivery, stepTrainRun, trainRunPlan, RAIL_LIVERIES } from './train';
 export { buildSky } from './sky';
 export { buildPedestrians } from './pedestrians';
 export { computeTraffic } from './traffic';
@@ -34,4 +38,4 @@ export { buildWater } from './water';
 export { buildTerraces } from './terraces';
 export { makeHeightField, makeElevation, applyHeightField } from './elevation';
 export { makeRng, hash2, pointInPolygon } from './util';
-export { Accum3D } from './meshbuild';
+export { Accum3D, chipExtrude, edgeChipSpec, EDGE_CHIP_NEAR_M, type ChipSpec, type ChipExtrudeOpts, type EdgeWearLevel } from './meshbuild';

@@ -5,6 +5,10 @@
 > **Status:** **Phases 1–4 BUILT** (2026-07-17). `msUpload` coalesced-run fix also shipped. Phase 4 (Web Workers)
 > needs **in-browser verification in Frogmarks** (the blob-worker is the one thing headless tests can't prove). The
 > smaller items (pool-compaction-on-idle, time-sliced reassembly, `maxLiveChunks`) are pending.
+> **Status (2026-10-04): the three smaller items are BUILT** — idle compaction (`WorldManager._scheduleIdleCompact`, GPU
+> compaction + capacity shrink: performance-plan P10.B6 / P10.D4, `geom-compaction.ts`), time-sliced reassembly (P5.W1, then
+> P13 step 3b `slicedReassembly`, P20 `budgetNewSlots`, P22 `landingBudget`), and a live-tile cap (`_maxLiveTiles = 40`).
+> The later streaming work is performance-plan §P10–P22; index [../STATUS-2026-10-04.md](../STATUS-2026-10-04.md).
 
 ## Why (the three stacked costs behind "tiled loading lags")
 

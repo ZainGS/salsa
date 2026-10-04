@@ -13,6 +13,7 @@
  * so the GPU sees the blurred texture when the composite quad is drawn.
  */
 
+import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { BLOOM_CAPTURE_FS, BLOOM_FULLSCREEN_VS, BLOOM_BLUR_FS, BLOOM_COMPOSITE_FS } from './shaders/bloom-shaders';
 import { PARTICLE_VERTEX_SHADER } from './shaders/particle-shaders';
 import type { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
@@ -34,8 +35,11 @@ export class BloomPass {
   // (audit 5.14: the former _vBlurPipeline alias was dead state — H and V blur
   // share _hBlurPipeline; the step direction comes from the uniform.)
   private _capturePipeline:   GPURenderPipeline | null = null;
-  private _hBlurPipeline:     GPURenderPipeline | null = null;
-  private _compositePipeline: GPURenderPipeline | null = null;
+  // P2: non-blocking cache handles — the renderer runs bloom only when ready() (docs/specs/performance-plan.md).
+  private _hBlurPipeline:     PipelineHandle<GPURenderPipeline> | null = null;
+  private _compositePipeline: PipelineHandle<GPURenderPipeline> | null = null;
+  /** True once the blur + composite pipelines compiled (requests them if not). */
+  ready(): boolean { const a = this._hBlurPipeline?.get(), b = this._compositePipeline?.get(); return !!(a && b); }
 
   // ── Bind group layouts ─────────────────────────────────────────────────
   // Capture reuses the caller-provided particle BGL0/BGL1 layouts.
@@ -211,7 +215,8 @@ export class BloomPass {
   /** Draw the blurred bloom additively in the currently open main render pass. */
   private readonly _paramsScratch = new Float32Array(2);   // reused (was a fresh array every frame)
   drawComposite(pass: GPURenderPassEncoder, nearestSampler: GPUSampler): void {
-    if (!this._compositePipeline || !this.sourceTexture) return;
+    const composite = this._compositePipeline?.get();
+    if (!composite || !this.sourceTexture) return;
 
     // Update params uniform
     this._paramsScratch[0] = this.threshold; this._paramsScratch[1] = this.intensity;
@@ -233,7 +238,7 @@ export class BloomPass {
       });
     }
 
-    pass.setPipeline(this._compositePipeline);
+    pass.setPipeline(composite);
     pass.setBindGroup(0, this._compositeBG);
     pass.draw(3);
   }
@@ -272,7 +277,9 @@ export class BloomPass {
         storeOp: 'store',
       }],
     });
-    pass.setPipeline(this._hBlurPipeline!);
+    const blur = this._hBlurPipeline?.get();
+    if (!blur) { pass.end(); return; }
+    pass.setPipeline(blur);
     pass.setBindGroup(0, bg);
     pass.draw(3);
     pass.end();
@@ -310,17 +317,18 @@ export class BloomPass {
     const blurPrimitive: GPUPrimitiveState = { topology: 'triangle-list' };
     const blurTarget: GPUColorTargetState  = { format: 'rgba16float' };
 
-    this._hBlurPipeline = device.createRenderPipeline({
+    const cache = GPUPipelineCache.for(device);
+    this._hBlurPipeline = cache.render({
       layout: blurLayout,
       vertex:   { module: fullscreenVS, entryPoint: 'vs_fullscreen' },
       fragment: { module: blurFS, entryPoint: 'fs_blur', targets: [blurTarget] },
       primitive: blurPrimitive,
       label: 'BloomHBlur',
-    });
+    }, undefined, 'bloom.hblur');   // KEYED (bug-hunt 2026-10-01 D-R3): re-enabling bloom reuses the compiled pipelines
 
     // V-blur reuses this same pipeline (step direction comes from the uniform).
 
-    this._compositePipeline = device.createRenderPipeline({
+    this._compositePipeline = cache.render({
       layout: compositeLayout,
       vertex:   { module: fullscreenVS, entryPoint: 'vs_fullscreen' },
       fragment: {
@@ -337,7 +345,9 @@ export class BloomPass {
       },
       primitive: blurPrimitive,
       label: 'BloomComposite',
-    });
+    }, undefined, 'bloom.composite:' + this.swapChainFormat);
+    void this._hBlurPipeline.warm(PIPELINE_PRIORITY.DOCUMENT);
+    void this._compositePipeline.warm(PIPELINE_PRIORITY.DOCUMENT);
   }
 }
 
@@ -349,11 +359,12 @@ export function createBloomCapturePipeline(
   device: GPUDevice,
   particleBGL0: GPUBindGroupLayout,
   particleBGL1: GPUBindGroupLayout,
-): GPURenderPipeline {
+): PipelineHandle<GPURenderPipeline> {
   const captureFS = device.createShaderModule({ code: BLOOM_CAPTURE_FS, label: 'BloomCaptureFS' });
   const vertexVS  = device.createShaderModule({ code: PARTICLE_VERTEX_SHADER, label: 'BloomCaptureVS' });
 
-  return device.createRenderPipeline({
+  // P2: a non-blocking cache handle; the caller skips bloom capture while it compiles.
+  return GPUPipelineCache.for(device).render({
     layout: device.createPipelineLayout({ bindGroupLayouts: [particleBGL0, particleBGL1] }),
     vertex: { module: vertexVS, entryPoint: 'vs_particle' },
     fragment: {
@@ -370,5 +381,5 @@ export function createBloomCapturePipeline(
     },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
     label: 'BloomCapturePipeline',
-  });
+  }, undefined, 'bloom.capture');   // KEYED (D-R3): a bloom toggle reuses it
 }

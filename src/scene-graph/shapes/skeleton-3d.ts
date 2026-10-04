@@ -49,6 +49,19 @@ export class Skeleton3D extends Node {
    */
   public isProceduralBody = false;
 
+  /** Runtime-only skeleton (e.g. the Play-mode auto default player): never serialized by the document save paths.
+   *  Mirrors Mesh3D.excludeFromDocument. Not itself persisted. */
+  public excludeFromDocument = false;
+
+  /**
+   * How every mesh bound to this skeleton blends its joints (audit 2026-09-28 C1 Phase 3). Per SKELETON, not per
+   * mesh: the body, its clothes, hair and charms share one skeleton and MUST deform identically, or clothes separate
+   * from the skin. 'linear' = linear blend skinning (the original behaviour); 'dualQuat' = dual-quaternion skinning,
+   * which keeps joint volume (no pinch at elbows/knees). New procedural bodies are created 'dualQuat'; everything
+   * else — and every skeleton saved before this existed — stays 'linear'. Persisted via toJSON/fromJSON.
+   */
+  public skinningMethod: 'linear' | 'dualQuat' = 'linear';
+
   constructor(data: SkeletonData) {
     super();
     this.data = data;
@@ -259,6 +272,7 @@ export class Skeleton3D extends Node {
       type: 'Skeleton3D',
       id: this.id,
       ...(this.isProceduralBody ? { isProceduralBody: true } : {}),
+      ...(this.skinningMethod !== 'linear' ? { skinningMethod: this.skinningMethod } : {}),
       skeletonData: {
         name: this.data.name,
         joints: this.data.joints.map(j => ({
@@ -377,6 +391,7 @@ export class Skeleton3D extends Node {
     if (data.skeletonData?.nlaBindPose) skel.data.nlaBindPose = data.skeletonData.nlaBindPose;
     if (data.id) skel.id = data.id;
     if (data.isProceduralBody) skel.isProceduralBody = true;
+    if (data.skinningMethod === 'dualQuat') skel.skinningMethod = 'dualQuat';
     skel.name = data.name ?? '';
     return skel;
   }

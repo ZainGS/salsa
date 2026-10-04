@@ -1,6 +1,10 @@
 # City Props, Decals & GARP — closing the detail gap
 
-**Status:** 📋 Not built (this document is the plan)
+**Status:** 📋 Not built (this document is the plan) — **status 2026-10-04: largely BUILT** — parametric prop generators +
+creator registry (vending, bike-rack, bollard, lamp-post, trash-bin, crate, vent, a-board, stall), decals Mode A + B
+([decals.md](decals.md)), `GarpManager` + `garp-atlas-builder.ts` (vending body / products / can labels, pools persist in
+`garpJSON`), and P20 instanced props shared across tiles (performance-plan §P20). Coordinated skins for props beyond
+vending and real brand art are open (docs/TODO.md §GARP).
 **Date:** 2026-07-27
 **Related:** [city-detail.md](city-detail.md) · [city-visual-upgrade.md](city-visual-upgrade.md) · [building-generator.md](building-generator.md) · [procedural-ground.md](procedural-ground.md) · [instancing-blocks.md](instancing-blocks.md)
 

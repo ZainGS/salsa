@@ -92,10 +92,15 @@ scale.
 | `heightM` | m | 0.6–2.6 | cabinet height |
 | `widthM` | m | 0.4–1.4 | cabinet width |
 | `depthM` | m | 0.3–1.0 | cabinet depth |
-| `productCols` | int | 1–4 | product grid columns behind the glass |
-| `productRows` | int | 1–4 | product grid rows |
+| `stock` | `'cans' \| 'image'` | — | 3D cans on shelves (default), or a flat image display (the `products` skin) |
+| `shelves` | int | 1–5 | shelves of cans behind the glass (default 3) |
+| `cansPerShelf` | int | 2–12 | cans per shelf (default 8) |
 | `glow` | × | 0–2 | lit-window emissive multiplier (1 = default) |
-| `seed` | int | — | product-colour + jitter stream |
+| `seed` | int | — | can-arrangement stream (which design sits in which slot) |
+
+> **Changed 2026-09-29:** `productCols` / `productRows` (the old box grid) are gone: `shelves` / `cansPerShelf` /
+> `stock` replace them. Old saves still load (the old keys are ignored). The panel is schema-driven, so the new
+> sliders appear on their own if you build it from the schema.
 
 Defaults reproduce a standard jido-hanbaiki (0.84 × 1.8 × 0.6 m). `meta` from `createVending3D` is
 `{ height, footprint }` (metres) for placement/overlap.

@@ -183,6 +183,8 @@ classic `renderEyes` single-composite function is left in place untouched.
 
 ## B4. Shader (parallax branch)
 
+> ⚠ **2026-10-01:** bit 30 is now `toonShadow` and bit 31 `retroColor` (`material-3d.ts`) — ALL 32 material flag bits are used. `eyeParallax` needs a new flag scheme first (e.g. a second flags word, or reuse an existing per-material slot) before B1. The "bit 30" references below are historical. **Status (2026-10-04): that second word exists** — `flags2` (MeshInstance normalMatrix column 3 `.x`, `material-3d.ts`), bits 9..23 free and earmarked "next: parallax eyes". Part B itself is still not started.
+
 Gated on a new flag (`eyeParallax`, **bit 30**). Only the face decal ever sets it. In the skinned-textured FS:
 
 ```
