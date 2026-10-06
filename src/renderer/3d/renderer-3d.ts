@@ -33,6 +33,7 @@ import { MAX_POINT_LIGHTS, packSceneUniforms, selectNearestPointLights, computeL
 import { ShadowRunTester, CasterSig, StaticLayerMembers, copyCascadeBox, cascadeBoxHolds, cascadeDepthMargin, cascadeRefresh, newCascadeCacheState, stepSunDirection, type CascadeCacheState } from './shadow-cache';
 import { DEFAULT_SHADOW_CASCADES, sanitizeShadowCascades, cascadeHalfExtents, cascadeBias, type ShadowCascadeSettings } from './shadow-cascades';
 import { ShadowMinMax } from './shadow-minmax';
+import { RD, renderDebugShadeMode, renderDebugShaderBits, rdColorLoad, rdDepthLoad } from './render-debug';
 import { shadowLodScreenThreshold, shadowLodThreshold, shadowTexel } from './shadow-lod';
 import { Mesh3D, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
@@ -1856,11 +1857,11 @@ export class Renderer3D {
     const drew3D = this._drew3DThisFrame; this._drew3DThisFrame = false;
     // Temporal AA replaces FXAA on the frames it resolved; a capture that bypassed TAA gets FXAA in its place.
     const taaDone = this._taaOn && !!this._taa?.resolvedThisFrame;
-    if ((this._aa.mode === 'fxaa' || this._taaBypassFxaa) && !taaDone && drew3D && (!this.getLoResSize(w, h) || this.loResIsDynamic())) {   // resolution scaling keeps FXAA
+    if ((this._aa.mode === 'fxaa' || this._taaBypassFxaa) && !taaDone && drew3D && (!this.getLoResSize(w, h) || this.loResIsDynamic()) && !(RD.on && RD.f.noFxaa)) {   // resolution scaling keeps FXAA (render debug: noFxaa skips it)
       this._fxaaPass ??= new FxaaPass(this.device, this._swapChainFormat);
       src = this._fxaaPass.run(encoder, srcTex, w, h, this._aa.quality);
     }
-    const out = this._postProcessPass?.run(encoder, src, w, h, this._worldTimeSec() % 3600) ?? null;   // time → film grain
+    const out = RD.on && RD.f.noPost ? null : this._postProcessPass?.run(encoder, src, w, h, this._worldTimeSec() % 3600) ?? null;   // time → film grain (render debug: noPost skips it)
     return out ?? (src !== srcTex ? src : null);
   }
 
@@ -1884,7 +1885,7 @@ export class Renderer3D {
   /** After post-processing + the copy to the screen: put the UNPROCESSED frame back wherever no 3D surface was drawn
    *  (the focus background), so bloom / grade / vignette / film only affect the scene. No-op without a focus bg. */
   restoreFocusBgAfterPost(encoder: GPUCommandEncoder, rawFrame: GPUTexture, target: GPUTextureView, depthView: GPUTextureView): void {
-    if (!this.focusBgActive() || !this._postBgKeepPass) return;
+    if (!this.focusBgActive() || !this._postBgKeepPass || (RD.on && (RD.f.noBackground3D || RD.f.noPostBgKeep))) return;
     this._postBgKeepPass.run(encoder, rawFrame, target, depthView);
   }
 
@@ -1955,7 +1956,7 @@ export class Renderer3D {
   drawPostOverlays(encoder: GPUCommandEncoder, targetView: GPUTextureView, depthView: GPUTextureView): void {
     if (!this.hasPostOverlays()) return;
     const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: targetView, loadOp: 'load', storeOp: 'store' }],
+      colorAttachments: [{ view: targetView, loadOp: rdColorLoad(), storeOp: 'store' }],   // ('load'; render debug clearColorLoads → 'clear')
       // Depth is CLEARED here (not loaded) so nothing in the scene occludes the card; it exists only so a 3D
       // extruded card self-occludes correctly (front face over back while it spins). Reuses the scene depth texture.
       depthStencilAttachment: {
@@ -2029,6 +2030,7 @@ export class Renderer3D {
   /** The scene-color texture to bind in the mesh group: the live grab (prev frame) when set, else the 1×1 default. */
   private _sceneColorBindTexture(): GPUTexture {
     this._ensureSceneColorResources();
+    if (RD.on && (RD.f.noSceneGrab || RD.f.directToSwapchain)) return this._sceneColorDefaultTex!;   // render debug: no grab (the bind-group cache sees the change)
     return this._sceneColorGrabTex ?? this._sceneColorDefaultTex!;
   }
   /** webgpu-renderer hands us the previous-frame color grab; a change invalidates the cached mesh bind group. */
@@ -2275,6 +2277,7 @@ export class Renderer3D {
    * Returns [w, h] when lo-res is active, null when full-res should be used.
    */
   getLoResSize(canvasW: number, canvasH: number): [number, number] | null {
+    if (RD.on && RD.f.forceFullRes) return null;   // render debug: native resolution (the host also bypasses TAA + scaling)
     const sz = this._loResSizeRaw(canvasW, canvasH);
     if (!sz) return null;
     // P2: take the lo-res path only once its blit pipeline compiled — until then render full-res (never a blank frame).
@@ -3085,7 +3088,7 @@ export class Renderer3D {
       e.copyTextureToTexture({ texture: this._cascadeStaticTex!, origin: { x: 0, y: 0, z: i } }, { texture: this._cascadeTex!, origin: { x: 0, y: 0, z: i } }, [size, size, 1]);
       const pass = e.beginRenderPass({
         label: `ShadowCascade${i}`, colorAttachments: [],
-        depthStencilAttachment: { view: this._cascadeLayerViews[i], depthLoadOp: 'load', depthStoreOp: 'store' },
+        depthStencilAttachment: { view: this._cascadeLayerViews[i], depthClearValue: 1.0, depthLoadOp: rdDepthLoad(), depthStoreOp: 'store' },   // ('load'; render debug may clear)
       });
       if (hasDyn) {
         const ok = this._setPipe(pass, pipe);
@@ -3558,7 +3561,7 @@ export class Renderer3D {
    * even when there are no regular (non-skinned) meshes — e.g. after Bind Mesh.
    */
   drawMeshEditOverlayIfActive(pass: GPURenderPassEncoder): void {
-    if (!this._meshEditOverlay || !this._meshEditDataFn) return;
+    if (!this._meshEditOverlay || !this._meshEditDataFn || (RD.on && RD.f.noMeshEditOverlays)) return;
     const editData = this._meshEditDataFn();
     if (editData) this._meshEditOverlay.draw(pass, editData, this.camera);
   }
@@ -3685,6 +3688,7 @@ export class Renderer3D {
    * No-op if armature mode is not active, mode is 'dim', or mode is 'none'.
    */
   drawArmatureBg(pass: GPURenderPassEncoder, canvasW: number, canvasH: number): void {
+    if (RD.on && RD.f.noBackground3D) return;   // render debug
     if (this._armatureModeActive) {
       const mode = this._armatureBgOpts.mode;
       if (mode !== 'dim' && mode !== 'none') {
@@ -3747,7 +3751,7 @@ export class Renderer3D {
   /** Draw the mesh-edit 'dim' overlay AFTER meshes (parity with the armature dim mode,
    *  which is a semi-transparent overlay rather than an opaque pre-mesh background). */
   drawMeshEditDimIfActive(pass: GPURenderPassEncoder, canvasW: number, canvasH: number): void {
-    if (this._meshEditBgActive && this._meshEditBgOpts.mode === 'dim') {
+    if (this._meshEditBgActive && this._meshEditBgOpts.mode === 'dim' && !(RD.on && RD.f.noMeshEditOverlays)) {
       this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH);
     }
   }
@@ -3767,7 +3771,7 @@ export class Renderer3D {
    * those stay on top) — this also makes it show in an empty scene with zero meshes.
    */
   drawGridIfActive(pass: GPURenderPassEncoder): void {
-    if (!this._gridVisible || !this._gizmoRenderer) return;
+    if (!this._gridVisible || !this._gizmoRenderer || (RD.on && RD.f.noGrid)) return;
     this._gizmoRenderer.drawGrid(pass, this.camera, this._gridSpacing, this._gridColor, this._gridOpacity);
   }
 
@@ -4949,7 +4953,7 @@ export class Renderer3D {
     // Outline depth pre-pass: camera-view depth into outline texture, then Sobel.
     // Recorded into the shared pre-pass encoder (submitted below, before the main pass).
     this._skipDraws = false;
-    if (this._outlinePass && this._outlinePass.ready()) {   // P2: skipped (no outline) while its pipelines compile
+    if (this._outlinePass && this._outlinePass.ready() && !(RD.on && RD.f.noDepthPrepass)) {   // P2: skipped (no outline) while its pipelines compile
       this._outlinePass.ensureTextures(canvasWidth, canvasHeight);
       // FOG HORIZON: Silhouette outlines off = no ink past the fog edge (the Sobel pass reads world distance from depth).
       // visual-polish #8: the DEPTH FADE (thinner / lighter ink with distance) reads the same world-from-depth inverse.
@@ -5230,7 +5234,7 @@ export class Renderer3D {
       const enc = prePassEnc();
       const sz = this._shadowMapSize;
       enc.copyTextureToTexture({ texture: this._shadowStaticTex! }, { texture: this._shadowTexture! }, [sz, sz, 1]);
-      const pass = enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: this._shadowTextureView!, depthLoadOp: 'load', depthStoreOp: 'store' } });
+      const pass = enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: this._shadowTextureView!, depthClearValue: 1.0, depthLoadOp: rdDepthLoad(), depthStoreOp: 'store' } });   // ('load'; render debug may clear)
       const ok = this._setPipe(pass, pipe);   // P2 pending → retry the layer next frame
       pass.setBindGroup(0, this.meshBindGroup!);
       const _dtri = this._frame.trisDrawn;
@@ -5682,7 +5686,7 @@ export class Renderer3D {
     const opaqueVC = this._opaqueVC;
     const transparent = this._transparent;
     // Composite outline edges on top of all meshes (before gizmo)
-    if (this._outlinePass && this._outlinePass.ready()) {
+    if (this._outlinePass && this._outlinePass.ready() && !(RD.on && (RD.f.noOutlinePass || RD.f.noDepthPrepass))) {
       this._outlinePass.drawComposite(pass);
     }
 
@@ -5747,7 +5751,7 @@ export class Renderer3D {
         }
       }
 
-      if (hoverEntries.length > 0 && this._silhouettePass) {
+      if (hoverEntries.length > 0 && this._silhouettePass && !(RD.on && (RD.f.noSilhouetteOutline || RD.f.noHighlight))) {
         // Screen-space silhouette outline: rasterize the mask in a SEPARATE encoder (executes before the main
         // encoder submits, like the SSAO prepass), then composite the band into the open main pass (on top).
         const maskEnc = this.device.createCommandEncoder({ label: 'OutlineMaskEnc' });
@@ -5758,7 +5762,7 @@ export class Renderer3D {
       }
 
       // Source-link feedback: when a source mesh is selected, faintly highlight all linked instances.
-      if (this._selectedSourceId && this._highlightPass && this.meshBindGroup) {
+      if (this._selectedSourceId && this._highlightPass && this.meshBindGroup && !(RD.on && RD.f.noHighlight)) {
         const srcId = this._selectedSourceId;
         const alloc = this._geomAllocs.get(srcId);
         const hasOverride = this._vertexBufferOverrides.has(srcId);
@@ -5835,8 +5839,8 @@ export class Renderer3D {
             outlineDraws.push({ entry: { vertex: og.vb, index: og.ib, indexCount: og.count, firstIndex: 0, baseVertex: 0, instanceIdx: p.idx }, paramIndices, onTop: !!style.merge });
           }
         }
-        if (outlineDraws.length > 0) this._highlightPass.drawCustom(pass, this.meshBindGroup, outlineDraws);
-        if (spriteDraws.length > 0) this._spriteOutlinePass!.draw(pass, this.meshBindGroup, spriteDraws, canvasWidth, canvasHeight, _hlTime);
+        if (outlineDraws.length > 0 && !(RD.on && RD.f.noHighlight)) this._highlightPass.drawCustom(pass, this.meshBindGroup, outlineDraws);
+        if (spriteDraws.length > 0 && !(RD.on && RD.f.noSilhouetteOutline)) this._spriteOutlinePass!.draw(pass, this.meshBindGroup, spriteDraws, canvasWidth, canvasHeight, _hlTime);
         this._spriteSDFPending = spritePending;
       }
     }
@@ -5868,7 +5872,7 @@ export class Renderer3D {
     // called unconditionally from webgpu-renderer after all mesh draws.
 
     // Array Tool face handles (depth=always — always visible on top of scene)
-    if (this._gizmoRenderer && this._faceHandleData) {
+    if (this._gizmoRenderer && this._faceHandleData && !(RD.on && RD.f.noGizmo)) {
       this._gizmoRenderer.drawFaceHandles(pass, this._faceHandleData, this.camera);
     }
 
@@ -6632,6 +6636,10 @@ export class Renderer3D {
       taaDitherShift: this._taaOn ? this._taaDither : 0,     // temporal AA: the dither fades move every frame (cascadeParams.w)
     });
     this.device.queue.writeBuffer(this.sceneUniformBuffer, 0, data);
+    // RENDER DEBUG shading mode (render-debug.ts → IBLUniforms.dbgShade, float 53): written only when it changes.
+    // (+ the shader debug bits, IBLUniforms.dbgFlags, float 54)
+    const dbgShade = RD.on ? renderDebugShadeMode() : 0, dbgBits = RD.on ? renderDebugShaderBits() : 0;
+    if (dbgShade !== this._iblData[53] || dbgBits !== this._iblData[54]) { this._iblData[53] = dbgShade; this._iblData[54] = dbgBits; this._writeIBLBuffer(); }
   }
 
   private ensureInstanceBuffer(count: number): void {
@@ -9373,7 +9381,7 @@ export class Renderer3D {
     // clothes, all sharing one skeleton) is outlined as ONE union silhouette, not per-part (per-part fills the body
     // where the clothes occlude it). The style comes from whichever part carries mesh.outline (the body, set via the
     // "Character" outliner node). A standalone skinned mesh = a group of one.
-    if (this._highlightPass && this._highlightPass.supportsSkinned && this._skinnedMeshBG) {
+    if (this._highlightPass && this._highlightPass.supportsSkinned && this._skinnedMeshBG && !(RD.on && RD.f.noHighlight)) {
       const outlinedSkels = new Map<string, HighlightStyle[]>();   // skeleton → its outline layers (inner → outer)
       for (let i = 0; i < visible.length; i++) {
         const m = visible[i];
@@ -9441,8 +9449,8 @@ export class Renderer3D {
       const pEnc = this.device.createCommandEncoder();
       const pPass = pEnc.beginRenderPass({
         label: 'PlanarReflectionSkinned',
-        colorAttachments: [{ view: this._planarTex.createView(), loadOp: 'load', storeOp: 'store' }],
-        depthStencilAttachment: { view: this._planarDepthTex.createView(), depthLoadOp: 'load', depthStoreOp: 'store', stencilLoadOp: 'load', stencilStoreOp: 'store' },
+        colorAttachments: [{ view: this._planarTex.createView(), loadOp: rdColorLoad(), storeOp: 'store' }],   // ('load'; render debug may clear)
+        depthStencilAttachment: { view: this._planarDepthTex.createView(), depthClearValue: 1.0, depthLoadOp: rdDepthLoad(), depthStoreOp: 'store', stencilLoadOp: rdDepthLoad(), stencilStoreOp: 'store' },
       });
       // Same E1 elision as the main loop (the sort already grouped the parts).
       pPass.setBindGroup(0, this._planarSkinnedBG!);

@@ -10,6 +10,7 @@
 import { Camera3D } from './camera-3d';
 import { OrbitController } from './orbit-controller';
 import { addZonelessListener, removeZonelessListener } from '../util/zoneless-listeners';
+import { RD } from './render-debug';
 
 const SIZE  = 60;              // gizmo canvas size in px (was 120 — 50% smaller). All tuned pixel values
 const SCALE = SIZE / 120;      // below scale off the original 120px design, so changing SIZE stays proportional.
@@ -218,7 +219,13 @@ export class ViewGizmo {
 
     // ── Drawing ───────────────────────────────────────────────────
 
+    /** Render debug (render-debug.ts noViewGizmo): the overlay canvas is hidden; written only when it changes. */
+    private _rdHidden = false;
+
     draw(): void {
+        const rdHide = RD.on && RD.f.noViewGizmo;
+        if (rdHide !== this._rdHidden) { this._rdHidden = rdHide; this._el.style.visibility = rdHide ? 'hidden' : ''; }
+        if (rdHide) return;
         const ctx = this._ctx;
         ctx.clearRect(0, 0, SIZE, SIZE);
 

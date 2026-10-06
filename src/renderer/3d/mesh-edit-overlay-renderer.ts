@@ -21,6 +21,7 @@
 import { PipelineSet, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import { GIZMO_VERTEX_SHADER, GIZMO_FRAGMENT_SHADER, GIZMO_VERTEX_STRIDE, GIZMO_UNIFORM_SIZE } from './shaders/gizmo-shaders';
 import type { Camera3D } from './camera-3d';
+import { RD } from './render-debug';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import type { EditSelection } from '../../services/managers/mesh-edit-manager';
 import type { MeshEditSelectionMode } from '../../services/managers/mesh-edit-pointer-controller';
@@ -346,11 +347,13 @@ export class MeshEditOverlayRenderer {
       pass.setVertexBuffer(0, this._lineBuf);
       pass.draw(lineV.length / 7);
 
-      // Rear/occluded edges — stippled dashes only where depth test fails.
+      // Rear/occluded edges — stippled dashes only where depth test fails. (Render debug noRearEdges skips them.)
+      if (!(RD.on && RD.f.noRearEdges)) {
       pass.setPipeline(this._lineRearPipe.get()!);
       pass.setBindGroup(0, this._uniBG);
       pass.setVertexBuffer(0, this._lineBuf);
       pass.draw(lineV.length / 7);
+      }
     }
   }
 

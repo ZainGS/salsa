@@ -18,6 +18,7 @@
 
 import { PP_BLOOM_DOWN_FS, PP_BLOOM_UP_FS } from './shaders/post-process-shaders';
 import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle } from '../core/gpu-pipeline-cache';
+import { RD } from './render-debug';
 import {
   PP_FULLSCREEN_VS,
   PP_BLOOM_EXTRACT_FS,
@@ -423,7 +424,7 @@ export class PostProcessPass {
       return b;
     };
     const draw = (pipe: GPURenderPipeline, dst: GPUTexture, group: GPUBindGroup, load: boolean): void => {
-      const pass = encoder.beginRenderPass({ label: 'PPWidePass', colorAttachments: [{ view: dst.createView(), loadOp: load ? 'load' : 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
+      const pass = encoder.beginRenderPass({ label: 'PPWidePass', colorAttachments: [{ view: dst.createView(), loadOp: load && !(RD.on && RD.f.clearColorLoads) ? 'load' : 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
       pass.setPipeline(pipe); pass.setBindGroup(0, group); pass.draw(3); pass.end();
     };
     // DOWN: halo → level 0 → … → level L-1

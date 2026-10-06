@@ -51,7 +51,9 @@ struct IBLUniforms {
   ssrDepthPeel: f32,                 // 1 = backface-fill uses the depth-peel BACK layer (volume membership test)
   ssrFallbackShadow: f32,            // silhouette-solidify strength 0..1 (0 = off) - back-layer borrowing opacity
   ssrDeferred: f32,                  // 1 = sample the half-res resolve pass result (Stage 3b); 0 = inline trace
-  _fpad3: f32, _fpad4: f32, _fpad5: f32,
+  dbgShade: f32,                     // RENDER DEBUG (render-debug.ts): 0 = off, 1 = unlit, 2 = constant colour, 3 = magenta
+  dbgFlags: f32,                     // RENDER DEBUG bits (render-debug.ts): 1 = clamp the texture-array layer indices
+  _fpad5: f32,
 };
 
 @group(0) @binding(2) var<uniform> ibl: IBLUniforms;
@@ -3004,6 +3006,13 @@ fn fs_main(
   let fhSkip = (fhFlags & 1u) != 0u && u32(scene.fogParams.w) == 1u && renderStyle != 6u && !fhNoFogM
     && length(scene.fogEye.xyz - worldPos) >= scene.fogParams.x + max(scene.fogParams.y - scene.fogParams.x, 0.001);
 
+  // RENDER DEBUG (render-debug.ts; ibl.dbgShade, 0 = off: the normal path below runs unchanged). A uniform value, so
+  // these early returns keep the control flow uniform for the samples and derivatives below.
+  if (ibl.dbgShade > 1.5) {
+    if (ibl.dbgShade > 2.5) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
+    return vec4<f32>(inst.diffuseColor.rgb, 1.0);
+  }
+
   //__PATTERN_BLOCK__
 
   let L = normalize(-scene.lightDirection.xyz);
@@ -3034,17 +3043,23 @@ fn fs_main(
   let triplanar = (flags & 134217728u) != 0u;
   let tpFreq    = inst.uvTransform.x;
   let tpOff     = inst.uvTransform.zw;
-  let tpDx = textureSample(diffuseTexture, diffuseSampler, worldPos.zy * tpFreq + tpOff, i32(inst.textureIndex));
-  let tpDy = textureSample(diffuseTexture, diffuseSampler, worldPos.xz * tpFreq + tpOff, i32(inst.textureIndex));
-  let tpDz = textureSample(diffuseTexture, diffuseSampler, worldPos.xy * tpFreq + tpOff, i32(inst.textureIndex));
+  // RENDER DEBUG clampTexLayers (ibl.dbgFlags bit 0): clamp the layer indices to the bound arrays. Off, select() keeps
+  // the instance values unchanged.
+  let dbgClampL = (u32(ibl.dbgFlags) & 1u) != 0u;
+  let texLayer  = select(i32(inst.textureIndex), min(i32(inst.textureIndex), i32(textureNumLayers(diffuseTexture)) - 1), dbgClampL);
+  let garpLayer = select(i32(inst.textureIndex), min(i32(inst.textureIndex), i32(textureNumLayers(garpTexture)) - 1), dbgClampL);
+  let nrmLayer  = select(i32(inst.normalMapIndex), min(i32(inst.normalMapIndex), i32(textureNumLayers(normalMapTexture)) - 1), dbgClampL);
+  let tpDx = textureSample(diffuseTexture, diffuseSampler, worldPos.zy * tpFreq + tpOff, texLayer);
+  let tpDy = textureSample(diffuseTexture, diffuseSampler, worldPos.xz * tpFreq + tpOff, texLayer);
+  let tpDz = textureSample(diffuseTexture, diffuseSampler, worldPos.xy * tpFreq + tpOff, texLayer);
   var tpB  = abs(normalize(worldNormal));
   tpB = tpB / (tpB.x + tpB.y + tpB.z + 1e-5);
   let triDiff      = tpDx * tpB.x + tpDy * tpB.y + tpDz * tpB.z;
-  let uvDiff       = textureSample(diffuseTexture,   diffuseSampler,   sampUv, i32(inst.textureIndex));
+  let uvDiff       = textureSample(diffuseTexture,   diffuseSampler,   sampUv, texLayer);
   let diffSample   = select(uvDiff, triDiff, triplanar);
-  let garpSample   = textureSample(garpTexture,      diffuseSampler,   sampUv, i32(inst.textureIndex));
+  let garpSample   = textureSample(garpTexture,      diffuseSampler,   sampUv, garpLayer);
   let texSample    = select(diffSample, garpSample, garpTex);
-  let normalSample = textureSample(normalMapTexture, normalMapSampler, sampUv, i32(inst.normalMapIndex));
+  let normalSample = textureSample(normalMapTexture, normalMapSampler, sampUv, nrmLayer);
 
   // Alpha-test cutout (alpha-card hair): drop transparent strand texels. Order-independent (no blending).
   // Samples above are unconditional → uniform; the discard after them is fine.
@@ -3074,6 +3089,14 @@ fn fs_main(
       if (scene.ps1Config2.x > 0.0) { fhC = quantizeColorDithered(fhC, fhCd, fragPos); } else { fhC = quantizeColor(fhC, fhCd); }
     }
     return vec4<f32>(fhC, fhA);
+  }
+
+  // RENDER DEBUG unlit (ibl.dbgShade 1): base colour x texture, no lighting / shadows / IBL / fog.
+  if (ibl.dbgShade > 0.5) {
+    var dbgC = vec4<f32>(patBase, inst.diffuseColor.a);
+    if (hasTexture) { dbgC = dbgC * texSample; }
+    if (dbgC.a < 0.01) { discard; }
+    return dbgC;
   }
 
   // Resolve surface normal
@@ -3882,6 +3905,13 @@ fn fs_main(
   let fhSkip = (fhFlags & 1u) != 0u && u32(scene.fogParams.w) == 1u && !fhNoFogM
     && length(scene.fogEye.xyz - worldPos) >= scene.fogParams.x + max(scene.fogParams.y - scene.fogParams.x, 0.001);
 
+  // RENDER DEBUG (render-debug.ts; ibl.dbgShade, 0 = off: the normal path below runs unchanged). A uniform value, so
+  // these early returns keep the control flow uniform for the samples and derivatives below.
+  if (ibl.dbgShade > 1.5) {
+    if (ibl.dbgShade > 2.5) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
+    return vec4<f32>(inst.diffuseColor.rgb, 1.0);
+  }
+
   //__PATTERN_BLOCK__
 
   // BOARD SHADING (bit 16, packaging paperboard — untextured panels, e.g. a box before its dieline
@@ -3934,6 +3964,12 @@ fn fs_main(
     }
     if (fhA < 0.01) { discard; }
     return vec4<f32>(scene.fogColor.rgb, fhA);
+  }
+
+  // RENDER DEBUG unlit (ibl.dbgShade 1): the base colour, no lighting / shadows / IBL / fog.
+  if (ibl.dbgShade > 0.5) {
+    if (inst.diffuseColor.a < 0.01) { discard; }
+    return vec4<f32>(patBase, inst.diffuseColor.a);
   }
 
   let L = normalize(-scene.lightDirection.xyz);

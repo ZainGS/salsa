@@ -220,6 +220,10 @@ import {
 } from '../renderer/raster/brushes/brush-input-settings';
 import { runStrokePredictionSelfTest as _runStrokePredictionSelfTest, type StrokePredictionSelfTestReport } from '../renderer/raster/brushes/stroke-prediction-selftest';
 import { markRasterCompositeDirty as _markRasterCompositeDirty } from '../renderer/raster/core/raster-composite-dirty';
+import {
+    setRenderDebug as _setRenderDebug, getRenderDebug as _getRenderDebug, encodeRealFramePNG as _encodeRealFramePNG,
+    RENDER_DEBUG_FLAGS, type RenderDebugFlags, type RealScreenshot,
+} from '../renderer/3d/render-debug';
 
 // Re-exported so existing importers (and the host) keep one obvious entry point; the table itself lives
 // in src/world so the CITY generator can read it too (services may import world, never the reverse).
@@ -13999,6 +14003,31 @@ class ShapeManager {
      *  device loss (persisted: survives a reload), breadcrumbs, still-open GPU operations and uncaptured GPU errors.
      *  JSON-safe, for a host "GPU info" panel / copy-to-clipboard. */
     public getGpuDiagnostics3D(): ReturnType<WebGPURenderer['getGpuDiagnostics']> { return this.webgpuRenderer.getGpuDiagnostics(); }
+    /** RENDER DEBUG (docs/ui/gpu-diagnostics.md "Render debug"; mobile-parity RENDER-1): bisect switches that each skip
+     *  one 3D pass / feature or force a diagnostic mode (solid magenta, unlit, clear-instead-of-load, ...). All default
+     *  OFF (no change to the frame). Merges `patch`; `{ reset: true }` switches everything off first. Kept per machine
+     *  in localStorage `salsa.renderDebug` so it survives reloads (removed once all are off). Returns the flags. */
+    public setRenderDebug3D(patch: Partial<RenderDebugFlags> & { reset?: boolean } = {}): RenderDebugFlags {
+        const r = _setRenderDebug(patch);
+        this.scheduleRender();
+        return r;
+    }
+    public getRenderDebug3D(): RenderDebugFlags { return _getRenderDebug(); }
+    /** Every flag off (and the stored set removed). */
+    public resetRenderDebug3D(): RenderDebugFlags { return this.setRenderDebug3D({ reset: true }); }
+    /** The flags in display / suggested bisect order with short labels (for a host menu). */
+    public getRenderDebugFlagList3D(): ReadonlyArray<{ key: keyof RenderDebugFlags; label: string }> { return RENDER_DEBUG_FLAGS; }
+    /** Read-only facts for a bisect: the resolution scale in force (getResolutionScale3D().current) and mode, whether
+     *  the 3D scene is on the lo-res path (and its size), TAA, MSAA (never: 1), canvas size / format / alpha mode. */
+    public getRenderDebugStatus3D(): ReturnType<WebGPURenderer['getRenderDebugStatus']> { return this.webgpuRenderer.getRenderDebugStatus(); }
+    /** A REAL screenshot: the next frame's canvas (swap-chain) texture read back at the end of that frame — after
+     *  every pass, the post copy, the info card and the UI kit — i.e. exactly what is handed to the browser to
+     *  present (it cannot see the browser / OS compositor). `opaque` (default true) writes alpha 255. */
+    public async captureCanvasPNG3D(opts: { opaque?: boolean } = {}): Promise<RealScreenshot> {
+        const frame = await this.webgpuRenderer.captureRealFrame();
+        const png = await _encodeRealFramePNG(frame, opts.opaque !== false);
+        return { ...png, width: frame.width, height: frame.height, source: frame.source, format: frame.format, flags: _getRenderDebug() };
+    }
     /** Retry a recovery (e.g. after 'failed', or with autoRecoverDevice off). Resolves true when rendering is back. */
     public recoverDevice(): Promise<boolean> { return this.webgpuRenderer.recoverDevice(); }
     /** Automatic recovery on loss (default on). */

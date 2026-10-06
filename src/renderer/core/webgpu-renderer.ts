@@ -96,6 +96,32 @@ import { GpRenderer3D } from '../3d/gp-renderer-3d';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { RenderListIndex, RL_2D, RL_3D, RL_SKELETON, type RenderListNode } from './render-list-index';
+import { RD, rdColorLoad, rdDepthLoad, rdCanvasAlphaMode } from '../3d/render-debug';
+
+/** WebGPURenderer.captureRealFrame result: the raw pixels the renderer produced (RGBA order, alpha as stored, i.e.
+ *  premultiplied) and where they were read: 'swapchain' = the canvas texture itself at the end of the frame;
+ *  'lastFrameTex' / 'postProcessOutput' = the texture that frame copied to the canvas (fallback). */
+export interface RealFrameReadback {
+  rgba: Uint8ClampedArray; width: number; height: number; format: GPUTextureFormat;
+  source: 'swapchain' | 'lastFrameTex' | 'postProcessOutput';
+}
+/** WebGPURenderer.getRenderDebugStatus: read-only facts a render-debug bisect needs (is the lo-res path on, ...). */
+export interface RenderDebugStatus {
+  /** The scale the 3D scene renders at now (getResolutionScale().current; 1 = native) and the scaler mode. */
+  resolutionScale: number; resolutionMode: string;
+  /** The lo-res target the 3D scene renders into this frame, or null on the native path. dynamic = resolution scaling /
+   *  TAA (upscaled + depth upsampled), not the PS1 look. */
+  loResPath: { width: number; height: number; dynamic: boolean } | null;
+  temporalAA: boolean;
+  /** MSAA is not used: every pass and pipeline is single-sampled. */
+  msaaSampleCount: 1;
+  canvas: { width: number; height: number };
+  swapChainFormat: GPUTextureFormat; canvasAlphaMode: GPUCanvasAlphaMode; canvasCopySrc: boolean;
+}
+interface RealShotPending {
+  buf: GPUBuffer; w: number; h: number; padded: number; format: GPUTextureFormat; source: RealFrameReadback['source'];
+  waiters: { resolve: (r: RealFrameReadback) => void; reject: (e: unknown) => void }[];
+}
 
 type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -649,7 +675,7 @@ export class WebGPURenderer {
     this._gpuTimer?.setEnabled(timing && !this._captureMode);
     this._renderer3D?.setGpuTimerSource(!this._gpuTimer || !this._gpuTimer.enabled ? 'none' : this._gpuTimer.supported ? 'timestamp' : 'estimate');
     if (!timing) this._gpuMs = null;
-    const full = this._fullResHold > 0 || !!this._captureMode;   // exports / snapshots always render at native size
+    const full = this._fullResHold > 0 || !!this._captureMode || (RD.on && RD.f.forceFullRes);   // exports / snapshots always render at native size (and render debug forceFullRes)
     r3d?.setUserResolutionScale(full ? 1 : this._resScaler.scale());
     // Temporal AA: exports / snapshots render natively (no jitter, no history) with FXAA standing in.
     this._loadTemporalPref();
@@ -763,8 +789,8 @@ export class WebGPURenderer {
       this.context.configure({
         device: unwrapDevice(this.device),
         format: this.swapChainFormat,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-        alphaMode: 'premultiplied',
+        usage: this._contextUsage(),
+        alphaMode: this._contextAlphaMode(),
       });
     } catch { /* context may not be ready yet */ }
     // setCanvasSize was a no-op while suspended (UI-16): catch up on any resize / DPR / caps change made meanwhile
@@ -1356,8 +1382,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     this.context.configure({
       device: unwrapDevice(this.device),
       format: this.swapChainFormat,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-      alphaMode: 'premultiplied',
+      usage: this._contextUsage(),
+      alphaMode: this._contextAlphaMode(),
     });
     this._rebuildOwnGpuResources();
     for (const o of [...this._gpuOwners]) {
@@ -1804,8 +1830,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   this.context.configure({
     device: unwrapDevice(this.device),
     format: this.swapChainFormat,
-    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-    alphaMode: 'premultiplied',
+    usage: this._contextUsage(),
+    alphaMode: this._contextAlphaMode(),
   });
 
   // 6) Make sure the canvas has the right DPR size and depth buffer
@@ -1891,8 +1917,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         this.context.configure({
             device: unwrapDevice(this.device),
             format: this.swapChainFormat,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-            alphaMode: 'premultiplied',
+            usage: this._contextUsage(),
+            alphaMode: this._contextAlphaMode(),
         });
 
         /* About GPUTextureView and MSAA: 
@@ -2199,8 +2225,15 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // so that i have a persistent copy for the thumbnail generation. 
         // Then, right before submission to the device, I copy lastFrameText to the backTex, 
         // which is the WebGPU context, so the backTex texture is what gets drawn onto the screen?
+        if (rdCanvasAlphaMode() !== this._contextAlpha) {   // render debug forceOpaqueAlpha toggled: re-configure the canvas
+          try { this.context.configure({ device: unwrapDevice(this.device), format: this.swapChainFormat, usage: this._contextUsage(), alphaMode: this._contextAlphaMode() }); }
+          catch (e) { console.warn('[Salsa][render-debug] canvas alphaMode change failed', e); this._contextAlpha = rdCanvasAlphaMode(); }
+        }
         const backTex = this.context.getCurrentTexture(); 
-        const offscreenView = this.lastFrameTex!.createView();
+        // RENDER DEBUG directToSwapchain: draw straight into the canvas texture (no lastFrameTex, no copy, no post).
+        const rdDirect = RD.on && RD.f.directToSwapchain && !this._captureMode;
+        const rdInline = RD.on && RD.f.inlineOverlays;   // render debug: overlays in the main pass (no reloading pass)
+        const offscreenView = rdDirect ? backTex.createView() : this.lastFrameTex!.createView();
         let artboard = this.getArtboardScissor();
         // NOTE: render to the OFFSCREEN view, not the swapchain.
         // That way we can persist the texture for the thumbnail.
@@ -2783,6 +2816,11 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
         // Editing-only overlays (selection highlights, connection-port dots, carets, the 2D grid) are UI aids, not
         // content — skip them all during a capture so exports/previews show just the artwork.
+        if (rdInline) {
+          // Render debug inlineOverlays: the overlay set in THIS pass (same order), so no second pass loads the targets.
+          passEncoder.setViewport(0, 0, this.canvas.width, this.canvas.height, 0, 1);
+          this._drawOverlaySet(passEncoder, visibleNodes);
+        }
         passEncoder.end();
 
         // -- SSR / glass-refraction grab: SCENE ONLY --
@@ -2790,7 +2828,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // reflections or refraction. Also PRE-post-process now: a reflection that baked in vignette/bloom
         // darkened its corners with the screen's grade -- the raw scene image is the correct source.
         // Skipped during captures (the capture frame is transparent/no-3D -- it would poison the next frame).
-        if (this.sceneColorGrabTex && !this._captureMode) {
+        if (this.sceneColorGrabTex && !this._captureMode && !(RD.on && (RD.f.noSceneGrab || RD.f.directToSwapchain))) {
           commandEncoder.copyTextureToTexture(
             { texture: this.lastFrameTex! },
             { texture: this.sceneColorGrabTex },
@@ -2812,46 +2850,25 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // -- Overlay pass (EXCLUDED from the grab): 3D gizmos/grid/handles + 2D selection UI --
         // Same colour/depth targets with load/load -- the on-screen result is identical to drawing these in
         // the main pass; only the grab above no longer sees them.
-        if (this._overlays3DPending || !this._captureMode) {
+        if (!rdInline && (this._overlays3DPending || !this._captureMode)) {
           const overlayPass = commandEncoder.beginRenderPass({
             label: 'OverlayPass',
-            colorAttachments: [{ view: offscreenView, loadOp: 'load', storeOp: 'store' }],
+            // (load / load / load; render debug clearColorLoads / clearDepthStencilLoads turn them into clears)
+            colorAttachments: [{ view: offscreenView, loadOp: rdColorLoad(), storeOp: 'store' }],
             depthStencilAttachment: {
               view: this.interactionService.depthTextureView,
-              depthLoadOp: 'load', depthStoreOp: 'store',
-              stencilLoadOp: 'load', stencilStoreOp: 'store',
+              depthClearValue: 1.0, depthLoadOp: rdDepthLoad(), depthStoreOp: 'store',
+              stencilLoadOp: rdDepthLoad(), stencilStoreOp: 'store',
             },
           });
-          if (this._overlays3DPending) {
-            this._overlays3DPending = false;
-            this.draw3DOverlays(overlayPass);
-          }
-          if (!this._captureMode) {
-          // ── Selection highlight overlay (behind carets) ──
-          const selHighlights = this.webGPURenderStrategy.collectSelectionHighlights(visibleNodes);
-          this.selectionHighlightManager.update(selHighlights);
-          this.drawSelectionHighlightInstances(overlayPass);
-
-          // ── Connection-port indicator dots ──
-          this.updateConnectionPortDots();
-          this.drawOverlayDotInstances(overlayPass);
-
-          // Aggregate carets
-          const carets = this.webGPURenderStrategy.collectActiveCarets(visibleNodes);
-          this.caretManager.update(carets);
-
-          // Draw the caret instances
-          this.drawCaretInstances(overlayPass);
-
-          // 2D canvas grid — drawn LAST so it sits above raster/vector/3D (user-requested layering).
-          this.renderGridOverlay(overlayPass);
-          }
+          this._drawOverlaySet(overlayPass, visibleNodes);
           overlayPass.end();
         }
 
         // Run scene post-processing (bloom / color grade / vignette) if any effects are active.
         // Returns the processed output texture, or null when all effects are disabled.
-        const ppOutput = this._renderer3D?.runPostProcess(
+        // (Render debug directToSwapchain: the frame is already in the canvas texture, which cannot be sampled.)
+        const ppOutput = rdDirect ? null : this._renderer3D?.runPostProcess(
           commandEncoder, this.lastFrameTex!, this.canvas.width, this.canvas.height,
         ) ?? null;
 
@@ -2860,7 +2877,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // lastFrameTex is always preserved unchanged for thumbnail snapshots.
         // A capture renders into lastFrameTex only (for readback) and must NOT present, so the on-screen frame
         // is left untouched (no flicker) — the caller re-renders normally afterwards.
-        if (!this._captureMode) {
+        if (!this._captureMode && !rdDirect) {
           commandEncoder.copyTextureToTexture(
             { texture: ppOutput ?? this.lastFrameTex! },
             { texture: backTex },
@@ -2890,7 +2907,11 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           } catch (e) { console.warn('[ui-kit] overlay draw failed', e); }
         }
 
+        // RENDER DEBUG real screenshot (captureRealFrame): read back the finished canvas texture in this encoder.
+        const realShot = this._realShotWaiters.length > 0 && !this._captureMode
+          ? this._encodeRealShot(commandEncoder, backTex, ppOutput ?? this.lastFrameTex!, rdDirect) : null;
         this.device.queue.submit([commandEncoder.finish()]);
+        if (realShot) void this._finishRealShot(realShot);
         if (uiKitMore) this.scheduleRender();
         this._gpuTimer?.endFrame();   // resolution scaling: resolve this frame's GPU timestamps
         this._renderer3D?.noteCullCpuMs(performance.now() - _cull0);   // GPU culling auto mode (performance-plan §P15)
@@ -2916,9 +2937,131 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     // ── 3D Mesh rendering ─────────────────────────────────────────
 
     /**
-     * Draw Mesh3D nodes from the visible node list.
+     * Draw Mesh3D nodes from the visible node list (draw3DMeshes, below the render-debug helpers).
      * Initializes Renderer3D lazily on first use.
      */
+
+    /** The overlay set (EXCLUDED from the scene-colour grab): the deferred 3D overlays, then the 2D selection UI
+     *  (selection highlights, connection-port dots, carets, the 2D grid; not during a capture). Normally drawn in the
+     *  OverlayPass; render debug inlineOverlays draws it at the end of the main pass instead. */
+    private _drawOverlaySet(pass: GPURenderPassEncoder, visibleNodes: Node[]): void {
+          if (this._overlays3DPending) {
+            this._overlays3DPending = false;
+            this.draw3DOverlays(pass);
+          }
+          if (!this._captureMode) {
+          // ── Selection highlight overlay (behind carets) ──
+          const selHighlights = this.webGPURenderStrategy.collectSelectionHighlights(visibleNodes);
+          this.selectionHighlightManager.update(selHighlights);
+          this.drawSelectionHighlightInstances(pass);
+
+          // ── Connection-port indicator dots ──
+          this.updateConnectionPortDots();
+          this.drawOverlayDotInstances(pass);
+
+          // Aggregate carets
+          const carets = this.webGPURenderStrategy.collectActiveCarets(visibleNodes);
+          this.caretManager.update(carets);
+
+          // Draw the caret instances
+          this.drawCaretInstances(pass);
+
+          // 2D canvas grid — drawn LAST so it sits above raster/vector/3D (user-requested layering).
+          this.renderGridOverlay(pass);
+          }
+    }
+
+    // ── RENDER DEBUG: the real screenshot (docs/ui/gpu-diagnostics.md "Render debug") ──
+    /** The canvas context also carries COPY_SRC (set by the first captureRealFrame; kept for the session). */
+    private _swapchainCopySrc = false;
+    private _realShotWaiters: { resolve: (r: RealFrameReadback) => void; reject: (e: unknown) => void }[] = [];
+    /** The canvas alpha mode in force ('premultiplied'; render debug forceOpaqueAlpha = 'opaque'). render() re-configures
+     *  the context when the flag changes. */
+    private _contextAlpha: GPUCanvasAlphaMode = 'premultiplied';
+    private _contextAlphaMode(): GPUCanvasAlphaMode { return (this._contextAlpha = rdCanvasAlphaMode()); }
+    /** The canvas context usage: RENDER_ATTACHMENT | COPY_DST (+ COPY_SRC once a real screenshot was asked for). */
+    private _contextUsage(): number {
+        return GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | (this._swapchainCopySrc ? GPUTextureUsage.COPY_SRC : 0);
+    }
+    /**
+     * Read back what the renderer actually produced: the next frame's CANVAS (swap-chain) texture, copied at the end
+     * of that frame's command encoder, after every pass that writes it (main + overlay passes, post copy, focus-bg
+     * restore, info card, UI kit), right before it is handed to the browser to present. The first call reconfigures
+     * the canvas context with COPY_SRC (kept for the session). When the canvas texture cannot be copied (the context
+     * was reconfigured without COPY_SRC by a foreign owner), the source the frame copied to the canvas is read instead
+     * (the source field says which). Rejects after 5 s without a frame.
+     */
+    public captureRealFrame(): Promise<RealFrameReadback> {
+        if (!this.device || !this.context) return Promise.reject(new Error('the renderer has no GPU device yet'));
+        if (!this._swapchainCopySrc) {
+            this._swapchainCopySrc = true;
+            try {
+                this.context.configure({ device: unwrapDevice(this.device), format: this.swapChainFormat, usage: this._contextUsage(), alphaMode: this._contextAlphaMode() });
+            } catch (e) {
+                this._swapchainCopySrc = false;
+                console.warn('[Salsa][render-debug] could not add COPY_SRC to the canvas context; reading the pre-present frame', e);
+            }
+        }
+        return new Promise<RealFrameReadback>((resolve, reject) => {
+            const w = { resolve: (r: RealFrameReadback) => { clearTimeout(t); resolve(r); }, reject: (e: unknown) => { clearTimeout(t); reject(e); } };
+            const t = setTimeout(() => {
+                const i = this._realShotWaiters.indexOf(w);
+                if (i >= 0) this._realShotWaiters.splice(i, 1);
+                reject(new Error('no frame was rendered within 5 s (renderer suspended or device lost?)'));
+            }, 5000);
+            this._realShotWaiters.push(w);
+            this.scheduleRender();
+        });
+    }
+    public getRenderDebugStatus(): RenderDebugStatus {
+        const r3 = this._renderer3D, w = this.canvas?.width ?? 0, h = this.canvas?.height ?? 0;
+        const res = this.getResolutionScale();
+        const lo = r3 && w > 0 && h > 0 ? r3.getLoResSize(w, h) : null;
+        return {
+            resolutionScale: res.current, resolutionMode: res.mode,
+            loResPath: lo && r3 ? { width: lo[0], height: lo[1], dynamic: r3.loResIsDynamic() } : null,
+            temporalAA: !!r3?.temporalActive, msaaSampleCount: 1, canvas: { width: w, height: h },
+            swapChainFormat: this.swapChainFormat, canvasAlphaMode: this._contextAlpha, canvasCopySrc: this._swapchainCopySrc,
+        };
+    }
+    private _encodeRealShot(enc: GPUCommandEncoder, backTex: GPUTexture, presentedSrc: GPUTexture, direct: boolean): RealShotPending | null {
+        const waiters = this._realShotWaiters; this._realShotWaiters = [];
+        try {
+            const canCopyCanvas = typeof backTex.usage === 'number' && (backTex.usage & GPUTextureUsage.COPY_SRC) !== 0;
+            if (!canCopyCanvas && direct) throw new Error('the canvas texture has no COPY_SRC and directToSwapchain bypasses lastFrameTex');
+            const src = canCopyCanvas ? backTex : presentedSrc;
+            const source: RealFrameReadback['source'] = canCopyCanvas ? 'swapchain' : presentedSrc === this.lastFrameTex ? 'lastFrameTex' : 'postProcessOutput';
+            const w = src.width, h = src.height, padded = Math.ceil(w * 4 / 256) * 256;
+            const buf = this.device.createBuffer({ size: padded * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, label: 'RealScreenshot' });
+            enc.copyTextureToBuffer({ texture: src }, { buffer: buf, bytesPerRow: padded, rowsPerImage: h }, { width: w, height: h, depthOrArrayLayers: 1 });
+            return { buf, w, h, padded, format: src.format, source, waiters };
+        } catch (e) {
+            for (const x of waiters) x.reject(e);
+            return null;
+        }
+    }
+    private async _finishRealShot(p: RealShotPending): Promise<void> {
+        try {
+            await p.buf.mapAsync(GPUMapMode.READ);
+            const src = new Uint8Array(p.buf.getMappedRange());
+            const out = new Uint8ClampedArray(p.w * p.h * 4);
+            const bgra = String(p.format).startsWith('bgra');
+            for (let y = 0, d = 0; y < p.h; y++) {
+                const row = y * p.padded;
+                for (let x = 0; x < p.w; x++, d += 4) {
+                    const i = row + x * 4;
+                    out[d] = bgra ? src[i + 2] : src[i]; out[d + 1] = src[i + 1]; out[d + 2] = bgra ? src[i] : src[i + 2]; out[d + 3] = src[i + 3];
+                }
+            }
+            p.buf.unmap(); p.buf.destroy();
+            const r: RealFrameReadback = { rgba: out, width: p.w, height: p.h, format: p.format, source: p.source };
+            for (const x of p.waiters) x.resolve(r);
+        } catch (e) {
+            try { p.buf.destroy(); } catch { /* already gone */ }
+            for (const x of p.waiters) x.reject(e);
+        }
+    }
+
     private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height, deferOverlays = false): void {
       // Reused scratch (no per-frame array allocation) — see field docs.
       // P9: indexed writes + one final length (no iterator results; the backing stores are kept across frames)
@@ -3011,10 +3154,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       this._renderer3D.drawGhostPreviewIfActive(passEncoder, w, h);
       // Ground reference grid — depth-occluded by meshes (the depth buffer is loaded in the overlay pass).
       this._renderer3D.drawGridIfActive(passEncoder);
-      this._renderer3D.drawArtboardFrameIfActive(passEncoder);   // illustration × free3D render frame
+      const rdNoGizmo = RD.on && RD.f.noGizmo;   // render debug: no gizmo / selection box / editor frames
+      if (!rdNoGizmo) this._renderer3D.drawArtboardFrameIfActive(passEncoder);   // illustration × free3D render frame
       // Play mode (Round 8): none of the editor affordances below are drawn (selection box / gizmo / bone overlay /
       // mesh-edit handles / snap viz / camera frustum / emitter icons) — it's a game view.
       if (this.interactionService.playActive) return;
+      if (!rdNoGizmo) {
       this._renderer3D.drawCameraFrustumIfActive(passEncoder);   // selected camera-node frustum
       // Particle-emitter icons (editor affordance — hidden while a creator/Player mode owns input).
       if (!this.interactionService.suppressBoxSelect) this._renderer3D.drawEmitterIconsIfActive(passEncoder, h);
@@ -3022,11 +3167,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       this._renderer3D.drawSelectionGizmoIfActive(passEncoder, w, h);
       // Bone overlay (dim + gizmo) — always on top.
       this._renderer3D.drawBoneOverlayIfActive(passEncoder, w, h);
+      }
       // Mesh-edit 'dim' focus overlay, then the edit handles on top of the dim.
       this._renderer3D.drawMeshEditDimIfActive(passEncoder, w, h);
       this._renderer3D.drawMeshEditOverlayIfActive(passEncoder);
       // Vertex-snap double-circle viz — last (depth-always).
-      this._renderer3D.drawSnapVizIfActive(passEncoder, h);
+      if (!rdNoGizmo) this._renderer3D.drawSnapVizIfActive(passEncoder, h);
     }
 
     private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
@@ -3915,7 +4061,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
      * Artboard-space + alpha-blended, so it pans/zooms with the canvas. No-op unless enabled.
      */
     private renderGridOverlay(pass: GPURenderPassEncoder): void {
-        if (!this._canvasGridVisible || !this._canvasGridVisibleOverride || !this.pipelineManager) return;
+        if (!this._canvasGridVisible || !this._canvasGridVisibleOverride || !this.pipelineManager || (RD.on && RD.f.noGrid)) return;
         this.ensureBackgroundResources();
         if (!this.gridOverlayBindGroup) return;
         // Resolution + inverse-world (same artboard transform as the background pattern), written

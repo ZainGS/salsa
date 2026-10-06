@@ -1,4 +1,5 @@
 import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cache';
+import { rdColorLoad, rdDepthLoad } from './render-debug';
 /**
  * PostBgKeepPass — keeps a FOCUS-MODE background (armature / mesh-edit: wavy / solid / gradient) out of the scene's
  * post-processing.
@@ -52,9 +53,9 @@ export class PostBgKeepPass {
     }
     const pass = encoder.beginRenderPass({
       label: 'PostBgKeep',
-      colorAttachments: [{ view: target, loadOp: 'load', storeOp: 'store' }],
+      colorAttachments: [{ view: target, loadOp: rdColorLoad(), storeOp: 'store' }],   // ('load'; render debug may clear)
       depthStencilAttachment: {
-        view: depthView, depthLoadOp: 'load', depthStoreOp: 'store', stencilLoadOp: 'load', stencilStoreOp: 'store',
+        view: depthView, depthClearValue: 1.0, depthLoadOp: rdDepthLoad(), depthStoreOp: 'store', stencilLoadOp: rdDepthLoad(), stencilStoreOp: 'store',
       },
     });
     pass.setPipeline(pipe);
