@@ -30,9 +30,15 @@ import {
   SYSTEM_APPS,
 } from '../persistence/shell-storage';
 import { ShellRenderer, ensureShellFont, FONT_FAMILY, TITLEBAR_FONT } from '../../renderer/shell/shell-renderer';
-import { drawPlaceholderIcon, iconKindForSystemKey } from '../../renderer/shell/shell-icons';
+import { iconKindForSystemKey, type IconKind } from '../../renderer/shell/shell-icons';
 import { SHELL_ICON_PENCIL, SHELL_ICON_GEAR, SHELL_ICON_INSTALL } from '../../renderer/shell/shell-icon-assets';
-import { generateBillboard3DGeometry, type Billboard3DConfig } from '../../renderer/3d/billboard-3d';
+import type { Billboard3DConfig } from '../../renderer/3d/billboard-3d';
+import {
+  rgbaCss, bakeImageIcon, peekImageIcon, bakePlaceholderIcon, peekPlaceholderIcon, type IconBake,
+} from '../../renderer/shell/shell-icon-bake';
+import { MODE_FADE_MS } from '../../renderer/shell/shell-bake';
+import { shellMark } from '../../renderer/shell/shell-perf';
+import { sameProjectList, projectsOfKind } from './shell-project-diff';
 import { unzipSync, strFromU8 } from 'fflate';
 import {
   computeShellLayout,
@@ -51,6 +57,7 @@ import {
   type ShellTileSpec,
   type ShellRenderModel,
   type ViewerSpec,
+  type ShellChipLayout,
 } from '../../renderer/shell/shell-layout';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { syncShellCanvasBacking, shellBackingRatio } from '../../renderer/shell/shell-backing';
@@ -80,55 +87,8 @@ const SHELL_DEMO_CD = true;
  *  renderer's countdown ring (RING_SECONDS). */
 const DWELL_MS = 3000;
 
-/** Format an [r,g,b,a] (0..1) color as a CSS rgba() string. */
-function rgbaCss(c: [number, number, number, number]): string {
-  return `rgba(${Math.round(c[0] * 255)},${Math.round(c[1] * 255)},${Math.round(c[2] * 255)},${c[3]})`;
-}
-
-/** Load an image element from a URL or data URL (for logo injection). */
-function loadImageEl(src: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = src;
-  });
-}
-
-/** Bake a colored outline into an icon canvas (in place): stamp the icon's
- *  silhouette in the outline color around two rings of offsets — a cheap
- *  circular dilation — then draw the icon back on top. The color survives only
- *  in the `rimPx` band just outside every alpha edge: the outer silhouette AND
- *  the rims of interior holes, whose centers stay transparent. Lets cutout icons
- *  (gear) show see-through holes with a printed, themed rim. See
- *  `setBillboardFromImage`. */
-function bakeRim(canvas: HTMLCanvasElement, rimPx: number, color: [number, number, number, number]): void {
-  const w = canvas.width, h = canvas.height;
-  const ctx = canvas.getContext('2d')!;
-  // Snapshot the icon, and build a flat outline-colored version of its silhouette.
-  const icon = document.createElement('canvas'); icon.width = w; icon.height = h;
-  icon.getContext('2d')!.drawImage(canvas, 0, 0);
-  const tint = document.createElement('canvas'); tint.width = w; tint.height = h;
-  const tc = tint.getContext('2d')!;
-  tc.drawImage(icon, 0, 0);
-  tc.globalCompositeOperation = 'source-in';
-  tc.fillStyle = rgbaCss(color);
-  tc.fillRect(0, 0, w, h);
-  // Dilate by stamping the tinted silhouette across the whole disc (every radius
-  // up to rimPx, ~1px angular spacing), then draw the icon on top. A sparse ring
-  // set leaves wedge gaps at sharp convex features (the pencil tip) where the
-  // discrete directions fan apart; filling the disc closes them.
-  ctx.clearRect(0, 0, w, h);
-  for (let r = rimPx; r >= 1; r--) {
-    const steps = Math.max(8, Math.ceil(2 * Math.PI * r));
-    for (let i = 0; i < steps; i++) {
-      const a = (i / steps) * Math.PI * 2;
-      ctx.drawImage(tint, Math.cos(a) * r, Math.sin(a) * r);
-    }
-  }
-  ctx.drawImage(icon, 0, 0);
-}
+/** The Shell must have been mounted this long before a heavy bake / prewarm may start (its first frames stay smooth). */
+const CALM_AFTER_MOUNT_MS = 500;
 
 /** Which dashboard view the shell is currently presenting. */
 export type ShellMode = 'shell' | 'illustrations';
@@ -206,9 +166,26 @@ export class ShellUIManager {
 
   /** Bridge to the host document store (set via setDocumentSource). */
   private docSource: ShellDocumentSource | null = null;
-  /** In-memory project list, refreshed asynchronously from the document
+  /** In-memory project list (EVERY kind), refreshed asynchronously from the document
    *  source so the render path can read it synchronously. */
-  private projectCache: ProjectEntry[] = [];
+  private allProjects: ProjectEntry[] = [];
+  /** The active dashboard's projects (allProjects filtered by `dashboardKind`), memoised. Keeping the unfiltered
+   *  list means opening either dashboard shows its projects straight from the cache — no refetch at the flip. */
+  private _projectCache: ProjectEntry[] | null = null;
+  private get projectCache(): ProjectEntry[] {
+    return this._projectCache ??= projectsOfKind(this.allProjects, this.dashboardKind);
+  }
+  private setAllProjects(list: ProjectEntry[]): void {
+    this.allProjects = list;
+    this._projectCache = null;
+    this.invalidateProjects();
+  }
+  /** Drop the memoised sorted list (it holds CLONES of the entries) and note that the list changed. */
+  private invalidateProjects(): void {
+    this._sortedProjects = null;
+    this._projectsEpoch++;
+  }
+  private _projectsEpoch = 0;
 
   private view: ShellViewState = {
     mode: 'shell',
@@ -228,6 +205,9 @@ export class ShellUIManager {
   // ── Renderer-coupled scene state (populated by initializeScene) ──
   private renderer: ShellRenderer | null = null;
   private sceneCanvas: HTMLCanvasElement | null = null;
+  /** The canvas context + format the scene configured (restored to the editor's alpha mode on unmount). */
+  private sceneContext: GPUCanvasContext | null = null;
+  private sceneFormat: GPUTextureFormat | null = null;
   /** Host-injected logo image (URL/data URL) for the default hero billboard. */
   private logoSrc: string | null = null;
   /** Dwell-focus state: the focused tile, its unfocus timer, and the countdown
@@ -256,8 +236,6 @@ export class ShellUIManager {
   private transitionActive = false;
   private transitionTo: ShellMode = 'shell';
   private transitionStart = 0;
-  private transitionT = 0;
-  private transitionRaf: number | null = null;
   private resumeMainOnDestroy = false;
   private changeUnsub?: () => void;
   private resizeObserver?: ResizeObserver;
@@ -328,9 +306,10 @@ export class ShellUIManager {
     try {
       const all = await this.docSource.listProjects();
       if (seq !== this._refreshSeq) return;   // a newer refresh already landed — discard this stale snapshot
-      // Show only the documents for the active dashboard (untagged = 'illustration').
-      this.projectCache = all.filter(p => (p.kind ?? 'illustration') === this.dashboardKind);
-      this._sortedProjects = null;
+      // Nothing changed → no emit (an emit rebuilds the model, re-requests thumbnails and re-enters the host).
+      if (sameProjectList(this.allProjects, all)) return;
+      // Every kind is kept; the grid shows only the active dashboard's (untagged = 'illustration').
+      this.setAllProjects(all);
       this.onChange.emit('projects');
     } catch {
       /* keep the last good cache */
@@ -512,9 +491,8 @@ export class ShellUIManager {
     }
     // Only show the optimistic tile if the new entry belongs to the ACTIVE dashboard — otherwise it would flash in
     // the wrong grid until the next refresh filters it out.
+    this.setAllProjects([entry, ...this.allProjects.filter(p => p.id !== entry.id)]);
     if ((entry.kind ?? 'illustration') === this.dashboardKind) {
-      this.projectCache = [entry, ...this.projectCache.filter(p => p.id !== entry.id)];
-      this._sortedProjects = null;
       this.onChange.emit('projects');
     }
     return { ...entry };
@@ -525,6 +503,7 @@ export class ShellUIManager {
     await this.docSource?.renameProject(projectId, name);
     const p = this.projectCache.find(p => p.id === projectId);
     if (p) { p.name = name; p.lastModified = Date.now(); }
+    this.invalidateProjects();
     this.onChange.emit('projects');
   }
 
@@ -542,6 +521,7 @@ export class ShellUIManager {
       p.lastModified = Date.now();
       if (opts.thumbnailDataUrl !== undefined) p.thumbnailDataUrl = opts.thumbnailDataUrl;
       if (opts.sizeBytes !== undefined) p.sizeBytes = opts.sizeBytes;
+      this.invalidateProjects();
       this.onChange.emit('projects');
     }
     void this.refreshProjects();
@@ -550,8 +530,7 @@ export class ShellUIManager {
   /** Delete a project (deletes the underlying document + any exported copy). */
   async deleteProject(projectId: string): Promise<void> {
     await this.docSource?.deleteProject(projectId);
-    this.projectCache = this.projectCache.filter(p => p.id !== projectId);
-    this._sortedProjects = null;
+    this.setAllProjects(this.allProjects.filter(p => p.id !== projectId));
     if (this.view.selectedSlotId === projectId) this.view.selectedSlotId = null;
     // Best-effort cleanup of any exported .frogmarks package.
     await this.storage.deleteProjectFile(projectId);
@@ -586,8 +565,10 @@ export class ShellUIManager {
     this.view.selectedSlotId = null;
     this.currentPage = 0;
     this.gridScrollY = 0;   // reset the illustrations grid scroll on entry/exit
-    // Entering the project browser — pull a fresh list from the store.
-    if (mode === 'illustrations') void this.refreshProjects();
+    // Entering the project browser — pull a fresh list from the store. Not at the flip of a cross-fade: the grid
+    // shows the cache at once and the refresh runs when the fade has finished (onModeFadeEnd), so the store read +
+    // a second rebuild don't land in the middle of the animation.
+    if (mode === 'illustrations' && !this.transitionActive) void this.refreshProjects();
     this.onChange.emit('mode');
   }
 
@@ -596,38 +577,55 @@ export class ShellUIManager {
   private dashboardKind: 'illustration' | 'packaging' = 'illustration';
   getDashboardKind(): 'illustration' | 'packaging' { return this.dashboardKind; }
 
-  openIllustratorDashboard(): void { this.dashboardKind = 'illustration'; this.startModeTransition('illustrations'); }
+  private setDashboardKind(kind: 'illustration' | 'packaging'): void {
+    if (this.dashboardKind === kind) return;
+    this.dashboardKind = kind;
+    this._projectCache = null;     // derived from the kind
+    this._sortedProjects = null;
+  }
+
+  /** The projects of a dashboard, newest first (the memoised list for the active one). */
+  private projectsFor(kind: 'illustration' | 'packaging'): ProjectEntry[] {
+    if (kind === this.dashboardKind) return this.getProjects();
+    return projectsOfKind(this.allProjects, kind).sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0));
+  }
+
+  openIllustratorDashboard(): void { shellMark('shell:tap'); this.setDashboardKind('illustration'); this.startModeTransition('illustrations'); }
   /** Package Designer sub-dashboard — same project grid, filtered to packaging-kind documents. */
-  openPackageDashboard(): void { this.dashboardKind = 'packaging'; this.startModeTransition('illustrations'); }
+  openPackageDashboard(): void { shellMark('shell:tap'); this.setDashboardKind('packaging'); this.startModeTransition('illustrations'); }
   closeIllustratorDashboard(): void { this.startModeTransition('shell'); }
 
   /** Animate a dip-to-background cross-fade between the shell home and the
    *  illustrations grid, flipping the underlying mode at the midpoint (hidden by
-   *  the scrim, so each view is only ever shown alone). */
+   *  the scrim, so each view is only ever shown alone). The fade runs on the renderer's clock
+   *  (ShellRenderer.beginModeFade): the scrim alpha is computed inside its render(), so the only model rebuild of
+   *  the whole transition is the one at the flip (was: a full rebuild + layout + text measuring every frame). */
   private startModeTransition(to: ShellMode): void {
     if (!this.transitionActive && this.view.mode === to) return;   // already there
     this.transitionTo = to;
     this.transitionStart = performance.now();
     this.transitionActive = true;
-    if (this.transitionRaf == null) this.transitionRaf = requestAnimationFrame(this.tickTransition);
+    if (this.renderer) {
+      this.renderer.beginModeFade(this.transitionStart, MODE_FADE_MS, this.onModeFadeMidpoint, this.onModeFadeEnd);
+    } else {
+      // No scene mounted: nothing to fade, just switch.
+      this.onModeFadeMidpoint();
+      this.onModeFadeEnd();
+    }
   }
 
-  private tickTransition = (): void => {
-    const DURATION = 380;   // ms
-    const t = Math.min(1, (performance.now() - this.transitionStart) / DURATION);
-    this.transitionT = t;
-    if (t >= 0.5 && this.view.mode !== this.transitionTo) {
-      this.setMode(this.transitionTo);   // flip at the dip → emits → rebuildAndRender
-    } else {
-      this.rebuildAndRender();           // refresh modeFade (+ current view)
-    }
-    if (t < 1) {
-      this.transitionRaf = requestAnimationFrame(this.tickTransition);
-    } else {
-      this.transitionActive = false;
-      this.transitionRaf = null;
-      this.rebuildAndRender();           // settle modeFade to 0/1
-    }
+  /** The dip is at its darkest: flip the mode (emits → the one rebuildAndRender of the transition). */
+  private onModeFadeMidpoint = (): void => {
+    if (this.view.mode === this.transitionTo) return;
+    shellMark('shell:mode-flip');
+    if (this.transitionTo === 'illustrations') this.renderer?.armGridMarks();
+    this.setMode(this.transitionTo);
+  };
+
+  private onModeFadeEnd = (): void => {
+    this.transitionActive = false;
+    // The refresh setMode skipped at the flip: now that nothing is animating (emits only if the list changed).
+    if (this.view.mode === 'illustrations') void this.refreshProjects();
   };
 
   /** Drives the cartridge / sketchbook viewer. Pass null to deselect. */
@@ -760,8 +758,15 @@ export class ShellUIManager {
     context.configure({
       device: unwrapDevice(device), format,   // the editor's device is a HANDLE (proxy); configure brand-checks it
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
-      alphaMode: 'premultiplied',
+      // The Shell fills its canvas with alpha 1 (an opaque background clear, then only blends that keep alpha 1),
+      // so 'opaque' shows the same pixels as 'premultiplied' did while letting the compositor skip the per-pixel
+      // blend of a full-screen layer. Hand-back: a host with a dedicated Shell canvas (Frogmarks) reinitializes the
+      // editor on ITS canvas (premultiplied); for a host that shares one canvas, destroyScene puts the editor's
+      // configuration back before the editor draws again.
+      alphaMode: 'opaque',
     });
+    this.sceneContext = context;
+    this.sceneFormat = format;
 
     // Hard-suspend the editor renderer and take over the canvas. suspendRendering
     // (not pause) also blocks the on-demand scheduleRender path, so editor
@@ -785,11 +790,14 @@ export class ShellUIManager {
       this.rebuildAndRender();
       this.mountChromeCluster();  // top-right utility icons + panels (HTML-in-Canvas)
       this.renderer.start(); // idle cartridge animation
+      this.schedulePrewarm(); // the Illustrations view's labels + first screenful of thumbnails, at idle
 
       // Load the Bungee web font, then re-rasterize the labels with it.
       void ensureShellFont().then(() => {
+        this._textEpoch++;                 // measured widths / fitted font sizes are stale
         this.renderer?.invalidateText();
         this.rebuildAndRender();
+        this.schedulePrewarm();
       });
     } catch (e) {
       try { this.detachInteraction(); } catch { /* best-effort */ }
@@ -804,35 +812,31 @@ export class ShellUIManager {
     }
   }
 
-  /** Build placeholder icon cutouts for the system apps: draw a transparent
-   *  silhouette → upload to the thumbnail atlas + generate a Billboard3D mesh.
-   *  Re-run each mount (the renderer/viewer is recreated on mount). */
+  /** Build the icon cutouts for the system apps + the hero: a Billboard3D mesh + an atlas thumbnail each.
+   *  Re-run each mount (the renderer/viewer is recreated on mount), but the BAKES are memoised for the page
+   *  (shell-icon-bake.ts): a mount after the first applies them synchronously, with no image decode, rim bake or
+   *  tracing. A bake that is still needed is queued (see enqueueCalm): never in the Shell's first moments and never
+   *  during a mode cross-fade, one icon at a time, yielding between its steps. */
   private generateSystemIcons(): void {
     if (!this.renderer) return;
-    const make = (key: string, iconKind: Parameters<typeof drawPlaceholderIcon>[0]) => {
-      const icon = drawPlaceholderIcon(iconKind);
-      this.renderer!.requestThumbnail(key, icon.dataUrl);
-      const geo = generateBillboard3DGeometry(icon.rgba, icon.w, icon.h, {
-        borderPx: 6, depth: 0.05, sideColor: [1, 1, 1, 1],
-      });
-      this.renderer!.setSystemIcon(key, geo);
-    };
+    const placeholder = (key: string, kind: IconKind) =>
+      this.iconJob(key, peekPlaceholderIcon(kind), () => bakePlaceholderIcon(kind));
+    // Hero first (it is the biggest thing on the home): the host's injected logo (re-baked with the theme outline)
+    // if present, else the frog placeholder. Don't reset to the frog when a logo exists — it
+    // would flash during the async re-bake (e.g. on every theme switch).
+    if (this.logoSrc) this.applyLogoBillboard();
+    else placeholder(SHELL_HERO_ID, 'frog');
     for (const app of SYSTEM_APPS) {
       // Pencil + gear use real PNG art (embedded data URLs), baked as cutouts
       // (rimPx > 0) so the gear's holes read as true see-through gaps with a rim.
-      if (app.systemKey === 'illustrator') { void this.setBillboardFromImage(app.id, SHELL_ICON_PENCIL, { alphaThreshold: 110 }, 8); continue; }
-      if (app.systemKey === 'settings')    { void this.setBillboardFromImage(app.id, SHELL_ICON_GEAR,   { alphaThreshold: 110 }, 8); continue; }
-      make(app.id, iconKindForSystemKey(app.systemKey));
+      if (app.systemKey === 'illustrator') { this.setBillboardFromImage(app.id, SHELL_ICON_PENCIL, { alphaThreshold: 110 }, 8); continue; }
+      if (app.systemKey === 'settings')    { this.setBillboardFromImage(app.id, SHELL_ICON_GEAR,   { alphaThreshold: 110 }, 8); continue; }
+      placeholder(app.id, iconKindForSystemKey(app.systemKey));
     }
-    make(SHELL_STAR_ID, 'star');          // kept for a future Favorites feature
     // Install Cart: real PNG art (arrow + tray), baked as a cutout. The bake's
     // dilation bridges the arrow→tray gap so both parts trace as one silhouette.
-    void this.setBillboardFromImage(SHELL_DOWNLOAD_ID, SHELL_ICON_INSTALL, { alphaThreshold: 110 }, 8);
-    // Hero: the host's injected logo (re-baked with the theme outline) if present,
-    // else the frog placeholder. Don't reset to the frog when a logo exists — it
-    // would flash during the async re-bake (e.g. on every theme switch).
-    if (this.logoSrc) void this.applyLogoBillboard();
-    else make(SHELL_HERO_ID, 'frog');
+    this.setBillboardFromImage(SHELL_DOWNLOAD_ID, SHELL_ICON_INSTALL, { alphaThreshold: 110 }, 8);
+    placeholder(SHELL_STAR_ID, 'star');          // kept for a future Favorites feature
   }
 
   /** Inject the host's logo image (URL or data URL) to use as the default hero
@@ -841,55 +845,135 @@ export class ShellUIManager {
    *  have a transparent background so the cutout silhouette traces cleanly. */
   setLogoBillboard(src: string): void {
     this.logoSrc = src;
-    if (this.renderer) void this.applyLogoBillboard();
+    if (this.renderer) this.applyLogoBillboard();
   }
 
-  private _logoReady = false;
-  /** Rasterize the injected logo → Billboard3D geometry, registered as the hero. On the FIRST load, keep the hero
-   *  slot EMPTY until the logo image has decoded + baked, then FADE it in (~0.5s) — no white-card flash. Re-bakes
-   *  (theme switch) don't re-hide/fade — the logo already exists. (Bouncing-dots placeholder is kept for reuse.) */
-  private async applyLogoBillboard(): Promise<void> {
-    if (!this.logoSrc) return;
-    const firstLoad = !this._logoReady;
-    if (firstLoad) this.renderer?.hideHero();
-    await this.setBillboardFromImage(SHELL_HERO_ID, this.logoSrc, { borderPx: 12 });
-    if (firstLoad) { this._logoReady = true; this.renderer?.revealHero(); this.rebuildAndRender(); }
+  /** Rasterize the injected logo → Billboard3D geometry, registered as the hero. While this renderer has NO hero
+   *  mesh yet (first load, or a mount whose bake is still pending) the hero slot stays EMPTY until the logo has
+   *  decoded + baked — no white-card / cartridge flash. Re-bakes (theme switch) don't re-hide: the logo already
+   *  exists. (Bouncing-dots placeholder is kept for reuse.) */
+  private applyLogoBillboard(): void {
+    const r = this.renderer;
+    if (!this.logoSrc || !r) return;
+    const cfg = { borderPx: 12 };
+    const outline = this.activeTheme.billboardOutline;
+    const hadHero = r.hasSystemIcon(SHELL_HERO_ID);
+    const cached = peekImageIcon(this.logoSrc, outline, 0, cfg);
+    if (!hadHero && !cached) r.hideHero();
+    const src = this.logoSrc;
+    this.iconJob(SHELL_HERO_ID, cached, () => bakeImageIcon(src, outline, 0, cfg), () => {
+      if (!hadHero && !cached) r.revealHero();
+    });
   }
 
   /** Load an image (URL or data URL) → Billboard3D cutout + atlas thumbnail,
    *  registered under `key`. The image should have a transparent background so
-   *  the silhouette traces cleanly. Shared by the host logo and the PNG-art
-   *  system icons (pencil/gear). */
+   *  the silhouette traces cleanly. Shared by the PNG-art system icons (pencil/gear/install). */
   private _iconBakeGen = 0;   // bumped on every theme switch; a bake whose gen is stale drops its result
-  private async setBillboardFromImage(key: string, src: string, cfg: Partial<Billboard3DConfig> = {}, rimPx = 0): Promise<void> {
+  private setBillboardFromImage(key: string, src: string, cfg: Partial<Billboard3DConfig> = {}, rimPx = 0): void {
     if (!this.renderer) return;
+    const outline = cfg.sideColor ?? this.activeTheme.billboardOutline;
+    this.iconJob(key, peekImageIcon(src, outline, rimPx, cfg), () => bakeImageIcon(src, outline, rimPx, cfg));
+  }
+
+  /** Hand a finished bake to the renderer: the mesh + the atlas thumbnail (already decoded when possible). */
+  private applyIconBake(r: ShellRenderer, key: string, bake: IconBake): void {
+    if (bake.bitmap) r.requestThumbnailBitmap(key, bake.bitmapKey, bake.bitmap);
+    else r.requestThumbnail(key, bake.atlasUrl);
+    r.setSystemIcon(key, bake.geo);
+  }
+
+  /** Apply `cached` now, or queue `bake` (calm moments only) and apply its result — unless the theme changed or the
+   *  scene was torn down meanwhile (the next mount queues its own job, which reuses the memoised bake). */
+  private iconJob(key: string, cached: IconBake | null, bake: () => Promise<IconBake>, after?: () => void): void {
+    const r = this.renderer;
+    if (!r) return;
+    if (cached) { this.applyIconBake(r, key, cached); after?.(); return; }
     const gen = this._iconBakeGen;
-    try {
-      const img = await loadImageEl(src);
-      if (gen !== this._iconBakeGen || !this.renderer) return;   // theme switched (or torn down) mid-load → stale bake
-      const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
-      if (!w || !h) return;
-      const canvas = document.createElement('canvas');
-      canvas.width = w; canvas.height = h;
-      const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(img, 0, 0, w, h);
-      // Cutout mode (rimPx > 0): bake a themed outline around every alpha edge —
-      // the outer silhouette AND interior holes — so the holes can render as
-      // true see-through gaps with a printed rim. The bake also pre-dilates the
-      // mask, so geometry needs no borderPx and triangulates the smoothed shape.
-      const outline = cfg.sideColor ?? this.activeTheme.billboardOutline;
-      const cutout = rimPx > 0;
-      if (cutout) bakeRim(canvas, rimPx, outline);
-      const atlasSrc = cutout ? canvas.toDataURL() : src;   // baked image → atlas
-      const rgba = ctx.getImageData(0, 0, w, h).data;
-      const geo = generateBillboard3DGeometry(rgba, w, h, {
-        borderPx: cutout ? 0 : 6, depth: 0.05, sideColor: outline, cutoutHoles: cutout, ...cfg,
-      });
-      this.renderer.requestThumbnail(key, atlasSrc);
-      this.renderer.setSystemIcon(key, geo);
-      this.rebuildAndRender();
-    } catch (e) {
-      console.warn('[Shell] Failed to load icon billboard:', key, e);
+    this.enqueueCalm(async () => {
+      if (this.renderer !== r || gen !== this._iconBakeGen) return;   // stale before it started: don't bake for nobody
+      try {
+        const b = await bake();
+        if (this.renderer !== r || gen !== this._iconBakeGen) return; // theme switched (or torn down) mid-bake
+        this.applyIconBake(r, key, b);
+        this.rebuildAndRender();
+      } catch (e) {
+        console.warn('[Shell] Failed to load icon billboard:', key, e);
+        if (this.renderer !== r || gen !== this._iconBakeGen) return;
+      }
+      after?.();   // also after a failed bake (as before: the hero slot is revealed with its fallback mesh)
+    });
+  }
+
+  // ── Calm-time work queue (icon bakes, the Illustrations prewarm) ──────
+
+  private _calmChain: Promise<void> = Promise.resolve();
+  /** Run `task` after the ones queued before it, and only once the Shell is calm (see whenCalm). */
+  private enqueueCalm(task: () => Promise<void> | void): void {
+    this._calmChain = this._calmChain.then(async () => {
+      await this.whenCalm();
+      await task();
+    }).catch((e) => { console.warn('[Shell] deferred task failed:', e); });
+  }
+
+  /** Resolves when the mounted Shell is at least CALM_AFTER_MOUNT_MS old and no mode cross-fade is running, then at
+   *  the browser's next idle slot (or at once when no scene is mounted — the task then decides what to do). */
+  private async whenCalm(): Promise<void> {
+    const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+    for (;;) {
+      const r = this.renderer;
+      if (!r) return;
+      const wait = CALM_AFTER_MOUNT_MS - r.mountAgeMs;
+      if (wait > 0) { await sleep(wait); continue; }
+      if (this.transitionActive) { await sleep(60); continue; }
+      break;
+    }
+    await new Promise<void>((res) => {
+      const g = globalThis as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void };
+      if (typeof g.requestIdleCallback === 'function') g.requestIdleCallback(() => res(), { timeout: 300 });
+      else setTimeout(res, 0);
+    });
+  }
+
+  private _prewarmQueued = false;
+  /** Queue a prewarm of the Illustrations view (coalesced). Runs at a calm moment while the HOME is showing. */
+  private schedulePrewarm(): void {
+    if (this._prewarmQueued || !this.renderer) return;
+    this._prewarmQueued = true;
+    this.enqueueCalm(async () => {
+      this._prewarmQueued = false;
+      await this.prewarmIllustrationsView();
+    });
+  }
+
+  /**
+   * Prepare the Illustrations grid while the home is showing, so tapping Illustrator only has to draw it: lay the
+   * grid out once (filling the text-measure caches), rasterize its labels into the atlas (additive: the home labels
+   * stay), and decode + upload the first screenful of thumbnails, a few per slice. Nothing is drawn differently.
+   */
+  private async prewarmIllustrationsView(): Promise<void> {
+    const r = this.renderer, c = this.sceneCanvas;
+    if (!r || !c || this.view.mode !== 'shell' || this.transitionActive || c.width === 0 || c.height === 0) return;
+    const model = computeShellLayout(c.width, c.height, [], { page: 0, zoom: this.zoom }, this.activeTheme);
+    // The Illustrator dashboard (the common tap); the Package Designer grid shares the chips + most of the atlas.
+    const projects = this.projectsFor('illustration');
+    this.layoutProjectGrid(model, 0, null, 'illustration');
+    r.prewarmLabels(model.labels);
+    // First screenful of thumbnails (cards on screen at scroll 0), newest first.
+    const H = c.height;
+    const ids: string[] = [];
+    const byId = new Map<string, ProjectEntry>();
+    for (const p of projects) byId.set(p.id, p);
+    for (const it of model.projectGrid ?? []) {
+      if (it.rect[1] + it.rect[3] <= 0 || it.rect[1] >= H) continue;
+      const url = byId.get(it.id)?.thumbnailDataUrl;
+      if (url) { r.requestThumbnail(it.id, url); ids.push(it.id); }
+    }
+    const SLICE = 4;
+    for (let i = 0; i < ids.length; i += SLICE) {
+      if (this.renderer !== r || this.view.mode !== 'shell' || this.transitionActive) return;   // the real view took over
+      r.prewarmThumbnails(ids.slice(i, i + SLICE));
+      await new Promise<void>((res) => setTimeout(res, 40));
     }
   }
 
@@ -1138,6 +1222,19 @@ export class ShellUIManager {
     this.renderer.destroy();
     this.renderer = null;
     this.sceneCanvas = null;
+    // Back to the editor's context configuration (the Shell ran 'opaque'): on a shared canvas the editor draws to
+    // this context next. Usage stays RENDER_ATTACHMENT | COPY_DST (the editor's compositor copies into the swapchain).
+    if (this.sceneContext && this.sceneFormat) {
+      try {
+        const dev = this.ctx.webgpuRenderer.getDevice();
+        if (dev) this.sceneContext.configure({
+          device: unwrapDevice(dev), format: this.sceneFormat,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+          alphaMode: 'premultiplied',
+        });
+      } catch { /* the canvas is already gone: nothing to hand back */ }
+    }
+    this.sceneContext = null;
     // Drop references to the now-removed DOM + stale layout so we don't hold detached nodes between mounts.
     if (this._clusterScrollHandler) {
       window.removeEventListener('scroll', this._clusterScrollHandler, { capture: true } as EventListenerOptions);
@@ -1196,7 +1293,7 @@ export class ShellUIManager {
   /** Recompute the layout from current state and push it to the renderer. */
   private rebuildAndRender(): void {
     if (!this.renderer || !this.sceneCanvas) return;
-    this.syncCanvasBackingStore();
+    const resized = this.syncCanvasBackingStore();
     this.requestThumbnails();
     this.currentModel = computeShellLayout(
       this.sceneCanvas.width,
@@ -1228,11 +1325,9 @@ export class ShellUIManager {
     this.currentModel.ringTileId = this.dwellId ?? undefined;
     this.currentModel.ringCountdownStart = this.dwellCountdownStart;
     // Mode chrome: home gets the greeting; illustrations gets the curved
-    // thumbnail grid + floating Back / New Project chips. (modeFade = 1 snaps to
-    // the grid for now; Phase 2 animates the cross-fade.)
-    this.currentModel.modeFade = this.transitionActive
-      ? this.transitionT
-      : (this.view.mode === 'illustrations' ? 1 : 0);
+    // thumbnail grid + floating Back / New Project chips. modeFade is the RESTING value for the mode; while a
+    // cross-fade runs the renderer overrides it with the animated one (beginModeFade), so nothing is rebuilt per frame.
+    this.currentModel.modeFade = this.view.mode === 'illustrations' ? 1 : 0;
     this.zoomButtons = [];   // re-populated by buildChrome (home only)
     if (this.view.mode === 'illustrations') {
       this.buildProjectGrid(this.currentModel);
@@ -1240,7 +1335,22 @@ export class ShellUIManager {
       this.buildChrome(this.currentModel);
     }
     this.renderer.setModel(this.currentModel);
+    // A backing-store resize cleared the canvas: redraw NOW (the rAF loop's next frame is a whole frame away, and this
+    // may run after this frame's rAF callbacks — the cleared canvas would be presented once).
+    if (resized) this.renderer.render();
     this.updateChromeCluster();
+    // The project list / the canvas changed while the home is up → the prepared Illustrations view is stale.
+    if (this.view.mode === 'shell' && this._prewarmSig !== this.prewarmSignature()) {
+      this._prewarmSig = this.prewarmSignature();
+      this.schedulePrewarm();
+    }
+  }
+
+  /** What the prepared Illustrations view depends on (compared by identity / value on each home rebuild). */
+  private _prewarmSig = '';
+  private prewarmSignature(): string {
+    const c = this.sceneCanvas;
+    return `${c?.width ?? 0}x${c?.height ?? 0}|${this.activeThemeName}|${this._textEpoch}|${this._projectsEpoch}`;
   }
 
   /** Illustrations mode: build the curved thumbnail grid (one card per project)
@@ -1248,8 +1358,21 @@ export class ShellUIManager {
    *  Cards are a FIXED size (CSS px × DPR, mobile-parity UI-14); chips are sized
    *  from their measured labels so they never clip. */
   private buildProjectGrid(model: ShellRenderModel): void {
+    this.gridScrollY = this.layoutProjectGrid(model, this.gridScrollY, this.view.hoveredSlotId);
+  }
+
+  // Text measuring is the expensive part of a grid rebuild (a rebuild runs on every hover / scroll step), and its
+  // results only change with the text, the box and the loaded fonts: memoised until the fonts change (_textEpoch).
+  private _textEpoch = 0;
+  private _measEpoch = -1;
+  private _titleFontCache = new Map<string, number>();
+  private _chipCache: { key: string; chips: ShellChipLayout } | null = null;
+
+  /** Lay the Illustrations grid (cards, titles, chips) into `model` for a scroll offset + hovered id. Returns the
+   *  clamped scroll. Has no side effects on the view state, so it also serves the idle prewarm. */
+  private layoutProjectGrid(model: ShellRenderModel, scrollY: number, hoveredId: string | null, kind: 'illustration' | 'packaging' = this.dashboardKind): number {
     const c = this.sceneCanvas;
-    if (!c) return;
+    if (!c) return scrollY;
     const W = c.width, H = c.height;
     // Device px per CSS px of the canvas AS BACKED (CSS size × the capped DPR — UI-16), not window.devicePixelRatio.
     const dpr = shellBackingRatio(c, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
@@ -1258,25 +1381,34 @@ export class ShellUIManager {
       meas.font = `400 ${fontPx}px ${family}`;
       return meas.measureText(text).width;
     };
+    if (this._measEpoch !== this._textEpoch) {   // fonts (re)loaded → every cached measurement is stale
+      this._measEpoch = this._textEpoch;
+      this._titleFontCache.clear();
+      this._chipCache = null;
+    }
 
     // Floating chrome chips first: the grid starts below them (they may wrap on a narrow screen).
-    const pkg = this.dashboardKind === 'packaging';
+    const pkg = kind === 'packaging';
     const chipDefs: [string, string][] = [
       [SHELL_BACK_ID, '‹ Back'],
       [SHELL_NEW_PROJECT_ID, pkg ? '+ New Product Packaging' : '+ New Project'],
     ];
-    const chips = layoutShellChips(chipDefs.map(cd => cd[1]), measureIn(FONT_FAMILY), W, H, dpr);
+    const chipKey = `${pkg ? 1 : 0}|${W}|${H}|${dpr}`;
+    if (this._chipCache?.key !== chipKey) {
+      this._chipCache = { key: chipKey, chips: layoutShellChips(chipDefs.map(cd => cd[1]), measureIn(FONT_FAMILY), W, H, dpr) };
+    }
+    const chips = this._chipCache.chips;
 
-    const projects = this.getProjects();
+    const projects = this.projectsFor(kind);
     const ids = projects.map(p => p.id);
     const top = chips.bottom + 16 * dpr;
     // Clamp scroll to the content height (probe with zero offset first).
     const probe = computeProjectGrid(W, H, ids, 0, dpr, top);
     const maxScroll = Math.max(0, probe.contentHeight - H);
-    this.gridScrollY = Math.max(0, Math.min(this.gridScrollY, maxScroll));
-    const grid = computeProjectGrid(W, H, ids, this.gridScrollY, dpr, top);
+    scrollY = Math.max(0, Math.min(scrollY, maxScroll));
+    const grid = computeProjectGrid(W, H, ids, scrollY, dpr, top);
     model.projectGrid = grid.items.map(it => ({
-      ...it, hover: this.view.hoveredSlotId === it.id ? 1 : 0,
+      ...it, hover: hoveredId === it.id ? 1 : 0,
     }));
     model.gridContentHeight = grid.contentHeight;
 
@@ -1296,7 +1428,13 @@ export class ShellUIManager {
       const xReserve = titleH * 0.70 + 4 * b;         // close button slot
       const availW = Math.max(8, gw - leftPad - xReserve);
       // 12–16 CSS px; shrinks toward 12 px before the atlas falls back to an ellipsis.
-      const fontPx = projectCardTitleFontPx(name, availW, titleH, dpr, measureTitle);
+      const fontKey = `${availW}|${titleH}|${dpr}|${name}`;
+      let fontPx = this._titleFontCache.get(fontKey);
+      if (fontPx === undefined) {
+        fontPx = projectCardTitleFontPx(name, availW, titleH, dpr, measureTitle);
+        if (this._titleFontCache.size > 4000) this._titleFontCache.clear();
+        this._titleFontCache.set(fontKey, fontPx);
+      }
       model.labels.push({
         id: it.id,
         text: name,
@@ -1316,7 +1454,7 @@ export class ShellUIManager {
       model.tiles.push({
         id, kind: 'empty', rect: [x, y, w, h],
         fill: theme.systemFill, cornerRadius: 0,   // sharp Win9x button
-        selected: false, hovered: this.view.hoveredSlotId === id,
+        selected: false, hovered: hoveredId === id,
       });
       model.labels.push({
         id, text, centerX: x + w / 2,
@@ -1324,6 +1462,7 @@ export class ShellUIManager {
         maxWidthPx: w, fontPx: chips.fontPx, color: [0.13, 0.13, 0.15, 1],   // dark text on the grey button
       });
     });
+    return scrollY;
   }
 
   /** Change page (clamped) and redraw. */
@@ -1520,11 +1659,11 @@ export class ShellUIManager {
   /** Ensure the canvas backing store matches its CSS size × DPR under the device caps (mobile-parity UI-16: the
    *  editor's rule — mobile DPR ≤ 1.5 / ≤ ~2.5 MP, desktop uncapped). The main renderer normally owns this, but it
    *  is suspended while the shell is up (and skips sizing then), so the two never fight over canvas.width. */
-  private syncCanvasBackingStore(): void {
+  private syncCanvasBackingStore(): boolean {
     const c = this.sceneCanvas;
-    if (!c) return;
+    if (!c) return false;
     const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
-    syncShellCanvasBacking(c, dpr, this.ctx.webgpuRenderer?.getGpuCaps?.() ?? DESKTOP_CAPS);
+    return syncShellCanvasBacking(c, dpr, this.ctx.webgpuRenderer?.getGpuCaps?.() ?? DESKTOP_CAPS);
   }
 
   // ── Interaction ──────────────────────────────────────────────────────
@@ -1655,7 +1794,7 @@ export class ShellUIManager {
       if (this.boundWheel) removeZonelessListener(c, 'wheel', this.boundWheel);
     }
     if (this.boundKeyDown) window.removeEventListener('keydown', this.boundKeyDown);
-    if (this.transitionRaf != null) { cancelAnimationFrame(this.transitionRaf); this.transitionRaf = null; }
+    this.renderer?.cancelModeFade();
     this.transitionActive = false;
     this.resizeObserver?.disconnect();
     this.resizeObserver = undefined;

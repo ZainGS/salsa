@@ -31,6 +31,12 @@ const MAX_CELLS = COLS * COLS;        // 64 resident cells — recycled by LRU a
 // them on scroll. Sized well above the atlas so the on-screen working set is never evicted.
 const URL_CACHE = MAX_CELLS * 12;     // 768
 
+/** Atlas cell edge (px): the size `requestBitmap` expects. */
+export const THUMB_CELL_PX = CELL;
+
+/** A thumbnail's UV rect in the atlas. */
+export interface ThumbUV { u0: number; v0: number; u1: number; v1: number }
+
 interface Cell {
   index: number;
   x: number; y: number;
@@ -47,6 +53,8 @@ export class ShellThumbnailAtlas {
   private cells = new Map<string, Cell>();    // id → its committed atlas cell (at most MAX_CELLS)
   private urls = new Map<string, string>();   // id → latest requested data URL — bounded Map-LRU (URL_CACHE)
   private failed = new Set<string>();          // data URLs that failed to load — skip until a fresh url is requested
+  /** Pre-decoded CELL×CELL bitmaps by key (requestBitmap). Owned by the caller (shared across mounts): never closed here. */
+  private bitmaps = new Map<string, ImageBitmap>();
   private nextIndex = 0;                       // next never-used cell index (until MAX_CELLS)
   private frame = 0;                           // per-frame counter (beginFrame)
 
@@ -88,30 +96,67 @@ export class ShellThumbnailAtlas {
     if (cell) {   // committed already → refresh its pixels in the same slot
       cell.dataUrl = dataUrl;
       cell.ready = false;
-      void this.load(id, dataUrl, cell.index, cell.x, cell.y);
+      if (!this.uploadReadyBitmap(cell)) void this.load(id, dataUrl, cell.index, cell.x, cell.y);
     }
   }
 
-  /** UV rect for a cell — a FRESH literal (never the live Cell, which callers could mutate + corrupt LRU state). */
-  private uv(c: Cell): { u0: number; v0: number; u1: number; v1: number } { return { u0: c.u0, v0: c.v0, u1: c.u1, v1: c.v1 }; }
+  /**
+   * Like `request`, for an image that is ALREADY decoded: `bitmap` must be CELL×CELL (see THUMB_CELL_PX) and stays
+   * owned by the caller (it is never closed here, so one bitmap can feed every mount). `key` identifies its content
+   * the way a data URL does for `request`. The cell uploads synchronously — no fetch / decode, no frame without it.
+   */
+  requestBitmap(id: string, key: string, bitmap: ImageBitmap): void {
+    this.bitmaps.set(key, bitmap);
+    this.request(id, key);
+  }
+
+  /** True when a url / bitmap key is remembered for `id` (its thumbnail will show once decoded). */
+  hasSource(id: string): boolean {
+    const url = this.urls.get(id);
+    return !!url && !this.failed.has(url);
+  }
+
+  /** Upload a pre-decoded bitmap for `cell` right now. False when its source is a data URL (async decode). */
+  private uploadReadyBitmap(cell: Cell): boolean {
+    const bmp = this.bitmaps.get(cell.dataUrl);
+    if (!bmp || bmp.width !== CELL || bmp.height !== CELL) return false;
+    try {
+      this.device.queue.copyExternalImageToTexture(
+        { source: bmp },
+        { texture: this.texture, origin: { x: cell.x, y: cell.y } },
+        { width: CELL, height: CELL },
+      );
+    } catch { return false; }   // (a closed / detached bitmap) → fall back to the async path
+    cell.ready = true;
+    return true;
+  }
+
+  /** UV rect for a cell — a FRESH literal (never the live Cell, which callers could mutate + corrupt LRU state),
+   *  or written into the caller's reusable `out` (per-frame callers: no allocation). */
+  private uv(c: Cell, out?: ThumbUV): ThumbUV {
+    if (!out) return { u0: c.u0, v0: c.v0, u1: c.u1, v1: c.v1 };
+    out.u0 = c.u0; out.v0 = c.v0; out.u1 = c.u1; out.v1 = c.v1;
+    return out;
+  }
 
   /** Pure read: the UV rect for an id that already has a READY cell, else null. No cell commit, no recency bump. */
-  get(id: string): { u0: number; v0: number; u1: number; v1: number } | null {
+  get(id: string, out?: ThumbUV): ThumbUV | null {
     const c = this.cells.get(id);
-    return c && c.ready ? this.uv(c) : null;
+    return c && c.ready ? this.uv(c, out) : null;
   }
 
   /**
    * Mark `id` as visible THIS frame and ensure it owns an atlas cell (committing
    * one — evicting the least-recently-used off-screen cell if the atlas is full —
    * and kicking a decode on first commit). Returns the UV rect once ready, else null.
-   * Call only for on-screen thumbnails so off-screen ones stay evictable.
+   * Call only for on-screen thumbnails so off-screen ones stay evictable. Pass `out` to get the rect written into a
+   * caller-owned object instead of a fresh one.
    */
-  touch(id: string): { u0: number; v0: number; u1: number; v1: number } | null {
+  touch(id: string, out?: ThumbUV): ThumbUV | null {
     const url = this.urls.get(id);
     if (!url || this.failed.has(url)) return null;   // no url, or a known-broken url → don't commit/retry a slot
     let cell = this.cells.get(id);
-    if (cell) { cell.lastUsed = this.frame; return cell.ready ? this.uv(cell) : null; }
+    if (cell) { cell.lastUsed = this.frame; return cell.ready ? this.uv(cell, out) : null; }
 
     const index = this.acquireIndex();
     if (index < 0) return null;   // every cell is in use this very frame (atlas smaller than the visible set) — skip
@@ -123,6 +168,7 @@ export class ShellThumbnailAtlas {
       dataUrl: url, ready: false, lastUsed: this.frame,
     };
     this.cells.set(id, cell);
+    if (this.uploadReadyBitmap(cell)) return this.uv(cell, out);   // pre-decoded → resident at once
     void this.load(id, url, index, x, y);
     return null;
   }
@@ -174,5 +220,6 @@ export class ShellThumbnailAtlas {
     this.cells.clear();
     this.urls.clear();
     this.failed.clear();
+    this.bitmaps.clear();   // (the bitmaps themselves belong to the caller)
   }
 }

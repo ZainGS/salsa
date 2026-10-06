@@ -1954,9 +1954,14 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // on-demand render loop would otherwise sit on the incomplete frame until the next input event).
         GPUPipelineCache.for(this.device).onPipelineReady(() => this.scheduleRender());
         if (this.needsFrame) queueMicrotask(() => this.scheduleRender());   // a frame requested before the device existed
-        const g = globalThis as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void };
-        if (typeof g.requestIdleCallback === 'function') g.requestIdleCallback(() => this.warmPipelinesNow(), { timeout: 200 });
-        else setTimeout(() => this.warmPipelinesNow(), 0);
+        const g = globalThis as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void; salsaHoldPipelineWarmup?: boolean };
+        // mobile-parity UI-17 (d): a host whose own UI is on screen first (the Frogmarks Shell) sets
+        // `globalThis.salsaHoldPipelineWarmup = true` BEFORE the device exists and calls bootAndWarm() when that UI is
+        // calm, so the ~hundred pipeline compiles do not compete with its first frames. The automatic warm then stands
+        // down (read when it fires, so the host can set it any time before); an explicit warmPipelinesNow() still runs.
+        const auto = () => { if (!g.salsaHoldPipelineWarmup) this.warmPipelinesNow(); };
+        if (typeof g.requestIdleCallback === 'function') g.requestIdleCallback(auto, { timeout: 200 });
+        else setTimeout(auto, 0);
     }
 
     private rebuildRenderListIfNeeded() {

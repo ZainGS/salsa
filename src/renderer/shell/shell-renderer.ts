@@ -1,14 +1,20 @@
 /**
  * ShellRenderer — WebGPU renderer for the Frogmarks Shell UI.
  *
- * Layered, console-style ("3DS") look, all in one command encoder:
- *   1. Background  — vertical gradient (fullscreen triangle).
- *   2. Inset panel — a debossed repeating grid of empty slots (SDF).
- *   3. Tiles       — raised rounded squares with a drop shadow, beveled rim
+ * Layered, console-style ("3DS") look, all in ONE render pass (one colour clear, one depth clear; draw order =
+ * the list below):
+ *   1. Background  — vertical gradient (fullscreen triangle) + the home backdrop (riso sticker / wire terrain).
+ *   2. Viewer      — the 3D cartridge/sketchbook/logo (top region; depth-tested).
+ *   3. Inset panel — a debossed repeating grid of empty slots (SDF), blitted from a baked texture.
+ *   4. Tiles       — raised rounded squares with a drop shadow, beveled rim
  *                    (finite-difference SDF normal), specular sheen, optional
  *                    thumbnail, animated hover-lift + selection ring.
- *   4. Labels      — textured quads from the Canvas-2D label atlas.
- *   5. Viewer      — the 3D cartridge/sketchbook (own depth pass, top region).
+ *   5. Labels      — textured quads from the Canvas-2D label atlas; chrome; the paper grain (baked).
+ *   6. Tile 3D     — the per-tile icon cutouts / CDs / coins (depth-tested among themselves).
+ *   7. Scrim       — the home <-> illustrations dip, while a mode cross-fade runs.
+ *
+ * The 2D pipelines declare the pass's depth format with compare 'always' and no depth write, so they are unaffected
+ * by (and do not affect) the 3D draws. See docs/ui/shell-ui.md "Frame structure".
  *
  * "3D" here is layered depth + parallax + SDF bevel/shadow rather than thick
  * extruded geometry — which matches the 3DS reference and keeps every layer a
@@ -25,8 +31,18 @@ import type { ShellRenderModel } from './shell-layout';
 import { GRID_CURVE } from './shell-layout';
 import { ShellLabelAtlas } from './shell-text';
 import { ShellThumbnailAtlas } from './shell-thumbnails';
-import { CartridgeViewer } from './shell-cartridge';
+import { CartridgeViewer, SHELL_DEPTH_FORMAT, type ViewerRegion } from './shell-cartridge';
 import { ShellHtmlLayer } from './shell-html-layer';
+import type { RenderTile } from './shell-layout';
+import type { LabelEntry, LabelRequest } from './shell-text';
+import type { ThumbUV } from './shell-thumbnails';
+import { shellGpuCached } from './shell-gpu-cache';
+import { panelBakeKey, panelBakeRect, panelOccupiedMask, backdropStickerRect, modeFadeT, scrimAlphaForFade, type BakeRect } from './shell-bake';
+import {
+  getShellDebug, shellMark, shellMarkDelta, startShellLongTaskLog, shellLongTaskCount, shellLongTaskLastMs,
+  ShellFrameStats, ShellPerfHud, formatShellHud, type ShellDebugFlags,
+} from './shell-perf';
+import { GpuFrameTimer } from '../core/gpu-frame-timer';
 
 export const FONT_FAMILY = '"Bungee", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 
@@ -81,8 +97,8 @@ const WINDOW_STRIDE = 32;
 const GLOBALS_SIZE = 144;
 /** Background UBO: top(16)+bottom(16)+time(16) = 48. */
 const BG_SIZE = 48;
-/** Panel UBO: origin(8)+colPitch(4)+rowPitch(4)+inset(4)+corner(4)+cols(4)+rows(4)+cardCorner(4)+occupied(4)+pad2(8)+panel(16)+insetCol(16)+card(16)+region(16) = 112. */
-const PANEL_SIZE = 112;
+/** Panel UBO: origin(8)+colPitch(4)+rowPitch(4)+inset(4)+corner(4)+cols(4)+rows(4)+cardCorner(4)+occupied(4)+pad2(8)+panel(16)+insetCol(16)+card(16)+region(16)+bake(16) = 128. */
+const PANEL_SIZE = 128;
 /** Arrow instance: a(16: cx,cy,radius,dir) + b(16: hover,_,_,_) = 32. */
 const ARROW_STRIDE = 32;
 /** Badge instance: rect(16) + fill(16) + params(16: corner,_,_,_) = 48. */
@@ -91,6 +107,13 @@ const BADGE_STRIDE = 48;
 const RING_STRIDE = 16;
 /** Dwell duration before a hovered tile auto-unfocuses. */
 const RING_SECONDS = 3;
+/** The baked panel keeps the shader's float output (premultiplied rgba), so blending the blit gives the same
+ *  result as blending the shader's own output did (an 8-bit bake would round BEFORE the blend). Read with
+ *  textureLoad, so the format does not need to be filterable. */
+const PANEL_BAKE_FORMAT: GPUTextureFormat = 'rgba32float';
+/** The baked grain keeps the shader's float value for the same reason (a multiply blend). */
+const GRAIN_BAKE_FORMAT: GPUTextureFormat = 'r32float';
+const EMPTY: readonly never[] = Object.freeze([]) as readonly never[];
 
 const GLOBALS_WGSL = /* wgsl */ `
 struct Globals { size: vec2<f32>, time: f32, mount: f32, pointer: vec2<f32>, rainbow: f32, dark: f32, ink: vec4<f32>, accentA: vec4<f32>, accentB: vec4<f32>, blobA: vec4<f32>, blobB: vec4<f32>, squiggle: vec4<f32>, panelBorder: vec4<f32> };
@@ -210,8 +233,13 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   // Polygon (bg.time.z>0.5) = tiny white specks FALLING over the 3D grid (masked to its footprint). Other
   // themes keep the solid confetti printed on the paper, a touch LIGHTER than the cream.
   if (bg.time.z > 0.5) {
-    let s = specks(in.uv, aspect, t) * gridMask(in.uv);   // s is vec3 — colour baked in (50/50 rose / cyan)
-    col = col + s;                                        // additive — only over the grid
+    // The mask first: outside the grid footprint it is exactly 0, where specks * 0 added nothing, so the two
+    // speck layers (4 hash-grid taps each) are skipped there. bg.time.w > 0.5 = the debug "no specks" toggle.
+    let gm = gridMask(in.uv);
+    if (gm > 0.0 && bg.time.w < 0.5) {
+      let s = specks(in.uv, aspect, t) * gm;                // s is vec3 — colour baked in (50/50 rose / cyan)
+      col = col + s;                                        // additive — only over the grid
+    }
   } else {
     let e = ephemera(in.uv + vec2<f32>(0.0, t * 0.01), aspect);
     col = col + vec3<f32>(0.035, 0.033, 0.030) * e;
@@ -223,7 +251,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 `;
 
-const PANEL_SHADER = /* wgsl */ `
+const PANEL_COMMON = /* wgsl */ `
 ${GLOBALS_WGSL}
 @group(0) @binding(0) var<uniform> globals: Globals;
 
@@ -234,24 +262,9 @@ struct Panel {
   panelColor: vec4<f32>, insetColor: vec4<f32>,
   card: vec4<f32>,     // x, y, w, h (px) — the floating card
   region: vec4<f32>,   // x, y, w, h (px) — quad coverage
+  bake: vec4<f32>,     // x, y, w, h (integer px) — the bake rect (the bake pipeline only)
 };
 @group(1) @binding(0) var<uniform> p: Panel;
-
-struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) frag: vec2<f32> };
-
-@vertex
-fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
-  var c = array<vec2<f32>, 6>(
-    vec2<f32>(0.0,0.0), vec2<f32>(1.0,0.0), vec2<f32>(1.0,1.0),
-    vec2<f32>(0.0,0.0), vec2<f32>(1.0,1.0), vec2<f32>(0.0,1.0));
-  let q = c[vi];
-  let px = p.region.xy + q * p.region.zw;
-  let clip = vec2<f32>(px.x / globals.size.x * 2.0 - 1.0, 1.0 - px.y / globals.size.y * 2.0);
-  var out: VsOut;
-  out.pos = vec4<f32>(clip, 0.0, 1.0);
-  out.frag = px;
-  return out;
-}
 
 fn sdRoundRect(pt: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
   let q = abs(pt) - b + vec2<f32>(r, r);
@@ -296,10 +309,9 @@ fn risoColor(s: f32) -> vec3<f32> {
   return c;
 }
 
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let f = in.frag;
-
+// The panel colour (premultiplied) at device pixel position f. Depends only on the Panel uniform and the themed
+// globals (no time, no pointer), which is what makes it bakeable.
+fn panelColor(f: vec2<f32>) -> vec4<f32> {
   // Cream paper card (rounded). Outside the card -> transparent.
   let cardHalf = p.card.zw * 0.5;
   let cardCenter = p.card.xy + cardHalf;
@@ -400,6 +412,86 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
   let outA = a * cardMask;
   return vec4<f32>(rgb * outA, outA);   // premultiplied
+}
+`;
+
+// Direct path (the debug "panelBake off" toggle, and the reference the bake must match): the panel quad, shaded
+// every frame.
+const PANEL_SHADER = /* wgsl */ `
+${PANEL_COMMON}
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) frag: vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
+  var c = array<vec2<f32>, 6>(
+    vec2<f32>(0.0,0.0), vec2<f32>(1.0,0.0), vec2<f32>(1.0,1.0),
+    vec2<f32>(0.0,0.0), vec2<f32>(1.0,1.0), vec2<f32>(0.0,1.0));
+  let q = c[vi];
+  let px = p.region.xy + q * p.region.zw;
+  let clip = vec2<f32>(px.x / globals.size.x * 2.0 - 1.0, 1.0 - px.y / globals.size.y * 2.0);
+  var out: VsOut;
+  out.pos = vec4<f32>(clip, 0.0, 1.0);
+  out.frag = px;
+  return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+  return panelColor(in.frag);
+}
+`;
+
+// Bake: the SAME quad, the same per-vertex pixel positions and the same interpolated varying as the direct path,
+// rasterised into a texture the size of the bake rect: the clip transform maps device pixel (bake.xy + (i, j)) onto
+// texel (i, j), i.e. the direct draw shifted by a whole number of pixels. Texel (i, j) therefore holds exactly what
+// the direct path outputs at that device pixel (the rest of the quad falls outside the target and is clipped).
+const PANEL_BAKE_SHADER = /* wgsl */ `
+${PANEL_COMMON}
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) frag: vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
+  var c = array<vec2<f32>, 6>(
+    vec2<f32>(0.0,0.0), vec2<f32>(1.0,0.0), vec2<f32>(1.0,1.0),
+    vec2<f32>(0.0,0.0), vec2<f32>(1.0,1.0), vec2<f32>(0.0,1.0));
+  let q = c[vi];
+  let px = p.region.xy + q * p.region.zw;
+  let rel = px - p.bake.xy;
+  let clip = vec2<f32>(rel.x / p.bake.z * 2.0 - 1.0, 1.0 - rel.y / p.bake.w * 2.0);
+  var out: VsOut;
+  out.pos = vec4<f32>(clip, 0.0, 1.0);
+  out.frag = px;
+  return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+  return panelColor(in.frag);
+}
+`;
+
+// Blit a baked texture 1:1 at an integer device-px rect: one textureLoad per pixel (no filtering), output as is.
+// Used for the panel (premultiplied blend, like the panel pipeline).
+const BLIT_SHADER = /* wgsl */ `
+${GLOBALS_WGSL}
+@group(0) @binding(0) var<uniform> globals: Globals;
+@group(1) @binding(0) var<uniform> rect: vec4<f32>;   // x, y, w, h (integer device px)
+@group(1) @binding(1) var tex: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+  var c = array<vec2<f32>, 6>(
+    vec2<f32>(0.0,0.0), vec2<f32>(1.0,0.0), vec2<f32>(1.0,1.0),
+    vec2<f32>(0.0,0.0), vec2<f32>(1.0,1.0), vec2<f32>(0.0,1.0));
+  let px = rect.xy + c[vi] * rect.zw;
+  return vec4<f32>(px.x / globals.size.x * 2.0 - 1.0, 1.0 - px.y / globals.size.y * 2.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+  let dims = vec2<i32>(textureDimensions(tex));
+  let ij = clamp(vec2<i32>(floor(fc.xy - rect.xy)), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+  return textureLoad(tex, ij, 0);
 }
 `;
 
@@ -618,7 +710,7 @@ fn vs(
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let coverage = textureSample(atlasTex, atlasSmp, in.uv).a;
+  let coverage = textureSample(atlasTex, atlasSmp, in.uv).r;   // r8 atlas: red = glyph coverage (shell-text.ts)
   let a = coverage * in.color.a;
   return vec4<f32>(in.color.rgb * a, a);
 }
@@ -641,6 +733,23 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   // Two slightly-offset speckle scales → organic tooth, not a regular dither.
   let n = h21(floor(fc.xy * 0.8)) * 0.6 + h21(floor(fc.xy * 1.7) + vec2<f32>(11.0, 7.0)) * 0.4;
   let g = 1.0 - n * 0.042;    // softer tooth (~4%)
+  return vec4<f32>(g, g, g, 1.0);
+}
+`;
+
+// The grain from its baked texture (one texel per device pixel, the value GRAIN_SHADER computes there).
+const GRAIN_BLIT_SHADER = /* wgsl */ `
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+  var c = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  return vec4<f32>(c[vi], 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+  let dims = vec2<i32>(textureDimensions(tex));
+  let ij = clamp(vec2<i32>(floor(fc.xy)), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+  let g = textureLoad(tex, ij, 0).r;
   return vec4<f32>(g, g, g, 1.0);
 }
 `;
@@ -1160,6 +1269,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 `;
 
 interface TileAnim { hover: number; select: number; appear: number; }
+/** The animation state of a tile that has none yet (shared, read-only: was a fresh literal per tile per frame). */
+const IDLE_ANIM: Readonly<TileAnim> = Object.freeze({ hover: 0, select: 0, appear: 1 });
+const GRID_TARGET: readonly [number, number, number] = [0, 0.05, 0];
+const GRID_UP: readonly [number, number, number] = [0, 1, 0];
+/** Every 2D Shell pipeline: the pass has a depth attachment (for the 3D viewer), which they neither test nor write. */
+const SHELL_2D_DEPTH: GPUDepthStencilState = { format: SHELL_DEPTH_FORMAT, depthWriteEnabled: false, depthCompare: 'always' };
 
 export class ShellRenderer {
   private device: GPUDevice;
@@ -1178,6 +1293,14 @@ export class ShellRenderer {
   private bgBindGroup!: GPUBindGroup;
   private panelPipeline!: GPURenderPipeline;
   private panelBindGroup!: GPUBindGroup;
+  // Baked panel: the static panel shader rendered once into a texture, then blitted 1:1 (see ensurePanelBake).
+  private panelBakePipeline!: GPURenderPipeline;
+  private panelBlitPipeline!: GPURenderPipeline;
+  private blitBGL!: GPUBindGroupLayout;
+  private panelBlitBuf!: GPUBuffer;
+  private panelBakeTex: GPUTexture | null = null;
+  private panelBakeView: GPUTextureView | null = null;
+  private panelBlitBindGroup: GPUBindGroup | null = null;
 
   private tilePipeline!: GPURenderPipeline;
   private tileBuf!: GPUBuffer;
@@ -1203,6 +1326,12 @@ export class ShellRenderer {
   private badgeCap = 16;
 
   private grainPipeline!: GPURenderPipeline;
+  // Baked grain: the grain shader rendered once per canvas size into a texture, then read back per pixel.
+  private grainBakePipeline!: GPURenderPipeline;
+  private grainBlitPipeline!: GPURenderPipeline;
+  private grainBlitBGL!: GPUBindGroupLayout;
+  private grainTex: GPUTexture | null = null;
+  private grainBindGroup: GPUBindGroup | null = null;
   private backdropPipeline!: GPURenderPipeline;
   // 3D wireframe grid backdrop (Polygon theme).
   private wireGridPipeline!: GPURenderPipeline;
@@ -1235,7 +1364,6 @@ export class ShellRenderer {
   private labelSampler!: GPUSampler;
   private labelBindGroup: GPUBindGroup | null = null;
   private labelBoundTexture: GPUTexture | null = null;
-  private _lastBuiltLabels: unknown = null;   // model.labels reference last passed to labelAtlas.build (skip re-build when unchanged)
 
   private thumbAtlas: ShellThumbnailAtlas;
   private thumbSampler!: GPUSampler;
@@ -1281,13 +1409,44 @@ export class ShellRenderer {
     this.htmlLayer = new ShellHtmlLayer(this.device, this.canvas);
     this.buildHtmlPipeline();
     this.buildLabelPipeline();
+    this.initPerf();
+  }
+
+  /**
+   * A Shell pipeline. Created once per device + swap-chain format and reused by every later mount
+   * (shell-gpu-cache.ts): `make` (and the shader module) only run on a cache miss. Pipelines that draw into the
+   * frame's pass get the pass's depth state (no test, no write) unless `offscreen` (the bake targets have no depth).
+   */
+  private pipe(key: string, code: string, make: (module: GPUShaderModule) => GPURenderPipelineDescriptor, offscreen = false): GPURenderPipeline {
+    return shellGpuCached(this.device, `sr.${key}|${this.format}`, () => {
+      const d = make(this.device.createShaderModule({ code }));
+      if (!offscreen) d.depthStencil = SHELL_2D_DEPTH;
+      return this.device.createRenderPipeline(d);
+    });
   }
 
   requestThumbnail(id: string, dataUrl: string): void { this.thumbAtlas.request(id, dataUrl); }
+  /** A thumbnail that is already decoded (a THUMB_CELL_PX² ImageBitmap the caller keeps): uploaded at once, no
+   *  data-URL round trip. `key` names its content (the atlas skips a repeat). */
+  requestThumbnailBitmap(id: string, key: string, bitmap: ImageBitmap): void { this.thumbAtlas.requestBitmap(id, key, bitmap); }
+
+  /** Rasterize labels that are not on screen yet (e.g. the illustrations grid's titles while the home is showing),
+   *  so the frame that first shows them only draws quads. Additive: what is on screen stays packed. */
+  prewarmLabels(labels: readonly LabelRequest[]): void {
+    const cur: readonly LabelRequest[] = this.model?.labels ?? EMPTY;
+    this.labelAtlas.build(cur.length ? [...cur, ...labels] : labels, FONT_FAMILY);
+  }
+  /** Commit atlas cells for (and start decoding) thumbnails that are about to be shown. */
+  prewarmThumbnails(ids: readonly string[]): void {
+    for (let i = 0; i < ids.length; i++) this.thumbAtlas.touch(ids[i], this._uv);
+  }
 
   /** Drop the cached text atlas so labels re-rasterize (e.g. after a web font
    *  loads). The next render rebuilds it with the new font. */
-  invalidateText(): void { this.labelAtlas.invalidate(); this._lastBuiltLabels = null; }
+  invalidateText(): void { this.labelAtlas.invalidate(); }
+
+  /** True when a cutout mesh is registered under `key` on THIS renderer (meshes do not survive a remount). */
+  hasSystemIcon(key: string): boolean { return this.viewer.hasBillboard(key); }
 
   /** Register a Billboard3D cutout mesh for a system-app icon (by key). */
   setSystemIcon(key: string, geo: import('../3d/billboard-3d').Billboard3DGeometry): void {
@@ -1317,13 +1476,48 @@ export class ShellRenderer {
     this.pointerTarget = [Math.max(-1, Math.min(1, nx)), Math.max(-1, Math.min(1, ny))];
   }
 
+  // ── Mode cross-fade (home ↔ illustrations) ──
+  private _fade: { startMs: number; durationMs: number; midFired: boolean; onMidpoint: () => void; onEnd: () => void } | null = null;
+  /**
+   * Run the dip-to-background cross-fade on the GPU clock: from `startMs` (performance.now()) the scrim alpha follows
+   * scrimAlphaForFade(modeFadeT(now)) for `durationMs`, computed inside render() — no model rebuild per frame.
+   * `onMidpoint` fires once, in the first frame at or past the midpoint and BEFORE that frame is drawn (the host
+   * swaps the model there, hidden by the scrim); `onEnd` fires when the fade completes. Calling it again restarts the
+   * fade (both hooks re-arm).
+   */
+  beginModeFade(startMs: number, durationMs: number, onMidpoint: () => void, onEnd: () => void): void {
+    this._fade = { startMs, durationMs, midFired: false, onMidpoint, onEnd };
+    this.start();
+  }
+  cancelModeFade(): void { this._fade = null; }
+  get modeFadeActive(): boolean { return this._fade !== null; }
+
+  /** Arm the `shell:grid-first-frame` / `shell:thumbs-ready` User Timing marks (the host calls it at the flip). */
+  armGridMarks(): void { this._gridMarks = 1; }
+  private _gridMarks: 0 | 1 | 2 = 0;
+
+  /** Seconds since this renderer was created (the host keeps heavy bakes out of the first moments after mount). */
+  get mountAgeMs(): number { return performance.now() - this.mountTime * 1000; }
+
   start(): void {
     if (this.running || this.destroyed) return;
     this.running = true;
     this.lastTime = performance.now() / 1000;
-    const tick = () => {
+    const tick = (ts: number) => {
       if (!this.running || this.destroyed) { this.rafId = null; return; }
-      this.render();
+      const stats = this.stats;
+      if (stats) {
+        // ?shellperf: time the frame (CPU = render(); GPU = timestamp queries around its submit, when available).
+        const t0 = performance.now();
+        this.gpuTimer?.beginFrame();
+        this.render();
+        this.gpuTimer?.endFrame();
+        const t1 = performance.now();
+        stats.frame(ts, t1 - t0);
+        this.hud?.update(t1, this._hudLines);
+      } else {
+        this.render();
+      }
       this.rafId = requestAnimationFrame(tick);
     };
     this.rafId = requestAnimationFrame(tick);
@@ -1334,12 +1528,76 @@ export class ShellRenderer {
     if (this.rafId != null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
   }
 
-  private _panelDirty = true;   // the panel UBO depends only on grid/theme/occupancy → re-upload only on model change
+  // Per-model derived data, resolved ONCE in setModel instead of every frame.
+  private _flatTiles: RenderTile[] = [];       // tiles drawn as flat 2D quads (not a 3D coin / CD / cutout)
+  private _ringTile: RenderTile | null = null; // the dwell-ring tile
+  private _tiles3dTop = Infinity;              // top edge (px) of the highest 3D tile (Infinity = none)
+  /** Mid-pass depth resets drawn (diagnostics; 0 with the home layout). */
+  depthResetCount = 0;
+  // Panel inputs: the key is recomputed per model (lazily, in render) and compared — a hover rebuild keeps it.
+  private _panelKey: string | null = null;
+  private _panelKeyW = 0;
+  private _panelKeyH = 0;
+  private _panelUboKey: string | null = null;    // the key the panel uniform buffer holds
+  private _panelBakedKey: string | null = null;  // the key the baked texture holds
+  private _panelRect: BakeRect | null = null;
+  private _panelBakeSize: [number, number] = [0, 0];
+  private _grainSize: [number, number] = [0, 0];
+  /** Bake counters (perf HUD + diagnostics): they should stay flat while hovering. */
+  panelBakeCount = 0;
+  grainBakeCount = 0;
+  private _stickerRect: BakeRect | null = null;
+  private _stickerW = -1;
+  private _stickerH = -1;
+  // Reused per-frame scratch objects (no allocation in render()).
+  private readonly _uv: ThumbUV = { u0: 0, v0: 0, u1: 0, v1: 0 };
+  private readonly _region: ViewerRegion = { x: 0, y: 0, w: 0, h: 0 };
+  private readonly _eye: [number, number, number] = [0, 0, 0];
+
   setModel(model: ShellRenderModel): void {
     this.model = model;
-    this._panelDirty = true;
+    this._panelKey = null;   // re-derived on the next frame; the panel re-uploads / re-bakes only if it changed
+    const flat = this._flatTiles; flat.length = 0;
+    const ringId = model.ringTileId ?? null;
+    let ring: RenderTile | null = null;
+    let top3d = Infinity;
+    for (const t of model.tiles) {
+      if (!t.discIcon && !t.cd && !t.billboardKey) flat.push(t);
+      else if (t.rect[1] < top3d) top3d = t.rect[1];
+      if (ringId && !ring && t.id === ringId) ring = t;
+    }
+    this._ringTile = ring;
+    this._tiles3dTop = top3d;
     if (!this.running) this.render();
   }
+
+  // ── perf HUD (?shellperf) ──
+  private readonly dbg: ShellDebugFlags = getShellDebug();
+  private stats: ShellFrameStats | null = null;
+  private hud: ShellPerfHud | null = null;
+  private gpuTimer: GpuFrameTimer | null = null;
+  private initPerf(): void {
+    if (this.dbg.longTasks) startShellLongTaskLog();
+    if (!this.dbg.hud) return;
+    const stats = this.stats = new ShellFrameStats();
+    this.hud = new ShellPerfHud(this.dbg, () => { if (!this.running) this.render(); });
+    try {
+      const timer = new GpuFrameTimer(this.device);
+      timer.onResult = (ms, source) => stats.gpu(ms, source);
+      timer.setEnabled(true);
+      this.gpuTimer = timer;
+    } catch { /* GPU time stays n/a */ }
+  }
+  private readonly _hudLines = (): string[] => {
+    const c = this.canvas;
+    const cssW = c.getBoundingClientRect?.().width || c.clientWidth;
+    const ms = (v: number | null) => (v === null ? '-' : v.toFixed(0));
+    return formatShellHud(this.stats!.summary(), c.width, c.height, cssW, [
+      `bakes panel ${this.panelBakeCount} grain ${this.grainBakeCount}   labels raster ${this.labelAtlas.rasterCount} repack ${this.labelAtlas.repackCount}`,
+      `longtasks ${shellLongTaskCount()} (last ${shellLongTaskLastMs().toFixed(0)} ms)`,
+      `tap>flip ${ms(shellMarkDelta('shell:tap', 'shell:mode-flip'))}  flip>frame ${ms(shellMarkDelta('shell:mode-flip', 'shell:grid-first-frame'))}  frame>thumbs ${ms(shellMarkDelta('shell:grid-first-frame', 'shell:thumbs-ready'))} ms`,
+    ]);
+  };
 
   // ── pipeline construction ──
 
@@ -1380,33 +1638,50 @@ export class ShellRenderer {
   }
 
   private buildBgPipeline(): void {
-    const module = this.device.createShaderModule({ code: BG_SHADER });
     const bgl = this.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
     this.bgBindGroup = this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: this.bgBuf } }] });
-    this.bgPipeline = this.device.createRenderPipeline({
+    this.bgPipeline = this.pipe('bg', BG_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
       vertex: { module, entryPoint: 'vs' },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildPanelPipeline(): void {
-    const module = this.device.createShaderModule({ code: PANEL_SHADER });
     const panelBGL = this.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
     this.panelBindGroup = this.device.createBindGroup({ layout: panelBGL, entries: [{ binding: 0, resource: { buffer: this.panelBuf } }] });
-    this.panelPipeline = this.device.createRenderPipeline({
+    // Bake (offscreen, float target, no blend: the texture holds the shader's premultiplied output as is) + blit.
+    this.panelBakePipeline = this.pipe('panelBake', PANEL_BAKE_SHADER, (module) => ({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL, panelBGL] }),
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: PANEL_BAKE_FORMAT }] },
+      primitive: { topology: 'triangle-list' },
+    }), true);
+    this.blitBGL = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+      ],
+    });
+    this.panelBlitBuf = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.panelBlitPipeline = this.pipe('panelBlit', BLIT_SHADER, (module) => ({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL, this.blitBGL] }),
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },   // the panel pipeline's blend
+      primitive: { topology: 'triangle-list' },
+    }));
+    this.panelPipeline = this.pipe('panel', PANEL_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL, panelBGL] }),
       vertex: { module, entryPoint: 'vs' },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildTilePipeline(): void {
-    const module = this.device.createShaderModule({ code: TILE_SHADER });
     this.tileBuf = this.device.createBuffer({ size: this.tileCap * TILE_STRIDE, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.tilePipeline = this.device.createRenderPipeline({
+    this.tilePipeline = this.pipe('tile', TILE_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL, this.thumbBGL] }),
       vertex: {
         module, entryPoint: 'vs',
@@ -1426,13 +1701,12 @@ export class ShellRenderer {
       },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildGridPipeline(): void {
-    const module = this.device.createShaderModule({ code: GRID_SHADER });
     this.gridBuf = this.device.createBuffer({ size: this.gridCap * GRID_STRIDE, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.gridPipeline = this.device.createRenderPipeline({
+    this.gridPipeline = this.pipe('grid', GRID_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL, this.thumbBGL] }),
       vertex: {
         module, entryPoint: 'vs',
@@ -1450,13 +1724,12 @@ export class ShellRenderer {
       },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildWindowPipeline(): void {
-    const module = this.device.createShaderModule({ code: WINDOW_SHADER });
     this.windowBuf = this.device.createBuffer({ size: this.windowCap * WINDOW_STRIDE, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.windowPipeline = this.device.createRenderPipeline({
+    this.windowPipeline = this.pipe('window', WINDOW_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL] }),
       vertex: {
         module, entryPoint: 'vs',
@@ -1473,7 +1746,7 @@ export class ShellRenderer {
       },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private growWindowBuf(n: number): void {
@@ -1485,22 +1758,20 @@ export class ShellRenderer {
   }
 
   private buildScrimPipeline(): void {
-    const module = this.device.createShaderModule({ code: SCRIM_SHADER });
     this.scrimBuf = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const bgl = this.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
     this.scrimBindGroup = this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: this.scrimBuf } }] });
-    this.scrimPipeline = this.device.createRenderPipeline({
+    this.scrimPipeline = this.pipe('scrim', SCRIM_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
       vertex: { module, entryPoint: 'vs' },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildArrowPipeline(): void {
-    const module = this.device.createShaderModule({ code: ARROW_SHADER });
     this.arrowBuf = this.device.createBuffer({ size: 2 * ARROW_STRIDE, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.arrowPipeline = this.device.createRenderPipeline({
+    this.arrowPipeline = this.pipe('arrow', ARROW_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL] }),
       vertex: {
         module, entryPoint: 'vs',
@@ -1517,13 +1788,12 @@ export class ShellRenderer {
       },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildRingPipeline(): void {
-    const module = this.device.createShaderModule({ code: RING_SHADER });
     this.ringBuf = this.device.createBuffer({ size: RING_STRIDE, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.ringPipeline = this.device.createRenderPipeline({
+    this.ringPipeline = this.pipe('ring', RING_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL] }),
       vertex: {
         module, entryPoint: 'vs',
@@ -1534,11 +1804,10 @@ export class ShellRenderer {
       },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildHtmlPipeline(): void {
-    const module = this.device.createShaderModule({ code: HTML_SHADER });
     this.htmlRectBuf = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.htmlSampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
     this.htmlBGL = this.device.createBindGroupLayout({
@@ -1548,12 +1817,12 @@ export class ShellRenderer {
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
-    this.htmlPipeline = this.device.createRenderPipeline({
+    this.htmlPipeline = this.pipe('html', HTML_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL, this.htmlBGL] }),
       vertex: { module, entryPoint: 'vs' },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private ensureHtmlBindGroup(tex: GPUTexture): void {
@@ -1579,9 +1848,8 @@ export class ShellRenderer {
   unmountHtml(): void { this.htmlLayer.unmount(); }
 
   private buildBadgePipeline(): void {
-    const module = this.device.createShaderModule({ code: BADGE_SHADER });
     this.badgeBuf = this.device.createBuffer({ size: this.badgeCap * BADGE_STRIDE, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.badgePipeline = this.device.createRenderPipeline({
+    this.badgePipeline = this.pipe('badge', BADGE_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL] }),
       vertex: {
         module, entryPoint: 'vs',
@@ -1599,17 +1867,16 @@ export class ShellRenderer {
       },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildBackdropPipeline(): void {
-    const module = this.device.createShaderModule({ code: BACKDROP_SHADER });
-    this.backdropPipeline = this.device.createRenderPipeline({
+    this.backdropPipeline = this.pipe('backdrop', BACKDROP_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL] }),
       vertex: { module, entryPoint: 'vs' },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private buildWireGridPipeline(): void {
@@ -1636,39 +1903,48 @@ export class ShellRenderer {
     this.device.queue.writeBuffer(this.wireGridIB, 0, indices);
     this.wireGridUBO = this.device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });   // mat4(64) + params(16) + color(16)
 
-    const module = this.device.createShaderModule({ code: WIRE_GRID_SHADER });
     const bgl = this.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
     this.wireGridBindGroup = this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: this.wireGridUBO } }] });
-    this.wireGridPipeline = this.device.createRenderPipeline({
+    this.wireGridPipeline = this.pipe('wireGrid', WIRE_GRID_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
       vertex: { module, entryPoint: 'vs', buffers: [{ arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }] }] },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'line-list' },
-    });
+    }));
   }
 
   private buildGrainPipeline(): void {
-    const module = this.device.createShaderModule({ code: GRAIN_SHADER });
-    this.grainPipeline = this.device.createRenderPipeline({
+    // result = dst * src (multiply); keep dst alpha.
+    const multiply: GPUBlendState = {
+      color: { srcFactor: 'zero', dstFactor: 'src', operation: 'add' },
+      alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' },
+    };
+    // Direct path (debug "grainBake off", and the reference the bake must match): the grain shader every frame.
+    this.grainPipeline = this.pipe('grain', GRAIN_SHADER, (module) => ({
       layout: 'auto',
       vertex: { module, entryPoint: 'vs' },
-      fragment: {
-        module, entryPoint: 'fs',
-        targets: [{
-          format: this.format,
-          // result = dst * src (multiply); keep dst alpha.
-          blend: {
-            color: { srcFactor: 'zero', dstFactor: 'src', operation: 'add' },
-            alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' },
-          },
-        }],
-      },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: multiply }] },
       primitive: { topology: 'triangle-list' },
+    }));
+    // Bake: the SAME shader into a canvas-sized float texture (its red channel = the grain value per pixel).
+    this.grainBakePipeline = this.pipe('grainBake', GRAIN_SHADER, (module) => ({
+      layout: 'auto',
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: GRAIN_BAKE_FORMAT }] },
+      primitive: { topology: 'triangle-list' },
+    }), true);
+    this.grainBlitBGL = this.device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } }],
     });
+    this.grainBlitPipeline = this.pipe('grainBlit', GRAIN_BLIT_SHADER, (module) => ({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.grainBlitBGL] }),
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: multiply }] },
+      primitive: { topology: 'triangle-list' },
+    }));
   }
 
   private buildLabelPipeline(): void {
-    const module = this.device.createShaderModule({ code: LABEL_SHADER });
     this.labelBuf = this.device.createBuffer({ size: this.labelCap * LABEL_STRIDE, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.labelAtlasBGL = this.device.createBindGroupLayout({
       entries: [
@@ -1676,7 +1952,7 @@ export class ShellRenderer {
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
-    this.labelPipeline = this.device.createRenderPipeline({
+    this.labelPipeline = this.pipe('label', LABEL_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.globalsBGL, this.labelAtlasBGL] }),
       vertex: {
         module, entryPoint: 'vs',
@@ -1694,7 +1970,7 @@ export class ShellRenderer {
       },
       fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
       primitive: { topology: 'triangle-list' },
-    });
+    }));
   }
 
   private growTileBuf(n: number): void {
@@ -1727,7 +2003,9 @@ export class ShellRenderer {
     const k = 1 - Math.exp(-dt / 0.09);          // ~90ms time constant
     const mountElapsed = performance.now() / 1000 - this.mountTime;
     const seen = this._animSeen; seen.clear();    // reused each frame (was a fresh Set + key-spread per frame)
-    m.tiles.forEach((t, i) => {
+    const tiles = m.tiles;
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i];
       seen.add(t.id);
       let a = this.anim.get(t.id);
       if (!a) { a = { hover: 0, select: 0, appear: 0 }; this.anim.set(t.id, a); }
@@ -1736,8 +2014,10 @@ export class ShellRenderer {
       // staggered appear by tile index
       const at = Math.max(0, Math.min(1, (mountElapsed - i * 0.025) / 0.30));
       a.appear = at * at * (3 - 2 * at);          // smoothstep
-    });
-    for (const id of this.anim.keys()) if (!seen.has(id)) this.anim.delete(id);   // deleting during keys() is safe
+    }
+    if (this.anim.size !== seen.size) {
+      for (const id of this.anim.keys()) if (!seen.has(id)) this.anim.delete(id);   // deleting during keys() is safe
+    }
     // ease pointer
     const pk = 1 - Math.exp(-dt / 0.12);
     this.pointer[0] += (this.pointerTarget[0] - this.pointer[0]) * pk;
@@ -1767,17 +2047,24 @@ export class ShellRenderer {
     return this._scratchU32.get(key)!;
   }
 
+  // Label instances are a pure function of (model.labels, the atlas contents): resolved + uploaded when either
+  // changes, not every frame (was: a key string with two toFixed() per label per frame + a full re-upload).
+  private _labelsFor: unknown = null;
+  private _labelsAtlasVersion = -1;
+  private _labelCount = 0;
   private prepareLabels(): number {
     const m = this.model;
     if (!m || m.labels.length === 0) return 0;
-    // Only (re)build the label atlas when the labels actually change. `m.labels` is a fresh array per setModel but
-    // stable across the many rAF frames between rebuilds — so this skips the per-frame `.map()` + signature sort/join
-    // that ran even when nothing changed. invalidateText() nulls `_lastBuiltLabels` to force a re-raster on font load.
-    if (m.labels !== this._lastBuiltLabels) {
-      this.labelAtlas.build(m.labels.map(l => ({ text: l.text, maxWidthPx: l.maxWidthPx, fontPx: l.fontPx, fontFamily: l.fontFamily, scaleX: l.scaleX, scaleY: l.scaleY })), FONT_FAMILY);
-      this._lastBuiltLabels = m.labels;
-    }
-    const tex = this.labelAtlas.getTexture();
+    const atlas = this.labelAtlas;
+    if (m.labels === this._labelsFor && atlas.version === this._labelsAtlasVersion) return this._labelCount;
+    // (Re)build: additive, so only labels the atlas has never seen are rasterized. `m.labels` is a fresh array per
+    // setModel but stable across the rAF frames between rebuilds. invalidateText() bumps the atlas version to force
+    // a re-raster on font load.
+    atlas.build(m.labels, FONT_FAMILY);
+    this._labelsFor = m.labels;
+    this._labelsAtlasVersion = atlas.version;
+    this._labelCount = 0;
+    const tex = atlas.getTexture();
     if (!tex) return 0;
     if (this.labelBoundTexture !== tex) {
       this.labelBindGroup = this.device.createBindGroup({ layout: this.labelAtlasBGL, entries: [{ binding: 0, resource: tex.createView() }, { binding: 1, resource: this.labelSampler }] });
@@ -1787,7 +2074,7 @@ export class ShellRenderer {
     const data = this.scratch('labels', m.labels.length * (LABEL_STRIDE / 4));
     let n = 0;
     for (const l of m.labels) {
-      const e = this.labelAtlas.get(l.text, l.maxWidthPx, l.fontPx, l.fontFamily ?? FONT_FAMILY, l.scaleX ?? 1, l.scaleY ?? 1);
+      const e: LabelEntry | null = atlas.get(l.text, l.maxWidthPx, l.fontPx, l.fontFamily ?? FONT_FAMILY, l.scaleX ?? 1, l.scaleY ?? 1);
       if (!e) continue;
       const x = l.centerX - e.wPx / 2, o = n * 12;
       data[o+0]=x; data[o+1]=l.topY; data[o+2]=e.wPx; data[o+3]=e.hPx;
@@ -1796,16 +2083,148 @@ export class ShellRenderer {
       n++;
     }
     if (n > 0) this.device.queue.writeBuffer(this.labelBuf, 0, data, 0, n * (LABEL_STRIDE / 4));
+    this._labelCount = n;
     return n;
   }
 
+  // ── Static bakes (panel, grain) ───────────────────────────────────────────
+
+  /** Upload the panel uniform + (re)compute the bake rect when the panel's inputs changed. */
+  private syncPanelInputs(m: ShellRenderModel, w: number, h: number): void {
+    if (this._panelKey === null || this._panelKeyW !== w || this._panelKeyH !== h) {
+      this._panelKey = panelBakeKey(m, w, h);
+      this._panelKeyW = w; this._panelKeyH = h;
+    }
+    if (this._panelKey === this._panelUboKey) return;
+    this._panelUboKey = this._panelKey;
+    const g = m.grid;
+    const rect = this._panelRect = panelBakeRect(g, w, h);
+    // Bitmask of cells (row*cols+col == tile index) that hold a 3D tile — system
+    // apps, FrogCarts, Install Cart — so the panel shader skips the riso/pattern
+    // behind them. Tiles fill cells in order, so tile i sits at cell i.
+    const occupied = panelOccupiedMask(m.tiles);
+    const pcLen = m.panelColor.length, icLen = m.insetColor.length;
+    const pLen = 12 + pcLen + icLen + 12;
+    const panelData = this.scratch('panel', pLen);
+    panelData[0] = g.left;       panelData[1] = g.top;     panelData[2]  = g.colPitch; panelData[3]  = g.rowPitch;
+    panelData[4] = g.tileSize;   panelData[5] = g.corner;  panelData[6]  = g.columns;  panelData[7]  = g.rows;
+    panelData[8] = g.cardCorner; panelData[9] = 0;         panelData[10] = 0;          panelData[11] = 0;   // [9] = occupied bitmask (written as u32 below)
+    panelData.set(m.panelColor, 12);
+    panelData.set(m.insetColor, 12 + pcLen);
+    const po = 12 + pcLen + icLen;
+    panelData[po]     = g.cardX; panelData[po + 1] = g.cardY;      panelData[po + 2] = g.cardW; panelData[po + 3] = g.cardH;
+    panelData[po + 4] = 0;       panelData[po + 5] = g.regionTop;  panelData[po + 6] = w;       panelData[po + 7] = g.regionHeight;
+    // the bake rect (read by the bake pipeline only; 1×1 when there is nothing to bake, never a zero divisor)
+    panelData[po + 8] = rect ? rect.x : 0; panelData[po + 9] = rect ? rect.y : 0; panelData[po + 10] = rect ? rect.w : 1; panelData[po + 11] = rect ? rect.h : 1;
+    this.scratchU32('panel')[9] = occupied;   // same backing store as panelData
+    this.device.queue.writeBuffer(this.panelBuf, 0, panelData, 0, pLen);
+  }
+
+  /**
+   * Make sure the baked panel texture holds the CURRENT panel (same key). Re-bakes (one small offscreen pass in this
+   * frame's encoder) only when the grid / theme colours / occupied cells / canvas size changed: hover, the dwell
+   * ring and selection rebuild the model but leave the key alone. False = nothing to blit or the bake is unavailable
+   * (the caller falls back to shading the panel directly).
+   */
+  private ensurePanelBake(encoder: GPUCommandEncoder): boolean {
+    const rect = this._panelRect;
+    if (!rect) return false;
+    if (this.panelBakeTex && this._panelBakedKey === this._panelKey) return true;
+    try {
+      if (!this.panelBakeTex || this._panelBakeSize[0] !== rect.w || this._panelBakeSize[1] !== rect.h) {
+        this.panelBakeTex?.destroy();
+        this.panelBakeTex = this.device.createTexture({
+          label: 'ShellPanelBake',
+          size: { width: rect.w, height: rect.h },
+          format: PANEL_BAKE_FORMAT,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this._panelBakeSize = [rect.w, rect.h];
+        this.panelBakeView = this.panelBakeTex.createView();
+        this.panelBlitBindGroup = this.device.createBindGroup({
+          layout: this.blitBGL,
+          entries: [{ binding: 0, resource: { buffer: this.panelBlitBuf } }, { binding: 1, resource: this.panelBakeView }],
+        });
+      }
+    } catch {
+      this.panelBakeTex = null;
+      return false;
+    }
+    const rd = this.scratch('panelBlit', 4);
+    rd[0] = rect.x; rd[1] = rect.y; rd[2] = rect.w; rd[3] = rect.h;
+    this.device.queue.writeBuffer(this.panelBlitBuf, 0, rd, 0, 4);
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: this.panelBakeView!, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }],
+    });
+    pass.setPipeline(this.panelBakePipeline);
+    pass.setBindGroup(0, this.globalsBindGroup);
+    pass.setBindGroup(1, this.panelBindGroup);
+    pass.draw(6);
+    pass.end();
+    this._panelBakedKey = this._panelKey;
+    this.panelBakeCount++;
+    return true;
+  }
+
+  /** Make sure the baked grain texture matches the canvas size (the grain is a pure function of the pixel position:
+   *  re-baked on resize only). False = unavailable (the caller shades the grain directly). */
+  private ensureGrainBake(encoder: GPUCommandEncoder, w: number, h: number): boolean {
+    if (this.grainTex && this._grainSize[0] === w && this._grainSize[1] === h) return true;
+    try {
+      this.grainTex?.destroy();
+      this.grainTex = this.device.createTexture({
+        label: 'ShellGrainBake',
+        size: { width: w, height: h },
+        format: GRAIN_BAKE_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this._grainSize = [w, h];
+      const view = this.grainTex.createView();
+      this.grainBindGroup = this.device.createBindGroup({ layout: this.grainBlitBGL, entries: [{ binding: 0, resource: view }] });
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{ view, clearValue: { r: 1, g: 1, b: 1, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+      });
+      pass.setPipeline(this.grainBakePipeline);
+      pass.draw(3);
+      pass.end();
+      this.grainBakeCount++;
+      return true;
+    } catch {
+      this.grainTex = null;
+      this._grainSize = [0, 0];
+      return false;
+    }
+  }
+
+  private _inRender = false;
   render(): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this._inRender) return;
+    this._inRender = true;
+    try { this.renderFrame(); } finally { this._inRender = false; }
+  }
+
+  private renderFrame(): void {
+    const nowMs = performance.now();
+
+    // Mode cross-fade (home ↔ illustrations): the scrim alpha is a function of the clock, computed HERE — nothing is
+    // rebuilt per frame. The host swaps the model at the midpoint (hidden by the scrim) through onMidpoint.
+    let fadeT = -1;
+    const fade = this._fade;
+    if (fade) {
+      const t = modeFadeT(nowMs, fade.startMs, fade.durationMs);
+      if (t >= 0.5 && !fade.midFired) { fade.midFired = true; fade.onMidpoint(); }
+      if (this._fade === fade) {   // (the midpoint hook may have restarted / cancelled the fade)
+        if (t >= 1) { this._fade = null; fade.onEnd(); }
+        else fadeT = t;
+      }
+    }
+
     const m = this.model;
     const w = this.canvas.width, h = this.canvas.height;
     if (!m || w === 0 || h === 0) return;
+    const dbg = this.dbg;
 
-    const now = performance.now() / 1000;
+    const now = nowMs / 1000;
     const dt = Math.min(0.05, Math.max(0, now - this.lastTime));
     this.lastTime = now;
     this.tickAnim(dt);
@@ -1827,17 +2246,16 @@ export class ShellRenderer {
 
     // Dwell ring: full while the countdown is paused (pointer still over the
     // tile → ringCountdownStart undefined); otherwise it depletes over
-    // RING_SECONDS from when the pointer left.
-    const ringId = m.ringTileId ?? null;
-    const ringTile = ringId ? m.tiles.find(t => t.id === ringId) : undefined;
+    // RING_SECONDS from when the pointer left. (The ring tile is resolved once per model, in setModel.)
+    const ringTile = this._ringTile;
     const ringProg = !ringTile ? 0
       : m.ringCountdownStart === undefined ? 1
       : Math.max(0, 1 - (now - m.ringCountdownStart) / RING_SECONDS);
     const drawRing = !!ringTile && ringProg > 0.001;
     if (drawRing && ringTile) {
-      const [rx, ry, rw, rh] = ringTile.rect;
+      const r = ringTile.rect;
       const rd = this.scratch('ring', 4);
-      rd[0] = rx + rw / 2; rd[1] = ry + rh / 2; rd[2] = rw; rd[3] = ringProg;
+      rd[0] = r[0] + r[2] / 2; rd[1] = r[1] + r[3] / 2; rd[2] = r[2]; rd[3] = ringProg;
       this.device.queue.writeBuffer(this.ringBuf, 0, rd, 0, 4);
     }
 
@@ -1861,36 +2279,19 @@ export class ShellRenderer {
       bgd.set(m.bgTop, 0);
       bgd.set(m.bgBottom, topLen);
       const bo = topLen + botLen;
-      bgd[bo] = now; bgd[bo + 1] = w / Math.max(1, h); bgd[bo + 2] = m.backdropGrid ? 1 : 0; bgd[bo + 3] = 0;
+      bgd[bo] = now; bgd[bo + 1] = w / Math.max(1, h); bgd[bo + 2] = m.backdropGrid ? 1 : 0;
+      bgd[bo + 3] = dbg.specks ? 0 : 1;   // debug: skip the specks (0 = draw them, the default)
       this.device.queue.writeBuffer(this.bgBuf, 0, bgd, 0, bgLen);
     }
-    // panel uniform (frosted card) — grid/theme/occupancy only, so it's rebuilt + uploaded on model change, not
-    // every frame (the buffer keeps its GPU contents between uploads).
-    if (this._panelDirty) {
-      this._panelDirty = false;
-      const g = m.grid;
-      // Bitmask of cells (row*cols+col == tile index) that hold a 3D tile — system
-      // apps, FrogCarts, Install Cart — so the panel shader skips the riso/pattern
-      // behind them. Tiles fill cells in order, so tile i sits at cell i.
-      let occupied = 0;
-      for (let i = 0; i < m.tiles.length && i < 32; i++) {
-        const t = m.tiles[i];
-        if (t.discIcon || t.cd || t.billboardKey) occupied |= (1 << i);
-      }
-      const pcLen = m.panelColor.length, icLen = m.insetColor.length;
-      const pLen = 12 + pcLen + icLen + 8;
-      const panelData = this.scratch('panel', pLen);
-      panelData[0] = g.left;       panelData[1] = g.top;     panelData[2]  = g.colPitch; panelData[3]  = g.rowPitch;
-      panelData[4] = g.tileSize;   panelData[5] = g.corner;  panelData[6]  = g.columns;  panelData[7]  = g.rows;
-      panelData[8] = g.cardCorner; panelData[9] = 0;         panelData[10] = 0;          panelData[11] = 0;   // [9] = occupied bitmask (written as u32 below)
-      panelData.set(m.panelColor, 12);
-      panelData.set(m.insetColor, 12 + pcLen);
-      const po = 12 + pcLen + icLen;
-      panelData[po]     = g.cardX; panelData[po + 1] = g.cardY;      panelData[po + 2] = g.cardW; panelData[po + 3] = g.cardH;
-      panelData[po + 4] = 0;       panelData[po + 5] = g.regionTop;  panelData[po + 6] = w;       panelData[po + 7] = g.regionHeight;
-      this.scratchU32('panel')[9] = occupied >>> 0;   // same backing store as panelData
-      this.device.queue.writeBuffer(this.panelBuf, 0, panelData, 0, pLen);
-    }
+
+    // project grid (illustrations mode) — curved floating thumbnail cards
+    const grid = m.projectGrid;
+    const inGrid = !!grid;
+
+    // panel uniform (frosted card) — grid/theme/occupancy only, so it's rebuilt + uploaded when those inputs change,
+    // not every frame and not on hover (the buffer keeps its GPU contents between uploads).
+    const drawPanel = !inGrid && dbg.panel;
+    if (drawPanel) this.syncPanelInputs(m, w, h);
 
     // arrows
     const arrows = m.arrows;
@@ -1907,17 +2308,18 @@ export class ShellRenderer {
 
     // tiles (coin tiles — system apps + Install Cart — are drawn as 3D discs
     // below, so exclude them here; the flat circle would otherwise sit under
-    // the coin)
+    // the coin). The flat list is derived once per model (setModel).
     this.thumbAtlas.beginFrame();   // advance the LRU clock; touch() below marks the on-screen thumbnails as used
-    const tiles = m.tiles.filter(t => !t.discIcon && !t.cd && !t.billboardKey);
+    const uv = this._uv;
+    const tiles = this._flatTiles;
     this.growTileBuf(Math.max(1, tiles.length));
     if (tiles.length > 0) {
       const stride = TILE_STRIDE / 4;
       const data = this.scratch('tiles', tiles.length * stride);
       for (let i = 0; i < tiles.length; i++) {
         const t = tiles[i];
-        const a = this.anim.get(t.id) ?? { hover: 0, select: 0, appear: 1 };
-        const thumb = this.thumbAtlas.touch(t.id);   // home tiles are always on-screen → keep their cells resident
+        const a = this.anim.get(t.id) ?? IDLE_ANIM;
+        const thumb = this.thumbAtlas.touch(t.id, uv);   // home tiles are always on-screen → keep their cells resident
         const o = i * stride;
         data[o+0]=t.rect[0]; data[o+1]=t.rect[1]; data[o+2]=t.rect[2]; data[o+3]=t.rect[3];
         data[o+4]=t.fill[0]; data[o+5]=t.fill[1]; data[o+6]=t.fill[2]; data[o+7]=t.fill[3];
@@ -1930,10 +2332,8 @@ export class ShellRenderer {
       this.device.queue.writeBuffer(this.tileBuf, 0, data, 0, tiles.length * stride);
     }
 
-    // project grid (illustrations mode) — curved floating thumbnail cards
-    const grid = m.projectGrid;
-    const inGrid = !!grid;
     let gridCount = 0;
+    let gridThumbsPending = 0;
     if (grid && grid.length > 0) {
       this.growGridBuf(grid.length);
       const gstride = GRID_STRIDE / 4;
@@ -1944,7 +2344,8 @@ export class ShellRenderer {
         // half-screen buffer covers the curve projection. Off-screen cards just peek (get) so they stay evictable —
         // this is what lets the LRU pool of 64 cells cover an unbounded illustration library as you scroll.
         const visible = it.rect[1] + it.rect[3] > -h * 0.5 && it.rect[1] < h * 1.5;
-        const thumb = visible ? this.thumbAtlas.touch(it.id) : this.thumbAtlas.get(it.id);
+        const thumb = visible ? this.thumbAtlas.touch(it.id, uv) : this.thumbAtlas.get(it.id, uv);
+        if (!thumb && this._gridMarks === 2 && it.rect[1] + it.rect[3] > 0 && it.rect[1] < h && this.thumbAtlas.hasSource(it.id)) gridThumbsPending++;
         const o = i * gstride;
         gdata[o+0] = it.rect[0] + it.rect[2] / 2;   // center x
         gdata[o+1] = it.rect[1] + it.rect[3] / 2;   // center y
@@ -1963,7 +2364,7 @@ export class ShellRenderer {
     }
 
     // window frames (Win9x chrome overlays — bottom panel, etc.)
-    const windows = m.windows ?? [];
+    const windows = m.windows ?? EMPTY;
     if (windows.length > 0) {
       this.growWindowBuf(windows.length);
       const wstride = WINDOW_STRIDE / 4;
@@ -2000,208 +2401,261 @@ export class ShellRenderer {
 
     const labelCount = this.prepareLabels();
 
+    const depthView = this.viewer.getDepthView(w, h);
+    if (!depthView) return;
     const encoder = this.device.createCommandEncoder();
     const view = this.context.getCurrentTexture().createView();
 
-    // ── Pass 1: background (gradient + ephemera) ──
-    const bgPass = encoder.beginRenderPass({
+    // Static bakes (offscreen, only when their inputs changed): before the frame's pass, in the same encoder.
+    const panelBaked = drawPanel && dbg.panelBake && this.ensurePanelBake(encoder);
+    const grainBaked = dbg.grain && dbg.grainBake && this.ensureGrainBake(encoder, w, h);
+
+    // ── THE pass: background → hero 3D → 2D UI → grain → tile 3D → scrim, in that order (one colour clear, one
+    // depth clear; no pass boundary = no tile store/reload of the whole framebuffer between layers). ──
+    const pass = encoder.beginRenderPass({
       colorAttachments: [{ view, clearValue: { r: m.bgBottom[0], g: m.bgBottom[1], b: m.bgBottom[2], a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+      // Depth is cleared once and never read back (UI-16). Hero and tile batch both use the full range, as before;
+      // see the depth reset ahead of the tile batch below.
+      depthStencilAttachment: { view: depthView, depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
     });
-    bgPass.setPipeline(this.bgPipeline);
-    bgPass.setBindGroup(0, this.bgBindGroup);
-    bgPass.draw(3);
+
+    // ── background (gradient + ephemera) ──
+    pass.setPipeline(this.bgPipeline);
+    pass.setBindGroup(0, this.bgBindGroup);
+    pass.draw(3);
     // Home backdrop, behind the viewer mesh (hidden in the illustrations grid). Polygon theme = a 3D
     // wireframe grid surface; every other theme = the riso sticker (blob + squiggle ribbons).
     if (!inGrid) {
       if (m.backdropGrid) {
-        const aspect = w / Math.max(1, h);
-        mat4.perspective(this.gridProj, 0.6, aspect, 0.1, 20);
-        const yaw = Math.sin(now * 0.1) * 0.08;             // very subtle left/right sway (mostly head-on)
-        const R = 2.6;
-        mat4.lookAt(this.gridView, [Math.sin(yaw) * R, 1.2, Math.cos(yaw) * R], [0, 0.05, 0], [0, 1, 0]);   // eyeY = look-down angle (higher = more top-down)
-        mat4.multiply(this.gridMvp, this.gridProj, this.gridView);
-        mat4.multiply(this.gridMvp, this.gridScreen, this.gridMvp);   // shrink + lift up behind the logo
-        const wgd = this.scratch('wiregrid', 24);
-        wgd.set(this.gridMvp as Float32Array, 0);
-        wgd[16] = now; wgd[17] = 0.85; wgd[18] = 2.2; wgd[19] = 0;                       // params: time, relief, freq, _
-        wgd[20] = m.squiggle[0]; wgd[21] = m.squiggle[1]; wgd[22] = m.squiggle[2]; wgd[23] = 0.72; // grid-line color + alpha
-        this.device.queue.writeBuffer(this.wireGridUBO, 0, wgd, 0, 24);
-        bgPass.setPipeline(this.wireGridPipeline);
-        bgPass.setBindGroup(0, this.wireGridBindGroup);
-        bgPass.setVertexBuffer(0, this.wireGridVB);
-        bgPass.setIndexBuffer(this.wireGridIB, 'uint16');
-        bgPass.drawIndexed(this.wireGridIndexCount);
-      } else {
-        bgPass.setPipeline(this.backdropPipeline);
-        bgPass.setBindGroup(0, this.globalsBindGroup);
-        bgPass.draw(3);
+        if (dbg.wireGrid) {
+          const aspect = w / Math.max(1, h);
+          mat4.perspective(this.gridProj, 0.6, aspect, 0.1, 20);
+          const yaw = Math.sin(now * 0.1) * 0.08;             // very subtle left/right sway (mostly head-on)
+          const R = 2.6;
+          const eye = this._eye; eye[0] = Math.sin(yaw) * R; eye[1] = 1.2; eye[2] = Math.cos(yaw) * R;
+          mat4.lookAt(this.gridView, eye, GRID_TARGET, GRID_UP);   // eyeY = look-down angle (higher = more top-down)
+          mat4.multiply(this.gridMvp, this.gridProj, this.gridView);
+          mat4.multiply(this.gridMvp, this.gridScreen, this.gridMvp);   // shrink + lift up behind the logo
+          const wgd = this.scratch('wiregrid', 24);
+          wgd.set(this.gridMvp as Float32Array, 0);
+          wgd[16] = now; wgd[17] = 0.85; wgd[18] = 2.2; wgd[19] = 0;                       // params: time, relief, freq, _
+          wgd[20] = m.squiggle[0]; wgd[21] = m.squiggle[1]; wgd[22] = m.squiggle[2]; wgd[23] = 0.72; // grid-line color + alpha
+          this.device.queue.writeBuffer(this.wireGridUBO, 0, wgd, 0, 24);
+          pass.setPipeline(this.wireGridPipeline);
+          pass.setBindGroup(0, this.wireGridBindGroup);
+          pass.setVertexBuffer(0, this.wireGridVB);
+          pass.setIndexBuffer(this.wireGridIB, 'uint16');
+          pass.drawIndexed(this.wireGridIndexCount);
+        }
+      } else if (dbg.backdrop) {
+        // The sticker shader is a full-screen triangle that is transparent outside the blob + squiggles: scissor it
+        // to their bounds (shell-bake.ts backdropStickerRect) so the 18-segment ribbon march only runs there.
+        if (this._stickerW !== w || this._stickerH !== h) { this._stickerRect = backdropStickerRect(w, h); this._stickerW = w; this._stickerH = h; }
+        const sr = this._stickerRect;
+        if (sr) {
+          pass.setScissorRect(sr.x, sr.y, sr.w, sr.h);
+          pass.setPipeline(this.backdropPipeline);
+          pass.setBindGroup(0, this.globalsBindGroup);
+          pass.draw(3);
+          pass.setScissorRect(0, 0, w, h);
+        }
       }
     }
-    bgPass.end();
 
-    // ── Pass 2: 3D viewer (cartridge / sketchbook / billboard) over the bg ──
-    if (m.viewer && !inGrid) {
-      const vh = m.viewerFraction * h;
+    // ── 3D viewer (cartridge / sketchbook / billboard) over the bg ──
+    let heroDepthBottom = 0;   // device-px row below which the hero cannot have written depth (0 = it did not draw)
+    if (m.viewer && !inGrid && dbg.hero) {
+      const region = this._region;
+      region.x = 0; region.y = 0; region.w = w; region.h = m.viewerFraction * h;
+      if (this._loadingDots || this._heroReady) heroDepthBottom = Math.min(h, Math.ceil(region.h));
       if (this._loadingDots) {
         // Bouncing-dots placeholder (kept for reuse; not currently used for the hero logo — that fades in instead).
-        this.viewer.renderLoadingDots(encoder, view, w, h, { x: 0, y: 0, w, h: vh }, now, this._loadingDotColor);
+        this.viewer.renderLoadingDots(pass, region, now, this._loadingDotColor);
       } else if (this._heroReady) {
         // Opacity fade-in DISABLED for now — the viewer's existing scale/pop-in appear animation handles the
         // entrance. hideHero()/revealHero() still keep the slot empty until the logo is baked (no white flash).
         // To re-enable the fade, restore the ramp below and pass it instead of 1:
         // const fade = this._heroFadeStart > 0 ? Math.min((now - this._heroFadeStart) / 0.5, 1) : 1;
-        const fade = 1;
-        const thumb = m.viewerThumbId ? this.thumbAtlas.touch(m.viewerThumbId) : null;   // the framed hero/selection → keep resident
-        this.viewer.render(encoder, view, w, h, { x: 0, y: 0, w, h: vh }, m.viewer, now, thumb, fade);
+        const heroFade = 1;
+        const thumb = m.viewerThumbId ? this.thumbAtlas.touch(m.viewerThumbId, uv) : null;   // the framed hero/selection → keep resident
+        this.viewer.render(pass, region, m.viewer, now, thumb, heroFade);
       }
       // else: hero hidden (draw nothing) until revealHero() — no untextured/white card flash while the logo loads.
+      pass.setViewport(0, 0, w, h, 0, 1);   // back to the full canvas for the 2D UI
     }
 
-    // ── Pass 3: all 2D UI on top (so chrome sits ABOVE the viewer) ──
-    const ui = encoder.beginRenderPass({
-      colorAttachments: [{ view, loadOp: 'load', storeOp: 'store' }],
-    });
+    // ── all 2D UI on top (so chrome sits ABOVE the viewer) ──
 
     // inset panel (home only — the illustrations grid floats with no panel)
-    if (!inGrid) {
-      ui.setPipeline(this.panelPipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setBindGroup(1, this.panelBindGroup);
-      ui.draw(6);
+    if (drawPanel) {
+      if (panelBaked && this.panelBlitBindGroup) {
+        pass.setPipeline(this.panelBlitPipeline);
+        pass.setBindGroup(0, this.globalsBindGroup);
+        pass.setBindGroup(1, this.panelBlitBindGroup);
+        pass.draw(6);
+      } else {
+        pass.setPipeline(this.panelPipeline);
+        pass.setBindGroup(0, this.globalsBindGroup);
+        pass.setBindGroup(1, this.panelBindGroup);
+        pass.draw(6);
+      }
     }
 
     // illustrations project grid (curved floating thumbnail cards)
     if (gridCount > 0) {
-      ui.setPipeline(this.gridPipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setBindGroup(1, this.thumbBindGroup);
-      ui.setVertexBuffer(0, this.quadBuf);
-      ui.setVertexBuffer(1, this.gridBuf);
-      ui.draw(6, gridCount);
+      pass.setPipeline(this.gridPipeline);
+      pass.setBindGroup(0, this.globalsBindGroup);
+      pass.setBindGroup(1, this.thumbBindGroup);
+      pass.setVertexBuffer(0, this.quadBuf);
+      pass.setVertexBuffer(1, this.gridBuf);
+      pass.draw(6, gridCount);
     }
 
     // tiles
     if (tiles.length > 0) {
-      ui.setPipeline(this.tilePipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setBindGroup(1, this.thumbBindGroup);
-      ui.setVertexBuffer(0, this.quadBuf);
-      ui.setVertexBuffer(1, this.tileBuf);
-      ui.draw(6, tiles.length);
+      pass.setPipeline(this.tilePipeline);
+      pass.setBindGroup(0, this.globalsBindGroup);
+      pass.setBindGroup(1, this.thumbBindGroup);
+      pass.setVertexBuffer(0, this.quadBuf);
+      pass.setVertexBuffer(1, this.tileBuf);
+      pass.draw(6, tiles.length);
     }
 
     // window frames (Win9x chrome overlays) — over the panel/tiles, under labels
     if (windows.length > 0) {
-      ui.setPipeline(this.windowPipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setVertexBuffer(0, this.quadBuf);
-      ui.setVertexBuffer(1, this.windowBuf);
-      ui.draw(6, windows.length);
+      pass.setPipeline(this.windowPipeline);
+      pass.setBindGroup(0, this.globalsBindGroup);
+      pass.setVertexBuffer(0, this.quadBuf);
+      pass.setVertexBuffer(1, this.windowBuf);
+      pass.draw(6, windows.length);
     }
 
     // dwell countdown ring around the focused tile
     if (drawRing) {
-      ui.setPipeline(this.ringPipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setVertexBuffer(0, this.quadBuf);
-      ui.setVertexBuffer(1, this.ringBuf);
-      ui.draw(6, 1);
+      pass.setPipeline(this.ringPipeline);
+      pass.setBindGroup(0, this.globalsBindGroup);
+      pass.setVertexBuffer(0, this.quadBuf);
+      pass.setVertexBuffer(1, this.ringBuf);
+      pass.draw(6, 1);
     }
 
     // chrome badges (pills behind chrome text)
     if (badges.length > 0) {
-      ui.setPipeline(this.badgePipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setVertexBuffer(0, this.quadBuf);
-      ui.setVertexBuffer(1, this.badgeBuf);
-      ui.draw(6, badges.length);
+      pass.setPipeline(this.badgePipeline);
+      pass.setBindGroup(0, this.globalsBindGroup);
+      pass.setVertexBuffer(0, this.quadBuf);
+      pass.setVertexBuffer(1, this.badgeBuf);
+      pass.draw(6, badges.length);
     }
 
     // labels
     if (labelCount > 0 && this.labelBindGroup) {
-      ui.setPipeline(this.labelPipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setBindGroup(1, this.labelBindGroup);
-      ui.setVertexBuffer(0, this.quadBuf);
-      ui.setVertexBuffer(1, this.labelBuf);
-      ui.draw(6, labelCount);
+      pass.setPipeline(this.labelPipeline);
+      pass.setBindGroup(0, this.globalsBindGroup);
+      pass.setBindGroup(1, this.labelBindGroup);
+      pass.setVertexBuffer(0, this.quadBuf);
+      pass.setVertexBuffer(1, this.labelBuf);
+      pass.draw(6, labelCount);
     }
 
     // page arrows
     if (arrows.length > 0) {
-      ui.setPipeline(this.arrowPipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setVertexBuffer(0, this.quadBuf);
-      ui.setVertexBuffer(1, this.arrowBuf);
-      ui.draw(6, arrows.length);
+      pass.setPipeline(this.arrowPipeline);
+      pass.setBindGroup(0, this.globalsBindGroup);
+      pass.setVertexBuffer(0, this.quadBuf);
+      pass.setVertexBuffer(1, this.arrowBuf);
+      pass.draw(6, arrows.length);
     }
 
     // HTML-in-Canvas element (drawn before grain so the grain prints over it)
     if (htmlTex && this.htmlBindGroup) {
-      ui.setPipeline(this.htmlPipeline);
-      ui.setBindGroup(0, this.globalsBindGroup);
-      ui.setBindGroup(1, this.htmlBindGroup);
-      ui.draw(6);
+      pass.setPipeline(this.htmlPipeline);
+      pass.setBindGroup(0, this.globalsBindGroup);
+      pass.setBindGroup(1, this.htmlBindGroup);
+      pass.draw(6);
     }
 
-    // riso paper grain over the whole composite (multiply) — drawn last
-    ui.setPipeline(this.grainPipeline);
-    ui.draw(3);
-    ui.end();
+    // riso paper grain over the composite so far (multiply) — last of the 2D layers
+    if (dbg.grain) {
+      if (grainBaked && this.grainBindGroup) {
+        pass.setPipeline(this.grainBlitPipeline);
+        pass.setBindGroup(0, this.grainBindGroup);
+      } else {
+        pass.setPipeline(this.grainPipeline);
+      }
+      pass.draw(3);
+    }
 
-    // System-app 3D discs — drawn over the composited 2D tiles. All tiles share ONE render pass (depth cleared
-    // once) instead of a pass + full-canvas depth clear per tile; each draw just sets its own viewport.
-    if (this.viewer) {
-      const batch = this.viewer.beginTileBatch(encoder, view, w, h);
+    // System-app 3D discs — drawn over the composited 2D tiles, in the same pass (each draw sets its own viewport).
+    // They used to get a freshly cleared depth buffer. The hero is the only thing that wrote depth so far, and only
+    // inside its viewport (rows above heroDepthBottom): if a 3D tile reaches into those rows, put depth back to 1.0
+    // there first. With the home layout the tiles sit below the hero, so this draws nothing.
+    if (dbg.tiles) {
+      const region = this._region;
+      const all = m.tiles;
+      if (heroDepthBottom > 0 && this._tiles3dTop < heroDepthBottom) {
+        this.viewer.resetDepth(pass, w, h, 0, 0, w, heroDepthBottom);
+        this.depthResetCount++;
+      }
       let discSlot = 0;
-      for (const t of m.tiles) {
-        const region = { x: t.rect[0], y: t.rect[1], w: t.rect[2], h: t.rect[3] };
+      for (let i = 0; i < all.length; i++) {
+        const t = all[i];
+        if (!t.cd && !t.billboardKey && !t.discIcon) continue;
+        region.x = t.rect[0]; region.y = t.rect[1]; region.w = t.rect[2]; region.h = t.rect[3];
         if (t.cd) {
-          this.viewer.drawCD(encoder, view, w, h, region, null, now, discSlot, batch ?? undefined);  // null cover = holographic (P1)
+          this.viewer.drawCD(pass, region, null, now, discSlot);  // null cover = holographic (P1)
           discSlot++;
         } else if (t.billboardKey) {
-          const icon = this.thumbAtlas.touch(t.billboardKey);   // system-app / cart icon — always drawn → keep resident
-          this.viewer.drawBillboard(encoder, view, w, h, region, t.billboardKey, icon, now, discSlot, m.billboardOutline, m.backdropGrid, batch ?? undefined);
+          const icon = this.thumbAtlas.touch(t.billboardKey, uv);   // system-app / cart icon — always drawn → keep resident
+          this.viewer.drawBillboard(pass, region, t.billboardKey, icon, now, discSlot, m.billboardOutline, m.backdropGrid);
           discSlot++;
         } else if (t.discIcon) {
-          const icon = this.thumbAtlas.touch(t.discIcon);   // disc-icon tile — always drawn → keep resident
-          this.viewer.drawDisc(encoder, view, w, h, region, icon, now, discSlot, batch ?? undefined);
+          const icon = this.thumbAtlas.touch(t.discIcon, uv);   // disc-icon tile — always drawn → keep resident
+          this.viewer.drawDisc(pass, region, icon, now, discSlot);
           discSlot++;
         }
       }
-      batch?.end();
+      if (discSlot > 0) pass.setViewport(0, 0, w, h, 0, 1);
     }
 
     // ── Mode cross-fade scrim (drawn over everything, incl. the 3D tiles) ──
     // modeFade 0→1; the dip peaks at the midpoint, hiding the home↔grid swap.
-    const modeFade = m.modeFade ?? (m.projectGrid ? 1 : 0);
-    const scrimAlpha = 1 - Math.abs(2 * modeFade - 1);
+    const modeFade = fadeT >= 0 ? fadeT : (m.modeFade ?? (m.projectGrid ? 1 : 0));
+    const scrimAlpha = scrimAlphaForFade(modeFade);
     if (scrimAlpha > 0.001) {
       const sd = this.scratch('scrim', 12);
       sd[0] = m.bgTop[0];    sd[1] = m.bgTop[1];    sd[2]  = m.bgTop[2];    sd[3]  = 1;
       sd[4] = m.bgBottom[0]; sd[5] = m.bgBottom[1]; sd[6]  = m.bgBottom[2]; sd[7]  = 1;
       sd[8] = scrimAlpha;    sd[9] = 0;             sd[10] = 0;             sd[11] = 0;
       this.device.queue.writeBuffer(this.scrimBuf, 0, sd, 0, 12);
-      const scrimPass = encoder.beginRenderPass({
-        colorAttachments: [{ view, loadOp: 'load', storeOp: 'store' }],
-      });
-      scrimPass.setPipeline(this.scrimPipeline);
-      scrimPass.setBindGroup(0, this.scrimBindGroup);
-      scrimPass.draw(3);
-      scrimPass.end();
+      pass.setPipeline(this.scrimPipeline);
+      pass.setBindGroup(0, this.scrimBindGroup);
+      pass.draw(3);
     }
+    pass.end();
 
     this.device.queue.submit([encoder.finish()]);
+
+    // User Timing: the first grid frame after a home → illustrations flip, then the frame where every on-screen
+    // card that has a thumbnail shows it.
+    if (inGrid && this._gridMarks === 1) { this._gridMarks = 2; shellMark('shell:grid-first-frame'); }
+    else if (inGrid && this._gridMarks === 2 && gridThumbsPending === 0) { this._gridMarks = 0; shellMark('shell:thumbs-ready'); }
   }
 
   destroy(): void {
     if (this.destroyed) return;
     this.stop();
     this.destroyed = true;
+    this._fade = null;
+    this.hud?.destroy(); this.hud = null;
+    this.gpuTimer?.destroy(); this.gpuTimer = null;
     this.quadBuf.destroy();
     this.globalsBuf.destroy();
     this.bgBuf.destroy();
     this.panelBuf.destroy();
+    this.panelBlitBuf.destroy();
+    this.panelBakeTex?.destroy(); this.panelBakeTex = null;
+    this.grainTex?.destroy(); this.grainTex = null;
     this.htmlLayer.destroy();
     this.htmlRectBuf.destroy();
     this.tileBuf.destroy();

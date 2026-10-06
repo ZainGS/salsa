@@ -8,9 +8,9 @@
  * deliberately not the engine's full Renderer3D, to keep the shell
  * decoupled and cheap.
  *
- * It owns its own render pass (loading the color the 2D grid pass already
- * drew, with its own depth buffer) and is constrained to the top region of
- * the canvas via the viewport. Idle animation is driven by a wall-clock
+ * It draws INSIDE ShellRenderer's single render pass (it owns the pass's depth
+ * buffer; see resetDepth) and is constrained to the
+ * top region of the canvas via the viewport. Idle animation is driven by a wall-clock
  * time value, matching the cadence in docs/specs/shell-ui.md:
  *   • spin  — one Y revolution per 12s
  *   • bob   — sine on Y, 2s period, ~5% of height
@@ -21,8 +21,12 @@ import { mat4 } from 'gl-matrix';
 import type { ViewerSpec } from './shell-layout';
 import type { ShellThumbnailAtlas } from './shell-thumbnails';
 import type { Billboard3DGeometry } from '../3d/billboard-3d';
+import { shellGpuCached } from './shell-gpu-cache';
 
-const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
+/** The Shell's depth format: the viewer's 3D pipelines write it, and every 2D Shell pipeline declares it (compare
+ *  'always', no write) so all of them can draw in ONE render pass. */
+export const SHELL_DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
+const WHITE: readonly [number, number, number, number] = [1, 1, 1, 1];
 
 // Uniform layout: mvp(64) + model(64) + body(16) + label(16) + light(16) + uvRect(16) + sideColor(16) = 208.
 // light.w doubles as a 0/1 "use thumbnail" flag. sideColor is used by the
@@ -453,6 +457,34 @@ function buildCD(R: number, D: number, rHole: number, segs: number): { verts: Fl
   return { verts: new Float32Array(v), indices: new Uint16Array(idx) };
 }
 
+// Depth inside the Shell's single render pass: ONE depth buffer, cleared once to 1.0. The hero viewer and the per-tile
+// batch both use the full [0, 1] range, exactly as when each had its own pass + depth clear (so every depth value, and
+// every depth-test outcome, is what it was). The hero only writes depth inside its viewport; if a 3D tile's rect
+// reaches into that region, the renderer calls resetDepth() over it before the tile batch: the in-pass equivalent of
+// the old second clear. With the home layout (tiles below the hero) that never happens: zero extra draws.
+
+/** Writes depth 1.0 (compare always) and no colour: a depth "clear" of the current scissor rect, mid-pass. */
+const DEPTH_RESET_SHADER = /* wgsl */ `
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+  var c = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  return vec4<f32>(c[vi], 1.0, 1.0);
+}
+@fragment
+fn fs() -> @location(0) vec4<f32> {
+  return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+}
+`;
+
+/** A device-px region (viewport) for one 3D draw. */
+export interface ViewerRegion { x: number; y: number; w: number; h: number }
+type UV = { u0: number; v0: number; u1: number; v1: number };
+
+const EYE: readonly [number, number, number] = [0, 0, 6.5];
+const ORIGIN: readonly [number, number, number] = [0, 0, 0];
+const UP: readonly [number, number, number] = [0, 1, 0];
+const FOV = 35 * Math.PI / 180;
+
 export class CartridgeViewer {
   private device: GPUDevice;
   private format: GPUTextureFormat;
@@ -460,6 +492,8 @@ export class CartridgeViewer {
   /** Reusable uniform scratch — the draw* methods each filled a fresh Float32Array(52) per call. fill(0) before
    *  each use preserves the zero-init the draws relied on; writeBuffer copies immediately so reuse is safe. */
   private readonly _u = new Float32Array(UNIFORM_SIZE / 4);
+  /** Reusable vec3 for translate / scale (was an array literal per call). */
+  private readonly _v3: [number, number, number] = [0, 0, 0];   // plain numbers (doubles), like the literals they replace
 
   private pipeline!: GPURenderPipeline;
   private billboardPipeline!: GPURenderPipeline;
@@ -477,6 +511,7 @@ export class CartridgeViewer {
   private discPipeline!: GPURenderPipeline;
   private disc!: MeshBuffers;
   private cdPipeline!: GPURenderPipeline;
+  private depthResetPipeline!: GPURenderPipeline;
   private cd!: MeshBuffers;
   private discUniformBufs: GPUBuffer[] = [];
   private discBindGroups: GPUBindGroup[] = [];
@@ -498,35 +533,38 @@ export class CartridgeViewer {
     this.device = device;
     this.format = format;
     this.thumbAtlas = thumbAtlas;
+    mat4.lookAt(this.view, EYE, ORIGIN, UP);   // the camera never moves
     this.build();
   }
 
   private build(): void {
-    const module = this.device.createShaderModule({ code: SHADER });
-
-    this.uniformBuf = this.device.createBuffer({
-      size: UNIFORM_SIZE,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    const bgl = this.device.createBindGroupLayout({
+    const dev = this.device, fmt = this.format;
+    // Pipelines + layouts are kept per device across Shell mounts (shell-gpu-cache.ts); buffers / bind groups are per mount.
+    const bgl = shellGpuCached(dev, 'cart.bgl', () => dev.createBindGroupLayout({
       entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
-    });
-    this.bindGroup = this.device.createBindGroup({
-      layout: bgl,
-      entries: [{ binding: 0, resource: { buffer: this.uniformBuf } }],
-    });
-
-    const thumbBGL = this.device.createBindGroupLayout({
+    }));
+    const thumbBGL = shellGpuCached(dev, 'cart.thumbBGL', () => dev.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
+    }));
+    const layout = shellGpuCached(dev, 'cart.layout', () => dev.createPipelineLayout({ bindGroupLayouts: [bgl, thumbBGL] }));
+    const sampler = shellGpuCached(dev, 'cart.sampler', () => dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }));
+
+    this.uniformBuf = dev.createBuffer({
+      size: UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    this.thumbBindGroup = this.device.createBindGroup({
+    this.bindGroup = dev.createBindGroup({
+      layout: bgl,
+      entries: [{ binding: 0, resource: { buffer: this.uniformBuf } }],
+    });
+    this.thumbBindGroup = dev.createBindGroup({
       layout: thumbBGL,
       entries: [
         { binding: 0, resource: this.thumbAtlas.getView() },
-        { binding: 1, resource: this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' }) },
+        { binding: 1, resource: sampler },
       ],
     });
 
@@ -539,27 +577,33 @@ export class CartridgeViewer {
         { shaderLocation: 3, offset: 32, format: 'float32' as const },
       ],
     };
+    const depthStencil: GPUDepthStencilState = { format: SHELL_DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' };
 
-    this.pipeline = this.device.createRenderPipeline({
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl, thumbBGL] }),
-      vertex: { module, entryPoint: 'vs', buffers: [vbufLayout] },
-      fragment: { module, entryPoint: 'fs', targets: [{ format: this.format }] },
-      primitive: { topology: 'triangle-list', cullMode: 'back' },
-      depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
+    this.pipeline = shellGpuCached(dev, `cart.box|${fmt}`, () => {
+      const module = dev.createShaderModule({ code: SHADER });
+      return dev.createRenderPipeline({
+        layout,
+        vertex: { module, entryPoint: 'vs', buffers: [vbufLayout] },
+        fragment: { module, entryPoint: 'fs', targets: [{ format: fmt }] },
+        primitive: { topology: 'triangle-list', cullMode: 'back' },
+        depthStencil,
+      });
     });
 
-    const bbModule = this.device.createShaderModule({ code: BILLBOARD_SHADER });
-    this.billboardPipeline = this.device.createRenderPipeline({
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl, thumbBGL] }),
-      vertex: { module: bbModule, entryPoint: 'vs', buffers: [vbufLayout] },
-      // Straight-alpha blend so bodyColor.a (opacity) can fade the hero logo in over the background.
-      // Default opacity is 1 → fully opaque → identical to before for every non-fading billboard.
-      fragment: { module: bbModule, entryPoint: 'fs', targets: [{ format: this.format, blend: {
-        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-      } }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },   // cutout: show both faces
-      depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
+    this.billboardPipeline = shellGpuCached(dev, `cart.billboard|${fmt}`, () => {
+      const bbModule = dev.createShaderModule({ code: BILLBOARD_SHADER });
+      return dev.createRenderPipeline({
+        layout,
+        vertex: { module: bbModule, entryPoint: 'vs', buffers: [vbufLayout] },
+        // Straight-alpha blend so bodyColor.a (opacity) can fade the hero logo in over the background.
+        // Default opacity is 1 → fully opaque → identical to before for every non-fading billboard.
+        fragment: { module: bbModule, entryPoint: 'fs', targets: [{ format: fmt, blend: {
+          color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        } }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },   // cutout: show both faces
+        depthStencil,
+      });
     });
 
     this.cartridge = this.upload(buildBox(2.0, 3.0, 0.4));
@@ -570,27 +614,40 @@ export class CartridgeViewer {
 
     // Coin + CD pipelines (same layout), sharing a pool of per-draw uniform
     // buffers — one buffer can't back multiple draws within a single frame.
-    const discLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bgl, thumbBGL] });
-    const discModule = this.device.createShaderModule({ code: DISC_SHADER });
-    this.discPipeline = this.device.createRenderPipeline({
-      layout: discLayout,
-      vertex: { module: discModule, entryPoint: 'vs', buffers: [vbufLayout] },
-      fragment: { module: discModule, entryPoint: 'fs', targets: [{ format: this.format }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
+    this.discPipeline = shellGpuCached(dev, `cart.disc|${fmt}`, () => {
+      const discModule = dev.createShaderModule({ code: DISC_SHADER });
+      return dev.createRenderPipeline({
+        layout,
+        vertex: { module: discModule, entryPoint: 'vs', buffers: [vbufLayout] },
+        fragment: { module: discModule, entryPoint: 'fs', targets: [{ format: fmt }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil,
+      });
     });
-    const cdModule = this.device.createShaderModule({ code: CD_SHADER });
-    this.cdPipeline = this.device.createRenderPipeline({
-      layout: discLayout,
-      vertex: { module: cdModule, entryPoint: 'vs', buffers: [vbufLayout] },
-      fragment: { module: cdModule, entryPoint: 'fs', targets: [{ format: this.format }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
+    this.cdPipeline = shellGpuCached(dev, `cart.cd|${fmt}`, () => {
+      const cdModule = dev.createShaderModule({ code: CD_SHADER });
+      return dev.createRenderPipeline({
+        layout,
+        vertex: { module: cdModule, entryPoint: 'vs', buffers: [vbufLayout] },
+        fragment: { module: cdModule, entryPoint: 'fs', targets: [{ format: fmt }] },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil,
+      });
+    });
+    this.depthResetPipeline = shellGpuCached(dev, `cart.depthReset|${fmt}`, () => {
+      const m = dev.createShaderModule({ code: DEPTH_RESET_SHADER });
+      return dev.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: m, entryPoint: 'vs' },
+        fragment: { module: m, entryPoint: 'fs', targets: [{ format: fmt, writeMask: 0 }] },   // depth only
+        primitive: { topology: 'triangle-list' },
+        depthStencil: { format: SHELL_DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'always' },
+      });
     });
     for (let i = 0; i < DISC_POOL; i++) {
-      const buf = this.device.createBuffer({ size: UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const buf = dev.createBuffer({ size: UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       this.discUniformBufs.push(buf);
-      this.discBindGroups.push(this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: buf } }] }));
+      this.discBindGroups.push(dev.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: buf } }] }));
     }
   }
 
@@ -610,6 +667,9 @@ export class CartridgeViewer {
     this.device.queue.writeBuffer(ibuf, 0, geo.indices);
     return { vbuf, ibuf, count: geo.indices.length, format: 'uint16' };
   }
+
+  /** True when a billboard mesh is registered under `key`. */
+  hasBillboard(key: string): boolean { return this.billboards.has(key); }
 
   /** Upload (or replace) a Billboard3D cutout mesh under `key`. Interleaves the
    *  primitive's arrays into the viewer's pos/normal/uv/faceType vertex format. */
@@ -632,37 +692,73 @@ export class CartridgeViewer {
     this.billboards.set(key, { vbuf, ibuf, count: geo.indices.length, format: 'uint32' });
   }
 
-  private ensureDepth(w: number, h: number): void {
-    if (this.depthTex && this.depthSize[0] === w && this.depthSize[1] === h) return;
+  /**
+   * The Shell's depth buffer (canvas-sized, created / resized on demand). ShellRenderer attaches it to its ONE
+   * render pass (cleared to 1.0, discarded at the end). Null only if the texture could not be created.
+   */
+  getDepthView(w: number, h: number): GPUTextureView | null {
+    if (this.depthTex && this.depthSize[0] === w && this.depthSize[1] === h) return this.depthView;
     this.depthTex?.destroy();
     this.depthTex = this.device.createTexture({
       size: { width: w, height: h },
-      format: DEPTH_FORMAT,
+      format: SHELL_DEPTH_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
     this.depthView = this.depthTex.createView();
     this.depthSize = [w, h];
+    return this.depthView;
   }
 
   /**
-   * Draw the viewer into the top region of the canvas. `colorView` is the
-   * current swapchain view (already cleared + grid-drawn). `region` is the
-   * top viewer rectangle in device px. `timeSec` drives idle animation.
+   * Put depth back to 1.0 over a device-px rect (integers, inside the canvas), mid-pass: what a fresh depth clear did
+   * for the tile batch when it had its own pass. Leaves the viewport on the full canvas and the scissor reset.
+   */
+  resetDepth(pass: GPURenderPassEncoder, canvasW: number, canvasH: number, x: number, y: number, w: number, h: number): void {
+    if (w <= 0 || h <= 0) return;
+    pass.setViewport(0, 0, canvasW, canvasH, 0, 1);
+    pass.setScissorRect(x, y, w, h);
+    pass.setPipeline(this.depthResetPipeline);
+    pass.draw(3);
+    pass.setScissorRect(0, 0, canvasW, canvasH);
+  }
+
+  private set4(o: number, a: number, b: number, c: number, d: number): void {
+    const u = this._u;
+    u[o] = a; u[o + 1] = b; u[o + 2] = c; u[o + 3] = d;
+  }
+  private setUV(o: number, r: UV | null): void {
+    if (r) this.set4(o, r.u0, r.v0, r.u1, r.v1); else this.set4(o, 0, 0, 1, 1);
+  }
+  private translate(x: number, y: number, z: number): void {
+    const v = this._v3; v[0] = x; v[1] = y; v[2] = z;
+    mat4.translate(this.model, this.model, v);
+  }
+  private scale(x: number, y: number, z: number): void {
+    const v = this._v3; v[0] = x; v[1] = y; v[2] = z;
+    mat4.scale(this.model, this.model, v);
+  }
+  /** mvp = perspective(region aspect) · view · model. */
+  private project(region: ViewerRegion): void {
+    mat4.perspective(this.proj, FOV, region.w / region.h, 0.1, 100);
+    mat4.multiply(this.mvp, this.proj, this.view);
+    mat4.multiply(this.mvp, this.mvp, this.model);
+  }
+
+  /**
+   * Draw the viewer into the top region of the canvas, inside the caller's render pass (color already holds the
+   * background; the pass's depth buffer was cleared to 1.0). `region` is the top viewer rectangle in device px.
+   * `timeSec` drives idle animation. Leaves the pass viewport set to `region`: the caller resets
+   * it before its next full-canvas draw.
    */
   render(
-    encoder: GPUCommandEncoder,
-    colorView: GPUTextureView,
-    canvasW: number,
-    canvasH: number,
-    region: { x: number; y: number; w: number; h: number },
+    pass: GPURenderPassEncoder,
+    region: ViewerRegion,
     spec: ViewerSpec,
     timeSec: number,
-    thumb: { u0: number; v0: number; u1: number; v1: number } | null,
+    thumb: UV | null,
     fade = 1,   // hero fade-in opacity (0→1); applied to billboards via bodyColor.a. 1 = fully opaque (default).
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
-    this.ensureDepth(canvasW, canvasH);
-    if (!this.depthView) return;
 
     // Billboard cutout (system-app icon) takes priority when present; a CD
     // viewer (hovered FrogCart) uses the iridescent annulus.
@@ -695,11 +791,11 @@ export class CartridgeViewer {
       const rollZ = Math.sin(timeSec * 0.40 + 1.3) * 0.05;  // ±~3° subtle roll
       const fbob  = Math.sin(timeSec * 0.90) * 0.10;        // vertical float
       const drift = Math.sin(timeSec * 0.50) * 0.05;        // side-to-side drift
-      mat4.translate(this.model, this.model, [drift, fbob + drop, 0]);
+      this.translate(drift, fbob + drop, 0);
       mat4.rotateZ(this.model, this.model, rollZ);
       mat4.rotateX(this.model, this.model, nodX);
       mat4.rotateY(this.model, this.model, swayY);
-      if (scale !== 1) mat4.scale(this.model, this.model, [scale, scale, scale]);
+      if (scale !== 1) this.scale(scale, scale, scale);
     } else {
       // Cutout billboards spin fully (they read well edge-on); the box meshes
       // (cartridge/sketchbook) only sway, so they never collapse to a sliver.
@@ -711,24 +807,20 @@ export class CartridgeViewer {
           : Math.sin(timeSec * 0.5) * 0.85;                  // gentle ±49° sway (box meshes)
       const bob = Math.sin(timeSec * Math.PI) * 0.12;        // 2s period
       const tilt = (isCD ? -24 : -10) * Math.PI / 180;       // tilt more for the CD
-      mat4.translate(this.model, this.model, [0, bob + drop, 0]);
+      this.translate(0, bob + drop, 0);
       mat4.rotateX(this.model, this.model, tilt);
       mat4.rotateY(this.model, this.model, spin);
-      if (scale !== 1) mat4.scale(this.model, this.model, [scale, scale, scale]);
+      if (scale !== 1) this.scale(scale, scale, scale);
       // Always-front: mirror past edge-on so the back reads as the front. NOTE: the negative-X scale inverts winding.
       // This path renders through the box `pipeline` (cullMode:'back'), so if mirrorBack is ever enabled for a BOX
       // mesh the front faces would be culled (mesh turns inside-out). Only the billboard spec sets it today, and that
       // draws through the cullMode:'none' billboard pipeline — safe. If enabling it for a box, cull 'none' here.
       if (spec.mirrorBack && Math.cos(spin) < 0) {
-        mat4.scale(this.model, this.model, [-1, 1, 1]);
+        this.scale(-1, 1, 1);
       }
     }
 
-    const aspect = region.w / region.h;
-    mat4.perspective(this.proj, 35 * Math.PI / 180, aspect, 0.1, 100);
-    mat4.lookAt(this.view, [0, 0, 6.5], [0, 0, 0], [0, 1, 0]);
-    mat4.multiply(this.mvp, this.proj, this.view);
-    mat4.multiply(this.mvp, this.mvp, this.model);
+    this.project(region);
 
     // ── uniforms ──
     const u = this._u; u.fill(0);
@@ -736,23 +828,14 @@ export class CartridgeViewer {
     u.set(this.model, 16);
     const body = spec.bodyColor, label = spec.labelColor;
     // For billboards bodyColor.a is the fade opacity; for the cartridge/box meshes keep the spec's alpha.
-    u.set([body[0], body[1], body[2], isBillboard ? fade : body[3]], 32);
-    u.set([label[0], label[1], label[2], label[3]], 36);
-    u.set([0.4, 0.7, 0.6, thumb ? 1 : 0], 40); // light dir (xyz) + useThumb (w)
-    u.set(thumb ? [thumb.u0, thumb.v0, thumb.u1, thumb.v1] : [0, 0, 1, 1], 44); // uvRect
-    const side = spec.sideColor ?? [1, 1, 1, 1];
-    u.set([side[0], side[1], side[2], side[3]], 48); // sideColor (billboard)
+    this.set4(32, body[0], body[1], body[2], isBillboard ? fade : body[3]);
+    this.set4(36, label[0], label[1], label[2], label[3]);
+    this.set4(40, 0.4, 0.7, 0.6, thumb ? 1 : 0); // light dir (xyz) + useThumb (w)
+    this.setUV(44, thumb); // uvRect
+    const side = spec.sideColor;
+    if (side) this.set4(48, side[0], side[1], side[2], side[3]); else this.set4(48, 1, 1, 1, 1); // sideColor (billboard)
     this.device.queue.writeBuffer(this.uniformBuf, 0, u);
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
-      depthStencilAttachment: {
-        view: this.depthView,
-        depthClearValue: 1.0,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'discard',   // UI-16: nothing re-loads the hero depth (every pass clears its own)
-      },
-    });
     // Constrain to the top viewer region. Viewport y is from the top in WebGPU.
     pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
     pass.setPipeline(isCD ? this.cdPipeline : (isBillboard ? this.billboardPipeline : this.pipeline));
@@ -761,103 +844,65 @@ export class CartridgeViewer {
     pass.setVertexBuffer(0, mesh.vbuf);
     pass.setIndexBuffer(mesh.ibuf, mesh.format);
     pass.drawIndexed(mesh.count);
-    pass.end();
   }
 
   /**
    * Loading placeholder for the hero slot: 3 dots that hop up/down, staggered, while the host logo image loads.
    * Drawn with the disc mesh (a dot, front-on), solid-coloured (no texture), one per disc-uniform-pool slot so all
-   * three draw in a single encoder. The host swaps back to the real hero the moment the logo is ready (see
-   * ShellUIManager) — this is what replaces the white-card flash.
+   * three draw in the caller's pass (sharing its depth). The host swaps back to the real hero the
+   * moment the logo is ready (see ShellUIManager) — this is what replaces the white-card flash.
    */
   renderLoadingDots(
-    encoder: GPUCommandEncoder,
-    colorView: GPUTextureView,
-    canvasW: number,
-    canvasH: number,
-    region: { x: number; y: number; w: number; h: number },
+    pass: GPURenderPassEncoder,
+    region: ViewerRegion,
     timeSec: number,
     color: [number, number, number, number],
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
-    this.ensureDepth(canvasW, canvasH);
-    if (!this.depthView) return;
-    const aspect = region.w / region.h;
-    mat4.perspective(this.proj, 35 * Math.PI / 180, aspect, 0.1, 100);
-    mat4.lookAt(this.view, [0, 0, 6.5], [0, 0, 0], [0, 1, 0]);
     const N = Math.min(3, this.discUniformBufs.length);
-    // Use the TOP slots of the disc uniform pool (24 slots) — coins/tiles take the low indices, so these never
-    // collide with a hovered-tile coin drawn in the same encoder.
+    // Use the TOP slots of the disc uniform pool — coins/tiles take the low indices, so these never
+    // collide with a hovered-tile coin drawn in the same frame.
     const base = this.discUniformBufs.length - N;
     const spacing = 0.95, dotScale = 0.26, amp = 0.42, speed = 6.5, stagger = 0.5;   // stagger ≈ a ~50ms phase lag between dots
+    pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
+    pass.setPipeline(this.discPipeline);
+    pass.setBindGroup(1, this.thumbBindGroup);
+    pass.setVertexBuffer(0, this.disc.vbuf);
+    pass.setIndexBuffer(this.disc.ibuf, this.disc.format);
     for (let i = 0; i < N; i++) {
       const slot = base + i;
       const hop = Math.abs(Math.sin(timeSec * speed - i * stagger)) * amp;           // 0→amp→0 bounce, per-dot phase
       mat4.identity(this.model);
-      mat4.translate(this.model, this.model, [(i - 1) * spacing, hop - 0.30, 0]);
-      mat4.scale(this.model, this.model, [dotScale, dotScale, dotScale]);
-      mat4.multiply(this.mvp, this.proj, this.view);
-      mat4.multiply(this.mvp, this.mvp, this.model);
+      this.translate((i - 1) * spacing, hop - 0.30, 0);
+      this.scale(dotScale, dotScale, dotScale);
+      this.project(region);
       const u = this._u; u.fill(0);
       u.set(this.mvp, 0);
       u.set(this.model, 16);
       u.set(color, 32);                       // dot body colour
       u.set(color, 36);                       // label (unused — no thumb)
-      u.set([0.3, 0.6, 0.7, 0], 40);          // light dir + useThumb = 0 (solid colour, no texture)
-      u.set([0, 0, 1, 1], 44);
+      this.set4(40, 0.3, 0.6, 0.7, 0);        // light dir + useThumb = 0 (solid colour, no texture)
+      this.set4(44, 0, 0, 1, 1);
       this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
-        depthStencilAttachment: { view: this.depthView, depthClearValue: 1.0, depthLoadOp: i === 0 ? 'clear' : 'load', depthStoreOp: i === N - 1 ? 'discard' : 'store' },   // UI-16: only the next dot loads it
-      });
-      pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
-      pass.setPipeline(this.discPipeline);
       pass.setBindGroup(0, this.discBindGroups[slot]);
-      pass.setBindGroup(1, this.thumbBindGroup);
-      pass.setVertexBuffer(0, this.disc.vbuf);
-      pass.setIndexBuffer(this.disc.ibuf, this.disc.format);
       pass.drawIndexed(this.disc.count);
-      pass.end();
     }
   }
 
   /**
-   * Draw a system-app coin into a tile's screen region (own depth pass, over
-   * the already-composited 2D tiles). `iconRect` is the icon's atlas UV rect
-   * (or null → no icon). `slot` indexes the per-disc uniform pool.
+   * Draw a system-app coin into a tile's screen region, inside the caller's render pass (over the already-drawn 2D
+   * tiles). `iconRect` is the icon's atlas UV rect (or null → no icon). `slot` indexes the
+   * per-disc uniform pool. Leaves the pass viewport set to `region`.
    */
-  /** Open ONE render pass for a batch of per-tile 3D draws (coins / CDs / billboards): color LOADED (over the 2D
-   *  grid), depth CLEARED once. Pass the returned encoder to drawDisc/drawCD/drawBillboard so they share it instead
-   *  of each opening their own pass + full-canvas depth clear. Caller must `.end()` it. Null if depth isn't ready. */
-  beginTileBatch(encoder: GPUCommandEncoder, colorView: GPUTextureView, canvasW: number, canvasH: number): GPURenderPassEncoder | null {
-    this.ensureDepth(canvasW, canvasH);
-    return this.openTilePass(encoder, colorView);
-  }
-  /** A single-draw fallback pass (depth CLEARED) — used when a draw is called without a shared batch pass. */
-  private openTilePass(encoder: GPUCommandEncoder, colorView: GPUTextureView): GPURenderPassEncoder | null {
-    if (!this.depthView) return null;
-    return encoder.beginRenderPass({
-      colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
-      // UI-16: depth is cleared here and never loaded by a later pass → discard (no depth write-back to memory).
-      depthStencilAttachment: { view: this.depthView, depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
-    });
-  }
-
   drawDisc(
-    encoder: GPUCommandEncoder,
-    colorView: GPUTextureView,
-    canvasW: number,
-    canvasH: number,
-    region: { x: number; y: number; w: number; h: number },
-    iconRect: { u0: number; v0: number; u1: number; v1: number } | null,
+    pass: GPURenderPassEncoder,
+    region: ViewerRegion,
+    iconRect: UV | null,
     timeSec: number,
     slot: number,
-    batchPass?: GPURenderPassEncoder,
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
     if (slot >= this.discUniformBufs.length) { this.warnPoolFull(); return; }
-    if (!batchPass) this.ensureDepth(canvasW, canvasH);
-    if (!this.depthView) return;
 
     const phase = slot * 2.1;
     const tilt = -22 * Math.PI / 180;                    // look down at the coin
@@ -865,58 +910,44 @@ export class CartridgeViewer {
     const bob = Math.sin(timeSec * 1.0 + phase) * 0.07;
 
     mat4.identity(this.model);
-    mat4.translate(this.model, this.model, [0, bob, 0]);
+    this.translate(0, bob, 0);
     mat4.rotateX(this.model, this.model, tilt);
     mat4.rotateY(this.model, this.model, sway);
-    mat4.scale(this.model, this.model, [1.7, 1.7, 1.7]);
-
-    const aspect = region.w / region.h;
-    mat4.perspective(this.proj, 35 * Math.PI / 180, aspect, 0.1, 100);
-    mat4.lookAt(this.view, [0, 0, 6.5], [0, 0, 0], [0, 1, 0]);
-    mat4.multiply(this.mvp, this.proj, this.view);
-    mat4.multiply(this.mvp, this.mvp, this.model);
+    this.scale(1.7, 1.7, 1.7);
+    this.project(region);
 
     const u = this._u; u.fill(0);
     u.set(this.mvp, 0);
     u.set(this.model, 16);
-    u.set([0.13, 0.13, 0.16, 1], 32);             // dark coin body
-    u.set([0.9, 0.9, 0.95, 1], 36);               // label (unused — icon via thumb)
-    u.set([0.3, 0.6, 0.7, iconRect ? 1 : 0], 40); // light dir + useThumb
-    u.set(iconRect ? [iconRect.u0, iconRect.v0, iconRect.u1, iconRect.v1] : [0, 0, 1, 1], 44);
+    this.set4(32, 0.13, 0.13, 0.16, 1);             // dark coin body
+    this.set4(36, 0.9, 0.9, 0.95, 1);               // label (unused — icon via thumb)
+    this.set4(40, 0.3, 0.6, 0.7, iconRect ? 1 : 0); // light dir + useThumb
+    this.setUV(44, iconRect);
     this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
 
-    const p = batchPass ?? this.openTilePass(encoder, colorView);
-    if (!p) return;
-    p.setViewport(region.x, region.y, region.w, region.h, 0, 1);
-    p.setPipeline(this.discPipeline);
-    p.setBindGroup(0, this.discBindGroups[slot]);
-    p.setBindGroup(1, this.thumbBindGroup);
-    p.setVertexBuffer(0, this.disc.vbuf);
-    p.setIndexBuffer(this.disc.ibuf, this.disc.format);
-    p.drawIndexed(this.disc.count);
-    if (!batchPass) p.end();
+    pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
+    pass.setPipeline(this.discPipeline);
+    pass.setBindGroup(0, this.discBindGroups[slot]);
+    pass.setBindGroup(1, this.thumbBindGroup);
+    pass.setVertexBuffer(0, this.disc.vbuf);
+    pass.setIndexBuffer(this.disc.ibuf, this.disc.format);
+    pass.drawIndexed(this.disc.count);
   }
 
   /**
-   * Draw a FrogCart CD (iridescent annulus) into a tile's screen rect — own
-   * depth pass, over the 2D tiles. `cover` is the cover-art atlas rect (Phase 2;
-   * null = holographic only). `slot` indexes the shared per-draw uniform pool.
+   * Draw a FrogCart CD (iridescent annulus) into a tile's screen rect, inside the caller's render pass (over the 2D
+   * tiles). `cover` is the cover-art atlas rect (Phase 2; null = holographic only). `slot` indexes
+   * the shared per-draw uniform pool.
    */
   drawCD(
-    encoder: GPUCommandEncoder,
-    colorView: GPUTextureView,
-    canvasW: number,
-    canvasH: number,
-    region: { x: number; y: number; w: number; h: number },
-    cover: { u0: number; v0: number; u1: number; v1: number } | null,
+    pass: GPURenderPassEncoder,
+    region: ViewerRegion,
+    cover: UV | null,
     timeSec: number,
     slot: number,
-    batchPass?: GPURenderPassEncoder,
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
     if (slot >= this.discUniformBufs.length) { this.warnPoolFull(); return; }
-    if (!batchPass) this.ensureDepth(canvasW, canvasH);
-    if (!this.depthView) return;
 
     const phase = slot * 1.7;
     const tilt = -26 * Math.PI / 180;                  // see the face + the sheen
@@ -924,62 +955,48 @@ export class CartridgeViewer {
     const bob = Math.sin(timeSec * 1.1 + phase) * 0.06;
 
     mat4.identity(this.model);
-    mat4.translate(this.model, this.model, [0, bob, 0]);
+    this.translate(0, bob, 0);
     mat4.rotateX(this.model, this.model, tilt);
     mat4.rotateY(this.model, this.model, spin);
-    mat4.scale(this.model, this.model, [1.75, 1.75, 1.75]);
-
-    const aspect = region.w / region.h;
-    mat4.perspective(this.proj, 35 * Math.PI / 180, aspect, 0.1, 100);
-    mat4.lookAt(this.view, [0, 0, 6.5], [0, 0, 0], [0, 1, 0]);
-    mat4.multiply(this.mvp, this.proj, this.view);
-    mat4.multiply(this.mvp, this.mvp, this.model);
+    this.scale(1.75, 1.75, 1.75);
+    this.project(region);
 
     const u = this._u; u.fill(0);
     u.set(this.mvp, 0);
     u.set(this.model, 16);
-    u.set([0.72, 0.74, 0.80, 1], 32);                  // chrome silver base
-    u.set([0.9, 0.9, 0.95, 1], 36);                    // (label unused)
-    u.set([0.3, 0.6, 0.7, cover ? 1 : 0], 40);         // w = use cover art
-    u.set(cover ? [cover.u0, cover.v0, cover.u1, cover.v1] : [0, 0, 1, 1], 44);
+    this.set4(32, 0.72, 0.74, 0.80, 1);                // chrome silver base
+    this.set4(36, 0.9, 0.9, 0.95, 1);                  // (label unused)
+    this.set4(40, 0.3, 0.6, 0.7, cover ? 1 : 0);       // w = use cover art
+    this.setUV(44, cover);
     this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
 
-    const p = batchPass ?? this.openTilePass(encoder, colorView);
-    if (!p) return;
-    p.setViewport(region.x, region.y, region.w, region.h, 0, 1);
-    p.setPipeline(this.cdPipeline);
-    p.setBindGroup(0, this.discBindGroups[slot]);
-    p.setBindGroup(1, this.thumbBindGroup);
-    p.setVertexBuffer(0, this.cd.vbuf);
-    p.setIndexBuffer(this.cd.ibuf, this.cd.format);
-    p.drawIndexed(this.cd.count);
-    if (!batchPass) p.end();
+    pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
+    pass.setPipeline(this.cdPipeline);
+    pass.setBindGroup(0, this.discBindGroups[slot]);
+    pass.setBindGroup(1, this.thumbBindGroup);
+    pass.setVertexBuffer(0, this.cd.vbuf);
+    pass.setIndexBuffer(this.cd.ibuf, this.cd.format);
+    pass.drawIndexed(this.cd.count);
   }
 
   /**
    * Draw a Billboard3D cutout (a system-app icon shape) into a tile's screen
    * rect — a small spinning 3D cutout, like a mini hero logo (Install Cart =
-   * download arrow). `iconRect` is the icon's atlas UV rect (sampled on the
-   * faces). `slot` indexes the shared per-draw uniform pool.
+   * download arrow) — inside the caller's render pass. `iconRect` is the icon's atlas UV rect
+   * (sampled on the faces). `slot` indexes the shared per-draw uniform pool.
    */
   drawBillboard(
-    encoder: GPUCommandEncoder,
-    colorView: GPUTextureView,
-    canvasW: number,
-    canvasH: number,
-    region: { x: number; y: number; w: number; h: number },
+    pass: GPURenderPassEncoder,
+    region: ViewerRegion,
     key: string,
-    iconRect: { u0: number; v0: number; u1: number; v1: number } | null,
+    iconRect: UV | null,
     timeSec: number,
     slot: number,
-    sideColor: [number, number, number, number] = [1, 1, 1, 1],
+    sideColor: readonly [number, number, number, number] = WHITE,
     swayOnly = false,
-    batchPass?: GPURenderPassEncoder,
   ): void {
     const mesh = this.billboards.get(key);
     if (!mesh || region.w <= 0 || region.h <= 0 || slot >= this.discUniformBufs.length) { if (slot >= this.discUniformBufs.length) this.warnPoolFull(); return; }
-    if (!batchPass) this.ensureDepth(canvasW, canvasH);
-    if (!this.depthView) return;
 
     const phase = slot * 1.4;
     const tilt = -8 * Math.PI / 180;
@@ -989,37 +1006,29 @@ export class CartridgeViewer {
     const bob = Math.sin(timeSec * Math.PI + phase) * 0.07;
 
     mat4.identity(this.model);
-    mat4.translate(this.model, this.model, [0, bob, 0]);
+    this.translate(0, bob, 0);
     mat4.rotateX(this.model, this.model, tilt);
     mat4.rotateY(this.model, this.model, spin);
-    mat4.scale(this.model, this.model, [3.25, 3.25, 3.25]); // cutouts read smaller → scale up
-
-    const aspect = region.w / region.h;
-    mat4.perspective(this.proj, 35 * Math.PI / 180, aspect, 0.1, 100);
-    mat4.lookAt(this.view, [0, 0, 6.5], [0, 0, 0], [0, 1, 0]);
-    mat4.multiply(this.mvp, this.proj, this.view);
-    mat4.multiply(this.mvp, this.mvp, this.model);
+    this.scale(3.25, 3.25, 3.25); // cutouts read smaller → scale up
+    this.project(region);
 
     const u = this._u; u.fill(0);
     u.set(this.mvp, 0);
     u.set(this.model, 16);
-    u.set([0.14, 0.14, 0.17, 1], 32);              // body (unused by cutout faces)
-    u.set([0.9, 0.9, 0.95, 1], 36);                // label
-    u.set([0.4, 0.7, 0.6, iconRect ? 1 : 0], 40);  // light dir + useThumb
-    u.set(iconRect ? [iconRect.u0, iconRect.v0, iconRect.u1, iconRect.v1] : [0, 0, 1, 1], 44);
-    u.set(sideColor, 48);                           // sideColor (themed cut edge / band)
+    this.set4(32, 0.14, 0.14, 0.17, 1);              // body (unused by cutout faces)
+    this.set4(36, 0.9, 0.9, 0.95, 1);                // label
+    this.set4(40, 0.4, 0.7, 0.6, iconRect ? 1 : 0);  // light dir + useThumb
+    this.setUV(44, iconRect);
+    this.set4(48, sideColor[0], sideColor[1], sideColor[2], sideColor[3]);   // sideColor (themed cut edge / band)
     this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
 
-    const p = batchPass ?? this.openTilePass(encoder, colorView);
-    if (!p) return;
-    p.setViewport(region.x, region.y, region.w, region.h, 0, 1);
-    p.setPipeline(this.billboardPipeline);
-    p.setBindGroup(0, this.discBindGroups[slot]);
-    p.setBindGroup(1, this.thumbBindGroup);
-    p.setVertexBuffer(0, mesh.vbuf);
-    p.setIndexBuffer(mesh.ibuf, mesh.format);
-    p.drawIndexed(mesh.count);
-    if (!batchPass) p.end();
+    pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
+    pass.setPipeline(this.billboardPipeline);
+    pass.setBindGroup(0, this.discBindGroups[slot]);
+    pass.setBindGroup(1, this.thumbBindGroup);
+    pass.setVertexBuffer(0, mesh.vbuf);
+    pass.setIndexBuffer(mesh.ibuf, mesh.format);
+    pass.drawIndexed(mesh.count);
   }
 
   destroy(): void {

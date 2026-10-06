@@ -36,6 +36,8 @@ export class GpuFrameTimer {
   private readonly _ring: { buf: GPUBuffer; busy: boolean }[] = [];
   private _used = 0;   // timestamps written this frame (2 per timed submission)
   private _origSubmit: GPUQueue['submit'] | null = null;
+  private _wrapper: GPUQueue['submit'] | null = null;   // our own-property wrapper on the queue
+  private _origWasOwn = false;                          // `orig` was itself another timer's wrapper (two timers on one queue)
   private _frameStart = 0;
   private _estimateBusy = false;
 
@@ -113,10 +115,11 @@ export class GpuFrameTimer {
     if (this._origSubmit) return;
     const q = dev.queue;
     const orig = q.submit;   // the prototype method (or whatever wrapper is already on it)
+    this._origWasOwn = Object.prototype.hasOwnProperty.call(q, 'submit');
     this._origSubmit = orig;
     this._used = 0;
     const qs = this._querySet;
-    (q as { submit: GPUQueue['submit'] }).submit = (cbs: Iterable<GPUCommandBuffer>): undefined => {
+    const wrapper = (cbs: Iterable<GPUCommandBuffer>): undefined => {
       if (!this._enabled || this._used + 2 > MAX_PAIRS * 2) return orig.call(q, cbs);
       const i = this._used;
       this._used += 2;
@@ -126,12 +129,22 @@ export class GpuFrameTimer {
       e.beginComputePass({ timestampWrites: { querySet: qs!, endOfPassWriteIndex: i + 1 } }).end();
       return orig.call(q, [b.finish(), ...cbs, e.finish()]);
     };
+    this._wrapper = wrapper;
+    (q as { submit: GPUQueue['submit'] }).submit = wrapper;
   }
 
   private _uninstall(): void {
     if (!this._origSubmit) return;
-    // Our wrapper is an OWN property of the queue object; deleting it restores the prototype's submit.
-    delete (this._device.queue as { submit?: unknown }).submit;
+    // Our wrapper is an OWN property of the queue object; deleting it restores the prototype's submit. Two timers can
+    // share a queue (the editor's + the Shell's ?shellperf HUD): if ours wraps another timer's wrapper, put THAT back
+    // instead of deleting it; if another wrapper sits on top of ours, leave the chain alone (ours passes straight
+    // through once disabled).
+    const q = this._device.queue as { submit?: unknown };
+    if (q.submit === this._wrapper) {
+      if (this._origWasOwn) q.submit = this._origSubmit;
+      else delete q.submit;
+    }
+    this._wrapper = null;
     this._origSubmit = null;
     this._used = 0;
   }

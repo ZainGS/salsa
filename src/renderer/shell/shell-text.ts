@@ -8,8 +8,16 @@
  * texture atlas, and sample that atlas in ShellRenderer's textured-quad pass.
  *
  * Each request carries its own font size, so different sizes coexist in one
- * atlas. The atlas rebuilds only when the set of (text, width, size) changes.
+ * atlas. The atlas is ADDITIVE (shell-label-pack.ts): a packed label keeps its
+ * cell, and only labels that are new get measured, rasterized and uploaded
+ * (just their rows). A full repack happens on the first build, after
+ * `invalidate()` and when the shelf runs out of room.
+ *
+ * The texture is r8unorm holding the glyph COVERAGE: the text is drawn white, so
+ * the canvas's premultiplied red channel equals its alpha; the label shader
+ * samples `.r`. (A quarter of the rgba8 upload + memory.)
  */
+import { LabelShelfPacker, labelKey, missingLabelKeys, atlasAllocHeight } from './shell-label-pack';
 
 /** UV + pixel-size record for one rasterized label. */
 export interface LabelEntry {
@@ -19,13 +27,33 @@ export interface LabelEntry {
 }
 
 const ATLAS_WIDTH = 2048;
+/** Supersample: rasterize at SS× the requested size, then report the LOGICAL size (÷ SS) so the on-screen quad is
+ *  unchanged but samples a denser texture → crisp labels (was 1:1 + linear = soft/blurry). */
+const SS = 3;
+/** The atlas height is allocated in steps of this many rows, so a few new labels don't resize the texture. */
+const ALLOC_STEP = 512;
+/** Labels accumulate (stale ones included) up to this height; past it the atlas repacks with the current set only. */
+const ACCUMULATE_MAX_H = 4096;
+
+export interface LabelRequest { text: string; maxWidthPx: number; fontPx: number; fontFamily?: string; scaleX?: number; scaleY?: number }
+type Req = { text: string; maxWidthPx: number; fontPx: number; fontFamily: string; scaleX: number; scaleY: number };
+type Placed = { key: string; text: string; w: number; h: number; padX: number; font: string; sx: number; sy: number; x: number; y: number };
 
 export class ShellLabelAtlas {
   private device: GPUDevice;
   private texture: GPUTexture | null = null;
   private size: [number, number] = [ATLAS_WIDTH, 1];
   private entries = new Map<string, LabelEntry>();
-  private signature = '';
+  /** Cells as packed (atlas px), for the "would it still fit" dry run. */
+  private cells = new Map<string, { w: number; h: number }>();
+  /** The request behind every packed label (to re-rasterize them when the texture grows). */
+  private reqs = new Map<string, Req>();
+  private packer = new LabelShelfPacker(ATLAS_WIDTH);
+  private dirtyAll = true;
+  private _version = 0;
+  /** Counters for the perf HUD / tests: labels rasterized, full repacks. */
+  rasterCount = 0;
+  repackCount = 0;
 
   private canvas = new OffscreenCanvas(ATLAS_WIDTH, 1);
   private c2d: OffscreenCanvasRenderingContext2D;
@@ -38,74 +66,117 @@ export class ShellLabelAtlas {
   /** The atlas GPU texture (null until `build` runs at least once). */
   getTexture(): GPUTexture | null { return this.texture; }
   getSize(): [number, number] { return this.size; }
+  /** Bumped whenever an entry or the texture changes (callers re-resolve their cached entries). */
+  get version(): number { return this._version; }
 
-  /** Force the next `build` to re-rasterize (e.g. after a web font loads). */
-  invalidate(): void { this.signature = ''; }
+  /** Force the next `build` to re-rasterize everything (e.g. after a web font loads). */
+  invalidate(): void { this.dirtyAll = true; this._version++; }
 
   /** Look up a label's atlas record. Returns null if it isn't packed.
    *  `fontFamily` must be the resolved family used at build time. */
   get(text: string, maxWidthPx: number, fontPx: number, fontFamily: string, scaleX = 1, scaleY = 1): LabelEntry | null {
-    return this.entries.get(this.key(text, maxWidthPx, fontPx, fontFamily, scaleX, scaleY)) ?? null;
-  }
-
-  private key(text: string, maxWidthPx: number, fontPx: number, fontFamily: string, scaleX = 1, scaleY = 1): string {
-    return `${text}|${Math.round(maxWidthPx)}|${Math.round(fontPx)}|${fontFamily}|${scaleX.toFixed(2)}|${scaleY.toFixed(2)}`;
+    return this.entries.get(labelKey(text, maxWidthPx, fontPx, fontFamily, scaleX, scaleY)) ?? null;
   }
 
   /**
-   * Rebuild the atlas for the given labels if the set changed. Each request
-   * carries its own `fontPx`, so tile labels, a big title, and small badges
-   * coexist in one atlas. Rows have variable height.
+   * Make sure every requested label is packed. Each request carries its own
+   * `fontPx`, so tile labels, a big title, and small badges coexist in one
+   * atlas. Rows have variable height. Labels packed by an earlier call stay
+   * (additive); only the missing ones are rasterized.
    */
-  build(
-    requests: { text: string; maxWidthPx: number; fontPx: number; fontFamily?: string; scaleX?: number; scaleY?: number }[],
-    defaultFontFamily: string,
-  ): void {
-    type Req = { text: string; maxWidthPx: number; fontPx: number; fontFamily: string; scaleX: number; scaleY: number };
+  build(requests: readonly LabelRequest[], defaultFontFamily: string): void {
     const uniq = new Map<string, Req>();
     for (const r of requests) {
       if (!r.text) continue;
       const sx = r.scaleX ?? 1, sy = r.scaleY ?? 1;
       const fam = r.fontFamily ?? defaultFontFamily;
-      uniq.set(this.key(r.text, r.maxWidthPx, r.fontPx, fam, sx, sy),
+      uniq.set(labelKey(r.text, r.maxWidthPx, r.fontPx, fam, sx, sy),
         { text: r.text, maxWidthPx: r.maxWidthPx, fontPx: r.fontPx, fontFamily: fam, scaleX: sx, scaleY: sy });
     }
-    const sig = `${defaultFontFamily}|` + [...uniq.keys()].sort().join('~');
-    if (sig === this.signature && this.texture) return;
-    this.signature = sig;
+    const maxH = this.device.limits?.maxTextureDimension2D ?? 8192;
 
-    // Shelf-pack with per-request font + variable row height.
-    type Placed = { key: string; text: string; w: number; h: number; padX: number; font: string; sx: number; sy: number; x: number; y: number };
-    const placed: Placed[] = [];
-    // Supersample: rasterize at SS× the requested size, then report the LOGICAL size (÷ SS) so the on-screen
-    // quad is unchanged but samples a denser texture → crisp labels (was 1:1 + linear = soft/blurry).
-    const SS = 3;
-    let cx = 0, cy = 0, rowMax = 0;
-    for (const [key, r] of uniq) {
-      const fpx = r.fontPx * SS;
-      const font = `400 ${fpx}px ${r.fontFamily}`;
-      this.c2d.font = font;
-      const lineH = Math.ceil(fpx * 1.4 * r.scaleY);   // taller/shorter row
-      const padX = Math.ceil(fpx * 0.3);
-      const text = this.truncate(r.text, r.maxWidthPx * SS);   // maxWidth is logical → compare at the SS× font
-      const w = Math.ceil(this.c2d.measureText(text).width * r.scaleX) + padX * 2;
-      if (cx + w > ATLAS_WIDTH) { cx = 0; cy += rowMax; rowMax = 0; }
-      placed.push({ key, text, w, h: lineH, padX, font, sx: r.scaleX, sy: r.scaleY, x: cx, y: cy });
-      cx += w;
-      rowMax = Math.max(rowMax, lineH);
+    if (!this.dirtyAll && this.texture) {
+      const missing = missingLabelKeys(uniq.keys(), k => this.entries.has(k));
+      if (missing.length === 0) return;
+      // Additive: place the new labels after the existing ones, if they fit the allocated texture.
+      const snap = this.packer.snapshot();
+      const placed: Placed[] = [];
+      for (const key of missing) placed.push(this.measureAndPlace(key, uniq.get(key)!));
+      if (this.packer.height <= this.size[1]) {
+        this.raster(placed, false);
+        return;
+      }
+      // Out of rows: undo the trial placement. Grow (keeping every packed label) while that stays under the
+      // accumulation cap; otherwise repack with the current set only (stale labels are dropped).
+      this.packer.restore(snap);
+      for (const key of missing) this.reqs.delete(key);
+      const cap = Math.min(maxH, ACCUMULATE_MAX_H);
+      if (this.fitsAccumulated(uniq, cap)) {
+        const keep = new Map<string, Req>(this.reqs);
+        for (const [k, r] of uniq) keep.set(k, r);
+        this.rebuildAll(keep, cap, this.size[1] * 2);   // grow geometrically: few regrows as labels accumulate
+        return;
+      }
     }
+    this.rebuildAll(uniq, maxH);
+  }
+
+  /** Would the packed labels + `extra` fit in `capH` rows? (A dry run of the shelf packer.) */
+  private fitsAccumulated(extra: Map<string, Req>, capH: number): boolean {
+    const dry = new LabelShelfPacker(ATLAS_WIDTH);
+    for (const c of this.cells.values()) dry.place(c.w, c.h);
+    for (const [k, r] of extra) {
+      if (this.cells.has(k)) continue;
+      const m = this.measure(r);
+      dry.place(m.w, m.h);
+    }
+    return dry.height <= capH;
+  }
+
+  private measure(r: Req): { text: string; w: number; h: number; padX: number; font: string } {
+    const fpx = r.fontPx * SS;
+    const font = `400 ${fpx}px ${r.fontFamily}`;
+    this.c2d.font = font;
+    const lineH = Math.ceil(fpx * 1.4 * r.scaleY);   // taller/shorter row
+    const padX = Math.ceil(fpx * 0.3);
+    const text = this.truncate(r.text, r.maxWidthPx * SS);   // maxWidth is logical → compare at the SS× font
+    const w = Math.ceil(this.c2d.measureText(text).width * r.scaleX) + padX * 2;
+    return { text, w, h: lineH, padX, font };
+  }
+
+  private measureAndPlace(key: string, r: Req): Placed {
+    const m = this.measure(r);
+    const at = this.packer.place(m.w, m.h);
+    this.reqs.set(key, r);
+    return { key, text: m.text, w: m.w, h: m.h, padX: m.padX, font: m.font, sx: r.scaleX, sy: r.scaleY, x: at.x, y: at.y };
+  }
+
+  /** Repack + re-rasterize exactly `set` (drops every other label). `minH` = allocate at least this many rows. */
+  private rebuildAll(set: Map<string, Req>, maxH: number, minH = 0): void {
+    this.packer.reset();
+    this.reqs = new Map();
+    this.cells.clear();
+    this.entries.clear();
+    const placed: Placed[] = [];
+    for (const [key, r] of set) placed.push(this.measureAndPlace(key, r));
     // Clamp to the device's max texture dimension — a very long label list could otherwise exceed it and throw
     // unguarded in createTexture. (Labels past the clamp get clipped rather than crashing the whole shell.)
-    const maxH = this.device.limits?.maxTextureDimension2D ?? 8192;
-    const atlasH = Math.max(1, Math.min(cy + rowMax, maxH));
-
-    if (this.canvas.height !== atlasH) this.canvas.height = atlasH;
+    const atlasH = atlasAllocHeight(Math.max(this.packer.height, minH), ALLOC_STEP, maxH);
+    if (this.canvas.height !== atlasH) this.canvas.height = atlasH;   // (a resize clears the canvas)
     this.c2d.clearRect(0, 0, ATLAS_WIDTH, atlasH);
+    this.ensureTexture(ATLAS_WIDTH, atlasH);
+    this.dirtyAll = false;
+    this.repackCount++;
+    this.raster(placed, true);
+  }
+
+  /** Draw `placed` into the canvas, record their entries and upload the rows they touch (or everything). */
+  private raster(placed: Placed[], all: boolean): void {
+    const atlasH = this.size[1];
     this.c2d.textBaseline = 'middle';
     this.c2d.textAlign = 'left';
     this.c2d.fillStyle = '#ffffff';
-
-    this.entries.clear();
+    let y0 = Infinity, y1 = 0;
     for (const p of placed) {
       this.c2d.font = p.font;             // per-label size (also re-set after resize)
       if (p.sx !== 1 || p.sy !== 1) {
@@ -118,6 +189,7 @@ export class ShellLabelAtlas {
       } else {
         this.c2d.fillText(p.text, p.x + p.padX, p.y + p.h / 2);
       }
+      this.cells.set(p.key, { w: p.w, h: p.h });
       this.entries.set(p.key, {
         u0: p.x / ATLAS_WIDTH,
         v0: p.y / atlasH,
@@ -126,9 +198,12 @@ export class ShellLabelAtlas {
         wPx: p.w / SS,   // report the LOGICAL (on-screen) size; the UVs above point at the SS× texels
         hPx: p.h / SS,
       });
+      y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y + p.h);
     }
-
-    this.uploadTexture(ATLAS_WIDTH, atlasH);
+    this.rasterCount += placed.length;
+    this._version++;
+    if (all) this.upload(0, atlasH);
+    else if (y1 > y0) this.upload(Math.max(0, Math.floor(y0)), Math.min(atlasH, Math.ceil(y1)));
   }
 
   /** Truncate `text` with an ellipsis so it fits within `maxWidthPx` (font
@@ -145,7 +220,7 @@ export class ShellLabelAtlas {
     return lo > 0 ? text.slice(0, lo) + ell : ell;
   }
 
-  private uploadTexture(w: number, h: number): void {
+  private ensureTexture(w: number, h: number): void {
     if (this.texture && (this.size[0] !== w || this.size[1] !== h)) {
       this.texture.destroy();
       this.texture = null;
@@ -154,16 +229,21 @@ export class ShellLabelAtlas {
       this.texture = this.device.createTexture({
         label: 'ShellLabelAtlas',
         size: { width: w, height: h },
-        format: 'rgba8unorm',
+        format: 'r8unorm',   // coverage only (see the file header)
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
       });
-      this.size = [w, h];
     }
-    const bitmap = this.canvas.transferToImageBitmap();
+    this.size = [w, h];
+  }
+
+  /** Upload canvas rows [y0, y1) to the texture. The canvas keeps its pixels (no transferToImageBitmap), which is
+   *  what lets a later build add labels without redrawing the old ones. premultipliedAlpha → red = coverage. */
+  private upload(y0: number, y1: number): void {
+    if (!this.texture || y1 <= y0) return;
     this.device.queue.copyExternalImageToTexture(
-      { source: bitmap },
-      { texture: this.texture },
-      { width: w, height: h },
+      { source: this.canvas, origin: { x: 0, y: y0 } },
+      { texture: this.texture, origin: { x: 0, y: y0 }, premultipliedAlpha: true },
+      { width: this.size[0], height: y1 - y0 },
     );
   }
 
@@ -171,5 +251,9 @@ export class ShellLabelAtlas {
     this.texture?.destroy();
     this.texture = null;
     this.entries.clear();
+    this.cells.clear();
+    this.reqs.clear();
+    this.packer.reset();
+    this.dirtyAll = true;
   }
 }
