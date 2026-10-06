@@ -201,6 +201,21 @@ export function legPoint(leg: Leg, s: number, out: { x: number; z: number; hx: n
     out.hx = (b[0] - a[0]) / sl; out.hz = (b[1] - a[1]) / sl; out.seg = i;
 }
 
+/** Closest point of a leg's polyline to (x, z): its leg distance `s` and the lateral distance `lat` to it. The car
+ *  ticker places an obstacle (the Play player) in a car's lane corridor with it. Allocation-free. */
+export function legProject(leg: Leg, x: number, z: number, out: { s: number; lat: number }): void {
+    let best = Infinity, bs = 0;
+    for (let i = 0; i < leg.pts.length - 1; i++) {
+        const a = leg.pts[i], b = leg.pts[i + 1], sl = leg.cum[i + 1] - leg.cum[i];
+        if (sl <= 1e-9) continue;
+        const ux = (b[0] - a[0]) / sl, uz = (b[1] - a[1]) / sl;
+        const t = Math.max(0, Math.min(sl, (x - a[0]) * ux + (z - a[1]) * uz));
+        const d = Math.hypot(x - a[0] - ux * t, z - a[1] - uz * t);
+        if (d < best) { best = d; bs = leg.cum[i] + t; }
+    }
+    out.s = bs; out.lat = best;
+}
+
 /** Junction mouth for a vehicle at a node: the kerb corner, or nothing at a straight pass-through / dead end. */
 function carMouth(net: RoadNet, n: number): number {
     const A = net.nodes[n].arms;

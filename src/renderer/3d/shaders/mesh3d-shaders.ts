@@ -2682,8 +2682,9 @@ struct MeshInstance {
   normalMatrix:   mat4x4<f32>,    // 64 bytes  (inverse-transpose of model for normals)
   diffuseColor:   vec4<f32>,      // 16 bytes  (r,g,b,a)
   specularColor:  vec4<f32>,      // 16 bytes  (r,g,b, shininess in .a)
-  emissiveColor:  vec4<f32>,      // 16 bytes  (r,g,b, flags in .a)
-  // flags.a: bit0 = hasTexture, bit1 = hasNormalMap, bits2-3 = renderStyle
+  emissive:       vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:          u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
+  // flags: bit0 = hasTexture, bit1 = hasNormalMap, bits2-4 = renderStyle (material-3d.ts encodeMaterialFlags)
   textureIndex:   u32,            //  4 bytes  layer index into diffuse texture_2d_array
   normalMapIndex: u32,            //  4 bytes  layer index into normal map texture_2d_array
   roughness:      f32,            //  4 bytes  PBR roughness (0 = mirror, 1 = rough)
@@ -2800,7 +2801,7 @@ fn vs_main(
   //    so each instanced copy bends about its own base. Phase is hashed from the model matrix's world
   //    translation (per-instance, no extra data). See foliageWindOffset / foliage-quality.md S1.
   var localPos = in.position;
-  let vFlags = bitcast<u32>(inst.emissiveColor.a);
+  let vFlags = inst.flags;
   if ((vFlags & 524288u) != 0u) {
     let originW = vec3<f32>(inst.modelMatrix[3].x, inst.modelMatrix[3].y, inst.modelMatrix[3].z);
     localPos = localPos + foliageWindOffset(in.position, originW,
@@ -2829,11 +2830,11 @@ fn vs_main(
   var lit = vDiffuse * scene.ambientColor.rgb * scene.ambientColor.a;
   let L = normalize(-scene.lightDirection.xyz);
   // SOFT LIGHTING (bit 28): wrap diffuse toward half-Lambert by scene.lightColor.w (no-op when the flag/strength is 0).
-  let softS = select(0.0, scene.lightColor.w, (bitcast<u32>(inst.emissiveColor.a) & 268435456u) != 0u);
+  let softS = select(0.0, scene.lightColor.w, (inst.flags & 268435456u) != 0u);
   let rawNdL = dot(worldNormal, L);
   let softNdL = mix(max(rawNdL, 0.0), rawNdL * 0.5 + 0.5, softS);
   // SKIN TOON-RAMP (bit 29): band the diffuse + warm the shadow (no-op when the flag is off). Applied AFTER soft.
-  let ramp = skinRamp(softNdL, bitcast<u32>(inst.emissiveColor.a), scene.skinRampParams);
+  let ramp = skinRamp(softNdL, inst.flags, scene.skinRampParams);
   lit += vDiffuse * ramp.rgb * scene.lightColor.rgb * scene.lightDirection.w * ramp.a;
   // Orthographic view = PARALLEL rays: use the constant camera forward (not a finite eye) so specular/fresnel/rim
   // don't wander as the ortho view pans/zooms. cameraPosition.w = 1 in ortho; forward = the depth-increasing
@@ -2843,8 +2844,8 @@ fn vs_main(
   let shininess = inst.specularColor.a;
   let spec = pow(max(dot(worldNormal, H), 0.0), max(shininess, 1.0));
   lit += inst.specularColor.rgb * scene.lightColor.rgb * spec;
-  lit += inst.emissiveColor.rgb * crowdK;
-  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
+  lit += inst.emissive * crowdK;
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (inst.flags & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = quantizeColor(lit, colorDepth); }
 
   // ── TBN for normal mapping ──────────────────────────────────
@@ -2882,7 +2883,8 @@ struct MeshInstance {
   normalMatrix:   mat4x4<f32>,
   diffuseColor:   vec4<f32>,
   specularColor:  vec4<f32>,
-  emissiveColor:  vec4<f32>,
+  emissive:       vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:          u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
   textureIndex:   u32,
   normalMapIndex: u32,
   roughness:      f32,
@@ -2979,7 +2981,7 @@ fn fs_main(
   @location(8)                    foliageY:     f32,
 ) -> @location(0) vec4<f32> {
   let inst        = u_instances[instanceIdx];
-  let flags       = bitcast<u32>(inst.emissiveColor.a);
+  let flags       = inst.flags;
   let hasTexture   = (flags & 1u) != 0u;
   let hasNormalMap = (flags & 2u) != 0u;
   let renderStyle  = (flags >> 2u) & 7u;
@@ -3566,7 +3568,8 @@ struct MeshInstance {
   normalMatrix:   mat4x4<f32>,
   diffuseColor:   vec4<f32>,
   specularColor:  vec4<f32>,
-  emissiveColor:  vec4<f32>,
+  emissive:       vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:          u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
   textureIndex:   u32,
   normalMapIndex: u32,
   roughness:      f32,
@@ -3644,7 +3647,7 @@ fn vs_main(
 
   // FOLIAGE WIND (bit 19) — same local-space, height-graded displacement as the main VS.
   var localPos = in.position;
-  let vFlags = bitcast<u32>(inst.emissiveColor.a);
+  let vFlags = inst.flags;
   if ((vFlags & 524288u) != 0u) {
     let originW = vec3<f32>(inst.modelMatrix[3].x, inst.modelMatrix[3].y, inst.modelMatrix[3].z);
     localPos = localPos + foliageWindOffset(in.position, originW,
@@ -3677,8 +3680,8 @@ fn vs_main(
   let shininess = inst.specularColor.a;
   let spec = pow(max(dot(worldNormal, H), 0.0), max(shininess, 1.0));
   lit += inst.specularColor.rgb * scene.lightColor.rgb * spec;
-  lit += inst.emissiveColor.rgb;
-  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
+  lit += inst.emissive;
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (inst.flags & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = vc_quantizeColor(lit, colorDepth); }
 
   let worldTangent3 = normalize((inst.normalMatrix * vec4<f32>(in.tangent.xyz, 0.0)).xyz);
@@ -3774,7 +3777,8 @@ struct MeshInstance {
   normalMatrix:   mat4x4<f32>,
   diffuseColor:   vec4<f32>,
   specularColor:  vec4<f32>,
-  emissiveColor:  vec4<f32>,
+  emissive:       vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:          u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
   textureIndex:   u32,
   normalMapIndex: u32,
   roughness:      f32,
@@ -3860,7 +3864,7 @@ fn fs_main(
   @location(8)                    foliageY:     f32,
 ) -> @location(0) vec4<f32> {
   let inst        = u_instances[instanceIdx];
-  let flags       = bitcast<u32>(inst.emissiveColor.a);
+  let flags       = inst.flags;
   let renderStyle = (flags >> 2u) & 7u;
   let rimEnabled  = (flags & 128u) != 0u;
   let toonOn      = (flags & 1073741824u) != 0u;   // bit 30 — toon shadows (Cel styles)
@@ -4538,7 +4542,7 @@ const PATTERN_BLOCK_FULL = /* wgsl */ `
   let gUvM = gr_uvMetres(uv, worldPos);
   let winAx = uvWorldAxes(uv, worldPos);                         // interior-mapping cell frame (uniform flow)
   var patBase = mix(inst.diffuseColor.rgb, inst.patternColor.rgb, patMask);
-  var emissiveRGB = inst.emissiveColor.rgb;
+  var emissiveRGB = inst.emissive;
   // CROWD PALETTE (flags2 bit 4, performance-plan P12): the per-vertex palette code tints the base + emissive.
   let crowdK = crowdTint(u32(inst.normalMatrix[3].x), uv, inst.patternColor.xyz);
   patBase = patBase * crowdK;
@@ -4546,7 +4550,7 @@ const PATTERN_BLOCK_FULL = /* wgsl */ `
   var roughOverride = inst.roughness;
   if (patMode == 6u && !fhSkip) {   // fog horizon: a fogged pixel needs no window interior
     let ws = windowShade(uv, inst.patternParams, winWL, worldPos, worldNormal, winAx, scene.cameraPosition.xyz,
-                         inst.diffuseColor.rgb, inst.patternColor.rgb, inst.emissiveColor.rgb, scene.ps1Config2.z, p8Fast, inst.patternColor.a);
+                         inst.diffuseColor.rgb, inst.patternColor.rgb, inst.emissive, scene.ps1Config2.z, p8Fast, inst.patternColor.a);
     patBase = ws.base;
     emissiveRGB = ws.emk;
   } else if (patMode == 7u) {
@@ -4556,7 +4560,7 @@ const PATTERN_BLOCK_FULL = /* wgsl */ `
       let adAsp = select(1.6, clamp(length(winAx.u) / max(length(winAx.v), 1e-12), 0.3, 6.0), dot(winAx.v, winAx.v) > 1e-24);
       let adC = adScreen(uv, gUvFw, adAsp, scene.ps1Config2.z);
       patBase = adC;
-      let adE = inst.emissiveColor.rgb / max(inst.diffuseColor.rgb, vec3<f32>(0.05));
+      let adE = inst.emissive / max(inst.diffuseColor.rgb, vec3<f32>(0.05));
       emissiveRGB = adC * max(adE.x, max(adE.y, adE.z)) * 0.9;
     } else {
       emissiveRGB = emissiveRGB * (0.3 + 1.5 * patMask);
@@ -4574,7 +4578,7 @@ const PATTERN_BLOCK_PLAIN = /* wgsl */ `
   let p8Fast = scene.cascadeBias.z > 0.5;
   let gUvFw = vec2<f32>(0.0, 0.0);
   var patBase = inst.diffuseColor.rgb;
-  var emissiveRGB = inst.emissiveColor.rgb;
+  var emissiveRGB = inst.emissive;
   // CROWD PALETTE (flags2 bit 4, performance-plan P12): the per-vertex palette code tints the base + emissive.
   let crowdK = crowdTint(u32(inst.normalMatrix[3].x), uv, inst.patternColor.xyz);
   patBase = patBase * crowdK;

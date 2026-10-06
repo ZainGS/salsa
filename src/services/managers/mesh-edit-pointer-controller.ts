@@ -26,6 +26,8 @@ export type MeshEditSelectionMode = 'vertex' | 'face' | 'edge';
 /** Radius (canvas device pixels) within which a vertex/edge midpoint counts as "hit". */
 const VERTEX_PICK_RADIUS_PX = 14;
 const EDGE_PICK_RADIUS_PX   = 10;
+/** TOUCH-8: vertex / edge pick radius multiplier under a finger. */
+const TOUCH_PICK_SCALE = 2;
 
 export class MeshEditPointerController {
   private _scene3d: Scene3DManager;
@@ -52,6 +54,12 @@ export class MeshEditPointerController {
   private readonly _onDown = (e: PointerEvent) => this._handleDown(e);
   private readonly _onMove = (e: PointerEvent) => this._handleMove(e);
   private readonly _onUp   = (e: PointerEvent) => this._handleUp(e);
+  private readonly _onCancel = (e: PointerEvent) => this._handleCancel(e);
+  /** TOUCH-5: touch pointers down; only the first drives a pick / vertex drag, a 2nd one cancels the drag. */
+  private _touchIds = new Set<number>();
+  private _dragPointerId: number | null = null;
+  /** Pick radius multiplier for the current press (TOUCH_PICK_SCALE for a finger, 1 for the mouse). */
+  private _pickScale = 1;
 
   private _scheduleRenderFn: () => void;
 
@@ -77,6 +85,7 @@ export class MeshEditPointerController {
     addZonelessListener(canvas, 'pointerdown', this._onDown);
     addZonelessListener(canvas, 'pointermove', this._onMove);
     addZonelessListener(canvas, 'pointerup',   this._onUp);
+    addZonelessListener(canvas, 'pointercancel', this._onCancel);
     canvas.style.cursor = 'crosshair';
   }
 
@@ -85,6 +94,9 @@ export class MeshEditPointerController {
     removeZonelessListener(this._canvas, 'pointerdown', this._onDown);
     removeZonelessListener(this._canvas, 'pointermove', this._onMove);
     removeZonelessListener(this._canvas, 'pointerup',   this._onUp);
+    removeZonelessListener(this._canvas, 'pointercancel', this._onCancel);
+    this._touchIds.clear();
+    this._dragPointerId = null;
     this._canvas.style.cursor = 'default';
     this._canvas = null;
     this._meshId = null;
@@ -111,6 +123,12 @@ export class MeshEditPointerController {
     if (!this._canvas || !this._meshId) return;
     // Only handle primary button
     if (e.button !== 0) return;
+    if (e.pointerType === 'touch') {
+      this._touchIds.add(e.pointerId ?? 0);
+      // A 2nd finger is a camera gesture: cancel (restore) the vertex drag the first finger started; never pick.
+      if (this._touchIds.size > 1) { this._cancelDrag(); return; }
+    }
+    this._pickScale = e.pointerType === 'touch' ? TOUCH_PICK_SCALE : 1;
 
     const { x: px, y: py } = this._toCanvasPx(e);
 
@@ -147,6 +165,7 @@ export class MeshEditPointerController {
           this._dragStartObjPos = { x: v.x, y: v.y, z: v.z };
           this._dragStartVerts = mesh.editMesh.vertices.map(vt => ({ x: vt.x, y: vt.y, z: vt.z }));
           this._canvas.setPointerCapture(e.pointerId);
+          this._dragPointerId = e.pointerId ?? null;
           this._canvas.style.cursor = 'grabbing';
         }
         this._scheduleRender();
@@ -164,6 +183,9 @@ export class MeshEditPointerController {
 
   private _handleMove(e: PointerEvent): void {
     if (!this._canvas || !this._meshId) return;
+    // Only the pointer that started a vertex drag moves it (a 2nd finger must not yank the vertex).
+    if (this._dragging && this._dragPointerId !== null && e.pointerId !== undefined && e.pointerId !== this._dragPointerId) return;
+    this._pickScale = e.pointerType === 'touch' ? TOUCH_PICK_SCALE : 1;
     const { x: px, y: py } = this._toCanvasPx(e);
 
     if (this._mode === 'vertex' && this._dragging && this._dragVertexIdx >= 0) {
@@ -207,6 +229,9 @@ export class MeshEditPointerController {
   }
 
   private _handleUp(e: PointerEvent): void {
+    if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+    if (this._dragging && this._dragPointerId !== null && e.pointerId !== undefined && e.pointerId !== this._dragPointerId) return;
+    this._dragPointerId = null;
     if (this._dragging && this._dragVertexIdx >= 0 && this._meshId && this._dragSnapshot) {
       const mesh = this._getMesh();
       if (mesh?.editMesh) {
@@ -238,6 +263,32 @@ export class MeshEditPointerController {
     if (this._canvas) this._canvas.style.cursor = 'crosshair';
   }
 
+  private _handleCancel(e: PointerEvent): void {
+    if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+    if (this._dragPointerId === null || e.pointerId === undefined || e.pointerId === this._dragPointerId) this._cancelDrag();
+  }
+
+  /** Abort an in-flight vertex drag: every vertex back to its drag-start position, no undo entry. */
+  private _cancelDrag(): void {
+    if (this._dragging && this._dragStartVerts) {
+      const mesh = this._getMesh();
+      if (mesh?.editMesh) {
+        const verts = mesh.editMesh.vertices, start = this._dragStartVerts;
+        for (let i = 0; i < verts.length && i < start.length; i++) { verts[i].x = start[i].x; verts[i].y = start[i].y; verts[i].z = start[i].z; }
+        mesh.syncFromEditMesh();
+        this._scheduleRender();
+      }
+    }
+    if (this._canvas && this._dragPointerId !== null) { try { this._canvas.releasePointerCapture(this._dragPointerId); } catch { /* gone */ } }
+    this._dragging = false;
+    this._dragVertexIdx = -1;
+    this._dragSnapshot = null;
+    this._dragStartObjPos = null;
+    this._dragStartVerts = null;
+    this._dragPointerId = null;
+    if (this._canvas) this._canvas.style.cursor = 'crosshair';
+  }
+
   // ── Picking ─────────────────────────────────────────────────────────────────
 
   private _pickFace(px: number, py: number): number {
@@ -266,7 +317,7 @@ export class MeshEditPointerController {
     if (!mesh?.editMesh) return -1;
     const { width: cw, height: ch } = this._canvas;
 
-    let best = -1, bestDist = VERTEX_PICK_RADIUS_PX;
+    let best = -1, bestDist = VERTEX_PICK_RADIUS_PX * this._pickScale;
     for (let vi = 0; vi < mesh.editMesh.vertices.length; vi++) {
       const v = mesh.editMesh.vertices[vi];
       const w = this._objToWorld(v.x, v.y, v.z, mesh);
@@ -285,7 +336,7 @@ export class MeshEditPointerController {
     const em = mesh.editMesh;
     const { width: cw, height: ch } = this._canvas;
 
-    let best = -1, bestDist = EDGE_PICK_RADIUS_PX;
+    let best = -1, bestDist = EDGE_PICK_RADIUS_PX * this._pickScale;
     for (let hi = 0; hi < em.halfEdges.length; hi++) {
       const he = em.halfEdges[hi];
       // Skip one half of each pair (avoid duplicate checks)

@@ -14,6 +14,7 @@ import type { InstanceXform } from './types';
 import { cellLevelAt } from './elevation';
 import { regionAt } from './layout';
 import { streetPlan, pavementLift, type Slot } from './street-slots';
+import { rockCluster, rockLayers, type RockPlacement } from './rocks';
 
 type V3 = [number, number, number];
 
@@ -99,6 +100,7 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
         return false;
     };
     const { regionByBlock } = graphLookups(graph);
+    const rockPl: RockPlacement[] = [];
 
     // Ponds sit INSIDE park blocks → reject any scatter point that lands in the water (no trees/rocks on the
     // pond). Pond AABBs are precomputed once per build; the cheap box reject skips the point-in-polygon test
@@ -112,6 +114,21 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
         }
         return false;
     };
+    // A point on a pond's bank inside `poly` (a pond vertex pushed out from the pond's centre by ~1.2 m), chosen by
+    // `u`; null when no pond touches the lot. Rocks by the water are what a Japanese park pond is edged with.
+    const pondEdgeAnchor = (poly: V2[], u: number): V2 | null => {
+        const lb = bounds(poly), cands: V2[] = [];
+        for (const { pond, b } of pondBB) {
+            if (b.max[0] < lb.min[0] || b.min[0] > lb.max[0] || b.max[1] < lb.min[1] || b.min[1] > lb.max[1]) continue;
+            const pc = centroid(pond), push = 1.2 / metersPerUnit;
+            for (const v of pond) {
+                const dx = v[0] - pc[0], dz = v[1] - pc[1], d = Math.hypot(dx, dz) || 1;
+                const q: V2 = [v[0] + (dx / d) * push, v[1] + (dz / d) * push];
+                if (pointInPolygon(q, poly) && !inWater(q)) cands.push(q);
+            }
+        }
+        return cands.length ? cands[Math.floor(u * cands.length) % cands.length] : null;
+    };
 
     for (const lot of graph.lots) {
         if (keep && !keep(regionByBlock.get(lot.block) ?? -1)) continue;
@@ -121,8 +138,15 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
         if (lot.zone === 'park') {
             const nTrees = Math.min(16, Math.max(1, Math.round(lot.area / (0.03 * scale * scale))));
             for (const p of scatterInPolygon(lot.poly, nTrees, lotRng)) { const r = lotRng.next(); if (!inWater(p)) plant(p, parkKind(p, r)); }
+            // ROCKS (rocks.ts): instanced archetypes in CLUSTERS (one big stone + a few small ones), not evenly
+            // scattered singles — and a park with a pond puts its first cluster on the pond's EDGE.
             const nRocks = Math.min(4, Math.round(nTrees * 0.25));
-            for (const p of scatterInPolygon(lot.poly, nRocks, lotRng)) if (!inWater(p)) addRock(rock, [p[0], gy, p[1]], lotRng, scale);
+            const nClusters = nRocks === 0 ? 0 : nRocks >= 3 ? 2 : 1;
+            const inLot = (x: number, z: number): boolean => pointInPolygon([x, z], lot.poly) && !inWater([x, z]);
+            const anchors = scatterInPolygon(lot.poly, nClusters, lotRng);
+            const edge = nClusters ? pondEdgeAnchor(lot.poly, lotRng.next()) : null;
+            if (edge) anchors[0] = edge;
+            for (const p of anchors) rockCluster(rockPl, p[0], p[1], gy, lotRng, 1 / metersPerUnit, inLot);
             // PARK PROP: bigger parks get one centrepiece — a playground, a fountain or a gazebo (parks stop
             // being just trees-on-grass). Seeded per lot; skipped if the centre landed in a pond.
             const pc = centroid(lot.poly);
@@ -191,8 +215,10 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     layers.push(...vesselLayers('potted', pottedSlots, unit, seed, gy + pavementLift(graph.params)));
     // Granite, not flat grey: a boulder reads as a boulder because of the mineral speckle and the
     // roughness break-up. `jitter` is dropped to near-nothing — a rock has no courses to jitter.
+    // `rock` now only carries the FOUNTAIN stone (basin + column + bowl); the park rocks are the instanced archetypes.
     if (!rock.empty) layers.push({ name: 'world:rocks', color: ROCK_COLOR, y: gy, geometry: rock.geometry(),
         ground: { surface: 'granite', tint: ROCK_COLOR, tileMm: 2600, jitter: 0.15, metersPerUnit } });
+    layers.push(...rockLayers(rockPl, metersPerUnit, 'world:rocks'));
     if (!parkProp.empty) layers.push({ name: 'world:park-prop', color: [0.72, 0.34, 0.28], y: gy, geometry: parkProp.geometry() });   // playground/gazebo (rusty red)
     // Fountain water: the same real water material, but a small basin — a much shorter swell, barely
     // choppy, and the strongest glitter in the city because it is the thing people look straight at.
@@ -268,7 +294,8 @@ export function addTree(foliage: Accum3D, trunk: Accum3D, base: V3, rng: Rng, sc
     }
 }
 
-/** A small jittered boulder. */
+/** LEGACY: a small jittered octahedron "boulder" (8 tris). The city's rocks are now the instanced archetypes of
+ *  rocks.ts (rockCluster + rockLayers); kept for external callers only. */
 export function addRock(rock: Accum3D, base: V3, rng: Rng, scale: number): void {
     const r = (0.02 + rng.next() * 0.03) * scale;
     rock.blob([base[0], base[1] + r * 0.5, base[2]], r, r * 0.7, r * 0.9, 0.35, rng.next() * 1000);

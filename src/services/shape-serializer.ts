@@ -361,6 +361,7 @@ export function recreateNode(data: any, deps: Shape2DRestoreDeps): Node | null {
             if (data.scaleZ      != null) mesh3d.scaleZ    = data.scaleZ;
             if (data.keyframeTracks)     mesh3d.keyframeTracks   = data.keyframeTracks;
             if (data.textureLibraryId)   mesh3d.textureLibraryId = data.textureLibraryId;
+            if (data.cameraBlock === 'block' || data.cameraBlock === 'ignore') mesh3d.cameraBlock = data.cameraBlock;
             if (Array.isArray(data.modifiers) && data.modifiers.length > 0) {
                 mesh3d.modifiers = data.modifiers;
                 mesh3d.invalidateModifierCache();

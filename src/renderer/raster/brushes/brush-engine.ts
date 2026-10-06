@@ -18,7 +18,7 @@ import {
   LINEAR_CURVE,
 } from './brush-preset';
 import { BrushStabilizer, StabilizedPoint } from './brush-stabilizer';
-import { BrushStampPipeline, StampParams } from './brush-stamp-pipeline';
+import { BrushStampPipeline, StampParams, TexelRect } from './brush-stamp-pipeline';
 import { BrushTipGenerator } from './brush-tip';
 import { CanvasGrainManager } from '../canvas-grain';
 import { rgbToHsb, hsbToRgb } from '../../../utils/color';
@@ -37,6 +37,22 @@ export interface PointerInput {
   tiltX?: number;
   /** Pen tilt in Y (degrees, -90 to 90). 0 if unavailable. */
   tiltY?: number;
+}
+
+/**
+ * The texel bounds (max-exclusive, unclipped) of the strip StrokeTextureRenderer draws for `vertices`: it writes a
+ * texel only when the texel centre lies within a segment's (interpolated) half-width of it, so the vertex bbox
+ * grown by the widest half-width (+1 texel of slack) contains every write. Exported for tests.
+ */
+export function strokeStripBounds(vertices: readonly StrokeVertex[]): TexelRect {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, hw = 0;
+  for (const v of vertices) {
+    x0 = Math.min(x0, v.x); x1 = Math.max(x1, v.x);
+    y0 = Math.min(y0, v.y); y1 = Math.max(y1, v.y);
+    hw = Math.max(hw, v.width);
+  }
+  const pad = hw + 1;
+  return { x0: Math.floor(x0 - pad), y0: Math.floor(y0 - pad), x1: Math.ceil(x1 + pad), y1: Math.ceil(y1 + pad) };
 }
 
 export class BrushEngine {
@@ -105,6 +121,32 @@ export class BrushEngine {
       x: Math.floor(d.x0 - pad), y: Math.floor(d.y0 - pad),
       w: Math.ceil(d.x1 - d.x0 + 2 * pad), h: Math.ceil(d.y1 - d.y0 + 2 * pad),
     };
+  }
+
+  /**
+   * BRUSH-6: the finished stroke's undo patch — BEFORE pixels (the stroke-start snapshot) and AFTER pixels
+   * (`texture`) of the region the stroke wrote, read straight from the GPU (two small readbacks, no full-canvas
+   * one). The region is the stamp pipeline's EXACT written rect (every composite and direct dab into the target
+   * is recorded there, so nothing outside it changed). Null for a stroke that wrote nothing or whose base no
+   * longer matches `texture`. Call once after endStroke(), before the next beginStroke().
+   */
+  public captureStrokePatch(
+    texture: GPUTexture,
+  ): Promise<{ x: number; y: number; w: number; h: number; before: Uint8Array; after: Uint8Array }> | null {
+    this.takeStrokeDirtyRect();   // consume the padded centre rect too (it only feeds the legacy snapshot path)
+    const exact: TexelRect | null = this.stampPipeline.takeStrokeTouchedRect();
+    if (!exact) return null;   // nothing reached the texture (off-canvas / no dab)
+    return this.stampPipeline.readStrokeRect(texture, exact);
+  }
+
+  /** BRUSH-1b: open a dab batch — every dab until endBatch() goes to the GPU as ONE submit with one composite.
+   *  The paint engine wraps each pointer frame's points in one batch. Nests. */
+  public beginBatch(): void { this.stampPipeline.beginBatch(); }
+  public endBatch(): void { this.stampPipeline.endBatch(); }
+
+  /** Diagnostics / tests: the stamp pipeline's submit + texel-traffic counters. */
+  public get stampStats(): { submits: number; copiedTexels: number; compositedTexels: number } {
+    return this.stampPipeline.stats;
   }
 
   constructor(device: GPUDevice) {
@@ -294,6 +336,7 @@ export class BrushEngine {
    */
   public endStroke(finalPoint: PointerInput): void {
     if (!this.isActive) return;
+    this.stampPipeline.flush();   // dabs batched so far land before the end-of-stroke passes
 
     const flushed = this.stabilizer.flush({
       x: finalPoint.x,
@@ -309,8 +352,9 @@ export class BrushEngine {
 
     // If stroke texture is enabled, render the textured strip onto the stroke
     // accumulation texture, replacing the dab-based preview with the final result.
+    // (Only for a stroke that painted into the accum — an erase stroke never did, and its accum is discarded.)
     const st = this.preset?.strokeTexture;
-    if (st?.enabled && this.strokeVertices.length >= 2 && this.targetTexture) {
+    if (st?.enabled && this.strokeVertices.length >= 2 && this.targetTexture && this.stampPipeline.strokeHasAccumPaint) {
       // Get access to the stroke accum texture to overwrite it
       const accumTex = this.stampPipeline.getStrokeAccumTex();
       if (accumTex) {
@@ -325,6 +369,8 @@ export class BrushEngine {
           st.texelsPerUnit,
           st.edgeSoftness,
         );
+        // ... and tell the pipeline where, so endStroke's bounded flatten puts it on the canvas.
+        this.stampPipeline.markStrokeAccumWritten(strokeStripBounds(this.strokeVertices));
       }
     }
 
@@ -595,6 +641,7 @@ export class BrushEngine {
 
     // ── Smudge readback: sample canvas color under brush for next dab ──
     if (smudge?.enabled && !this._smudgeReadbackPending && this.targetTexture) {
+      // (samplePixel flushes the open dab batch first, so it reads this dab — same as before batching)
       this._smudgeReadbackPending = true;
       const tex = this.targetTexture;
       this.stampPipeline.samplePixel(tex, dabX, dabY).then(color => {

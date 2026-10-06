@@ -15,13 +15,18 @@ import type { WorldGraph } from './types';
 
 const graph: WorldGraph = generateCityLayout({ seed: 7, radius: 200, pattern: 'grid', elevation: 0 });
 
-/** The merged 'world:rocks' layer's vertices as a set of stringified rows (stride-12 mesh vertices; position first). */
+/** Every rock as a set of stringified rows: the merged 'world:rocks' layer's vertices (the fountain stone; stride-12
+ *  mesh vertices, position first) plus each instanced 'world:rocks-*' archetype copy (layer + transform). */
 function rockRows(g: WorldGraph, keep?: ((r: number) => boolean) | null): Set<string> {
-  const layer = buildBiome(g, keep).find((l) => l.name === 'world:rocks');
   const rows = new Set<string>();
-  if (!layer) return rows;
-  const v = layer.geometry.vertices;
-  for (let i = 0; i < v.length; i += 12) rows.add(`${v[i]},${v[i + 1]},${v[i + 2]}`);
+  for (const layer of buildBiome(g, keep)) {
+    if (layer.name === 'world:rocks') {
+      const v = layer.geometry.vertices;
+      for (let i = 0; i < v.length; i += 12) rows.add(`${v[i]},${v[i + 1]},${v[i + 2]}`);
+    } else if (layer.name.startsWith('world:rocks-')) {
+      for (const t of layer.instances ?? []) rows.add(`${layer.name}|${t.x},${t.y},${t.z},${t.ry},${t.s}`);
+    }
+  }
   return rows;
 }
 

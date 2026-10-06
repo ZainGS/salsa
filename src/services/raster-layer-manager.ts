@@ -822,6 +822,23 @@ export class RasterLayerManager {
     return this.animationEnabled;
   }
 
+  /** Document load / new document: animation mode off and the timeline back to a new timeline's state. A document
+   *  without animation used to inherit the previous one's (and save it as its own). The load re-enables it when the
+   *  document has animation. */
+  public resetAnimationForDocumentLoad(): void {
+    this.animationEnabled = false;
+    this.timeline.resetForDocumentLoad();
+  }
+
+  /** The layer stack a new document starts with: one blank 'Background' raster layer (selected) and the default
+   *  'Vector' layer, replacing every existing layer (and its pixels / cels / undo snapshots). */
+  public resetToDefaultLayers(): void {
+    this.clearAllLayers();
+    const bg = this.addLayer('Background');
+    this.addVectorLayer('Vector');
+    this.selectLayer(bg.id);
+  }
+
   /**
    * Convert a layer to animated (multi-frame) mode.
    * The layer's current texture becomes the first cel.

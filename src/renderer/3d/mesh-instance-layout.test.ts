@@ -88,3 +88,114 @@ describe('MeshInstance layout — TS stride ↔ every WGSL struct', () => {
         expect(total).toBeGreaterThanOrEqual(13);
     });
 });
+
+// ── Field-level contract (mobile-parity CLOTH-3) ────────────────────────────────────────────────────────────────
+// The CPU writer (renderer-3d.ts) stores a few lanes as RAW u32 (dataView.setUint32): the material flags (float 43)
+// and the texture / normal-map layer indices (44, 45). Every other lane is an f32 value. A WGSL struct that declares
+// a raw-u32 lane as f32 and bitcasts it is WRONG on real hardware: a flags word with only bits < 23 set is a
+// SUBNORMAL f32, which mobile drivers flush to zero (garments lost their texture / pattern / style on an Android
+// tablet). So every named field of every `struct MeshInstance` must sit at the CPU writer's offset with the CPU
+// writer's scalar kind. Fields named with a leading underscore are unread padding: offset-checked, kind-free.
+
+/** The CPU record, by byte offset (renderer-3d.ts slot writers; MESH_INSTANCE_STRIDE = 240). */
+const CPU_LAYOUT: Record<string, { offset: number; type: string }> = {
+    modelMatrix:    { offset: 0,   type: 'mat4x4<f32>' },
+    normalMatrix:   { offset: 64,  type: 'mat4x4<f32>' },
+    diffuseColor:   { offset: 128, type: 'vec4<f32>' },
+    specularColor:  { offset: 144, type: 'vec4<f32>' },
+    emissive:       { offset: 160, type: 'vec3<f32>' },
+    flags:          { offset: 172, type: 'u32' },
+    textureIndex:   { offset: 176, type: 'u32' },
+    normalMapIndex: { offset: 180, type: 'u32' },
+    roughness:      { offset: 184, type: 'f32' },
+    metalness:      { offset: 188, type: 'f32' },
+    patternColor:   { offset: 192, type: 'vec4<f32>' },
+    patternParams:  { offset: 208, type: 'vec4<f32>' },
+    uvTransform:    { offset: 224, type: 'vec4<f32>' },
+};
+
+/** The fields of a struct body with their WGSL byte offsets. */
+function structFields(body: string): { name: string; type: string; offset: number; size: number }[] {
+    const out: { name: string; type: string; offset: number; size: number }[] = [];
+    let offset = 0;
+    for (const raw of body.split('\n')) {
+        const line = raw.replace(/\/\/.*$/, '').trim();
+        const m = line.match(/^(\w+)\s*:\s*(mat4x4<f32>|mat3x3<f32>|vec[234]<[uif]32>|[uif]32)\s*,?/);
+        if (!m) continue;
+        const { size, align } = typeLayout(m[2]);
+        offset = alignUp(offset, align);
+        out.push({ name: m[1], type: m[2], offset, size });
+        offset += size;
+    }
+    return out;
+}
+
+/** Every non-test .ts under src/renderer that declares a `struct MeshInstance`. */
+function meshInstanceFiles(): string[] {
+    const rendererRoot = fileURLToPath(new URL('..', import.meta.url));
+    const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((d) => {
+        const full = join(dir, d.name);
+        if (d.isDirectory()) return walk(full);
+        return d.name.endsWith('.ts') && !d.name.endsWith('.test.ts') ? [full] : [];
+    });
+    return walk(rendererRoot).filter((f) => readFileSync(f, 'utf8').includes('struct MeshInstance'));
+}
+
+describe('MeshInstance layout — every WGSL field matches the CPU writer (CLOTH-3)', () => {
+    it('the CPU layout table agrees with the writer: exactly floats 43-45 are written as raw u32', () => {
+        const r3 = read('./renderer-3d.ts');
+        const u32Floats = new Set([...r3.matchAll(/setUint32\(\((?:offset|off) \+ (\d+)\) \* 4/g)].map((m) => Number(m[1])));
+        expect([...u32Floats].sort((a, b) => a - b)).toEqual([43, 44, 45]);
+        const tableU32 = Object.values(CPU_LAYOUT).filter((f) => f.type === 'u32').map((f) => f.offset / 4).sort((a, b) => a - b);
+        expect(tableU32).toEqual([43, 44, 45]);
+        // The emissive rgb stays three f32 values at floats 40-42.
+        expect(r3).toMatch(/data\[offset \+ 40\] = mat3d\.emissive\.r;/);
+        expect(r3).toMatch(/dataView\.setUint32\(\(offset \+ 43\) \* 4, encodeMaterialFlags\(mat3d\), true\);/);
+    });
+
+    it('every named field of every struct MeshInstance sits at the CPU offset with the CPU type', () => {
+        let structs = 0;
+        for (const f of meshInstanceFiles()) {
+            for (const body of meshInstanceStructs(readFileSync(f, 'utf8'))) {
+                structs++;
+                const fields = structFields(body);
+                // the flags lane is always declared (and as u32), in every copy
+                expect(fields.find((x) => x.name === 'flags'), `${f}: MeshInstance.flags`).toEqual(
+                    { name: 'flags', type: 'u32', offset: 172, size: 4 });
+                for (const fd of fields) {
+                    if (fd.name.startsWith('_')) {
+                        // padding: must not straddle the flags lane with an f32 type (that is the CLOTH-3 bug shape)
+                        if (fd.offset <= 172 && fd.offset + fd.size > 172) expect(fd.type, `${f}: ${fd.name} covers the flags lane`).toBe('u32');
+                        continue;
+                    }
+                    const cpu = CPU_LAYOUT[fd.name];
+                    expect(cpu, `${f}: unknown MeshInstance field "${fd.name}" (add it to CPU_LAYOUT)`).toBeDefined();
+                    expect(fd.offset, `${f}: ${fd.name} offset`).toBe(cpu.offset);
+                    expect(fd.type, `${f}: ${fd.name} type`).toBe(cpu.type);
+                }
+            }
+        }
+        expect(structs).toBeGreaterThanOrEqual(13);
+    });
+
+    it('no shader still reads the old f32 lane or bitcasts an instance field', () => {
+        for (const f of meshInstanceFiles()) {
+            const s = readFileSync(f, 'utf8');
+            expect(s, `${f}: emissiveColor (the old vec4 with flags in .a)`).not.toMatch(/emissiveColor/);
+            expect(s, `${f}: bitcast of an instance field`).not.toMatch(/bitcast<u32>\(\s*(?:inst|u_instances\[[^\]]*\]|instances\[[^\]]*\])\./);
+        }
+    });
+
+    it('every instance member a shader reads is declared in its MeshInstance struct', () => {
+        let reads = 0;
+        for (const f of meshInstanceFiles()) {
+            const s = readFileSync(f, 'utf8');
+            const declared = new Set(meshInstanceStructs(s).flatMap((b) => structFields(b).map((x) => x.name)));
+            for (const m of s.matchAll(/\b(?:inst|u_instances\[[^\]]*\]|instances\[[^\]]*\])\.(\w+)/g)) {
+                reads++;
+                expect(declared.has(m[1]), `${f}: reads instance member "${m[1]}"`).toBe(true);
+            }
+        }
+        expect(reads).toBeGreaterThan(50);
+    });
+});

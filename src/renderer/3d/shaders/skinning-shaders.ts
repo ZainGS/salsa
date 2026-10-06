@@ -30,7 +30,8 @@ struct MeshInstance {
   normalMatrix:   mat4x4<f32>,
   diffuseColor:   vec4<f32>,
   specularColor:  vec4<f32>,
-  emissiveColor:  vec4<f32>,
+  emissive:       vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:          u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
   textureIndex:   u32,
   normalMapIndex: u32,
   roughness:      f32,
@@ -159,19 +160,19 @@ const SKINNED_VS_BODY = /* wgsl */`
   let L = normalize(-scene.lightDirection.xyz);
   // SOFT LIGHTING (bit 28): wrap the diffuse toward half-Lambert (away-side lifts to mid, no hard dark triangle on a
   // face) by scene.lightColor.w — flat anime skin. select() keeps it a no-op (exact Lambert) when the flag is off.
-  let softS = select(0.0, scene.lightColor.w, (bitcast<u32>(inst.emissiveColor.a) & 268435456u) != 0u);
+  let softS = select(0.0, scene.lightColor.w, (inst.flags & 268435456u) != 0u);
   let rawNdL = dot(worldNormal, L);
   let softNdL = mix(max(rawNdL, 0.0), rawNdL * 0.5 + 0.5, softS);
   // SKIN TOON-RAMP (bit 29): band the diffuse + warm the shadow (no-op when the flag is off). Applied AFTER soft.
-  let ramp = skinRamp(softNdL, bitcast<u32>(inst.emissiveColor.a), scene.skinRampParams);
+  let ramp = skinRamp(softNdL, inst.flags, scene.skinRampParams);
   lit += inst.diffuseColor.rgb * ramp.rgb * scene.lightColor.rgb * scene.lightDirection.w * ramp.a;
   let V = normalize(scene.cameraPosition.xyz - worldPos4.xyz);
   let H = normalize(L + V);
   let shininess = inst.specularColor.a;
   let spec = pow(max(dot(worldNormal, H), 0.0), max(shininess, 1.0));
   lit += inst.specularColor.rgb * scene.lightColor.rgb * spec;
-  lit += inst.emissiveColor.rgb;
-  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
+  lit += inst.emissive;
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (inst.flags & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = quantizeColor(lit, colorDepth); }
 
   // TBN
@@ -298,7 +299,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   let L = normalize(-scene.lightDirection.xyz);
   let NdotL = max(dot(worldNormal, L), 0.0);
   lit += vcol.rgb * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
-  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (inst.flags & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = quantizeColor(lit, colorDepth); }
 
   let worldTangent3 = normalize((inst.normalMatrix * vec4<f32>(skinnedTanXYZ, 0.0)).xyz);

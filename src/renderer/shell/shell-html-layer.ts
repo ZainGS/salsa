@@ -25,6 +25,8 @@
  * MVP/`getElementTransform` math the 3D-mesh case needs.
  */
 
+import { shellBackingRatio } from './shell-backing';
+
 type HtmlRect = [number, number, number, number]; // x, y, w, h in device px
 
 interface ExperimentalQueue extends GPUQueue {
@@ -81,7 +83,7 @@ export class ShellHtmlLayer {
     this.anchor = null;
     this.rect = [x, y, w, h];
     if (!this.el) return;
-    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const dpr = this.backingRatio();
     this.el.style.width = `${w / dpr}px`;
     this.el.style.height = `${h / dpr}px`;
     this.positionEl();
@@ -96,7 +98,7 @@ export class ShellHtmlLayer {
   /** Recompute the anchored rect from the element's current size + canvas size. */
   layout(canvasW: number, canvasH: number): void {
     if (!this.el || !this.anchor) return;
-    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const dpr = this.backingRatio();
     const w = Math.max(1, (this.el.offsetWidth || 1) * dpr);
     const h = Math.max(1, (this.el.offsetHeight || 1) * dpr);
     const { ax, ay, mx, my } = this.anchor;
@@ -106,9 +108,15 @@ export class ShellHtmlLayer {
     this.positionEl();
   }
 
+  /** Canvas device px per CSS px AS BACKED (mobile-parity UI-16: the backing store is DPR-capped on mobile, so
+   *  window.devicePixelRatio would misplace the element's hit zone vs where it is drawn). */
+  private backingRatio(): number {
+    return shellBackingRatio(this.canvas, Math.max(1, (typeof window !== 'undefined' && window.devicePixelRatio) || 1));
+  }
+
   private positionEl(): void {
     if (!this.el) return;
-    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const dpr = this.backingRatio();
     const [x, y] = this.rect;
     if (this.supported) {
       this.el.style.transform = `translate(${x / dpr}px, ${y / dpr}px)`;
@@ -124,6 +132,7 @@ export class ShellHtmlLayer {
    *  a texture is ready to draw (supported mode only). */
   paint(): boolean {
     if (!this.supported || !this.el) return false;
+    // Texture RESOLUTION only (the element's own raster scale) — not a canvas-space conversion.
     const dpr = Math.max(1, window.devicePixelRatio || 1);
     const w = Math.max(1, Math.round((this.el.offsetWidth || 1) * dpr));
     const h = Math.max(1, Math.round((this.el.offsetHeight || 1) * dpr));

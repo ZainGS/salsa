@@ -11,6 +11,15 @@ export const HIT = {
   scaleHandleThreshold: 0.035,
 } as const;
 
+/** A handle threshold scaled for touch (TOUCH-8). The enlarged radius is capped at a third of the shape's smaller
+ *  side so a small shape's handles never swallow its whole body (it must still be draggable by a finger), but it
+ *  never drops below the mouse threshold. hitScale 1 returns the mouse threshold unchanged. */
+export function touchThreshold(base: number, hitScale: number, shape: { width: number; height: number }): number {
+  if (!(hitScale > 1)) return base;
+  const cap = Math.min(Math.abs(shape.width), Math.abs(shape.height)) / 3;
+  return Math.max(base, Math.min(base * hitScale, Number.isFinite(cap) ? cap : base));
+}
+
 const dist = (a: [number, number], b: [number, number]) =>
   Math.hypot(a[0] - b[0], a[1] - b[1]);
 
@@ -52,7 +61,9 @@ export function canvasPxToWorld(
 /** Returns true if worldMouse is within the rotation handle threshold of any corner. */
 export function isNearRotationHandle(
   shape: Shape,
-  worldMouse: Vec2
+  worldMouse: Vec2,
+  /** TOUCH-8: hit-radius multiplier (2 under a finger; 1 = the mouse threshold). */
+  hitScale = 1,
 ): boolean {
   // Optional: keep Sections unrotatable (matches your old behavior)
   if (shape.getType && shape.getType() === "Section") return false;
@@ -82,7 +93,7 @@ export function isNearRotationHandle(
   for (const [cx, cy] of corners) {
     const dx = m[0] - cx;
     const dy = m[1] - cy;
-    if (Math.hypot(dx, dy) <= HIT.rotateHandleThreshold) return true;
+    if (Math.hypot(dx, dy) <= touchThreshold(HIT.rotateHandleThreshold, hitScale, shape)) return true;
   }
   return false;
 }
@@ -90,7 +101,9 @@ export function isNearRotationHandle(
 /** Returns which scaling handle is closest (within threshold) or null. */
 export function getScalingSide(
   shape: Shape,
-  worldMouse: Vec2
+  worldMouse: Vec2,
+  /** TOUCH-8: hit-radius multiplier (2 under a finger; 1 = the mouse threshold). */
+  hitScale = 1,
 ): HandleSide | null {
   // mouse: world -> local
   const inv = shape.getInverseLocalMatrix();
@@ -135,5 +148,5 @@ export function getScalingSide(
   const closest = (Object.keys(dists) as ScalingSide[])
     .reduce((a, b) => dists[a] < dists[b] ? a : b);
 
-  return dists[closest] <= HIT.scaleHandleThreshold ? closest : null;
+  return dists[closest] <= touchThreshold(HIT.scaleHandleThreshold, hitScale, shape) ? closest : null;
 }

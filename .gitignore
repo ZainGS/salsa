@@ -23,3 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 .claude/
+
+# Project docs are kept local-only (specs, audits, review renders)
+docs/

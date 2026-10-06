@@ -131,7 +131,7 @@ describe('T3.2 traffic signals', () => {
     it('keeps the phase-switch layer grammar (world-traffic switches by name)', () => {
         expect(layers.length).toBeGreaterThan(0);
         for (const l of layers) {
-            const ok = l.name === 'world:signal-housing' || l.name === 'world:signal-red-stop' || SIGNAL_LAMP_RE.test(l.name);
+            const ok = l.name === 'world:signal-housing' || l.name === 'world:signal-red-stop' || l.name === 'world:signal-stop-rim' || SIGNAL_LAMP_RE.test(l.name);
             expect(ok, l.name).toBe(true);
         }
         expect(layers.some((l) => SIGNAL_LAMP_RE.test(l.name))).toBe(true);
@@ -146,7 +146,7 @@ describe('T3.2 traffic signals', () => {
     it('stays inside the per-head budget (4 heads + 4 pedestrian heads per signalled cross)', () => {
         const heads = signalledJunctions(g).length * 4;
         expect(heads).toBeGreaterThan(0);
-        const signalTris = tris(layers.filter((l) => l.name !== 'world:signal-red-stop' && l.nearTwin?.role !== 'far'));   // P9: the near twin is the full head
+        const signalTris = tris(layers.filter((l) => l.name !== 'world:signal-red-stop' && l.name !== 'world:signal-stop-rim' && l.nearTwin?.role !== 'far'));   // P9: the near twin is the full head
         expect(signalTris / heads).toBeLessThanOrEqual(520);
     });
 

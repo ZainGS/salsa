@@ -6,6 +6,11 @@
  *  - Left-drag: orbit (azimuth + elevation)
  *  - Scroll wheel: dolly (zoom via radius)
  *  - Right-drag / middle-drag: pan (shifts both position and target)
+ *  - TOUCH (TOUCH-3, docs/ui/touch-controls.md): fingers are tracked by pointerId (pointerType 'touch' only — the
+ *    mouse / pen path is unchanged). Per scheme: classic = 1 finger orbit, 2 fingers pan + pinch dolly;
+ *    freeLookNav = 1 finger free-look, 2 fingers pan + pinch dolly-through; altOrbitOnly = 1 finger left to the
+ *    tool, 2 fingers orbit + pinch zoom, 3 fingers pan. `touchNavLock` makes 1 finger orbit in every scheme (and 2
+ *    fingers pan + pinch). Double-tap → `onDoubleTap` (the host frames the tapped mesh / everything).
  *
  * Designed to be attached to a canvas and driven by pointer events.
  * Fully self-contained — no dependencies on the 2D renderer.
@@ -138,11 +143,46 @@ export class OrbitController {
    *  scheduleRender. Damped orbit doesn't need it — its per-frame momentum callback already keeps frames flowing. */
   onChange?: () => void;
 
+  // ── Touch (TOUCH-3) ──
+  /** "Navigate" lock: when true ONE finger orbits in every scheme (including altOrbitOnly tool modes, where one finger
+   *  normally belongs to the tool) and two fingers pan + pinch. Set by the host's Navigate toggle
+   *  (sm.setTouchNavigate3D). Mouse input is unaffected. */
+  touchNavLock = false;
+  /** Fired on a touch DOUBLE-TAP (client coords of the 2nd tap). The host frames the tapped mesh, or everything. */
+  onDoubleTap?: (clientX: number, clientY: number) => void;
+  /** ORTHOGRAPHIC pinch: a dolly is invisible in ortho, so the host applies the zoom (`ratio` > 1 = fingers apart =
+   *  zoom IN) through its own zoom path (decoupled `_meshEditZoom`, or the 2D illustration zoom). Absent = no zoom. */
+  onTouchZoom?: (ratio: number, clientX: number, clientY: number) => void;
+  /** Optional pan override (CSS-pixel deltas of the finger midpoint): return true when the host applied the pan
+   *  itself (an ortho view whose target is pinned to the 2D illustration view), false to let the orbit pan run. */
+  onTouchPan?: (dx: number, dy: number) => boolean;
+  /** Movement (CSS px) under which a touch still counts as a TAP (double-tap detection). */
+  static TAP_SLOP_PX = 10;
+  /** Max gap between the two taps of a double-tap (ms) and their max distance (CSS px). */
+  static DOUBLE_TAP_MS = 350;
+  static DOUBLE_TAP_PX = 40;
+  /** True while a multi-finger touch gesture (pan / pinch / two-finger orbit) is running. */
+  get isTouchGesturing(): boolean { return this._touchGesture === 'two' || this._touchGesture === 'three'; }
+  /** Number of touch pointers currently down on the canvas (tracked even while disabled). */
+  get activeTouchCount(): number { return this._touches.size; }
+  private _touches = new Map<number, { x: number; y: number }>();
+  private _touchGesture: 'none' | 'one' | 'two' | 'three' = 'none';
+  private _touchOne: 'orbit' | 'look' | null = null;
+  private _touchMidX = 0;
+  private _touchMidY = 0;
+  private _touchDist = 0;
+  private _tap: { id: number; x: number; y: number; t: number; moved: boolean } | null = null;
+  private _lastTap: { x: number; y: number; t: number } | null = null;
+  private _prevTouchAction: string | null = null;
+
   // Internal state
   private _isDragging = false;
   private _isMiddleDrag = false;
   private _lastX = 0;
   private _lastY = 0;
+  /** The pointer that started the current mouse / pen drag — moves from any OTHER pointer are ignored (they used to
+   *  share _lastX/_lastY, so a second pointer made the camera jump by the distance between them). */
+  private _dragPointerId: number | null = null;
 
   // Damping velocities
   private _azimuthVel = 0;
@@ -153,6 +193,7 @@ export class OrbitController {
   private _onPointerMove: (e: PointerEvent) => void;
   private _onPointerUp: (e: PointerEvent) => void;
   private _onWheel: (e: WheelEvent) => void;
+  private _onPointerCancel: (e: PointerEvent) => void;
   private _canvas: HTMLCanvasElement | null = null;
 
   constructor(camera: Camera3D, config: OrbitControllerConfig = {}) {
@@ -181,6 +222,7 @@ export class OrbitController {
     this._onPointerMove = this.handlePointerMove.bind(this);
     this._onPointerUp = this.handlePointerUp.bind(this);
     this._onWheel = this.handleWheel.bind(this);
+    this._onPointerCancel = this.handlePointerCancel.bind(this);
 
     // If explicit spherical angles were given, snap to them.
     // Otherwise derive radius/azimuth/elevation from the camera's current position
@@ -207,6 +249,10 @@ export class OrbitController {
     addZonelessListener(canvas, 'pointerup', this._onPointerUp);
     addZonelessListener(canvas, 'pointerleave', this._onPointerUp);
     addZonelessListener(canvas, 'wheel', this._onWheel, { passive: false });
+    // A cancelled pointer (the browser took over the touch, a palm-reject, a system gesture) must end the gesture.
+    addZonelessListener(canvas, 'pointercancel', this._onPointerCancel);
+    // Touch: the canvas consumes every finger gesture itself (no browser pan / pinch-zoom / pointercancel).
+    if (canvas.style) { this._prevTouchAction = canvas.style.touchAction ?? ''; canvas.style.touchAction = 'none'; }
     // freeLookNav uses RMB for free-look — swallow the browser context menu so it doesn't pop on right-drag.
     if (this.freeLookNav) {
       this._onContextMenu = (e: Event) => e.preventDefault();
@@ -221,6 +267,9 @@ export class OrbitController {
     removeZonelessListener(this._canvas, 'pointerup', this._onPointerUp);
     removeZonelessListener(this._canvas, 'pointerleave', this._onPointerUp);
     removeZonelessListener(this._canvas, 'wheel', this._onWheel);
+    removeZonelessListener(this._canvas, 'pointercancel', this._onPointerCancel);
+    if (this._prevTouchAction !== null && this._canvas.style) { this._canvas.style.touchAction = this._prevTouchAction; this._prevTouchAction = null; }
+    this._touches.clear(); this._touchGesture = 'none'; this._tap = null;
     if (this._onContextMenu) { this._canvas.removeEventListener('contextmenu', this._onContextMenu); this._onContextMenu = undefined; }
     this._canvas = null;
   }
@@ -228,6 +277,7 @@ export class OrbitController {
   // ── Input handlers ─────────────────────────────────────────────
 
   private handlePointerDown(e: PointerEvent): void {
+    if (e.pointerType === 'touch') { this._touchDown(e); return; }   // fingers: own per-pointer path (TOUCH-3)
     if (!this.enabled) return;
     if (this.freeLookNav) {
       // Unity flythrough scheme: LMB = select (no nav), Alt+LMB = orbit, MMB = pan, RMB = free-look (+ WASD via host).
@@ -244,6 +294,7 @@ export class OrbitController {
         return;
       }
       this._lastX = e.clientX; this._lastY = e.clientY;
+      this._dragPointerId = e.pointerId ?? null;
       return;
     }
     // Classic scheme (every other mode): LMB orbit (Alt-gated in altOrbitOnly), MMB/RMB pan.
@@ -257,10 +308,14 @@ export class OrbitController {
     }
     this._lastX = e.clientX;
     this._lastY = e.clientY;
+    if (this._isDragging) this._dragPointerId = e.pointerId ?? null;
   }
 
   private handlePointerMove(e: PointerEvent): void {
+    if (e.pointerType === 'touch') { this._touchMove(e); return; }
     if (!this.enabled || !this._isDragging) return;
+    // Only the pointer that started the drag moves the camera (a second pointer used to share _lastX → a jump).
+    if (this._dragPointerId !== null && e.pointerId !== undefined && e.pointerId !== this._dragPointerId) return;
     const dx = e.clientX - this._lastX;
     const dy = e.clientY - this._lastY;
     this._lastX = e.clientX;
@@ -275,10 +330,142 @@ export class OrbitController {
     }
   }
 
-  private handlePointerUp(_e: PointerEvent): void {
+  private handlePointerUp(e: PointerEvent): void {
+    if (e.pointerType === 'touch') { this._touchUp(e, false); return; }
+    // A different pointer lifting (e.g. a pen while the mouse drags) doesn't end the drag it didn't start.
+    if (this._isDragging && this._dragPointerId !== null && e.pointerId !== undefined && e.pointerId !== this._dragPointerId) return;
     if (this._isLookDrag) { this._isLookDrag = false; this.onLookEnd?.(); }   // RMB released → host stops WASD fly
     this._isDragging = false;
+    this._dragPointerId = null;
   }
+
+  private handlePointerCancel(e: PointerEvent): void {
+    if (e.pointerType === 'touch') { this._touchUp(e, true); return; }
+    this.handlePointerUp(e);
+  }
+
+  // ── Touch gestures (TOUCH-3) ───────────────────────────────────
+
+  /** One-finger action for the current scheme: classic → orbit, freeLookNav → free-look, altOrbitOnly → none (the
+   *  finger belongs to the tool). touchNavLock → orbit everywhere. */
+  private _oneFingerAction(): 'orbit' | 'look' | null {
+    if (this.touchNavLock) return 'orbit';
+    if (this.freeLookNav) return 'look';
+    if (this.altOrbitOnly) return null;
+    return 'orbit';
+  }
+
+  /** Centroid of the active touches (+ the spread between the first two, for the pinch). */
+  private _touchCentroid(): { x: number; y: number; dist: number } {
+    let x = 0, y = 0, n = 0;
+    let a: { x: number; y: number } | null = null, b: { x: number; y: number } | null = null;
+    for (const p of this._touches.values()) {
+      x += p.x; y += p.y; n++;
+      if (!a) a = p; else if (!b) b = p;
+    }
+    if (n === 0) return { x: 0, y: 0, dist: 0 };
+    return { x: x / n, y: y / n, dist: a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0 };
+  }
+
+  /** (Re)start a multi-finger gesture from the current finger positions — no jump when a finger joins / leaves. */
+  private _beginMultiTouch(): void {
+    const c = this._touchCentroid();
+    this._touchMidX = c.x; this._touchMidY = c.y; this._touchDist = c.dist;
+    this._touchGesture = this._touches.size >= 3 ? 'three' : 'two';
+    this._touchOne = null;
+  }
+
+  private _touchDown(e: PointerEvent): void {
+    const id = e.pointerId ?? 0;
+    // Tracked even while disabled (a gizmo drag owns the first finger) so a later finger still sees the true count.
+    this._touches.set(id, { x: e.clientX, y: e.clientY });
+    try { this._canvas?.setPointerCapture?.(id); } catch { /* pointer already gone */ }
+    const n = this._touches.size;
+    if (n === 1) {
+      this._tap = { id, x: e.clientX, y: e.clientY, t: this._now(), moved: false };
+      if (!this.enabled) { this._touchGesture = 'none'; return; }
+      this._touchOne = this._oneFingerAction();
+      this._touchGesture = this._touchOne ? 'one' : 'none';
+      return;
+    }
+    this._tap = null;                                     // a 2nd finger: not a tap
+    if (!this.enabled) { this._touchGesture = 'none'; return; }
+    this._beginMultiTouch();
+  }
+
+  private _touchMove(e: PointerEvent): void {
+    const id = e.pointerId ?? 0;
+    const p = this._touches.get(id);
+    if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (this._tap && this._tap.id === id && !this._tap.moved
+        && Math.hypot(e.clientX - this._tap.x, e.clientY - this._tap.y) > OrbitController.TAP_SLOP_PX) this._tap.moved = true;
+    if (!this.enabled) return;
+    if (this._touchGesture === 'one') {
+      if (this._touchOne === 'look') this.lookAround(dx, dy);
+      else if (this._touchOne === 'orbit') this.orbit(dx, dy);
+      return;
+    }
+    if (this._touchGesture !== 'two' && this._touchGesture !== 'three') return;
+    const c = this._touchCentroid();
+    const mdx = c.x - this._touchMidX, mdy = c.y - this._touchMidY;
+    const prevDist = this._touchDist;
+    this._touchMidX = c.x; this._touchMidY = c.y; this._touchDist = c.dist;
+    if (this._touchGesture === 'three') { this._touchPan(mdx, mdy); return; }
+    // altOrbitOnly (tool modes): two fingers ORBIT (one finger is the tool's); otherwise two fingers PAN.
+    if (this.altOrbitOnly && !this.touchNavLock) { if (mdx !== 0 || mdy !== 0) this.orbit(mdx, mdy); }
+    else this._touchPan(mdx, mdy);
+    if (prevDist > 0 && c.dist > 0) this.pinch(c.dist / prevDist, c.x, c.y);
+  }
+
+  private _touchUp(e: PointerEvent, cancelled: boolean): void {
+    const id = e.pointerId ?? 0;
+    if (!this._touches.has(id)) return;                   // pointerleave after pointerup, or never tracked
+    this._touches.delete(id);
+    try { this._canvas?.releasePointerCapture?.(id); } catch { /* not captured */ }
+    const tap = this._tap;
+    if (tap && tap.id === id) {
+      this._tap = null;
+      const now = this._now();
+      if (!cancelled && !tap.moved && this._touches.size === 0 && this.enabled) {
+        const last = this._lastTap;
+        if (last && now - last.t <= OrbitController.DOUBLE_TAP_MS
+            && Math.hypot(e.clientX - last.x, e.clientY - last.y) <= OrbitController.DOUBLE_TAP_PX) {
+          this._lastTap = null;
+          this.onDoubleTap?.(e.clientX, e.clientY);
+        } else {
+          this._lastTap = { x: e.clientX, y: e.clientY, t: now };
+        }
+      }
+    }
+    const n = this._touches.size;
+    if (n === 0) { this._touchGesture = 'none'; this._touchOne = null; return; }
+    // A finger left a 3-finger pan → continue as two fingers; after a multi-finger gesture the LAST finger does
+    // nothing until it lifts (no surprise orbit when you end a pinch one finger at a time).
+    if (n >= 2 && this.enabled && (this._touchGesture === 'two' || this._touchGesture === 'three')) this._beginMultiTouch();
+    else { this._touchGesture = 'none'; this._touchOne = null; }
+  }
+
+  private _touchPan(dx: number, dy: number): void {
+    if (dx === 0 && dy === 0) return;
+    if (this.onTouchPan?.(dx, dy)) return;                 // host applied it (ortho view pinned to the 2D pan)
+    this.pan(dx, dy);
+  }
+
+  /** One PINCH step: `ratio` = new finger spread / previous (> 1 = apart = zoom IN), around client (cx, cy).
+   *  Perspective: a continuous dolly — dolly-through when `dollyThrough` (wheelDollyStep with the pinch as the step
+   *  size), else the classic clamped radius / ratio. Orthographic: handed to the host (`onTouchZoom`). Public so
+   *  hosts / tests can drive it. */
+  pinch(ratio: number, cx = 0, cy = 0): void {
+    if (!Number.isFinite(ratio) || ratio <= 0 || Math.abs(ratio - 1) < 1e-4) return;
+    if (this.camera.mode === 'orthographic') { this.onTouchZoom?.(ratio, cx, cy); return; }
+    // radius / ratio ≙ one wheel step of size (1 − 1/ratio) inward, or (1/ratio − 1) outward.
+    if (ratio > 1) this._dollyStep(-1, 1 - 1 / ratio);
+    else this._dollyStep(1, 1 / ratio - 1);
+  }
+
+  private _now(): number { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
 
   /** FREE-LOOK: rotate the camera's look direction IN PLACE (yaw around world-up, pitch around its right axis) —
    *  the position stays put, the target swings. Re-syncs the orbit spherical state so a later Alt+LMB orbit is
@@ -323,9 +510,12 @@ export class OrbitController {
   _wheelAcc = 0;
 
   /** One wheel-dolly step (+1 = out, −1 = in) — the wheel handler's body, public so hosts/tests can drive it. */
-  dolly(delta: 1 | -1): void {
+  dolly(delta: 1 | -1): void { this._dollyStep(delta, this.zoomSpeed); }
+
+  /** {@link dolly} with an explicit step size (the wheel uses zoomSpeed; a pinch its own continuous step). */
+  private _dollyStep(delta: 1 | -1, speed: number): void {
     const floor = this.dollyFloor > 0 ? this.dollyFloor : Math.max(this.minRadius, (this.camera.sceneRadius || 10) * 0.05);
-    const r = wheelDollyStep(this.radius, delta, this.zoomSpeed, this.minRadius, this.maxRadius, this.dollyThrough, floor);
+    const r = wheelDollyStep(this.radius, delta, speed, this.minRadius, this.maxRadius, this.dollyThrough, floor);
     if (r.push > 0) {
       // Dolly-through: move the pivot forward along the view ray (the camera follows at the new radius).
       const t = this.camera.target, p = this.camera.position;

@@ -181,12 +181,12 @@ describe('flat crowd shading (PED_SHADE)', () => {
         expect(lifted).toBeLessThan(plain * 0.6);
     });
 
-    it('static poses: waiting people look at phones / clasp hands / rest on one leg, strollers are mid-stride, groups talk, benches sit', () => {
+    it('static poses: waiting people look at phones / clasp hands / rest on one leg, strollers pause (never a frozen mid-stride), groups talk, benches sit', () => {
         expect(staticPose('seat', 'sit', 0.5)).toBe('sit');
         expect(staticPose('wait', 'stand', 0.1)).toBe('phone');
         expect(staticPose('crowd', 'stand', 0.4)).toBe('clasp');
         expect(staticPose('crowd', 'stand', 0.6)).toBe('rest');
-        expect(staticPose('stroll', 'stand', 0.2)).toBe('stride');
+        for (let r = 0; r < 1; r += 0.01) expect(staticPose('stroll', 'stand', r)).not.toBe('stride');
         expect(staticPose('group', 'stand', 0.2)).toBe('talk');
         expect(staticPose('lean', 'stand', 0.9)).toBe('lean');
         expect(staticPose('rail', 'stand', 0.9)).toBe('rail');

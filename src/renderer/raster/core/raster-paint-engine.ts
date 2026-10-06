@@ -12,7 +12,10 @@
  */
 
 import { BrushEngine, PointerInput } from '../brushes/brush-engine';
-import { RasterSnapshotManager } from './raster-snapshot-manager';
+import { RasterSnapshotManager, RasterRectPatch } from './raster-snapshot-manager';
+
+/** A finished stroke's undo patch (BRUSH-6) plus the texture it was painted on. */
+export type StrokePatch = RasterRectPatch & { texture: GPUTexture };
 import {
   BrushPreset,
   serializePreset,
@@ -184,17 +187,42 @@ export class RasterPaintEngine {
     this.scheduleRender();
   }
 
-  public async endStroke(input: PointerInput): Promise<void> {
+  /** BRUSH-1b/4: add a frame's worth of (coalesced) points as ONE dab batch — one GPU submit and one bounded
+   *  composite for all of them, instead of one per dab. */
+  public addStrokePoints(inputs: readonly PointerInput[]): void {
+    if (inputs.length === 0) return;
+    this.brushEngine.beginBatch();
+    try {
+      for (const p of inputs) this.brushEngine.addPoint(p);
+    } finally {
+      this.brushEngine.endBatch();
+    }
+    this.scheduleRender();
+  }
+
+  /**
+   * Finish the stroke and build its undo patch (BRUSH-6): the BEFORE/AFTER pixels of the region the stroke wrote,
+   * read from the GPU (two small readbacks — no full-canvas readback, no clone of the previous snapshot).
+   * `pushSnapshot` (default true) pushes it onto this engine's own stack; the illustration path passes false and
+   * hands the returned patch to the selected LAYER's stack instead (the one undo actually reads), so a stroke
+   * no longer costs two snapshots. Resolves to null when the stroke changed nothing readable.
+   */
+  public async endStroke(input: PointerInput, opts?: { pushSnapshot?: boolean }): Promise<StrokePatch | null> {
     this.brushEngine.endStroke(input);
     this.scheduleRender();
 
-    // Push snapshot for undo after the stroke finishes. E5 tail: hand the stroke's dirty rect to the
-    // snapshot so only the touched region is read back (the full-canvas readback was the last per-stroke
-    // O(w·h) cost); the manager falls back to a full readback whenever the rect can't be trusted.
-    if (this.activeTexture) {
-      const rect = this.brushEngine.takeStrokeDirtyRect();
-      await this.snapshotManager.pushSnapshot(this.activeTexture, rect ?? undefined);
+    const tex = this.activeTexture;
+    if (!tex) return null;
+    const pending = this.brushEngine.captureStrokePatch(tex);
+    const read = pending ? await pending.catch(() => null) : null;
+    const patch: StrokePatch | null = read
+      ? { texture: tex, w: tex.width, h: tex.height, x: read.x, y: read.y, rw: read.w, rh: read.h, before: read.before, after: read.after }
+      : null;
+    if (opts?.pushSnapshot !== false) {
+      if (patch) await this.snapshotManager.pushPatch(tex, patch);
+      else await this.snapshotManager.pushSnapshot(tex);   // no patch (nothing written / size changed) → full, deduped
     }
+    return patch;
   }
 
   // ── Undo / Redo ──────────────────────────────────────────────────
@@ -362,7 +390,8 @@ export function createDefaultPresets(): BrushPreset[] {
         flowPressureCurve: CONSTANT_CURVE,
       },
       blending: { mode: 'normal', opacity: 1.0, flow: 1.0 },
-      stabilization: { method: 'moving-average', level: 5 },
+      // BRUSH-4: 5 → 4 (time-based window 167 → 133 ms; mean lag ≈ 50 → 39 ms) — tablet strokes trailed the pen.
+      stabilization: { method: 'moving-average', level: 4 },
       antiAliasing: true,
       minSize: 1,
       maxSize: 32,
@@ -595,7 +624,8 @@ export function createDefaultPresets(): BrushPreset[] {
         flowPressureCurve: CONSTANT_CURVE,
       },
       blending: { mode: 'normal', opacity: 1.0, flow: 1.0 },
-      stabilization: { method: 'predictive', level: 6 },
+      // BRUSH-4: 6 → 4 (time constant ≈ 157 → 108 ms; the stabilizer is time-based now, so this holds at any rate).
+      stabilization: { method: 'predictive', level: 4 },
       antiAliasing: true,
       minSize: 2,
       maxSize: 2, // fixed width (min == max)

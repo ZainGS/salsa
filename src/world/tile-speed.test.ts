@@ -56,7 +56,8 @@ describe('P22 tile build speed-ups: identical output', () => {
     it('a full tile marks its geometry packable (indexed, ≤ 65,536 vertices); flat tiles are left alone', () => {
         const full = buildTileLayerGroups(P, 0, 1, true, OPTS);
         let yes = 0, no = 0;
-        for (const G of full) for (const L of G.layers) { const g = L.geometry as { packable?: boolean; vertices: Float32Array }; if (g.packable) { yes++; expect(g.vertices.length / 12).toBeLessThanOrEqual(65536); } else no++; }
+        for (const G of full) for (const L of G.layers) { if (G.name.endsWith('World Sign Text')) continue;   // the textured text plates stay unpacked (sign-text-tiles.test.ts)
+            const g = L.geometry as { packable?: boolean; vertices: Float32Array }; if (g.packable) { yes++; expect(g.vertices.length / 12).toBeLessThanOrEqual(65536); } else no++; }
         expect(yes).toBeGreaterThan(500);
         expect(no).toBeLessThan(yes / 20);
         const flat = buildTileLayerGroups(P, 0, 1, false, OPTS);

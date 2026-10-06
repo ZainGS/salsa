@@ -197,10 +197,18 @@ export function noboriGeometry(): { flag: MeshGeometry; text: MeshGeometry; pole
         flag.quad4([a, y0, rip(a)], [b, y0, rip(b)], [b, y1, rip(b)], [a, y1, rip(a)]);
     }
     // Lettering: 4-5 glyph blocks down the middle + a narrow loop band on the pole side, a hair off each face.
+    // ★ Each block is split at the cloth's STRIP seams so it follows the same piecewise-flat ripple as the flag. One
+    //   chord quad per block (xa → xb) cut straight through the cloth's kinks — the 3 cm ripple dwarfs the 8 mm offset,
+    //   so the middle blocks clipped through the flag ("squares glitching through the middle", 2026-10-04).
+    const seams: number[] = [];
+    for (let i = 1; i < strips; i++) seams.push(x0 + (x1 - x0) * i / strips);
     const glyph = (xa: number, xb: number, ya: number, yb: number): void => {
+        const xs = [xa, ...seams.filter(x => x > xa + 1e-6 && x < xb - 1e-6), xb];
         for (const side of [1, -1]) {
-            const za = rip(xa) + side * 0.008, zb = rip(xb) + side * 0.008;
-            text.quad4([xa, ya, za], [xb, ya, zb], [xb, yb, zb], [xa, yb, za]);
+            for (let j = 0; j + 1 < xs.length; j++) {
+                const pa = xs[j], pb = xs[j + 1], za = rip(pa) + side * 0.008, zb = rip(pb) + side * 0.008;
+                text.quad4([pa, ya, za], [pb, ya, zb], [pb, yb, zb], [pa, yb, za]);
+            }
         }
     };
     const gx0 = x0 + M.flagW * 0.3, gx1 = x0 + M.flagW * 0.74, gh = 0.2, gap = 0.07;

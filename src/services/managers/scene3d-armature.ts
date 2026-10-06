@@ -413,6 +413,7 @@ export class Scene3DArmature {
         // On-demand renderer: an instant (non-damped) camera change — a wheel dolly especially — must request a
         // frame, or it applies to the camera but doesn't draw until a stray mouse-move schedules one.
         this._orbitController.onChange = () => this.ctx.scheduleRender();
+        this._wireOrbitTouch(this._orbitController);
         const canvas = this.ctx.webgpuRenderer.getCanvas();
         if (canvas) this._orbitController.attach(canvas);
 
@@ -932,6 +933,45 @@ export class Scene3DArmature {
     }
 
     getOrbitController(): OrbitController | undefined { return this._orbitController; }
+
+    // ── TOUCH-3 (docs/ui/touch-controls.md) ──────────────────────────────────────────────────────────
+    /** Host "Navigate" lock: one finger orbits in every scheme (tool modes included). Survives orbit re-creation. */
+    private _touchNavLock = false;
+    /** Double-tap handler (client coords) — Scene3DManager frames the tapped mesh, or everything. */
+    touchDoubleTapHandler: ((clientX: number, clientY: number) => void) | null = null;
+
+    setTouchNavigate3D(on: boolean): void {
+        this._touchNavLock = !!on;
+        if (this._orbitController) this._orbitController.touchNavLock = this._touchNavLock;
+    }
+    getTouchNavigate3D(): boolean { return this._touchNavLock; }
+
+    /** Hook a freshly created orbit controller's touch gestures into this view's zoom / pan paths. */
+    private _wireOrbitTouch(orb: OrbitController): void {
+        orb.touchNavLock = this._touchNavLock;
+        orb.onDoubleTap = (x, y) => this.touchDoubleTapHandler?.(x, y);
+        // Ortho pinch: the decoupled creator view zooms `_meshEditZoom` (like its wheel interceptor); an illustration-
+        // synced ortho view zooms the 2D view, which the per-frame sync turns into orthoSize.
+        orb.onTouchZoom = (ratio, cx, cy) => {
+            if (this._meshEditZoom != null) {
+                this._meshEditZoom = Math.max(1e-3, Math.min(1e4, this._meshEditZoom * ratio));
+                this.ctx.scheduleRender();
+            } else {
+                this.ctx.webgpuRenderer.touchZoom2D(ratio, cx, cy);
+            }
+        };
+        // Ortho pan in an illustration-synced view: the target is re-pinned every frame, so pan the 2D view instead.
+        orb.onTouchPan = (dx, dy) => {
+            if (this.renderer3D.getCamera().mode !== 'orthographic' || this._meshEditZoom != null) return false;
+            this.ctx.webgpuRenderer.touchPan2D(dx, dy);
+            return true;
+        };
+        // The 2D raster pinch stands down while this controller owns multi-finger touch (no double zoom).
+        this.ctx.interactionService.touchGestures3D = () => {
+            const o = this._orbitController;
+            return !!o && o.enabled && o.attachedCanvas !== null;
+        };
+    }
 
     private _setThinWrapper(node: MeshGroup3D | null): void {
         if (this._selectedThinWrapper === node) return;

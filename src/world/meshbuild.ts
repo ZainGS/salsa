@@ -346,8 +346,9 @@ export class Accum3D {
         }
     }
 
-    /** A flat filled disc at `c` facing `dir` (the round signal lamps). */
-    disc(c: V3, dir: V3, r: number, segs = 12): void {
+    /** A flat filled disc at `c` facing `dir` (the round signal lamps). `rot` turns the ring (radians) — e.g. π/8 on an
+     *  8-gon gives the flat-top STOP octagon instead of a point at the top. */
+    disc(c: V3, dir: V3, r: number, segs = 12, rot = 0): void {
         const n = norm3(dir), up: V3 = Math.abs(n[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
         const u = norm3(cross3(n, up)), v = norm3(cross3(n, u));
         // Centred radial UVs: centre → (0.5,0.5), rim → the unit circle around it. Lets a shape use the
@@ -355,7 +356,7 @@ export class Accum3D {
         // that fades to nothing at the rim instead of a hard sticker edge. Colour-only discs ignore uv.
         const centre = this.vert(c, n, 0.5, 0.5), ring: number[] = [];
         for (let i = 0; i < segs; i++) {
-            const a = (i / segs) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a), cx = ca * r, cy = sa * r;
+            const a = rot + (i / segs) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a), cx = ca * r, cy = sa * r;
             ring.push(this.vert([c[0] + u[0] * cx + v[0] * cy, c[1] + u[1] * cx + v[1] * cy, c[2] + u[2] * cx + v[2] * cy], n, 0.5 + 0.5 * ca, 0.5 + 0.5 * sa));
         }
         for (let i = 0; i < segs; i++) { const m = (i + 1) % segs; this.tri(centre, ring[i], ring[m]); }

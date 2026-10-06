@@ -97,11 +97,15 @@ class MinHeap {
 /**
  * Decimate a triangle mesh to ~`targetRatio` of its faces (0..1). Position-only, curvature-adaptive.
  * Locks boundary edges (keeps open borders), skips collapses that flip a face or go non-manifold. Deterministic.
+ * `src[i]` = the input vertex output vertex i survived as (its position may have moved to the collapse optimum).
+ * `lockBorderVerts`: also never collapse an edge that TOUCHES an open-border vertex (by default only border edges are
+ * locked, so a border vertex can still slide inward — fine for one closed surface, but it opens gaps where separately
+ * decimated pieces must keep meeting, e.g. garment hems over a body).
  */
-export function simplifyMesh(positionsIn: V3[], trisIn: Tri[], targetRatio: number): { positions: V3[]; tris: Tri[] } {
+export function simplifyMesh(positionsIn: V3[], trisIn: Tri[], targetRatio: number, opts: { lockBorderVerts?: boolean } = {}): { positions: V3[]; tris: Tri[]; src: Int32Array } {
   const ratio = Math.max(0.02, Math.min(1, targetRatio));
   const nV = positionsIn.length;
-  if (ratio >= 0.999 || trisIn.length < 4 || nV < 4) return { positions: positionsIn.map(p => [...p] as V3), tris: trisIn.map(t => [...t] as Tri) };
+  if (ratio >= 0.999 || trisIn.length < 4 || nV < 4) return { positions: positionsIn.map(p => [...p] as V3), tris: trisIn.map(t => [...t] as Tri), src: Int32Array.from({ length: nV }, (_, i) => i) };
 
   const pos: V3[] = positionsIn.map(p => [...p] as V3);
   const faces: (Tri | null)[] = trisIn.map(t => [...t] as Tri);
@@ -156,6 +160,17 @@ export function simplifyMesh(positionsIn: V3[], trisIn: Tri[], targetRatio: numb
     }
   }
 
+  // Open-border vertices (an edge with exactly one face) — only consulted with lockBorderVerts.
+  const border = new Uint8Array(nV);
+  if (opts.lockBorderVerts) {
+    const edgeN = new Map<number, number>();
+    for (const f of faces) for (let e = 0; e < 3; e++) {
+      let a = f![e], b = f![(e + 1) % 3]; if (a > b) { const tmp = a; a = b; b = tmp; }
+      const key = a * nV + b; edgeN.set(key, (edgeN.get(key) ?? 0) + 1);
+    }
+    for (const [key, n] of edgeN) if (n === 1) { border[Math.floor(key / nV)] = 1; border[key % nV] = 1; }
+  }
+
   let faceCount = faces.length;
   const target = Math.max(4, Math.floor(faces.length * ratio));
 
@@ -180,6 +195,7 @@ export function simplifyMesh(positionsIn: V3[], trisIn: Tri[], targetRatio: numb
     const e = heap.pop()!;
     const { a, b, t } = e;
     if (!alive[a] || !alive[b] || stamp[a] !== e.sa || stamp[b] !== e.sb) continue;   // dead or stale
+    if (border[a] || border[b]) continue;          // lockBorderVerts: borders stay exactly where they are
     const sh = sharedFaces(a, b);
     if (sh.length !== 2) continue;               // boundary (1) or non-manifold (>2) → lock
     const shSet = new Set(sh);
@@ -206,7 +222,8 @@ export function simplifyMesh(positionsIn: V3[], trisIn: Tri[], targetRatio: numb
   // Compact: drop dead verts + null faces, remap indices.
   const remap = new Int32Array(nV).fill(-1);
   const outPos: V3[] = [];
-  for (let v = 0; v < nV; v++) if (alive[v]) { remap[v] = outPos.length; outPos.push(pos[v]); }
+  const src: number[] = [];   // output vertex -> the input vertex it survived as (callers carry per-vertex attributes)
+  for (let v = 0; v < nV; v++) if (alive[v]) { remap[v] = outPos.length; outPos.push(pos[v]); src.push(v); }
   const outTris: Tri[] = [];
   for (const f of faces) {
     if (!f) continue;
@@ -214,7 +231,7 @@ export function simplifyMesh(positionsIn: V3[], trisIn: Tri[], targetRatio: numb
     if (a < 0 || b < 0 || c < 0 || a === b || b === c || a === c) continue;
     outTris.push([a, b, c]);
   }
-  return { positions: outPos, tris: outTris };
+  return { positions: outPos, tris: outTris, src: Int32Array.from(src) };
 }
 
 /**

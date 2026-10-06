@@ -104,6 +104,12 @@ export class Scene3DTextures {
    *  fresh one from the saved entries' data URLs. */
   resetForDeviceLoss(): void { this._textureLibrary = undefined; }
 
+  /** Document load / new document: start an empty library. restoreTextureLibraryData MERGES into the live library, so
+   *  every texture of every document opened this session used to stay in it — and was written into the next document
+   *  by its next 3D save. The old library's GPU textures are not destroyed here: the previous document's meshes may
+   *  still be drawn until the load removes them (they are released with those meshes). */
+  resetForDocumentLoad(): void { this._textureLibrary = undefined; }
+
   // ── Texture library ──────────────────────────────────────────────
 
   getTextureLibrary(): TextureLibrary {

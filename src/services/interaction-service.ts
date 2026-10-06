@@ -196,6 +196,12 @@ export class InteractionService {
      *  2D pan/zoom still drives the welded 3D camera as intended. */
     public cameraOwnsView = false;
 
+    /** TOUCH-3/7 (docs/ui/touch-controls.md): returns true while a 3D OrbitController is attached + enabled — it then
+     *  OWNS multi-finger touch (orbit / pan / pinch, routing an ortho pinch to the right zoom path itself), so the 2D
+     *  raster pinch / two-finger pan stands down instead of zooming the artboard a second time. Set by
+     *  Scene3DArmature; null = no 3D touch navigation. */
+    public touchGestures3D: (() => boolean) | null = null;
+
     public adjustZoom(delta: number, mouseX: number, mouseY: number, illustrationMode?: boolean, illustrationBounds?: { width: number; height: number }) {
     // free3D nav owns zoom via its orbit-controller dolly — a 2D zoom gesture (e.g. Ctrl+scroll) here must not
     // change the shared 2D zoomFactor and shift the artboard view underneath.

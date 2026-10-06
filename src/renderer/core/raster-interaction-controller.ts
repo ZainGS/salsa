@@ -62,6 +62,20 @@ import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d'
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 
+/** One pointerdown, for the double-click test. */
+export interface PressSample { t: number; type: string; x: number; y: number }
+
+/** TOUCH-5: is `cur` the second press of a double-click after `prev`? Within `thresholdMs`, from the SAME kind of
+ *  pointer and — for touch — within `touchSlopPx` of the first tap. (Two fingers landing together used to read as a
+ *  double-click: any two pointerdowns within 300 ms counted.) The mouse rule is unchanged: time only. A press that
+ *  lands while another finger is down never gets here (it becomes a pinch). */
+export function isDoubleClickPress(prev: PressSample, cur: PressSample, thresholdMs = 300, touchSlopPx = 40): boolean {
+    if (!((cur.t - prev.t) < thresholdMs)) return false;
+    if (cur.type !== prev.type) return false;
+    if (cur.type === 'touch' && Math.hypot(cur.x - prev.x, cur.y - prev.y) > touchSlopPx) return false;
+    return true;
+}
+
 export class RasterInteractionController {
     constructor(private r: WebGPURenderer) {}
 
@@ -72,6 +86,121 @@ export class RasterInteractionController {
 
     private beginUndoCapture(seeds: Iterable<Node>): void {
         this._undoToken = this.r.interactionService.vectorUndo.begin(this.r.sceneGraph.root, seeds);
+    }
+
+    // ── TOUCH (TOUCH-5 / TOUCH-7, docs/ui/touch-controls.md) ─────────────────────────────────────────────────
+    // Fingers are tracked by pointerId. Only the FIRST finger drives the select / drag / box / pan gesture; a 2nd
+    // finger CANCELS that gesture (reverting a half-done move / scale / rotate) and turns into a 2D PINCH-zoom +
+    // two-finger PAN around the finger midpoint. The mouse / pen path is unchanged (no pointerType 'touch').
+
+    /** Hit-radius multiplier for the 2D transform handles / line endpoints under a finger (TOUCH-8). */
+    static TOUCH_HIT_SCALE = 2;
+    /** Active touch pointers (client coords). */
+    private _touches = new Map<number, { x: number; y: number }>();
+    /** The finger driving the current single-pointer gesture (null = none / not touch). */
+    private _primaryTouchId: number | null = null;
+    /** Two-finger gesture state: the midpoint + spread at the last step. `nav` false = a 3D orbit controller owns the
+     *  multi-finger gesture (the 2D view must not ALSO zoom / pan), so the fingers are just swallowed until lifted. */
+    private _pinch: { mx: number; my: number; dist: number; nav: boolean } | null = null;
+    /** Pointer type + position of the last pointerdown (the double-click test). */
+    private _lastClickType = '';
+    private _lastClickX = 0;
+    private _lastClickY = 0;
+
+    /** True while a two-finger 2D gesture (or a swallowed 3D-owned one) is in progress. */
+    get isPinching(): boolean { return this._pinch !== null; }
+
+    /** Backing-store pixels per CSS pixel (the pan units are backing pixels × 2 — see InteractionService.adjustPan). */
+    private _cssToBacking(rect: DOMRect): number {
+        const c = this.r.canvas;
+        const k = rect.width > 0 ? c.width / rect.width : 1;
+        return Number.isFinite(k) && k > 0 ? k : 1;
+    }
+
+    /** PAN the 2D view by a CSS-pixel screen delta so the content follows the finger exactly (any devicePixelRatio).
+     *  Also used by the 3D orbit controller's ortho touch pan (illustration-synced views). */
+    public touchPan2D(dxCss: number, dyCss: number): void {
+        if (dxCss === 0 && dyCss === 0) return;
+        const k = this._cssToBacking(this.cacheRect()) * 2;
+        this.r.interactionService.adjustPan(dxCss * k, dyCss * k, this.r.illustrationMode, this.r.illustrationBounds);
+        if (!this.r.backgroundPatternFixed) this.r.bgDirty.matrix = true;
+        this.r.renderListDirty = true;
+        this.r.scheduleRender();
+    }
+
+    /** ZOOM the 2D view by `ratio` (> 1 = in) keeping the content under client (cx, cy) fixed. Also used by the 3D
+     *  orbit controller's ortho pinch (illustration-synced views). */
+    public touchZoom2D(ratio: number, clientX: number, clientY: number): void {
+        if (!Number.isFinite(ratio) || ratio <= 0 || Math.abs(ratio - 1) < 1e-4) return;
+        const rect = this.cacheRect();
+        const k = this._cssToBacking(rect);
+        // adjustZoom doubles its point (wheel convention: CSS px from the canvas centre) → pass backing px / 1.
+        const mx = (clientX - (rect.left + rect.width / 2)) * k;
+        const my = (clientY - (rect.top + rect.height / 2)) * k;
+        this.r.interactionService.adjustZoom(ratio - 1, mx, my, this.r.illustrationMode, this.r.illustrationBounds);
+        for (const node of this.r.interactionService.selectedNodes) (node as Shape).triggerRerender();
+        this.r.renderListDirty = true;
+        this.r.scheduleRender();
+    }
+
+    /** CANCEL the in-flight single-pointer gesture (a 2nd finger landed / the pointer was cancelled): a move / scale /
+     *  rotate / endpoint drag is reverted to its pointer-down snapshot (no undo entry), a marquee is dropped, a pan just
+     *  stops. Safe when idle. */
+    public cancelActiveGesture(): void {
+        const kind = this.r.mode.kind;
+        this.r.interactionService.pointerDown = false;
+        if (kind === 'idle') { this._undoToken = null; return; }
+        if (this._undoToken) {
+            const token = this._undoToken;
+            this._undoToken = null;
+            this.r.interactionService.vectorUndo.revert(token);
+        }
+        if (kind === 'boxSelecting') this.r.interactionService.boxSelectPreview = null;
+        if (kind === 'endpointDragging' || kind === 'draggingPlacement' || kind === 'resizingPlacement' || kind === 'rotatingPlacement') {
+            this.r.interactionService.endInteractive();
+        }
+        this.r.mode = { kind: 'idle' };
+        this.r.renderListDirty = true;
+        this.r.scheduleRender();
+    }
+
+    /** Pointer CANCELLED by the browser (system gesture, palm rejection, the page took the touch). */
+    public handlePointerCancel(event: PointerEvent): void {
+        if (event.pointerType === 'touch') {
+            const id = event.pointerId ?? 0;
+            if (!this._touches.has(id)) return;
+            this._touches.delete(id);
+            if (this._pinch) {
+                if (this._touches.size === 0) this._pinch = null;
+                else if (this._touches.size >= 2) this._beginPinch();
+                return;
+            }
+            if (id !== this._primaryTouchId) return;
+            this._primaryTouchId = null;
+        }
+        this.cancelActiveGesture();
+    }
+
+    private _beginPinch(): void {
+        const pts = [...this._touches.values()];
+        const a = pts[0], b = pts[1];
+        // A 3D orbit controller with touch gestures owns multi-finger input → the 2D view stays put.
+        const owned3D = this.r.interactionService.touchGestures3D?.() ?? false;
+        this._pinch = { mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, dist: Math.hypot(a.x - b.x, a.y - b.y), nav: !owned3D };
+        this.lastClickTime = 0;            // a pinch is never half of a double-click
+    }
+
+    private _pinchMove(): void {
+        const p = this._pinch;
+        if (!p || this._touches.size < 2) return;
+        const pts = [...this._touches.values()];
+        const a = pts[0], b = pts[1];
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, dist = Math.hypot(a.x - b.x, a.y - b.y);
+        if (p.nav && !this.r.interactionService.playActive) {
+            this.touchPan2D(mx - p.mx, my - p.my);
+            if (p.dist > 0 && dist > 0) this.touchZoom2D(dist / p.dist, mx, my);
+        }
+        p.mx = mx; p.my = my; p.dist = dist;
     }
 
   public handleKeyDown(event: KeyboardEvent) {
@@ -187,14 +316,40 @@ export class RasterInteractionController {
   private lastClickTime: number = 0;
   
   public handlePointerDown(event: PointerEvent) {
+    // TOUCH-5: fingers are tracked by id. A 2nd finger cancels the 1-finger gesture and becomes a pinch / pan;
+    // any finger beyond the first while one is busy never starts a select / drag / box.
+    const isTouch = event.pointerType === 'touch';
+    if (isTouch) {
+      this._touches.set(event.pointerId ?? 0, { x: event.clientX, y: event.clientY });
+      if (this._pinch) {                                        // a finger joined a pinch: re-seed (no jump)
+        if (this._touches.size >= 2) this._beginPinch();
+        return;
+      }
+      if (this._touches.size >= 2) {
+        this.cancelActiveGesture();
+        this._primaryTouchId = null;
+        this._beginPinch();
+        return;
+      }
+      this._primaryTouchId = event.pointerId ?? 0;
+    }
+
     // Track pointer state for shader uniforms
     this.r.interactionService.pointerDown = true;
 
     // Only schedule render if a mode is entered or selection changes
     const DOUBLE_CLICK_THRESHOLD = 300; // ms
     const now = Date.now();
-    const isDoubleClick = (now - this.lastClickTime) < DOUBLE_CLICK_THRESHOLD;
+    // Two pointerdowns within 300 ms are a double-click only from the SAME kind of pointer (a finger tap, then a mouse
+    // click is not) and, for touch, near the same spot (two fingers landing together used to read as a double-click).
+    const pType = event.pointerType ?? '';
+    const isDoubleClick = isDoubleClickPress(
+      { t: this.lastClickTime, type: this._lastClickType, x: this._lastClickX, y: this._lastClickY },
+      { t: now, type: pType, x: event.clientX, y: event.clientY }, DOUBLE_CLICK_THRESHOLD);
     this.lastClickTime = now;
+    this._lastClickType = pType;
+    this._lastClickX = event.clientX; this._lastClickY = event.clientY;
+    const hitScale = isTouch ? RasterInteractionController.TOUCH_HIT_SCALE : 1;
 
     // Play mode (Round 8): no 2D pan / select; only a left click reaches the UI system's hook below.
     if (this.r.interactionService.playActive && event.button !== 0) return;
@@ -260,7 +415,7 @@ export class RasterInteractionController {
     if (this.r.interactionService.selectedNodes.size === 1) {
       const sel = Array.from(this.r.interactionService.selectedNodes)[0];
       if (sel instanceof Line) {
-        const endpointThreshold = 0.02;
+        const endpointThreshold = 0.02 * hitScale;   // TOUCH-8: a finger gets a bigger grab radius
         // Transform local endpoints to world space
         const m = sel.localMatrix;
         const wx1 = m[0] * sel.x1 + m[4] * sel.y1 + m[12];
@@ -286,7 +441,7 @@ export class RasterInteractionController {
     // ROTATION → set rotating mode
     if (this.r.interactionService.selectedNodes.size === 1) {
       const shape = Array.from(this.r.interactionService.selectedNodes)[0] as Shape;
-      if (isNearRotationHandle(shape, [worldX, worldY])) {
+      if (isNearRotationHandle(shape, [worldX, worldY], hitScale)) {
         const initialMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
         this.beginUndoCapture([shape]);
         this.r.mode = {
@@ -301,7 +456,7 @@ export class RasterInteractionController {
     // SCALING → set scaling mode
     if (this.r.interactionService.selectedNodes.size === 1) {
       const shape = Array.from(this.r.interactionService.selectedNodes)[0] as Shape;
-      const side = getScalingSide(shape, [worldX, worldY]);
+      const side = getScalingSide(shape, [worldX, worldY], hitScale);
       if (side) {
         const sx0 = shape.scaleX ?? 1;
         const sy0 = shape.scaleY ?? 1;
@@ -801,6 +956,15 @@ export class RasterInteractionController {
     }
 
   public handlePointerMove(event: PointerEvent) {
+    // TOUCH-5/7: a pinch consumes every finger; otherwise only the gesture's own finger drives it.
+    if (event.pointerType === 'touch') {
+      const id = event.pointerId ?? 0;
+      const t = this._touches.get(id);
+      if (!t) return;
+      t.x = event.clientX; t.y = event.clientY;
+      if (this._pinch) { this._pinchMove(); return; }
+      if (id !== this._primaryTouchId) return;
+    }
     const mouseX = event.offsetX;
     const mouseY = event.offsetY;
     let interacted = false;
@@ -1316,6 +1480,20 @@ export class RasterInteractionController {
   }
 
   public handlePointerUp(event: PointerEvent) {
+  if (event.pointerType === 'touch') {
+    const id = event.pointerId ?? 0;
+    if (!this._touches.has(id)) return;
+    this._touches.delete(id);
+    if (this._pinch) {
+      // The pinch ends when its 2nd finger lifts; the remaining finger does nothing until it lifts too (the
+      // cancelled 1-finger gesture never resumes mid-air).
+      if (this._touches.size === 0) this._pinch = null;
+      else if (this._touches.size >= 2) this._beginPinch();   // the finger pair changed: re-seed (no jump)
+      return;
+    }
+    if (id !== this._primaryTouchId) return;
+    this._primaryTouchId = null;
+  }
   // Track pointer state for shader uniforms
   this.r.interactionService.pointerDown = false;
   if (this.r.interactionService.playActive && this.r.mode.kind === 'idle') return;   // Play (Round 8): nothing to finish

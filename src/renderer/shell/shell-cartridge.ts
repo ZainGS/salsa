@@ -750,7 +750,7 @@ export class CartridgeViewer {
         view: this.depthView,
         depthClearValue: 1.0,
         depthLoadOp: 'clear',
-        depthStoreOp: 'store',
+        depthStoreOp: 'discard',   // UI-16: nothing re-loads the hero depth (every pass clears its own)
       },
     });
     // Constrain to the top viewer region. Viewport y is from the top in WebGPU.
@@ -808,7 +808,7 @@ export class CartridgeViewer {
       this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
       const pass = encoder.beginRenderPass({
         colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
-        depthStencilAttachment: { view: this.depthView, depthClearValue: 1.0, depthLoadOp: i === 0 ? 'clear' : 'load', depthStoreOp: 'store' },
+        depthStencilAttachment: { view: this.depthView, depthClearValue: 1.0, depthLoadOp: i === 0 ? 'clear' : 'load', depthStoreOp: i === N - 1 ? 'discard' : 'store' },   // UI-16: only the next dot loads it
       });
       pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
       pass.setPipeline(this.discPipeline);
@@ -838,7 +838,8 @@ export class CartridgeViewer {
     if (!this.depthView) return null;
     return encoder.beginRenderPass({
       colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
-      depthStencilAttachment: { view: this.depthView, depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
+      // UI-16: depth is cleared here and never loaded by a later pass → discard (no depth write-back to memory).
+      depthStencilAttachment: { view: this.depthView, depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
     });
   }
 

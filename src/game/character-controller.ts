@@ -195,9 +195,20 @@ export class CharacterController {
   private _windup = -1;
   /** Third-person: the turn (rad, + = left) the body still has to make toward the move direction after this step. */
   private _turnRemaining = 0;
+  /** Rise-bug safety net (2026-10-04): step-ups taken in a row while grounded WITHOUT moving horizontally. The first
+   *  one is allowed (a spawn / teleport settling onto a kerb, a tile landing under the feet); the next ones are held. */
+  private _stillRises = 0;
+  /** A/B (rise bug 2026-10-04): false = a grounded, unmoving character may step up every tick (the old behaviour: a
+   *  surface that follows the feet — e.g. the player's own contact blob — then lifts it forever). */
+  static stillRiseGuard = true;
+  /** Diagnostics: step-ups the still-rise guard refused. */
+  stillRisesHeld = 0;
 
   /** Injected collision (optional; see file header). Set by the host after construction. */
   groundSampler: ((x: number, z: number) => number | null) | null = null;
+  /** The standable ground height found under the feet on the last step (sampled surface, else cfg.groundY) — what a
+   *  contact shadow sits on while airborne. */
+  lastGroundY = 0;
   moveResolver: ((fromX: number, fromZ: number, toX: number, toZ: number, radius: number) => [number, number]) | null = null;
 
   constructor(cfg: Partial<CharacterConfig> = {}, start: Vec3 = [0, 0, 0]) {
@@ -239,6 +250,7 @@ export class CharacterController {
   teleport(p: Vec3): void {
     this.pos = [p[0], p[1], p[2]];
     this.prevPos = [p[0], p[1], p[2]];
+    this._stillRises = 0;
   }
 
   /** Apply look deltas (radians; + yaw = turn RIGHT, + pitch = look up) — camera only in third-person. The Play loop
@@ -338,6 +350,7 @@ export class CharacterController {
     // The standable ground under the (possibly new) x,z — the sampled scene surface, else the flat fallback.
     const ground = this.groundSampler?.(this.pos[0], this.pos[2]);
     const groundY = (ground === null || ground === undefined) ? c.groundY : ground;
+    this.lastGroundY = groundY;
 
     // Jump: edge-triggered + buffered, with coyote time after walking off the ground.
     const wasGrounded = this.grounded;
@@ -375,7 +388,16 @@ export class CharacterController {
     // — that is overhead geometry, not a floor. Walking (grounded, not jumping) stays glued to ground that drops by
     // no more than stepHeight (down stairs / slopes), so it doesn't flicker into "falling" every step.
     const rising = this.vel[1] > 0;
-    if (this.pos[1] <= groundY && !(rising && groundY > preY + 1e-6)) {
+    // Safety net (rise bug 2026-10-04): a grounded character that did not move horizontally this step cannot keep
+    // gaining height. A surface that follows the feet (it was the player's own contact-shadow blob being collided
+    // with) otherwise lifts it by a few mm every tick, forever. One still step-up is allowed (a spawn settling onto a
+    // kerb, ground that landed under the feet); the next ones in a row are held at the current height.
+    const stillStep = wasGrounded && !jumped && groundY > preY + 1e-6 && this.pos[0] === prevX && this.pos[2] === prevZ;
+    if (!stillStep) this._stillRises = 0;
+    if (stillStep && CharacterController.stillRiseGuard && this._stillRises >= 1) {
+      this.pos[1] = preY; this.vel[1] = 0; this.grounded = true; this.stillRisesHeld++;
+    } else if (this.pos[1] <= groundY && !(rising && groundY > preY + 1e-6)) {
+      if (stillStep) this._stillRises++;
       this.pos[1] = groundY; this.vel[1] = 0; this.grounded = true;
     } else if (wasGrounded && !jumped && groundY <= preY + 1e-6 && preY - groundY <= c.stepHeight) {
       this.pos[1] = groundY; this.vel[1] = 0; this.grounded = true;

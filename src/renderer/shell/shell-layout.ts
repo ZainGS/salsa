@@ -202,6 +202,9 @@ export interface ProjectGridItem {
   rect: Rgba;
   /** 1 while hovered (drives the lift/brighten), else 0. */
   hover: number;
+  /** Title-bar height (device px). Shared by the GRID_SHADER chrome, the ✕ hit-test and the title label;
+   *  absent → the legacy `max(9, h·0.10)`. */
+  titleH?: number;
 }
 
 export interface ShellTheme {
@@ -566,42 +569,156 @@ export function gridProjectX(cx: number, viewportW: number): { sc: number; projX
   return { sc, projX: viewportW / 2 + (cx - viewportW / 2) * sc };
 }
 
+// Fixed-size cards (mobile-parity UI-14): every card is the same size whatever the project count; more projects
+// add identical cards, left-aligned, wrapping to new rows, scrolled vertically. All sizes are CSS px × DPR
+// (the layout works in canvas device px).
+
+/** Card width (CSS px) on a wide viewport. */
+export const PROJECT_TILE_W_CSS = 220;
+/** Card width (CSS px) when the viewport is narrower than {@link PROJECT_TILE_COMPACT_BELOW_CSS}. */
+export const PROJECT_TILE_W_COMPACT_CSS = 180;
+/** Viewport width (CSS px) below which the compact card width is used. */
+export const PROJECT_TILE_COMPACT_BELOW_CSS = 900;
+/** Card height ÷ width (title bar + ~16:9 thumbnail below). */
+export const PROJECT_TILE_ASPECT = 0.7;
+/** Card title-bar height floor (CSS px) — tall enough for a 12–16 px title. */
+export const PROJECT_TITLE_H_CSS = 20;
+const PROJECT_GAP_CSS = 12;          // between columns
+const PROJECT_ROW_GAP_CSS = 14;      // between rows
+const PROJECT_BOTTOM_PAD_CSS = 24;   // below the last row
+/** Side margin = clamp(3 % of the width, 16, 48) CSS px; the chips' left edge aligns with it. */
+export function projectGridSideMargin(viewportW: number, dpr = 1): number {
+  const d = dpr > 0 ? dpr : 1;
+  return Math.min(48 * d, Math.max(16 * d, viewportW * 0.03));
+}
+
+/** Shell chrome font clamp (CSS px) for the chip buttons and the card titles. */
+export const SHELL_FONT_MIN_CSS = 12;
+export const SHELL_FONT_MAX_CSS = 16;
+/** Minimum chip (button) height (CSS px): a comfortable touch target. */
+export const SHELL_CHIP_MIN_H_CSS = 44;
+
+/** Clamp a device-px font size into [SHELL_FONT_MIN_CSS, SHELL_FONT_MAX_CSS] × dpr (rounded). */
+export function clampShellFontPx(fontPx: number, dpr = 1): number {
+  const d = dpr > 0 ? dpr : 1;
+  return Math.round(Math.min(SHELL_FONT_MAX_CSS * d, Math.max(SHELL_FONT_MIN_CSS * d, fontPx)));
+}
+
+/** Text-width measurer: device-px width of `text` at `fontPx` (device px). */
+export type ShellTextMeasure = (text: string, fontPx: number) => number;
+
+export interface ShellChipLayout {
+  /** One rect per label, in input order ([x, y, w, h], device px). */
+  rects: Rgba[];
+  /** Font for every chip label (device px). */
+  fontPx: number;
+  /** Bottom edge of the lowest chip row (device px). */
+  bottom: number;
+}
+
 /**
- * Lay out the illustrations thumbnail grid: square cards in a centered,
- * full-bleed column grid (no panel), with vertical `scrollY` applied. Returns
- * the cards (base rects, pre-curve) + total content height for scroll clamping.
+ * Lay out the floating chip buttons (‹ Back, + New Project, …) from their MEASURED label widths: each chip is
+ * `text + 2·padX` wide and at least {@link SHELL_CHIP_MIN_H_CSS} tall, so labels are never clipped. The font
+ * follows the viewport height, clamped to 12–16 CSS px; if the row doesn't fit the width it first shrinks the
+ * font (down to 12 px), then wraps chips onto further rows.
+ */
+export function layoutShellChips(
+  labels: string[],
+  measure: ShellTextMeasure,
+  viewportW: number,
+  viewportH: number,
+  dpr = 1,
+): ShellChipLayout {
+  const d = dpr > 0 ? dpr : 1;
+  const x0 = projectGridSideMargin(viewportW, d);
+  const maxRight = Math.max(x0 + 1, viewportW - x0);
+  const gap = 8 * d;
+  const y0 = Math.min(64 * d, Math.max(12 * d, viewportH * 0.05));
+  const minFont = clampShellFontPx(0, d);
+  let fontPx = clampShellFontPx(viewportH * 0.02, d);
+  const padOf = (f: number) => Math.max(12 * d, f * 0.9);
+  const widthsAt = (f: number) => labels.map(t => Math.ceil(Math.max(0, measure(t, f))) + 2 * padOf(f));
+  const rowW = (ws: number[]) => ws.reduce((s, w) => s + w, 0) + Math.max(0, ws.length - 1) * gap;
+  let widths = widthsAt(fontPx);
+  // Shrink toward the minimum font before wrapping (text width scales ~linearly with the font).
+  while (fontPx > minFont && x0 + rowW(widths) > maxRight) {
+    fontPx = Math.max(minFont, fontPx - Math.max(1, Math.round(d)));
+    widths = widthsAt(fontPx);
+  }
+  const h = Math.max(SHELL_CHIP_MIN_H_CSS * d, Math.round(fontPx * 2.1));
+  const rects: Rgba[] = [];
+  let x = x0, y = y0;
+  for (const w of widths) {
+    if (x > x0 && x + w > maxRight) { x = x0; y += h + gap; }   // wrap (a lone over-wide chip still gets its row)
+    rects.push([x, y, w, h]);
+    x += w + gap;
+  }
+  return { rects, fontPx, bottom: labels.length ? y + h : y0 };
+}
+
+/**
+ * Card-title font (device px): `titleH·0.68` clamped to 12–16 CSS px, then shrunk (not below 12 px) so the
+ * name fits `availW`; the label atlas ellipsizes only what still doesn't fit at the minimum.
+ */
+export function projectCardTitleFontPx(
+  name: string, availW: number, titleH: number, dpr = 1, measure?: ShellTextMeasure,
+): number {
+  const d = dpr > 0 ? dpr : 1;
+  const minFont = clampShellFontPx(0, d);
+  let f = clampShellFontPx(titleH * 0.68, d);
+  if (measure && name) {
+    const w = measure(name, f);
+    if (w > availW && w > 0) f = Math.max(minFont, Math.floor(f * availW / w));
+  }
+  return f;
+}
+
+/** Title-bar height (device px) of a project card — the GRID_SHADER chrome, ✕ hit-test and label all use it. */
+export function projectCardTitleH(item: Pick<ProjectGridItem, 'rect' | 'titleH'>): number {
+  return item.titleH ?? Math.max(9, item.rect[3] * 0.10);
+}
+
+/**
+ * Lay out the illustrations thumbnail grid: FIXED-size cards (220 CSS px wide, 180 under 900 CSS px, × `dpr`;
+ * aspect {@link PROJECT_TILE_ASPECT}) in left-aligned rows that wrap, with vertical `scrollY` applied. The card
+ * size never depends on the project count. `topMargin` (device px) is where the first row starts — the caller
+ * passes the chip row's bottom + a gap; omitted → a default single chip row. Returns the cards (base rects,
+ * pre-curve) + total content height for scroll clamping.
  */
 export function computeProjectGrid(
   viewportW: number,
   viewportH: number,
   ids: string[],
   scrollY: number,
-): { items: ProjectGridItem[]; contentHeight: number; cols: number } {
+  dpr = 1,
+  topMargin?: number,
+): { items: ProjectGridItem[]; contentHeight: number; cols: number; tileW: number; tileH: number } {
+  const d = dpr > 0 ? dpr : 1;
+  const sideMargin = projectGridSideMargin(viewportW, d);
+  const usableW = Math.max(1, viewportW - 2 * sideMargin);
+  const cssW = viewportW / d;
+  // Fixed card width; only a viewport narrower than one card shrinks it (never stretches it).
+  const tileW = Math.min(usableW, (cssW < PROJECT_TILE_COMPACT_BELOW_CSS ? PROJECT_TILE_W_COMPACT_CSS : PROJECT_TILE_W_CSS) * d);
+  const tileH = Math.round(tileW * PROJECT_TILE_ASPECT);
+  const titleH = Math.max(PROJECT_TITLE_H_CSS * d, tileH * 0.10);
+  const gap = PROJECT_GAP_CSS * d;
+  const rowGap = PROJECT_ROW_GAP_CSS * d;
+  const cols = Math.max(1, Math.floor((usableW + gap) / (tileW + gap)));
   if (viewportW <= 0 || viewportH <= 0 || ids.length === 0) {
-    return { items: [], contentHeight: 0, cols: 1 };
+    return { items: [], contentHeight: 0, cols, tileW, tileH };
   }
-  // Dense gallery of small landscape (16:9) cards, like the Frogmarks dashboard.
-  const sideMargin = viewportW * 0.03;
-  const usableW = viewportW - 2 * sideMargin;
-  const targetTileW = viewportW * 0.17;         // aim ~5 columns (room for titled windows)
-  const gap = viewportW * 0.006;
-  let cols = Math.max(1, Math.round((usableW + gap) / (targetTileW + gap)));
-  cols = Math.min(cols, ids.length);
-  const tileW = (usableW - (cols - 1) * gap) / cols;
-  const tileH = tileW * 0.66;                    // title bar + ~16:9 content below
-  const rowGap = viewportH * 0.012;
-  const topMargin = viewportH * 0.13;           // room for the top chips
+  const top = topMargin ?? (Math.min(64 * d, Math.max(12 * d, viewportH * 0.05)) + SHELL_CHIP_MIN_H_CSS * d + 16 * d);
   const rows = Math.ceil(ids.length / cols);
 
   const items: ProjectGridItem[] = [];
   for (let i = 0; i < ids.length; i++) {
     const col = i % cols, row = Math.floor(i / cols);
     const x = sideMargin + col * (tileW + gap);
-    const y = topMargin + row * (tileH + rowGap) - scrollY;
-    items.push({ id: ids[i], rect: [x, y, tileW, tileH], hover: 0 });
+    const y = top + row * (tileH + rowGap) - scrollY;
+    items.push({ id: ids[i], rect: [x, y, tileW, tileH], hover: 0, titleH });
   }
-  const contentHeight = topMargin + rows * tileH + (rows - 1) * rowGap + viewportH * 0.05;
-  return { items, contentHeight, cols };
+  const contentHeight = top + rows * tileH + (rows - 1) * rowGap + PROJECT_BOTTOM_PAD_CSS * d;
+  return { items, contentHeight, cols, tileW, tileH };
 }
 
 /** Hit-test the curved project grid (top-most card). Mirrors the GPU curve so
@@ -622,7 +739,7 @@ export function hitTestProjectGrid(model: ShellRenderModel, px: number, py: numb
 /**
  * Hit-test the title-bar CLOSE (✕) button of a project card → returns that card's id (a delete-intent target),
  * else null. The button geometry MUST match the one drawn in GRID_SHADER's fragment shader (shell-renderer):
- * a `bs`-square button inset at the top-right of the `titleH` title bar. Card-local px are mapped into the same
+ * a `bs`-square button inset at the top-right of the `titleH` (projectCardTitleH) title bar. Card-local px are mapped into the same
  * curved/scaled screen space the card is drawn + hit-tested in (`projX - hw + xLocal*sc`, `cy - hh + yLocal*sc`).
  */
 export function hitTestProjectGridClose(model: ShellRenderModel, px: number, py: number, viewportW: number): string | null {
@@ -634,7 +751,7 @@ export function hitTestProjectGridClose(model: ShellRenderModel, px: number, py:
     const hw = (w / 2) * sc, hh = (h / 2) * sc;
     const cy = y + h / 2;
     const b = Math.min(Math.max(Math.min(w, h) * 0.012, 1.5), 2.5);
-    const titleH = Math.max(9, h * 0.10);
+    const titleH = projectCardTitleH(grid[i]);
     const bs = titleH * 0.70;
     const bx1 = w - 2 * b - b * 1.5, bx0 = bx1 - bs;   // card-local button box (matches the shader)
     const by0 = 2 * b + (titleH - bs) * 0.5, by1 = by0 + bs;

@@ -276,14 +276,16 @@ export function staticCrowd(graph: WorldGraph, keep?: ((region: number) => boole
 }
 
 /** A static person's POSE from their spot + a hash roll: people waiting at a bus stop / signal mostly look at their
- *  phones or wait hands-clasped; strollers are caught mid-stride (a few reading a phone); groups and shoppers stand. */
+ *  phones or wait hands-clasped; strollers have paused (phone / weight on one leg / standing); groups and shoppers stand.
+ *  Never 'stride': a static person gets the live crowd's idle sway, and a frozen mid-step pose that sways reads as a
+ *  broken walk cycle. Walking people are the moving crowd (traffic.ts), not static records. */
 export function staticPose(kind: StaticPerson['kind'], seatPose: Pose, r: number): Pose {
     if (seatPose === 'sit') return 'sit';
     switch (kind) {
         case 'lean': return 'lean';
         case 'rail': return 'rail';
         case 'wait': case 'crowd': return r < 0.3 ? 'phone' : r < 0.45 ? 'clasp' : r < 0.8 ? 'rest' : 'stand';
-        case 'stroll': return r < 0.55 ? 'stride' : r < 0.72 ? 'phone' : r < 0.86 ? 'rest' : 'stand';
+        case 'stroll': return r < 0.4 ? 'phone' : r < 0.75 ? 'rest' : 'stand';
         case 'group': return r < 0.4 ? 'talk' : r < 0.65 ? 'rest' : r < 0.75 ? 'clasp' : r < 0.83 ? 'phone' : 'stand';
         default: return r < 0.25 ? 'clasp' : r < 0.6 ? 'rest' : 'stand';
     }

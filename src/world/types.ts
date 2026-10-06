@@ -44,6 +44,8 @@ export type PedestrianStyle = 'flat' | 'default' | 'cel' | 'cel-hd' | 'ink';
 /** visual-polish #11 tail: how the detailed flat roofs carry their plant (LayoutParams.roofEquipment). */
 export type RoofEquipmentStyle = 'classic' | 'clustered';
 export const PEDESTRIAN_STYLES: readonly PedestrianStyle[] = ['flat', 'default', 'cel', 'cel-hd', 'ink'];
+/** What the static crowd is built from (LayoutParams.crowdStyle). */
+export type CrowdStyle = 'mannequin' | 'character';
 
 /** How the street network is generated. Hybrid per §6.3: cities lean 'grid', towns lean 'radial'. */
 export type RoadPattern = 'radial' | 'grid';
@@ -205,6 +207,12 @@ export interface LayoutParams {
      *  diffuse + an emissive lift; follows the city's render style) · 'default' = normal lit PBR (full colour, no lift)
      *  · 'cel' / 'cel-hd' / 'ink' = that render style on the crowd only (the ground + buildings keep theirs). */
     pedestrianStyle?: PedestrianStyle;
+    /** WHAT the static crowd's near / mid people are built from (docs/specs/crowd-characters.md): 'mannequin' (absent =
+     *  the default; saved cities unchanged) = the mannequin kit · 'character' = baked archetypes from the procedural
+     *  CHARACTER system (faceless, lock hair, real garment cuts; crowd-character.ts) where a person's class / pose has
+     *  one, the mannequin otherwise (and always for the xfar tier). Instanced crowd only. Rebuilds 'World Pedestrians'
+     *  (salsaWorld.update({ crowdStyle: 'character' })). */
+    crowdStyle?: CrowdStyle;
     traffic: boolean;       // MOVING cars/train/walkers while in City mode (the live sim ticker)
     clouds: boolean;         // drifting procedural clouds above the city (part of the live ticker)
     cloudDensity: number;    // 0..1 — how many clouds (≈3 at 0 … ≈18 at 1)

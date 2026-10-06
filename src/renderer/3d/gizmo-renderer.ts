@@ -1008,7 +1008,12 @@ function hitRotateRing(
   lO: vec3,
   lD: vec3,
   axis: 'x' | 'y' | 'z',
+  /** TOUCH-8 hit-radius multiplier: widens the washer + its wall thickness (1 = the mouse band). */
+  hs = 1,
 ): number | null {
+  const ringInner = 1 - (1 - HIT_RING_INNER) * hs;
+  const ringOuter = 1 + (HIT_RING_OUTER - 1) * hs;
+  const ringHalfT = HIT_RING_HALF_T * hs;
   const axIdx = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
   const [c0, c1] = axis === 'x' ? [1, 2] : axis === 'y' ? [0, 2] : [0, 1];
 
@@ -1025,7 +1030,7 @@ function hitRotateRing(
       const px = lO[c0] + t * lD[c0];
       const py = lO[c1] + t * lD[c1];
       const dist = Math.sqrt(px * px + py * py);
-      if (dist >= HIT_RING_INNER && dist <= HIT_RING_OUTER) tryT(t);
+      if (dist >= ringInner && dist <= ringOuter) tryT(t);
     }
   }
 
@@ -1036,14 +1041,14 @@ function hitRotateRing(
     const a = dx * dx + dy * dy;
     if (a >= 1e-8) {
       const b = 2 * (ox * dx + oy * dy);
-      const c = ox * ox + oy * oy - HIT_RING_OUTER * HIT_RING_OUTER;
+      const c = ox * ox + oy * oy - ringOuter * ringOuter;
       const disc = b * b - 4 * a * c;
       if (disc >= 0) {
         const sq = Math.sqrt(disc);
         for (const t of [(-b - sq) / (2 * a), (-b + sq) / (2 * a)]) {
           if (t > 1e-4) {
             const ax = lO[axIdx] + t * lD[axIdx];
-            if (Math.abs(ax) <= HIT_RING_HALF_T) tryT(t);
+            if (Math.abs(ax) <= ringHalfT) tryT(t);
           }
         }
       }
@@ -1060,6 +1065,8 @@ function hitPlane(
   lO: vec3,
   lD: vec3,
   plane: 'xy' | 'xz' | 'yz',
+  /** TOUCH-8 hit-radius multiplier: pads the quad (1 = the mouse quad). */
+  hs = 1,
 ): number | null {
   // The plane handle lies at depth=0 of the third axis
   const normIdx = plane === 'xy' ? 2 : plane === 'xz' ? 1 : 0;
@@ -1073,7 +1080,8 @@ function hitPlane(
   const px = lO[c0] + t * lD[c0];
   const py = lO[c1] + t * lD[c1];
 
-  const inRange = (v: number) => v >= PLANE_OFF && v <= PLANE_OFF + PLANE_SIZE;
+  const pad = Math.max(0, hs - 1) * 0.04;
+  const inRange = (v: number) => v >= PLANE_OFF - pad && v <= PLANE_OFF + PLANE_SIZE + pad;
   if (inRange(px) && inRange(py)) return t;
   return null;
 }
@@ -1081,6 +1089,9 @@ function hitPlane(
 // ── GizmoRenderer class ────────────────────────────────────────────
 
 export class GizmoRenderer {
+  /** TOUCH-8: hit-radius multiplier for the transform gizmo picks (axes, rings, plane quads, OBB corners, array /
+   *  face handles). The pointer handler sets it to ~2 for a finger and back to 1 for the mouse; drawing is unchanged. */
+  hitScale = 1;
   private device: GPUDevice;
   private swapChainFormat: GPUTextureFormat;
 
@@ -1410,7 +1421,7 @@ export class GizmoRenderer {
     const center  = this.computeCenter(selectedMeshes);
     const scale   = GizmoRenderer.computeGizmoScale(camera, center);
     // Hit radius = 2× the visual sphere radius for comfortable picking
-    const hitR    = scale * 0.018 * 2.2 * 2.0;
+    const hitR    = scale * 0.018 * 2.2 * 2.0 * this.hitScale;
     const hitR2   = hitR * hitR;
 
     let bestT   = Infinity;
@@ -2001,7 +2012,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
   ): ArrayHandleHit {
     const testSphere = (pos: [number, number, number]): boolean => {
       const scale = GizmoRenderer.computeGizmoScale(camera, vec3.fromValues(...pos));
-      const hitR2 = (scale * 0.10 * 2.2) ** 2;
+      const hitR2 = (scale * 0.10 * 2.2 * this.hitScale) ** 2;
       const dx = pos[0] - rayOrigin[0];
       const dy = pos[1] - rayOrigin[1];
       const dz = pos[2] - rayOrigin[2];
@@ -2132,7 +2143,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         h.pos[2] + h.dir[2] * shaftLen,
       ];
 
-      const hitR  = scale * (primary ? 0.10 : 0.065) * 2.5;
+      const hitR  = scale * (primary ? 0.10 : 0.065) * 2.5 * this.hitScale;
       const hitR2 = hitR * hitR;
       const dx = tipPos[0] - rayOrigin[0];
       const dy = tipPos[1] - rayOrigin[1];
@@ -2187,20 +2198,21 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       }
     }
 
+    const hs = this.hitScale;
     if (mode === 'move' || mode === 'scale') {
-      tryHit('x', hitAxisCylinder(lO, lD, 'x', HIT_RADIUS_AXIS));
-      tryHit('y', hitAxisCylinder(lO, lD, 'y', HIT_RADIUS_AXIS));
-      tryHit('z', hitAxisCylinder(lO, lD, 'z', HIT_RADIUS_AXIS));
+      tryHit('x', hitAxisCylinder(lO, lD, 'x', HIT_RADIUS_AXIS * hs));
+      tryHit('y', hitAxisCylinder(lO, lD, 'y', HIT_RADIUS_AXIS * hs));
+      tryHit('z', hitAxisCylinder(lO, lD, 'z', HIT_RADIUS_AXIS * hs));
       if (mode === 'move') {
-        tryHit('xy', hitPlane(lO, lD, 'xy'));
-        tryHit('xz', hitPlane(lO, lD, 'xz'));
-        tryHit('yz', hitPlane(lO, lD, 'yz'));
+        tryHit('xy', hitPlane(lO, lD, 'xy', hs));
+        tryHit('xz', hitPlane(lO, lD, 'xz', hs));
+        tryHit('yz', hitPlane(lO, lD, 'yz', hs));
       }
     } else {
       // rotate
-      tryHit('x', hitRotateRing(lO, lD, 'x'));
-      tryHit('y', hitRotateRing(lO, lD, 'y'));
-      tryHit('z', hitRotateRing(lO, lD, 'z'));
+      tryHit('x', hitRotateRing(lO, lD, 'x', hs));
+      tryHit('y', hitRotateRing(lO, lD, 'y', hs));
+      tryHit('z', hitRotateRing(lO, lD, 'z', hs));
     }
 
     return bestAxis;

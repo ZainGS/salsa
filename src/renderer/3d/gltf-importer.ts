@@ -6,7 +6,14 @@
  *   GLTF 2.0 JSON with external/embedded buffers
  *   Static mesh primitives (TRIANGLES mode only — mode 4, the spec default)
  *   POSITION / NORMAL / TEXCOORD_0 / TANGENT vertex attributes
- *   uint16 and uint32 index buffers
+ *   Every accessor component type (i8 / u8 / i16 / u16 / u32 / f32), tightly packed or
+ *   interleaved (bufferView.byteStride), honouring accessor.normalized (signed + unsigned)
+ *   Sparse accessors (over a bufferView or over zeros) and bufferView-less accessors (= zeros)
+ *   u8 / u16 / u32 index buffers
+ *   Skinning: JOINTS_0/WEIGHTS_0 (+ JOINTS_1/WEIGHTS_1 reduced to the top 4 by weight)
+ *   Morph targets: names from primitive.extras.targetNames or mesh.extras.targetNames,
+ *   default weights from mesh.weights (GltfMeshResult.morphWeights)
+ *   extensionsRequired guard: unsupported required extensions (Draco, meshopt, ...) throw
  *   Per-node TRS transforms (translation, quaternion rotation, scale, matrix)
  *   Embedded images (bufferView byte ranges + base64 data URIs)
  *   Diffuse texture (baseColorTexture) and normal map (normalTexture) per material
@@ -15,8 +22,8 @@
  *   Missing NORMAL / TANGENT → recomputed automatically
  *
  * Not supported (deferred):
- *   External URI buffers/images, skeletal/morph animation, sparse accessors,
- *   interleaved vertex attributes across multiple buffer views, GLTF extensions.
+ *   External URI buffers/images, animations, compressed geometry (Draco / meshopt),
+ *   material extensions (KHR_materials_*, KHR_texture_transform, VRM MToon) are ignored.
  *
  * Output: GltfMeshResult[] — one entry per mesh node, ready for createCustomMesh().
  */
@@ -47,6 +54,11 @@ export interface GltfMeshResult {
   isTransparent: boolean;
   /** Morph targets (blend shapes) parsed from prim.targets[]. Empty when absent. */
   morphTargets: BlendShape[];
+  /**
+   * Default morph weights from mesh.weights (parallel to morphTargets; 0 when absent).
+   * Exposed on the import result only — not yet applied to the scene mesh by the importers.
+   */
+  morphWeights?: number[];
 }
 
 // ── Skinning types ─────────────────────────────────────────────────────────
@@ -138,6 +150,8 @@ export async function parseGLTF(
 
 interface GltfJson {
   asset:       { version: string };
+  extensionsUsed?:     string[];
+  extensionsRequired?: string[];
   scene?:      number;
   scenes?:     { nodes?: number[] }[];
   nodes?:      GltfNode[];
@@ -171,6 +185,7 @@ interface GltfSkin {
 interface GltfMesh {
   name?:       string;
   primitives:  GltfPrimitive[];
+  weights?:    number[];   // default morph target weights
   extras?:     { targetNames?: string[] };
 }
 
@@ -180,6 +195,7 @@ interface GltfPrimitive {
   material?:  number;
   mode?:      number;  // 4 = TRIANGLES (default)
   targets?:   Array<Record<string, number>>;  // morph target attribute accessors
+  extras?:    { targetNames?: string[] };
 }
 
 interface GltfAccessor {
@@ -188,6 +204,12 @@ interface GltfAccessor {
   componentType:  number;
   count:          number;
   type:           string;
+  normalized?:    boolean;
+  sparse?: {
+    count:   number;
+    indices: { bufferView: number; byteOffset?: number; componentType: number };
+    values:  { bufferView: number; byteOffset?: number };
+  };
 }
 
 interface GltfBufferView {
@@ -229,6 +251,7 @@ async function buildResults(
   json: GltfJson,
   binaries: ArrayBuffer[],
 ): Promise<GltfMeshResult[]> {
+  assertRequiredExtensionsSupported(json);
   const results: GltfMeshResult[] = [];
   if (!json.meshes || json.meshes.length === 0) return results;
 
@@ -304,7 +327,7 @@ function buildPrimitive(
     const raw = readAccessorRaw(json, binaries, prim.indices);
     if (raw instanceof Uint32Array) {
       indices32 = raw;
-    } else if (raw instanceof Uint16Array) {
+    } else if (raw instanceof Uint16Array || raw instanceof Uint8Array) {
       indices32 = new Uint32Array(raw.length);
       for (let i = 0; i < raw.length; i++) indices32[i] = raw[i];
     } else {
@@ -387,8 +410,11 @@ function buildPrimitive(
 
   // ── Morph targets ─────────────────────────────────────────────────
   const morphTargets: BlendShape[] = [];
+  const morphWeights: number[] = [];
   if (prim.targets && prim.targets.length > 0) {
-    const targetNames = mesh.extras?.targetNames;
+    // Per-primitive names win (some exporters, incl. VRM tooling, write them there).
+    const targetNames = prim.extras?.targetNames ?? mesh.extras?.targetNames;
+    for (let ti = 0; ti < prim.targets.length; ti++) morphWeights.push(mesh.weights?.[ti] ?? 0);
     for (let ti = 0; ti < prim.targets.length; ti++) {
       const target = prim.targets[ti];
       const posDelta = target['POSITION'] !== undefined
@@ -429,6 +455,7 @@ function buildPrimitive(
     diffuseColor,
     isTransparent,
     morphTargets,
+    morphWeights,
     // Stash texture indices for resolveImages() to pick up
     _diffuseTexIdx:  pbr?.baseColorTexture?.index ?? -1,
     _normalMapTexIdx: mat?.normalTexture?.index   ?? -1,
@@ -489,65 +516,127 @@ async function resolveImages(
 
 // ── Accessor reading ───────────────────────────────────────────────────────
 
+/** Any typed array an accessor can decode to (one per glTF componentType). */
+type AccessorArray = Float32Array | Uint32Array | Uint16Array | Int16Array | Uint8Array | Int8Array;
+
+type AccessorCtor = new (lengthOrBuffer: number | ArrayBuffer) => AccessorArray;
+
+const COMPONENT_CTOR: Record<number, AccessorCtor> = {
+  5120: Int8Array, 5121: Uint8Array, 5122: Int16Array, 5123: Uint16Array, 5125: Uint32Array, 5126: Float32Array,
+};
+
+/**
+ * Read `elemCount` elements of `numComps` components each, starting at `byteOffset` in `buf`.
+ * Tightly packed data is copied with one slice (so the result is always aligned); a
+ * `byteStride` larger than the element size is deinterleaved with a DataView.
+ * Returns null when the type is unknown or the range runs past the end of the buffer.
+ */
+function readComponents(
+  buf: ArrayBuffer,
+  byteOffset: number,
+  componentType: number,
+  elemCount: number,
+  numComps: number,
+  byteStride?: number,
+): AccessorArray | null {
+  const Ctor = COMPONENT_CTOR[componentType];
+  const compSize = COMPONENT_SIZE[componentType];
+  if (!Ctor || !compSize) return null;
+  const elemSize = compSize * numComps;
+  const stride = byteStride && byteStride > 0 ? byteStride : elemSize;
+  const lastByte = elemCount > 0 ? byteOffset + (elemCount - 1) * stride + elemSize : byteOffset;
+  if (lastByte > buf.byteLength) {
+    console.warn(`[GLTF] accessor range ${byteOffset}..${lastByte} exceeds buffer (${buf.byteLength} bytes)`);
+    return null;
+  }
+
+  if (stride === elemSize) {
+    return new Ctor(buf.slice(byteOffset, byteOffset + elemCount * elemSize));
+  }
+
+  const out = new Ctor(elemCount * numComps);
+  const dv = new DataView(buf);
+  let get: (o: number) => number;
+  switch (componentType) {
+    case 5120: get = (o) => dv.getInt8(o); break;
+    case 5121: get = (o) => dv.getUint8(o); break;
+    case 5122: get = (o) => dv.getInt16(o, true); break;
+    case 5123: get = (o) => dv.getUint16(o, true); break;
+    case 5125: get = (o) => dv.getUint32(o, true); break;
+    default:   get = (o) => dv.getFloat32(o, true);
+  }
+  for (let el = 0; el < elemCount; el++) {
+    const src = byteOffset + el * stride;
+    for (let c = 0; c < numComps; c++) out[el * numComps + c] = get(src + c * compSize);
+  }
+  return out;
+}
+
+/**
+ * Decode an accessor into a typed array of its own component type (no normalisation).
+ *  - No bufferView: zeros (glTF spec; common for morph targets, usually with `sparse`).
+ *  - `sparse`: the listed elements are replaced over the base (bufferView data or zeros).
+ */
 function readAccessorRaw(
   json: GltfJson,
   binaries: ArrayBuffer[],
   accIdx: number,
-): Float32Array | Uint32Array | Uint16Array | null {
+): AccessorArray | null {
   const acc = json.accessors?.[accIdx];
   if (!acc) return null;
-  if (acc.bufferView === undefined) return null;
+  const Ctor = COMPONENT_CTOR[acc.componentType];
+  if (!Ctor) return null;
+  const numComps = TYPE_COUNT[acc.type] ?? 1;
 
-  const bv     = json.bufferViews![acc.bufferView];
-  const buf    = binaries[bv.buffer];
-  if (!buf) return null;
+  let out: AccessorArray | null;
+  if (acc.bufferView === undefined) {
+    out = new Ctor(acc.count * numComps);
+  } else {
+    const bv  = json.bufferViews?.[acc.bufferView];
+    const buf = bv ? binaries[bv.buffer] : undefined;
+    if (!bv || !buf) return null;
+    out = readComponents(
+      buf, (bv.byteOffset ?? 0) + (acc.byteOffset ?? 0),
+      acc.componentType, acc.count, numComps, bv.byteStride,
+    );
+    if (!out) return null;
+  }
 
-  const compSize   = COMPONENT_SIZE[acc.componentType] ?? 4;
-  const numComps   = TYPE_COUNT[acc.type] ?? 1;
-  const byteStride = bv.byteStride ?? (compSize * numComps);
-  const base       = (bv.byteOffset ?? 0) + (acc.byteOffset ?? 0);
-
-  // Fast path: tightly packed
-  if (byteStride === compSize * numComps) {
-    const totalBytes = acc.count * numComps * compSize;
-    const slice = buf.slice(base, base + totalBytes);
-    switch (acc.componentType) {
-      case 5126: return new Float32Array(slice);
-      case 5125: return new Uint32Array(slice);
-      case 5123: return new Uint16Array(slice);
-      default:   return new Uint32Array(slice);
+  const sp = acc.sparse;
+  if (sp && sp.count > 0) {
+    const ibv = json.bufferViews?.[sp.indices.bufferView];
+    const vbv = json.bufferViews?.[sp.values.bufferView];
+    const ibuf = ibv ? binaries[ibv.buffer] : undefined;
+    const vbuf = vbv ? binaries[vbv.buffer] : undefined;
+    if (!ibv || !vbv || !ibuf || !vbuf) return out;
+    const idx = readComponents(
+      ibuf, (ibv.byteOffset ?? 0) + (sp.indices.byteOffset ?? 0), sp.indices.componentType, sp.count, 1,
+    );
+    const vals = readComponents(
+      vbuf, (vbv.byteOffset ?? 0) + (sp.values.byteOffset ?? 0), acc.componentType, sp.count, numComps,
+    );
+    if (!idx || !vals) return out;
+    for (let i = 0; i < sp.count; i++) {
+      const target = idx[i];
+      if (target >= acc.count) continue;
+      for (let c = 0; c < numComps; c++) out[target * numComps + c] = vals[i * numComps + c];
     }
   }
-
-  // Interleaved: deinterleave
-  const out = acc.componentType === 5126
-    ? new Float32Array(acc.count * numComps)
-    : acc.componentType === 5125
-      ? new Uint32Array(acc.count * numComps)
-      : new Uint16Array(acc.count * numComps);
-
-  const srcView = new DataView(buf);
-  let readFn: (off: number) => number;
-  switch (acc.componentType) {
-    case 5126: readFn = (o) => srcView.getFloat32(o, true); break;
-    case 5125: readFn = (o) => srcView.getUint32(o, true);  break;
-    case 5123: readFn = (o) => srcView.getUint16(o, true);  break;
-    default:   readFn = (o) => srcView.getFloat32(o, true);
-  }
-
-  for (let el = 0; el < acc.count; el++) {
-    const srcBase = base + el * byteStride;
-    for (let c = 0; c < numComps; c++) {
-      out[el * numComps + c] = readFn(srcBase + c * compSize);
-    }
-  }
-  return out as Float32Array | Uint32Array | Uint16Array;
+  return out;
 }
 
+/**
+ * Decode an accessor to floats. Integer data is normalised only when `accessor.normalized`
+ * is set (glTF formulas: u8 c/255, u16 c/65535, i8 max(c/127,-1), i16 max(c/32767,-1));
+ * otherwise integers convert as-is (KHR_mesh_quantization style).
+ * `forceNormalized` treats integer data as normalised even without the flag. It is used for
+ * WEIGHTS_n, which the spec only allows as float or normalised u8/u16.
+ */
 function readAccessorFloat32(
   json: GltfJson,
   binaries: ArrayBuffer[],
   accIdx: number,
+  forceNormalized = false,
 ): Float32Array | null {
   const acc = json.accessors?.[accIdx];
   if (!acc) return null;
@@ -555,14 +644,129 @@ function readAccessorFloat32(
   if (!raw) return null;
   if (raw instanceof Float32Array) return raw;
 
-  // Normalised integer → float conversion
   const out = new Float32Array(raw.length);
-  const isUnsigned = acc.componentType === 5121 || acc.componentType === 5123;
-  const scale = isUnsigned
-    ? 1 / (acc.componentType === 5121 ? 255 : 65535)
-    : 1 / (acc.componentType === 5120 ? 127 : 32767);
-  for (let i = 0; i < raw.length; i++) out[i] = raw[i] * scale;
+  if (!(acc.normalized || forceNormalized)) {
+    for (let i = 0; i < raw.length; i++) out[i] = raw[i];
+    return out;
+  }
+  switch (acc.componentType) {
+    case 5121: for (let i = 0; i < raw.length; i++) out[i] = raw[i] / 255; break;
+    case 5123: for (let i = 0; i < raw.length; i++) out[i] = raw[i] / 65535; break;
+    case 5120: for (let i = 0; i < raw.length; i++) out[i] = Math.max(raw[i] / 127, -1); break;
+    case 5122: for (let i = 0; i < raw.length; i++) out[i] = Math.max(raw[i] / 32767, -1); break;
+    default:   for (let i = 0; i < raw.length; i++) out[i] = raw[i];  // u32 cannot be normalised
+  }
   return out;
+}
+
+// ── Extension guard ────────────────────────────────────────────────────────
+
+/** Required extensions the importer can honour (geometry decodes correctly). */
+const SUPPORTED_REQUIRED_EXTENSIONS = new Set<string>([
+  'KHR_mesh_quantization',          // integer attributes, handled via componentType + normalized
+]);
+
+/**
+ * Required extensions that only change shading. Ignoring them gives correct geometry with a
+ * simplified look, so they are accepted with a warning rather than rejected.
+ */
+const SHADING_ONLY_REQUIRED_EXTENSIONS = new Set<string>([
+  'KHR_texture_transform',
+  'KHR_materials_unlit',
+  'KHR_materials_emissive_strength',
+  'KHR_materials_ior',
+  'KHR_materials_specular',
+  'KHR_materials_transmission',
+  'KHR_materials_volume',
+  'KHR_materials_clearcoat',
+  'KHR_materials_sheen',
+]);
+
+/**
+ * glTF spec: a loader that does not support an extension in `extensionsRequired` must fail.
+ * Throws a clear error instead of importing garbage (e.g. Draco-compressed vertex data).
+ * Extensions listed only in `extensionsUsed` are ignored.
+ */
+function assertRequiredExtensionsSupported(json: GltfJson): void {
+  const required = json.extensionsRequired ?? [];
+  const unsupported: string[] = [];
+  for (const ext of required) {
+    if (SUPPORTED_REQUIRED_EXTENSIONS.has(ext)) continue;
+    if (SHADING_ONLY_REQUIRED_EXTENSIONS.has(ext)) {
+      console.warn(`[GLTF] required extension ${ext} is ignored (shading only)`);
+      continue;
+    }
+    unsupported.push(ext);
+  }
+  if (unsupported.length === 0) return;
+  const compressed = unsupported.some(e => e === 'KHR_draco_mesh_compression' || e === 'EXT_meshopt_compression'
+    || e === 'KHR_meshopt_compression');
+  throw new Error(
+    `glTF import failed: the file requires unsupported extension(s): ${unsupported.join(', ')}.`
+    + (compressed
+      ? ' Re-export the model without mesh compression (e.g. gltf-transform copy, or Blender export with Draco off).'
+      : ''),
+  );
+}
+
+// ── Skin influences ────────────────────────────────────────────────────────
+
+/**
+ * Read JOINTS_0/WEIGHTS_0 (and JOINTS_1/WEIGHTS_1 when present) into the engine's fixed
+ * 4-influence layout. With 8 influences the top 4 by weight are kept and renormalised.
+ * Joint indices are integers (never normalised) clamped to u8.
+ */
+function readSkinInfluences(
+  json: GltfJson,
+  binaries: ArrayBuffer[],
+  prim: GltfPrimitive,
+  numVerts: number,
+): { jointIndices: Uint8Array; jointWeights: Float32Array } {
+  const jointIndices = new Uint8Array(numVerts * 4);
+  const jointWeights = new Float32Array(numVerts * 4);
+  const a = prim.attributes;
+  const j0 = a['JOINTS_0']  !== undefined ? readAccessorRaw(json, binaries, a['JOINTS_0']) : null;
+  const w0 = a['WEIGHTS_0'] !== undefined ? readAccessorFloat32(json, binaries, a['WEIGHTS_0'], true) : null;
+  const j1 = a['JOINTS_1']  !== undefined ? readAccessorRaw(json, binaries, a['JOINTS_1']) : null;
+  const w1 = a['WEIGHTS_1'] !== undefined ? readAccessorFloat32(json, binaries, a['WEIGHTS_1'], true) : null;
+
+  if (!j1 || !w1) {
+    if (j0) for (let i = 0; i < numVerts * 4; i++) jointIndices[i] = Math.min(255, j0[i] ?? 0);
+    if (w0) jointWeights.set(w0.subarray(0, numVerts * 4));
+    return { jointIndices, jointWeights };
+  }
+
+  const js = new Array<number>(8), ws = new Array<number>(8);
+  for (let v = 0; v < numVerts; v++) {
+    // Gather up to 8 influences, merging duplicate joints.
+    let n = 0;
+    for (let k = 0; k < 8; k++) {
+      const j = k < 4 ? (j0?.[v * 4 + k] ?? 0) : j1[v * 4 + k - 4] ?? 0;
+      const w = k < 4 ? (w0?.[v * 4 + k] ?? 0) : w1[v * 4 + k - 4] ?? 0;
+      if (!(w > 0)) continue;
+      let m = 0;
+      while (m < n && js[m] !== j) m++;
+      if (m < n) ws[m] += w;
+      else { js[n] = j; ws[n] = w; n++; }
+    }
+    // Partial selection sort: top 4 by weight.
+    const keep = Math.min(4, n);
+    let sum = 0;
+    for (let s = 0; s < keep; s++) {
+      let best = s;
+      for (let t = s + 1; t < n; t++) if (ws[t] > ws[best]) best = t;
+      if (best !== s) {
+        const tj = js[s]; js[s] = js[best]; js[best] = tj;
+        const tw = ws[s]; ws[s] = ws[best]; ws[best] = tw;
+      }
+      sum += ws[s];
+    }
+    for (let s = 0; s < keep; s++) {
+      jointIndices[v * 4 + s] = Math.min(255, js[s]);
+      jointWeights[v * 4 + s] = sum > 0 ? ws[s] / sum : 0;
+    }
+  }
+  return { jointIndices, jointWeights };
 }
 
 // ── Geometry helpers ───────────────────────────────────────────────────────
@@ -789,6 +993,7 @@ async function buildSkinnedResults(
   json: GltfJson,
   binaries: ArrayBuffer[],
 ): Promise<GltfSkinnedResult[]> {
+  assertRequiredExtensionsSupported(json);
   if (!json.skins || json.skins.length === 0) return [];
 
   const results: GltfSkinnedResult[] = [];
@@ -816,19 +1021,9 @@ async function buildSkinnedResults(
 
         const numVerts = baseResult.geometry.vertices.length / 12; // FLOATS_PER_VERT
 
-        // Read joint indices (may be UNSIGNED_BYTE or UNSIGNED_SHORT → clamp to u8)
-        const jointsRaw = readAccessorRaw(json, binaries, prim.attributes['JOINTS_0']);
-        const jointIndices = new Uint8Array(numVerts * 4);
-        if (jointsRaw) {
-          for (let i = 0; i < numVerts * 4; i++) {
-            jointIndices[i] = Math.min(255, jointsRaw[i] ?? 0);
-          }
-        }
-
-        // Read weights
-        const weightsRaw = readAccessorFloat32(json, binaries, prim.attributes['WEIGHTS_0']);
-        const jointWeights = new Float32Array(numVerts * 4);
-        if (weightsRaw) jointWeights.set(weightsRaw.subarray(0, numVerts * 4));
+        // Joint indices (u8/u16, clamped to u8) + weights (float or normalised u8/u16);
+        // JOINTS_1/WEIGHTS_1 are reduced to the top 4 influences.
+        const { jointIndices, jointWeights } = readSkinInfluences(json, binaries, prim, numVerts);
 
         // Read inverse bind matrices
         let ibm: Float32Array;
@@ -907,12 +1102,7 @@ async function buildSkinnedResults(
           const skin: GltfSkin | undefined = json.skins?.[0];
           if (!skin) continue;
           const numVerts = result.geometry.vertices.length / 12;
-          const jointsRaw = readAccessorRaw(json, binaries, prim.attributes['JOINTS_0']);
-          const jointIndices = new Uint8Array(numVerts * 4);
-          if (jointsRaw) for (let i = 0; i < numVerts * 4; i++) jointIndices[i] = Math.min(255, jointsRaw[i] ?? 0);
-          const weightsRaw = readAccessorFloat32(json, binaries, prim.attributes['WEIGHTS_0'] ?? -1);
-          const jointWeights = new Float32Array(numVerts * 4);
-          if (weightsRaw) jointWeights.set(weightsRaw.subarray(0, numVerts * 4));
+          const { jointIndices, jointWeights } = readSkinInfluences(json, binaries, prim, numVerts);
           const ibmLen = skin.joints.length * 16;
           const ibm = new Float32Array(ibmLen);
           const ibmRaw = skin.inverseBindMatrices !== undefined

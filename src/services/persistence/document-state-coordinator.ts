@@ -31,6 +31,8 @@ import { RasterTextureManager } from '../../renderer/raster/raster-texture-manag
 import { gpuPixelEpoch } from '../../renderer/raster/gpu-pixel-epoch';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D } from '../../scene-graph/shapes/array-group-3d';
+import { defaultDitherConfig } from '../../renderer/raster/effects/dither-engine';
+import { DEFAULT_CANVAS_GRID, EMPTY_EPHEMERA_JSON } from './blank-document';
 
 /**
  * Everything a save reads BACK from the GPU (no CPU copy exists): raster layer + cel pixels, UV-paint / decal textures
@@ -417,6 +419,11 @@ export class DocumentStateCoordinator {
             this.sm.clearDocumentSize();
         }
 
+        // Animation mode + timeline back to a new timeline's state FIRST (new-document audit 2026-10-06): step 4b only
+        // runs when this document HAS animation, so a document without it inherited the previous one's animation mode,
+        // frame count, fps, loop mode, play range and onion skin — and its next save wrote them in as its own.
+        this.rlm?.resetAnimationForDocumentLoad();
+
         // 4. Recreate raster layers from manifest, then upload pixel data
         if (this.rlm && payload.manifest.layers.length > 0) {
             // canvasWidth/canvasHeight records the actual pixel dimensions of the saved layer
@@ -489,6 +496,10 @@ export class DocumentStateCoordinator {
                     .find(l => (l.type ?? 'layer') === 'layer' || l.type === '3d-scene');
                 this.rlm.selectLayer((top ?? payload.manifest.layers[0]).id);
             }
+        } else if (this.rlm) {
+            // No layers in the manifest (a new / blank document): start from the default stack. The previous
+            // document's layers — and their pixels — used to stay on screen and be saved into this one.
+            this.rlm.resetToDefaultLayers();
         } else {
             console.warn('[Salsa restore] Skipped layer restore. rasterLayerManager:', !!this.rlm, 'manifest layers:', payload.manifest.layers.length);
             // Layers exist on disk but couldn't be restored → saving now would write an empty layer list and prune
@@ -550,18 +561,19 @@ export class DocumentStateCoordinator {
             this.rlm.forceFrameSync();
         }
 
-        // 5. Restore global dither config
-        if (payload.manifest.globalDitherConfig) {
-            this.sm.setDitherConfig(payload.manifest.globalDitherConfig);
-        }
+        // 5. Restore global dither config (absent = the default: a document without one — a new document — used to keep
+        // the previous document's dither and save it as its own)
+        this.sm.setDitherConfig(payload.manifest.globalDitherConfig ?? defaultDitherConfig());
 
-        // 5b. Restore the visible 2D canvas grid (per-illustration).
-        const cg = payload.manifest.canvasGrid;
-        if (cg) {
-            this.priv.getWebgpuRenderer().setCanvasGridColor(cg.color[0], cg.color[1], cg.color[2]);
-            this.priv.getWebgpuRenderer().setCanvasGridOpacity(cg.opacity);
-            this.priv.getWebgpuRenderer().setCanvasGridCells(cg.cells);
-            this.priv.getWebgpuRenderer().setCanvasGridVisible(cg.visible);
+        // 5b. Restore the visible 2D canvas grid (per-illustration). Absent = the defaults (grid off), as documented on
+        // DocumentManifest.canvasGrid — it used to keep the previous document's grid.
+        const cg = payload.manifest.canvasGrid ?? DEFAULT_CANVAS_GRID;
+        const gridRenderer = this.priv.getWebgpuRenderer();
+        if (gridRenderer) {
+            gridRenderer.setCanvasGridColor(cg.color[0], cg.color[1], cg.color[2]);
+            gridRenderer.setCanvasGridOpacity(cg.opacity);
+            gridRenderer.setCanvasGridCells(cg.cells);
+            gridRenderer.setCanvasGridVisible(cg.visible);
         }
 
         // 6. Restore 3D mesh nodes, then re-upload texture library and bind to meshes
@@ -774,13 +786,16 @@ export class DocumentStateCoordinator {
             catch (e) { fail('body params', e); }
         }
 
-        // Restore ephemera placements and sheets.
+        // Restore ephemera placements and sheets. Absent (a new document) = none: the previous document's placements
+        // and sheets used to stay and be saved into this one.
         if (payload.ephemeraJSON) {
             try {
                 this.priv.ephemera.deserialize(payload.ephemeraJSON);
             } catch (e) {
                 fail('ephemera', e);
             }
+        } else {
+            this.priv.ephemera?.deserialize?.(EMPTY_EPHEMERA_JSON);
         }
 
         // Restore GARP pools + skin sources BEFORE procedural regen (below) so the city's fascia resolver picks

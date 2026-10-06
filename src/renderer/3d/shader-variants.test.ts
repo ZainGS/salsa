@@ -1,7 +1,7 @@
 /**
  * Step 8 specialised shader variants (shader-variants.ts; performance-plan §P21): the variant key derivation, the WGSL
  * specialisation of every mesh fragment shader, the id registry, and the instance-layout contract the key relies on
- * (the flags are read back from float 43 of the slot = MeshInstance.emissiveColor.a).
+ * (the flags are read back from float 43 of the slot = MeshInstance.flags, a u32 lane).
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -56,7 +56,7 @@ describe('specialiseMeshFragment', () => {
       const s = src(k);
       const v = specialiseMeshFragment(s, 262144, false);
       expect(v).toContain('const flags = 262144u;');
-      expect(v).not.toMatch(/let\s+flags\s*=\s*bitcast<u32>\(inst\.emissiveColor\.a\)/);
+      expect(v).not.toMatch(/let\s+flags\s*=\s*inst\.flags;/);
       expect(v.length - s.length).toBeLessThan(200);   // a line substitution, nothing else
       expect(v).toContain('fn fs_main(');
     }
@@ -74,7 +74,7 @@ describe('specialiseMeshFragment', () => {
   });
   it('fails loud when the flags line drifted (no silent unspecialised copy)', () => {
     expect(() => specialiseMeshFragment('fn fs_main() { let f = 1u; }', 0, true)).toThrow(/flags line/);
-    const twice = src('MESH3D_FRAGMENT_SHADER_UNTEXTURED') + '\nfn x() { let flags = bitcast<u32>(inst.emissiveColor.a); }';
+    const twice = src('MESH3D_FRAGMENT_SHADER_UNTEXTURED') + '\nfn x() { let flags = inst.flags; }';
     expect(() => specialiseMeshFragment(twice, 0, true)).toThrow(/found 2/);
   });
   it('no backticks in the substituted lines (WGSL comments)', () => {
@@ -99,15 +99,18 @@ describe('ShaderVariantIds', () => {
   });
 });
 
-describe('layout contract: the variant key is the slot\'s emissiveColor.a (float 43)', () => {
-  it('MeshInstance puts emissiveColor at floats 40-43 in the mesh fragment shaders', () => {
+describe('layout contract: the variant key is the slot\'s flags lane (float 43)', () => {
+  it('MeshInstance puts emissive at floats 40-42 and the u32 flags at float 43 in the mesh fragment shaders', () => {
     for (const k of FS_EXPORTS) {
       const body = src(k).match(/struct\s+MeshInstance\s*\{([^}]*)\}/)![1];
       const fields = [...body.matchAll(/(\w+)\s*:\s*([\w<>]+)\s*,/g)].map((m) => [m[1], m[2]]);
       let off = 0;
       const at: Record<string, number> = {};
-      for (const [n, t] of fields) { at[n] = off; off += t === 'mat4x4<f32>' ? 16 : t.startsWith('vec4') ? 4 : 1; }
-      expect(at.emissiveColor).toBe(40);
+      const ty: Record<string, string> = {};
+      for (const [n, t] of fields) { at[n] = off; ty[n] = t; off += t === 'mat4x4<f32>' ? 16 : t.startsWith('vec4') ? 4 : t.startsWith('vec3') ? 3 : 1; }
+      expect(at.emissive).toBe(40);
+      expect(at.flags).toBe(43);
+      expect(ty.flags).toBe('u32');
     }
   });
   it('the renderer writes the flags at float 43 and reads the key back from the same float', () => {

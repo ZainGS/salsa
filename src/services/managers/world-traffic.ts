@@ -15,7 +15,7 @@ import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { computeTraffic, cellLevelAt, hash2, Accum3D } from '../../world';
 import type { MoverSpec, WorldGraph } from '../../world';
 import { trafficParamsKey, type TrafficPrecompute } from '../../world/traffic-precompute';
-import { roadNet, adoptRoadNet, carLeg, carNext, walkLeg, walkNext, legPoint, gateOpen, carHoldAt, type RoadNet, type Leg } from '../../world/route-sim';
+import { roadNet, adoptRoadNet, carLeg, carNext, walkLeg, walkNext, legPoint, legProject, gateOpen, carHoldAt, type RoadNet, type Leg } from '../../world/route-sim';
 import { bridgeSurfaceAt } from '../../world/bridge-deck';
 import { carHeightAt, crossingSurfaceY } from '../../world/local-line-build';
 import { LocalCrossings } from './world-crossings';
@@ -51,7 +51,59 @@ interface RouteAgent {
     /** Cars: committed through this leg's junction on the amber (won't brake in the box). */
     through: boolean;
     halfLen: number; bus: boolean;
+    /** Cars: the PEEKED next leg (car following looks through the junction): `nxFor` = the leg it was peeked from
+     *  (stale once the leg changes), `nx` = the next edge (−1 = dead end). The leg transition reuses it — carNext is
+     *  hash-keyed on (edge, id, visit + 1), so the peek is exactly the choice the transition would make. */
+    nxFor?: Leg | null; nx?: number; nxLeg?: Leg | null;
+    /** Cars, RIGHT-OF-WAY at an unsignalled junction (WorldTraffic._junctions): `gNode` = the node this car holds an
+     *  entry grant for (the far node of `gFor`, its current leg; −1 = none), toward edge `gOut`. `bNode` = the junction
+     *  box it is still clearing (entered from `bIn` onto `bOut`; −1 = none) — until its tail is off the curve. `jFor` /
+     *  `jArr` = the leg + sim time it became the head of its approach queue (first-come first-served). */
+    gNode?: number; gOut?: number; gFor?: Leg | null;
+    bNode?: number; bIn?: number; bOut?: number;
+    jFor?: Leg | null; jArr?: number;
 }
+
+/** CAR FOLLOWING + PLAYER YIELD tunables (WorldTraffic.follow). Distances in METRES (× s/15 world units). */
+export interface CarFollowConfig {
+    /** Gipps safe-speed following over the per-edge lane order (false = the old binary blocker only, A/B). */
+    on: boolean;
+    /** Standstill bumper-to-bumper gap a car keeps to its leader (m). */
+    jamGapM: number;
+    /** Time headway / reaction time of the safe-speed model (s): the moving gap grows by v·T. */
+    headwayS: number;
+    /** Hard floor on the bumper gap (m): the position clamp (emergency stop) never lets a car get closer. */
+    hardGapM: number;
+    /** Comfortable braking, × the car's own top speed per second (the red-light braking uses the same). */
+    brakeK: number;
+    /** Emergency braking cap, × top speed per second (a cut-in / a leader appearing inside the braking distance). */
+    emergencyK: number;
+    /** Cars yield to the Play player standing / walking in their lane corridor. */
+    playerYield: boolean;
+    /** The player's obstacle radius (m). */
+    playerRadiusM: number;
+    /** Half-width of a car's lane corridor (m) — the player counts as "in the lane" within this + their radius. */
+    corridorHalfM: number;
+    /** The player only counts when their feet (the ground under them) are within this height of the road (m) — a
+     *  player on a footbridge / overpass above the lane is no obstacle. */
+    playerHeightM: number;
+    /** RIGHT-OF-WAY at unsignalled junctions: a car enters the junction box only with a grant (no conflicting path
+     *  through the box occupied or claimed by an earlier car; stem traffic at a T last). false = the old behaviour. */
+    junctionYield: boolean;
+    /** Where an ungranted car waits: its front bumper this far behind the junction mouth (m) — pulled further back on
+     *  an approach a turning car's swept body reaches into. */
+    yieldBackM: number;
+    /** Two paths through a box conflict when their swept car axes come closer than this (m) — about two half-widths. */
+    boxClearM: number;
+    /** A car waiting longer than this (s) at the queue head jumps the priority order (lowest id first): no starvation
+     *  of a stem car on a busy main road, no circular wait. */
+    maxWaitS: number;
+}
+export const DEFAULT_CAR_FOLLOW: CarFollowConfig = {
+    on: true, jamGapM: 2, headwayS: 0.9, hardGapM: 0.6, brakeK: 3.2, emergencyK: 9,
+    playerYield: true, playerRadiusM: 0.45, corridorHalfM: 1.0, playerHeightM: 1.5,
+    junctionYield: true, yieldBackM: 0.5, boxClearM: 2.2, maxWaitS: 8,
+};
 
 /** The walker limb layers the ticker poses: thighs (`legL/R`), shins + shoes (`shinL/R`, `shoeL/R`), arms + hands. */
 const WALKER_LIMB_RE = /^world:traffic-walker-(leg|arm|hand|shin|shoe)([LR])$/;
@@ -153,6 +205,21 @@ export interface DoorVisit { mv: MoverRec; door: DoorSpot; start: number; dur: n
 /** Scratch for legPoint (allocation-free per frame). */
 const LP = { x: 0, z: 0, hx: 1, hz: 0, seg: 0 };
 
+/** Distance between segments (a0→a1) and (b0→b1) in the plane (0 when they cross). */
+function segSegDist(ax: number, az: number, bx: number, bz: number, cx: number, cz: number, dx: number, dz: number): number {
+    const ux = bx - ax, uz = bz - az, vx = dx - cx, vz = dz - cz;
+    const den = ux * vz - uz * vx;
+    if (Math.abs(den) > 1e-14) {
+        const t = ((cx - ax) * vz - (cz - az) * vx) / den, u = ((cx - ax) * uz - (cz - az) * ux) / den;
+        if (t >= 0 && t <= 1 && u >= 0 && u <= 1) return 0;
+    }
+    const pt = (px: number, pz: number, qx: number, qz: number, wx: number, wz: number): number => {
+        const l2 = wx * wx + wz * wz, t = l2 > 0 ? Math.max(0, Math.min(1, ((px - qx) * wx + (pz - qz) * wz) / l2)) : 0;
+        return Math.hypot(px - qx - wx * t, pz - qz - wz * t);
+    };
+    return Math.min(pt(ax, az, cx, cz, vx, vz), pt(bx, bz, cx, cz, vx, vz), pt(cx, cz, ax, az, ux, uz), pt(dx, dz, ax, az, ux, uz));
+}
+
 /** T7.3 — how often (in frames) a mover's MESHES are re-posed, from its camera distance (world units) relative to the
  *  city radius. The SIMULATION always runs every frame; only the transform write + terrain/warp sampling + the GPU
  *  instance upload are throttled. Near movers (street level) animate every frame; mid-distance ones every 2nd; far
@@ -231,6 +298,22 @@ export class WorldTraffic {
     /** Parked cars / roadworks per road side (`ri|side` → along intervals) — the swerve obstacles. */
     private _obstacles = new Map<string, { lo: number; hi: number }[]>();
     private _busStops = new Map<string, number[]>();
+    /** CAR FOLLOWING + PLAYER YIELD tunables (see CarFollowConfig) — live; console: salsaWorld.manager['_traffic'].follow. */
+    follow: CarFollowConfig = { ...DEFAULT_CAR_FOLLOW };
+    // Per-tick LANE ORDER (counting sort of the cars by their leg's directed edge, each bucket sorted by the distance
+    // left to the edge's end): a car's leader is its neighbour in its bucket, or the last car of its peeked next
+    // edge's bucket — O(cars) a tick, no all-pairs scan. Snapshot values (rem / vel / half-length) at tick start: a
+    // leader only moves forward, so a stale snapshot under-states the gap (safe).
+    private _laneOn = false;
+    private _laneStart = new Int32Array(0);
+    private _laneFill = new Int32Array(0);
+    private _laneItems = new Int32Array(0);
+    private _laneEdge = new Int32Array(0);
+    private _laneRem = new Float64Array(0);
+    private _laneVel = new Float64Array(0);
+    /** The Play player as a lane obstacle (city-local, unwarped) — `on` false outside Play (costs nothing). */
+    private readonly _pl = { on: false, x: 0, z: 0, r: 0 };
+    private readonly _pj = { s: 0, lat: 0 };
 
     /** Retime the signals (green / yellow / all-red seconds). Takes effect on the next tick. */
     setSignalTiming(t: Partial<SignalTiming>): void {
@@ -655,6 +738,9 @@ export class WorldTraffic {
         }
 
         if (this.blockGrid) this._buildBlockGrid(pose, s);
+        this._buildLanes(pose);
+        this._readPlayer(s);
+        this._junctions(time, s);
 
         // CHAT ENCOUNTERS (every 0.5 s): two nearby walkers may stop for a talk — emote bubbles pop up over both.
         // ~20% chance per near-pair per 10 s window (hash-keyed → no RNG state), then an 18 s cooldown.
@@ -976,6 +1062,8 @@ export class WorldTraffic {
     private _tickAgent(mv: MoverRec, i: number, dt: number, pose: Float32Array, s: number): void {
         const a = mv.agent!, sp = mv.spec, net = this._net!, time = this.w._simTime;
         let target = time < mv.pausedUntil ? 0 : sp.speed;
+        // Car following: the bumper gap to whatever is ahead in the lane (a car, the Play player) + its speed.
+        let fGap = Infinity, fVel = 0, fBind = false, lineD = Infinity;
 
         if (a.mode === 'walk') {
             // A gated leg (a zebra / a turn-round beat) holds at gateS until the green man (or the beat) comes.
@@ -1005,7 +1093,8 @@ export class WorldTraffic {
             if (this.xing.T && a.fading === 0) { const xd = (this._exitI = i, this._exitPose = pose, this.xing.holdDist(mv.cx, mv.cz, mv.hx, mv.hz, a.halfLen, false, this._exitBlocked)); if (xd < 0.4 * s) target = xd < 0.004 * s ? 0 : Math.min(target, Math.max(0.05 * sp.speed, xd * 2.2)); }
             // STOP SIGN (arriving from a T's stem): full stop, a beat, then go.
             if (a.leg.stopKind === 'sign' && !a.signDone) {
-                const stopAt = a.leg.stopS - a.halfLen;
+                // (under the right-of-way model: at its yield line, which is never in front of the sign's line)
+                const stopAt = this._jOn && this._jCtl(net.edges[a.leg.edge].to) ? this._yieldS(a) : a.leg.stopS - a.halfLen;
                 if (a.s >= stopAt - 0.004 * s) { target = 0; a.hold += dt; if (a.hold > 0.9 && mv.vel < 0.02 * sp.speed) a.signDone = true; }
                 else target = Math.min(target, Math.max(0.05 * sp.speed, (stopAt - a.s) * 2.2));
             }
@@ -1014,21 +1103,60 @@ export class WorldTraffic {
                 const e = net.edges[a.leg.edge], along = this._alongOnRoad(a, e), stops = this._busStops.get(e.ri + '|' + (e.forward ? -1 : 1));
                 if (stops) for (const st of stops) if (Math.abs(along - st) < 0.012 * s) { mv.pausedUntil = time + 2.4; mv.cooldownUntil = time + 9; target = 0; break; }
             }
+            // CAR FOLLOWING (Gipps safe speed): never faster than lets this car stop behind its leader — the car ahead
+            // in its lane, through the junction onto its next edge, or the Play player in its lane corridor — even if
+            // the leader brakes hard. A queue at a red light / behind the player builds car by car.
+            if (this.follow.on && a.fading !== -1) {
+                this._leaderGap(mv, i, s);
+                fGap = this._fg; fVel = this._fv;
+                if (fGap < Infinity) {
+                    const F = this.follow, M = s / 15, b = sp.speed * F.brakeK, T = F.headwayS, g = Math.max(0, fGap - F.jamGapM * M);
+                    const vSafe = Math.max(0, -b * T + Math.sqrt(b * b * T * T + fVel * fVel + 2 * b * g));
+                    if (vSafe < target) { target = vSafe; fBind = true; }
+                }
+            }
+            // RIGHT-OF-WAY: no entry grant for the unsignalled junction ahead → brake onto its yield line (front bumper
+            // behind the mouth, so a car turning through the box never sweeps into this one) and wait there.
+            if (this._jOn && a.fading !== -1 && !(a.gFor === a.leg && (a.gNode ?? -1) >= 0) && this._jCtl(net.edges[a.leg.edge].to) && this._peekLeg(a)) {
+                lineD = this._yieldS(a) - a.s;
+                const vL = lineD <= 0.004 * s ? 0 : Math.sqrt(2 * sp.speed * this.follow.brakeK * lineD);
+                if (vL < target) { target = vL; fBind = true; }
+            }
         }
 
         // ACCELERATE / DECELERATE (cars brake harder than they accelerate; walkers start and stop quickly).
-        const accel = sp.speed * (a.mode === 'car' ? 1.6 : 2.5) * dt, decel = sp.speed * (a.mode === 'car' ? 3.2 : 4) * dt;
+        const accel = sp.speed * (a.mode === 'car' ? 1.6 : 2.5) * dt;
+        let decel = sp.speed * (a.mode === 'car' ? this.follow.brakeK : 4) * dt;
+        // EMERGENCY BRAKE: a leader inside the comfortable braking distance (a cut-in, a car appearing round the corner,
+        // the player stepping out) → brake up to the emergency cap.
+        if (fBind && mv.vel - target > decel) decel = Math.min(mv.vel - target, sp.speed * this.follow.emergencyK * dt);
         mv.vel = target > mv.vel ? Math.min(target, mv.vel + accel) : Math.max(target, mv.vel - decel);
-        a.s += mv.vel * dt;
+        let adv = mv.vel * dt;
+        // HARD CLAMP: whatever the braking managed, the front bumper never comes closer than hardGap to the leader
+        // (no overlap, ever). The clamped car takes the leader's speed.
+        if (fGap < Infinity) {
+            const room = Math.max(0, fGap - this.follow.hardGapM * (s / 15));
+            if (adv > room) { adv = room; mv.vel = Math.min(mv.vel, fVel); }
+        }
+        // (an ungranted car never crosses its yield line)
+        if (adv > lineD) { adv = Math.max(0, lineD); mv.vel = 0; }
+        a.s += adv;
 
         // Leg transitions (route choice at the junction).
         for (let guard = 0; guard < 4 && a.s >= a.leg.total; guard++) {
             const over = a.s - a.leg.total;
             if (a.mode === 'car') {
                 if (a.fading === -1) { a.s = a.leg.total; break; }
-                const nx = carNext(net, a.leg.edge, a.id, ++a.visit, a.bus);
+                // (the peeked next leg — car following looked through the junction — is exactly this choice)
+                const peeked = a.nxFor === a.leg;
+                const nx = peeked ? (a.nx! < 0 ? null : a.nx!) : carNext(net, a.leg.edge, a.id, a.visit + 1, a.bus);
+                a.visit++;
                 if (nx === null) { a.s = a.leg.total; a.fading = -1; break; }
-                a.leg = carLeg(net, nx, a.leg.edge); a.s = over; a.signDone = false; a.hold = 0; a.through = false;
+                // Into a junction box: clearing it until the tail is off the curve (others' grants respect it).
+                const fromE = a.leg.edge, node = net.edges[fromE].to;
+                if (this._jCtl(node)) { a.bNode = node; a.bIn = fromE; a.bOut = nx; } else a.bNode = -1;
+                a.gNode = -1; a.gFor = null;
+                a.leg = peeked && a.nxLeg ? a.nxLeg : carLeg(net, nx, a.leg.edge); a.s = over; a.signDone = false; a.hold = 0; a.through = false;
             } else {
                 a.leg = walkNext(net, a.leg, a.id, ++a.visit, sp.speed);
                 if (a.leg.gate) { a.waiting = true; a.waited = 0; if (a.leg.gateS <= 1e-6) { a.s = 0; mv.vel = 0; break; } }
@@ -1083,6 +1211,429 @@ export class WorldTraffic {
         return false;
     };
     private readonly _xf = { u: 0, w: 0 };
+
+    /** Per tick: the LANE ORDER — every live car bucketed by its leg's directed edge (counting sort), each bucket
+     *  sorted by `rem` = distance left to the edge's end (front car first). Legs onto one edge share its straight run
+     *  and end point, so `rem` orders cars from different approaches consistently (a merge zips). Frozen (sim-LOD
+     *  fog) and visiting movers are left out, like the blocker scan. */
+    private _buildLanes(pose: Float32Array): void {
+        const net = this._net;
+        this._laneOn = false;
+        if (!net || !this.follow.on) return;
+        const M = this.movers, n = M.length, E = net.edges.length;
+        if (this._laneStart.length < E + 1) { this._laneStart = new Int32Array(E + 1); this._laneFill = new Int32Array(E + 1); }
+        if (this._laneItems.length < n) {
+            this._laneItems = new Int32Array(n); this._laneEdge = new Int32Array(n);
+            this._laneRem = new Float64Array(n); this._laneVel = new Float64Array(n);
+        }
+        const start = this._laneStart, fill = this._laneFill, items = this._laneItems, edgeOf = this._laneEdge, rem = this._laneRem, vel = this._laneVel;
+        start.fill(0, 0, E + 1);
+        let k = 0;
+        for (let j = 0; j < n; j++) {
+            const mv = M[j], a = mv.agent;
+            if (!a || a.mode !== 'car' || mv.visiting || !(pose[j * 4] === pose[j * 4])) { edgeOf[j] = -1; continue; }
+            edgeOf[j] = a.leg.edge; rem[j] = a.leg.total - a.s; vel[j] = mv.vel; start[a.leg.edge + 1]++; k++;
+        }
+        if (k === 0) return;
+        for (let e = 0; e < E; e++) start[e + 1] += start[e];
+        fill.set(start.subarray(0, E));
+        for (let j = 0; j < n; j++) { const e = edgeOf[j]; if (e >= 0) items[fill[e]++] = j; }
+        // Insertion sort per bucket (rem ascending; ties by index — deterministic). Buckets hold a handful of cars.
+        for (let e = 0; e < E; e++) {
+            const b0 = start[e], b1 = start[e + 1];
+            for (let q = b0 + 1; q < b1; q++) {
+                const j = items[q], r = rem[j];
+                let w = q - 1;
+                while (w >= b0 && (rem[items[w]] > r || (rem[items[w]] === r && items[w] > j))) { items[w + 1] = items[w]; w--; }
+                items[w + 1] = j;
+            }
+        }
+        this._laneOn = true;
+    }
+
+    /** Per tick: the Play player's feet (scene3d.playerFeet3D, world space) → city-local + unwarped, as a lane
+     *  obstacle. Absent outside Play → off. */
+    private _readPlayer(s: number): void {
+        const P = this._pl;
+        P.on = false;
+        if (!this.follow.on || !this.follow.playerYield) return;
+        const pf = (this.w.scene3d as unknown as { playerFeet3D?: { x: number; y: number; z: number; groundY?: number } | null }).playerFeet3D;
+        if (!pf) return;
+        // HEIGHT: the ground under the player (groundY — stable through a jump; else the feet) against the road a car
+        // would drive on at that spot. A player on a footbridge / overpass above the lane is no obstacle.
+        const fy = Number.isFinite(pf.groundY) ? pf.groundY! : pf.y;
+        let x = pf.x, z = pf.z, y = fy;
+        const m = this.w.cityRoot?.localMatrix as unknown as Float32Array | undefined;
+        if (m) {   // inverse of the city container's (rotation · scale + translation) matrix — orthogonal columns
+            const tx = pf.x - m[12], ty = fy - m[13], tz = pf.z - m[14];
+            const k0 = 1 / Math.max(1e-12, m[0] * m[0] + m[1] * m[1] + m[2] * m[2]), k1 = 1 / Math.max(1e-12, m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+            const k2 = 1 / Math.max(1e-12, m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
+            x = (m[0] * tx + m[1] * ty + m[2] * tz) * k0; y = (m[4] * tx + m[5] * ty + m[6] * tz) * k1; z = (m[8] * tx + m[9] * ty + m[10] * tz) * k2;
+        }
+        // Rendered (warped) → layout space: the one-step inverse of the domain warp (as hoverLandmarkAtScreen).
+        this.w._warpInto(x, z, this.w._warpScratch);
+        P.x = x - this.w._warpScratch[0]; P.z = z - this.w._warpScratch[1];
+        if (Number.isFinite(y) && Math.abs(y - this._groundY(P.x, P.z, true, s)) > this.follow.playerHeightM * (s / 15)) return;
+        P.r = this.follow.playerRadiusM * (s / 15);
+        P.on = true;
+    }
+
+    // ── RIGHT-OF-WAY at unsignalled junctions ────────────────────────────────────────────────────────────────────
+    // A car may enter the box of an unsignalled junction (≥ 3 arms) only with a GRANT. Per tick, per junction, the
+    // CANDIDATES are the heads of its approach queues within braking reach; they are ranked (overdue first, lowest id
+    // first · then main-road before stem traffic at a T · then first come · then id) and granted in that order when
+    // their path through the box conflicts with no car COMMITTED there (granted, or still clearing the box) and with
+    // no higher-ranked candidate still waiting, and their exit has room (don't block the box). An ungranted car waits
+    // with its front bumper behind the mouth (pulled back where a turning car's swept body reaches). Movement
+    // conflicts are swept car axes closer than boxClearM (cached per movement pair). O(cars + approach edges) a tick.
+    private _jOn = false;
+    private _jNet: RoadNet | null = null;
+    private _jHl = 0;
+    private _jStamp = 0;
+    private _jNodeStamp = new Int32Array(0);
+    private _jComHead = new Int32Array(0);
+    private _jCandHead = new Int32Array(0);
+    private _jActive = new Int32Array(0);
+    private _jeCar = new Int32Array(0);
+    private _jeIn = new Int32Array(0);
+    private _jeOut = new Int32Array(0);
+    private _jeHq = new Int32Array(0);
+    private _jeNext = new Int32Array(0);
+    private _jcNext = new Int32Array(0);
+    private _jOrder: number[] = [];
+    private _jWait: number[] = [];
+    private _jBack = new Float64Array(0);
+    private readonly _jSweep = new Map<number, Float64Array>();
+    private readonly _jConf = new Map<number, Map<number, boolean>>();
+    /** Diagnostics: grants given out of the normal order (a candidate overdue past maxWaitS). */
+    junctionOverdue = 0;
+
+    /** Is node `n` an unsignalled junction (or a bend) under the right-of-way model? */
+    private _jCtl(n: number): boolean {
+        return this._jCars[n] >= 2;
+    }
+    /** Per node: its number of car arms when it has a junction box (≥ 3 arms, or a bend) and no signals, else 0. */
+    private _jCars = new Uint8Array(0);
+    /** Reset the per-net caches (a new net / fleet). */
+    private _jEnsure(net: RoadNet): void {
+        if (this._jNet === net) return;
+        this._jNet = net;
+        this._jSweep.clear(); this._jConf.clear();
+        this._jBack = new Float64Array(net.edges.length).fill(NaN);
+        this._jNodeStamp = new Int32Array(net.nodes.length); this._jStamp = 0;
+        this._jComHead = new Int32Array(net.nodes.length); this._jCandHead = new Int32Array(net.nodes.length);
+        this._jActive = new Int32Array(net.nodes.length);
+        this._jCars = new Uint8Array(net.nodes.length);
+        this._jExtra = new Float64Array(net.edges.length); this._jExtraSt = new Int32Array(net.edges.length);
+        net.nodes.forEach((N, k) => {
+            const A = N.arms, box = A.length >= 3 || (A.length === 2 && A[0][0] * A[1][0] + A[0][1] * A[1][1] >= -0.985);   // (as carMouth)
+            if (!N.signal && box) this._jCars[k] = Math.min(255, N.out.filter(o => net.edges[o].car).length);
+        });
+        let hl = 0; for (const mv of this.movers) if (mv.agent?.mode === 'car' && !mv.agent.bus) hl = Math.max(hl, mv.agent.halfLen);
+        this._jHl = this._jQ(hl || 0.15 * net.s);
+    }
+    /** A half-length quantized UP to 0.25 m steps (the sweep cache key). */
+    private _jQ(hl: number): number { return Math.max(1, Math.ceil(hl / (0.25 * this._net!.s / 15) - 1e-6)); }
+    /** The swept car AXES of movement in → out through the box for a car of quantized half-length `hq` (x0, z0, x1, z1
+     *  per sample): the centre runs from one half-length before the mouth to one past the curve's end, the axis ± the
+     *  half-length along the path heading (a rigid body: on a tight curve its ends swing out along the tangent). */
+    private _sweep(inE: number, outE: number, hq: number): Float64Array {
+        const net = this._net!, key = (inE * net.edges.length + outE) * 128 + Math.min(127, hq);
+        let sw = this._jSweep.get(key);
+        if (sw) return sw;
+        const leg = carLeg(net, outE, inE), hl = hq * 0.25 * net.s / 15, step = 0.5 * net.s / 15, d = net.edges[inE].d, P0 = leg.pts[0];
+        const n = Math.max(2, Math.ceil((leg.sStart + 2 * hl) / step) + 1);
+        sw = new Float64Array(n * 4);
+        for (let k = 0; k < n; k++) {
+            const t = -hl + (leg.sStart + 2 * hl) * (k / (n - 1));
+            let cx: number, cz: number, hx: number, hz: number;
+            if (t < 0) { cx = P0[0] + d[0] * t; cz = P0[1] + d[1] * t; hx = d[0]; hz = d[1]; }
+            else { legPoint(leg, t, LP); cx = LP.x; cz = LP.z; hx = LP.hx; hz = LP.hz; }
+            sw[k * 4] = cx - hx * hl; sw[k * 4 + 1] = cz - hz * hl; sw[k * 4 + 2] = cx + hx * hl; sw[k * 4 + 3] = cz + hz * hl;
+        }
+        this._jSweep.set(key, sw);
+        return sw;
+    }
+    /** Do movements (i1 → o1, car half-length h1) and (i2 → o2, h2) through one box conflict? (Same approach lane =
+     *  a queue: never.) */
+    private _jConflict(i1: number, o1: number, h1: number, i2: number, o2: number, h2: number): boolean {
+        if (i1 === i2) return false;
+        const E = this._net!.edges.length, a = (i1 * E + o1) * 128 + Math.min(127, h1), b = (i2 * E + o2) * 128 + Math.min(127, h2);
+        const k0 = Math.min(a, b), k1 = Math.max(a, b);
+        let row = this._jConf.get(k0);
+        if (!row) { row = new Map(); this._jConf.set(k0, row); }
+        let c = row.get(k1);
+        if (c !== undefined) return c;
+        const A = this._sweep(i1, o1, h1), B = this._sweep(i2, o2, h2), lim = this.follow.boxClearM * (this._net!.s / 15);
+        c = false;
+        for (let p = 0; p < A.length && !c; p += 4) for (let q = 0; q < B.length; q += 4) {
+            if (segSegDist(A[p], A[p + 1], A[p + 2], A[p + 3], B[q], B[q + 1], B[q + 2], B[q + 3]) < lim) { c = true; break; }
+        }
+        row.set(k1, c);
+        return c;
+    }
+    /** How far behind its mouth a car on approach edge `e` waits (front bumper, world units): yieldBackM, or more if
+     *  an ordinary car's swept body on any movement not from `e` needs it further back (see _jIntrude). Cached. */
+    private _jBackOf(e: number): number {
+        let b = this._jBack[e];
+        if (b === b) return b;
+        const net = this._net!, node = net.nodes[net.edges[e].to], M = net.s / 15;
+        let intr = 0;
+        for (const o of node.out) {
+            if (!net.edges[o].car) continue;
+            for (const i2 of node.out) {
+                const in2 = net.edges[i2].rev;
+                if (in2 === e || !net.edges[in2].car || o === i2) continue;   // (o === i2: a U-turn back out its own arm)
+                // (an ordinary car's sweep: a longer car's ends swing wider — _jIntrude holds the approaches it reaches)
+                intr = Math.max(intr, this._jIntrude(e, in2, o, this._jHl));
+            }
+        }
+        b = Math.max(this.follow.yieldBackM * M, intr);
+        this._jBack[e] = b;
+        return b;
+    }
+    /** How far behind approach `e`'s mouth a waiting car's FRONT must stay so that the swept axes of movement in2 → o
+     *  (a car of quantized half-length `hq`) keep boxClearM from its axis — car bodies as capsules round their axes —
+     *  + 0.1 m (0 = never near). Cached per sweep. */
+    private _jIntrude(e: number, in2: number, o: number, hq: number): number {
+        const sw = this._sweep(in2, o, hq);
+        let row = this._jIntr.get(sw);
+        if (!row) { row = new Map(); this._jIntr.set(sw, row); }
+        let r = row.get(e);
+        if (r !== undefined) return r;
+        const net = this._net!, M = net.s / 15, lim = this.follow.boxClearM * M, d = net.edges[e].d;
+        const Q = carLeg(net, e, null).pts, q = Q[Q.length - 1];
+        let intr = 0;
+        for (let k = 0; k < sw.length; k += 4) for (let u = 0; u <= 4; u++) {
+            const px = sw[k] + (sw[k + 2] - sw[k]) * u / 4, pz = sw[k + 1] + (sw[k + 3] - sw[k + 1]) * u / 4;
+            const along = (q[0] - px) * d[0] + (q[1] - pz) * d[1], lat = Math.abs((px - q[0]) * d[1] - (pz - q[1]) * d[0]);
+            if (lat < lim) { const need = along + Math.sqrt(lim * lim - lat * lat); if (need > intr) intr = need; }
+        }
+        r = intr > 0 ? intr + 0.1 * M : 0;
+        row.set(e, r);
+        return r;
+    }
+    private readonly _jIntr = new WeakMap<Float64Array, Map<number, number>>();
+    /** Per tick: extra wait-back per approach edge while a LONG car (a bus) committed in the box sweeps into it. */
+    private _jExtra = new Float64Array(0);
+    private _jExtraSt = new Int32Array(0);
+    /** The leg distance where car `a`'s CENTRE waits for its grant (its stop sign's line if that is further back). */
+    private _yieldS(a: RouteAgent): number {
+        const e = a.leg.edge, ex = this._jExtraSt[e] === this._jStamp ? this._jExtra[e] : 0;
+        let y = a.leg.total - Math.max(this._jBackOf(e), ex) - a.halfLen;
+        if (a.leg.stopKind === 'sign') y = Math.min(y, a.leg.stopS - a.halfLen);
+        return Math.max(Math.min(a.s, a.leg.sStart), y);   // (never behind where it already is on its curve)
+    }
+
+    /** Per tick: hand out the junction-entry grants (see the section comment). */
+    private _junctions(time: number, s: number): void {
+        this._jOn = false;
+        const net = this._net, F = this.follow;
+        if (!net || !F.on || !F.junctionYield || !this._laneOn) return;
+        this._jEnsure(net);
+        this._jOn = true;
+        const Mv = this.movers, n = Mv.length, M = s / 15;
+        if (this._jcNext.length < n) { this._jcNext = new Int32Array(n); this._jeCar = new Int32Array(2 * n); this._jeIn = new Int32Array(2 * n); this._jeOut = new Int32Array(2 * n); this._jeHq = new Int32Array(2 * n); this._jeNext = new Int32Array(2 * n); }
+        const stamp = ++this._jStamp, nst = this._jNodeStamp, com = this._jComHead, cand = this._jCandHead, act = this._jActive;
+        const touch = (node: number): void => { if (nst[node] !== stamp) { nst[node] = stamp; com[node] = -1; cand[node] = -1; } };
+        const edgeOf = this._laneEdge, st = this._laneStart, it = this._laneItems, rem = this._laneRem, vel = this._laneVel;
+        let ne = 0;
+        const commit = (node: number, j: number, i: number, o: number): void => {
+            touch(node);
+            const hq = this._jQ(Mv[j].agent!.halfLen);
+            this._jeCar[ne] = j; this._jeIn[ne] = i; this._jeOut[ne] = o; this._jeHq[ne] = hq; this._jeNext[ne] = com[node]; com[node] = ne++;
+            // A long car in the box: the other approaches it sweeps into wait further back while it is there.
+            if (hq > this._jHl) for (const x of net.nodes[node].out) {
+                const e2 = net.edges[x].rev; if (e2 === i || !net.edges[e2].car) continue;
+                const need = this._jIntrude(e2, i, o, hq);
+                if (need <= 0) continue;
+                if (this._jExtraSt[e2] !== stamp) { this._jExtraSt[e2] = stamp; this._jExtra[e2] = 0; }
+                this._jExtra[e2] = Math.max(this._jExtra[e2], need);
+            }
+        };
+        // 1. COMMITTED: granted (not yet in) + still clearing a box.
+        for (let j = 0; j < n; j++) {
+            const a = Mv[j].agent;
+            if (!a || a.mode !== 'car' || edgeOf[j] < 0) continue;
+            if ((a.bNode ?? -1) >= 0) {
+                if (a.leg.edge !== a.bOut || a.s >= a.leg.sStart + a.halfLen) a.bNode = -1;
+                else commit(a.bNode!, j, a.bIn!, a.bOut!);
+            }
+            if ((a.gNode ?? -1) >= 0) {
+                if (a.gFor !== a.leg) a.gNode = -1;
+                else commit(a.gNode!, j, a.leg.edge, a.gOut!);
+            }
+        }
+        // 2. CANDIDATES: the head car of each approach queue, within its braking reach of the line.
+        let na = 0;
+        for (const e of net.carEdges) {
+            const b0 = st[e]; if (b0 === st[e + 1]) continue;
+            const node = net.edges[e].to; if (!this._jCtl(node)) continue;
+            const j = it[b0], mv = Mv[j], a = mv.agent!;
+            if (a.fading === -1 || (a.gFor === a.leg && (a.gNode ?? -1) >= 0)) continue;
+            const v = Math.max(vel[j], mv.spec.speed), b = mv.spec.speed * F.brakeK;
+            if (rem[j] - a.halfLen > v * F.headwayS + (v * v) / (2 * b) + F.jamGapM * M + this._jBackOf(e) + 0.1 * s) continue;
+            if (!this._peekLeg(a)) continue;
+            if (a.jFor !== a.leg) { a.jFor = a.leg; a.jArr = time; }
+            touch(node);
+            if (cand[node] < 0) act[na++] = node;
+            this._jcNext[j] = cand[node]; cand[node] = j;
+        }
+        // 3. GRANTS per junction, in rank order.
+        const order = this._jOrder, wait = this._jWait, maxW = F.maxWaitS;
+        const cmp = (x: number, y: number): number => {
+            const A = Mv[x].agent!, B = Mv[y].agent!, tA = A.jArr ?? time, tB = B.jArr ?? time;
+            const oA = time - tA > maxW ? 0 : 1, oB = time - tB > maxW ? 0 : 1;
+            if (oA !== oB) return oA - oB;
+            if (oA === 0) return A.id - B.id;   // overdue: lowest id goes first
+            const sA = A.leg.stopKind === 'sign' ? 1 : 0, sB = B.leg.stopKind === 'sign' ? 1 : 0;
+            return (sA - sB) || (tA - tB) || (A.id - B.id);
+        };
+        for (let k = 0; k < na; k++) {
+            const node = act[k];
+            order.length = 0; wait.length = 0;
+            for (let j = cand[node]; j >= 0; j = this._jcNext[j]) order.push(j);
+            if (order.length > 1) order.sort(cmp);
+            for (const j of order) {
+                const mv = Mv[j], a = mv.agent!, i1 = a.leg.edge, o1 = a.nx!, h1 = this._jQ(a.halfLen);
+                let ok = !(a.leg.stopKind === 'sign' && !a.signDone), reach = false;
+                // A LONG car (a bus) sweeps further than the approaches' wait lines allow for: only with every head car
+                // it would reach held back far enough (not once overdue: a head car waiting on it would wait forever).
+                const outs: number[] = net.nodes[node].out;
+                if (ok && h1 > this._jHl && time - (a.jArr ?? time) <= maxW) for (const x of outs) {
+                    const e2: number = net.edges[x].rev; if (e2 === i1 || !net.edges[e2].car || st[e2] === st[e2 + 1]) continue;
+                    const need = this._jIntrude(e2, i1, o1, h1), c = it[st[e2]];
+                    if (need > this._jBackOf(e2) && rem[c] - Mv[c].agent!.halfLen < need) { ok = false; reach = true; break; }
+                }
+                for (let q = com[node]; ok && q >= 0; q = this._jeNext[q]) if (this._jeCar[q] !== j && this._jConflict(i1, o1, h1, this._jeIn[q], this._jeOut[q], this._jeHq[q])) ok = false;
+                for (let w = 0; ok && w < wait.length; w++) { const aw = Mv[wait[w]].agent!; if (this._jConflict(i1, o1, h1, aw.leg.edge, aw.nx!, this._jQ(aw.halfLen))) ok = false; }
+                // EXIT ROOM: the back of the queue on the exit must leave space for this car past the box (or be moving).
+                if (ok && st[o1] < st[o1 + 1]) {
+                    const c = it[st[o1 + 1] - 1], nl = a.nxLeg!;
+                    const tail = nl.total - rem[c] - Mv[c].agent!.halfLen;
+                    if (tail < nl.sStart + 2 * a.halfLen + F.jamGapM * M && vel[c] < 0.25 * Mv[c].spec.speed) ok = false;
+                }
+                if (ok) {
+                    if (time - (a.jArr ?? time) > maxW) this.junctionOverdue++;
+                    a.gNode = node; a.gOut = o1; a.gFor = a.leg;
+                    commit(node, j, i1, o1);
+                } else if (!reach) wait.push(j);   // (a bus held only by its reach does not block the cars it waits for)
+            }
+        }
+    }
+
+    /** The peeked next leg of a car (see RouteAgent.nxFor) — null at a dead end. */
+    private _peekLeg(a: RouteAgent): Leg | null {
+        if (a.nxFor !== a.leg) {
+            const net = this._net!, nx = carNext(net, a.leg.edge, a.id, a.visit + 1, a.bus);
+            a.nxFor = a.leg; a.nx = nx ?? -1; a.nxLeg = nx === null ? null : carLeg(net, nx, a.leg.edge);
+        }
+        return a.nxLeg ?? null;
+    }
+
+    private _fg = Infinity;
+    private _fv = 0;
+    private _phOn: Leg | null = null;
+    /** Distance along car `a`'s path (the rest of its leg, then its peeked next leg's junction part) to the point
+     *  (x, z), if that point lies inside its path corridor — else −1. Leaves the projection in `_pj` and the leg it hit
+     *  in `_phOn`. (The rest of our own leg first: a hairpin's curve can sweep into our lane's end.) */
+    private _pathHit(a: RouteAgent, nl: Leg | null, myRem: number, x: number, z: number, corr: number): number {
+        const PJ = this._pj;
+        legProject(a.leg, x, z, PJ);
+        if (PJ.lat < corr && PJ.s > a.s && PJ.s < a.leg.total - 1e-6) { this._phOn = a.leg; return PJ.s - a.s; }
+        if (!nl) return -1;
+        legProject(nl, x, z, PJ);
+        if (PJ.lat < corr && PJ.s > 1e-6 && PJ.s < nl.sStart + a.halfLen) { this._phOn = nl; return myRem + PJ.s; }
+        return -1;
+    }
+    /** Car `i`'s bumper gap to what is ahead in its lane → `_fg` (Infinity = nothing within its look-ahead) and that
+     *  obstacle's speed → `_fv`: the next car on its edge, else the last car on its peeked next edge (queued through
+     *  the junction / round the turn), and the Play player inside its lane corridor (speed 0). */
+    private _leaderGap(mv: MoverRec, i: number, s: number): void {
+        const a = mv.agent!, F = this.follow, M = s / 15;
+        let gap = Infinity, vL = 0;
+        const v = Math.max(mv.vel, mv.spec.speed), b = mv.spec.speed * F.brakeK;
+        // Far enough to see anything we might have to stop for: the safe-speed stopping distance + the gaps + slack.
+        const look = a.halfLen + v * F.headwayS + (v * v) / (2 * b) + F.jamGapM * M + 0.45 * s;
+        const myRem = a.leg.total - a.s;
+        if (this._laneOn) {
+            const st = this._laneStart, it = this._laneItems, rem = this._laneRem, e = a.leg.edge;
+            let j = -1;
+            // Bucket is rem-ascending; from the back, the first car with a smaller rem is the nearest one ahead.
+            for (let q = st[e + 1] - 1; q >= st[e]; q--) { const c = it[q]; if (c === i) continue; if (rem[c] < myRem || (rem[c] === myRem && c < i)) { j = c; break; } }
+            if (j >= 0) { gap = myRem - rem[j] - a.halfLen - this.movers[j].agent!.halfLen; vL = this._laneVel[j]; }
+            else if (myRem < look) {
+                const nl = this._peekLeg(a);
+                if (nl) {
+                    const e2 = nl.edge;
+                    for (let q = st[e2 + 1] - 1; q >= st[e2]; q--) {
+                        const c = it[q]; if (c === i) continue;
+                        // On the shared straight the rem difference is exact. A car still on ITS junction curve (from
+                        // another approach — a merge) is placed by projecting it onto our next leg; off our path it
+                        // counts as at the straight's start (it merges there): yield to it.
+                        const ac = this.movers[c].agent!;
+                        let dL = Math.max(0, nl.total - rem[c]);
+                        if (ac.s < ac.leg.sStart && ac.leg !== nl) {
+                            const PJ = this._pj, oc = this.movers[c];
+                            legProject(nl, oc.cx, oc.cz, PJ);
+                            dL = PJ.lat < 2 * F.corridorHalfM * M ? Math.min(dL, PJ.s) : Math.min(dL, nl.sStart);
+                        }
+                        gap = myRem + dL - a.halfLen - this.movers[c].agent!.halfLen; vL = this._laneVel[c];
+                        break;
+                    }
+                }
+                // The JUNCTION BOX ahead: cars still on a junction curve (tail not yet onto their straight) of the
+                // other exits. One that left MY lane (its leg starts at our lane's end point) is ahead of us along
+                // the shared entry until it clears; any other one inside our own path through the box (projected onto
+                // our next leg, within two car half-widths) is crossing / merging in front of us — wait for it to
+                // clear (don't enter an occupied box). Only cars OUTSIDE the box wait on cars inside it → no deadlock.
+                const net = this._net!, out = net.nodes[net.edges[e].to].out, P0 = a.leg.pts[a.leg.pts.length - 1], tol = 1e-4 * s + 1e-9;
+                const PJ = this._pj, corr = 2 * F.corridorHalfM * M;
+                for (let oi = 0; oi < out.length; oi++) {
+                    const o = out[oi];
+                    if ((nl && o === nl.edge) || !net.edges[o].car) continue;
+                    for (let q = st[o + 1] - 1; q >= st[o]; q--) {
+                        const c = it[q]; if (c === i) continue;
+                        const oc = this.movers[c], ac = oc.agent!, q0 = ac.leg.pts[0];
+                        if (ac.s >= ac.leg.sStart + ac.halfLen) continue;
+                        let g = Infinity, gv = 0;
+                        if (Math.abs(q0[0] - P0[0]) <= tol && Math.abs(q0[1] - P0[1]) <= tol) { g = myRem + ac.s - a.halfLen - ac.halfLen; gv = this._laneVel[c]; }
+                        else {
+                            // Where it is now, and where its curve still goes (its remaining curve points): the first
+                            // spot on our path it occupies / will sweep through is the obstacle — we wait at our mouth
+                            // instead of nosing into its turn. (Moving along our path = its speed; crossing = 0.)
+                            let at = this._pathHit(a, nl, myRem, oc.cx, oc.cz, corr);
+                            if (at >= 0) { legPoint(this._phOn!, PJ.s, LP); gv = this._laneVel[c] * Math.max(0, oc.hx * LP.hx + oc.hz * LP.hz); }
+                            const L2 = ac.leg, sEnd = L2.sStart + ac.halfLen;
+                            for (let pi = 1; pi < L2.pts.length && L2.cum[pi - 1] < sEnd; pi++) {
+                                if (L2.cum[pi] <= ac.s) continue;
+                                const h = this._pathHit(a, nl, myRem, L2.pts[pi][0], L2.pts[pi][1], corr);
+                                if (h >= 0 && (at < 0 || h < at)) { at = h; gv = 0; }
+                            }
+                            if (at >= 0) g = at - a.halfLen - ac.halfLen;
+                        }
+                        if (g < gap) { gap = g; vL = gv; }
+                    }
+                }
+            }
+        }
+        const P = this._pl;
+        if (P.on) {
+            const dx = P.x - mv.cx, dz = P.z - mv.cz, R = look + P.r;
+            if (dx * dx + dz * dz < R * R) {
+                const PJ = this._pj, corr = F.corridorHalfM * M + P.r;
+                let d = -1;
+                legProject(a.leg, P.x, P.z, PJ);
+                if (PJ.lat < corr && PJ.s >= a.s && PJ.s < a.leg.total - 1e-6) d = PJ.s - a.s;
+                else if (myRem < look) {
+                    const nl = this._peekLeg(a);
+                    if (nl) { legProject(nl, P.x, P.z, PJ); if (PJ.lat < corr && PJ.s > 1e-6) d = myRem + PJ.s; }
+                }
+                if (d >= 0) { const g = d - a.halfLen - P.r; if (g < gap) { gap = g; vL = 0; } }
+            }
+        }
+        this._fg = gap; this._fv = vL;
+    }
 
     /** A routed car's position along its ROAD (road.a → road.b coordinates) on the straight part of its leg. */
     private _alongOnRoad(a: RouteAgent, e: RoadNet['edges'][number]): number {
@@ -1217,12 +1768,17 @@ export class WorldTraffic {
             for (let j = 0; j < this.movers.length && clear; j++) {
                 if (j === i || this.movers[j].spec.kind !== 'car') continue;
                 const dx = pose[j * 4] - LP.x, dz = pose[j * 4 + 1] - LP.z;
-                if (dx * dx + dz * dz < (0.4 * s) * (0.4 * s)) clear = false;
+                // Clear by both car lengths + the standstill gap (a fixed 0.4 s let a bus re-enter on top of a car).
+                const oh = this.movers[j].agent?.halfLen ?? 0.15 * s, r = Math.max(0.4 * s, a.halfLen + oh + this.follow.jamGapM * (s / 15));
+                if (dx * dx + dz * dz < r * r) clear = false;
             }
             a.visit++;
             if (!clear) continue;
             a.leg = leg; a.s = leg.sStart; a.fading = 1; a.fade = 0.001; a.signDone = false; a.hold = 0; a.shift = 0; a.through = false;
+            a.gNode = -1; a.gFor = null; a.bNode = -1; a.jFor = null;
             mv.vel = mv.spec.speed * 0.5; mv.yaw = null;
+            // Into the tick's pose snapshot: a second car respawning this tick must see this one at the entry.
+            pose[i * 4] = LP.x; pose[i * 4 + 1] = LP.z; pose[i * 4 + 2] = LP.hx; pose[i * 4 + 3] = LP.hz;
             return;
         }
     }

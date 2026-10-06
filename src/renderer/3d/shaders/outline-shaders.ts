@@ -29,7 +29,8 @@ struct MeshInstance {
   normalMatrix: mat4x4<f32>,
   diffuseColor: vec4<f32>,
   specularColor: vec4<f32>,
-  emissiveColor: vec4<f32>,
+  emissive:      vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:         u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
   _pad0:        vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 240 (texIndex/normIndex/rough/metal + 2 pattern vec4 + uvTransform)
   _pad1:        vec4<f32>,
   _pad2:        vec4<f32>,
@@ -83,7 +84,7 @@ struct VertOut {
   // FOLIAGE WIND (bit 19, visual-polish #3): the same sway as the colour + shadow passes, so a canopy's ink stays on
   // its leaves instead of on where they were at rest (patternParams.xyz = _pad2 here).
   var localPos = pos;
-  if ((bitcast<u32>(instances[iIdx].emissiveColor.a) & 524288u) != 0u) {
+  if ((instances[iIdx].flags & 524288u) != 0u) {
     let m = instances[iIdx].modelMatrix;
     let wp = instances[iIdx]._pad2;
     localPos = localPos + foliageWindOffset(pos, vec3<f32>(m[3].x, m[3].y, m[3].z), wp.x, wp.y, wp.z,
@@ -105,7 +106,7 @@ struct VertOut {
   // passes (the pre-pass used to ink the bare card squares: long straight lines across every canopy). FOLIAGE
   // (leaf cards + foliage-shade bit 20) packs a HALF-LENGTH normal so the Sobel pass can tell it apart and apply the
   // foliage mode; the direction is kept, so the 'full' mode inks it exactly as before.
-  let mflags = bitcast<u32>(instances[in.iIdx].emissiveColor.a);
+  let mflags = instances[in.iIdx].flags;
   if ((mflags & 8192u) != 0u && leafCardCoverage(in.uv) < 0.5) { discard; }
   let isFoliage = (mflags & (8192u | 1048576u)) != 0u;
   // Pack world normal from [-1,1] to [0,1] for rgba8unorm storage.

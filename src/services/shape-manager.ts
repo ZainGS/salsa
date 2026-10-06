@@ -85,6 +85,7 @@ import { DualBrushSettings, DualBrushBlendOp, ColorJitter, WetEdgeSettings, Stro
 import { FloodFillEngine, FloodFillOptions } from '../renderer/raster/tools/flood-fill-engine';
 import { DocumentPersistence, DocumentManifest, DocumentSavePayload, DocumentInfo, AutoSaveConfig, isOPFSAvailable } from './persistence/document-persistence';
 import { DocumentStateCoordinator, type RestoreIssue } from './persistence/document-state-coordinator';
+import { createBlankDocumentPayload } from './persistence/blank-document';
 import { PixelFormat, isFormatSupported } from './persistence/pixel-codec';
 import { packProject as _packProject, unpackProject as _unpackProject } from './persistence/project-package';
 import { runWhenIdle } from './persistence/idle-gate';
@@ -139,6 +140,7 @@ import { CrateManager } from './managers/crate-manager';
 import { VentManager } from './managers/vent-manager';
 import { ABoardManager } from './managers/a-board-manager';
 import { StallManager } from './managers/stall-manager';
+import { CharacterV2Manager, scene3dCharacterV2Host } from '../character-v2';
 import type { VendingParams, VendingMeta } from '../world/vending';
 import type { ProcTransform, ProceduralObjectManager } from './managers/procedural-object-manager';
 import { creator3DTypes, creator3DSchema, creator3DDefaults, type CreatorParamSchema } from './managers/creator-registry';
@@ -263,6 +265,9 @@ class ShapeManager {
     public vents!: VentManager;
     public aBoards!: ABoardManager;
     public stalls!: StallManager;
+    /** Character v2 (docs/specs/character-v2.md, docs/ui/character-v2.md): frozen Persona base body + blend-shape sliders.
+     *  `sm.characterV2.create()` / `.setSlider(id, name, v)` / `.getSliders(id)` / `.toHandle(id)`; console: `salsaCharV2`. */
+    public characterV2!: CharacterV2Manager;
     /** typeId → its manager, for the generic creator dispatch (createCreator3D / setCreatorParams3D / …). */
     private readonly _creators = new Map<string, ProceduralObjectManager<unknown, unknown>>();
     public drawing!: DrawingToolManager;
@@ -599,6 +604,7 @@ class ShapeManager {
         this.vents = new VentManager(this.scene3d);           // Ground Vent Creator (grate / box)
         this.aBoards = new ABoardManager(this.scene3d);       // A-Board Creator (folding sidewalk sign)
         this.stalls = new StallManager(this.scene3d);         // Produce Stall Creator (market stall + awning)
+        this.characterV2 = new CharacterV2Manager(scene3dCharacterV2Host(this.scene3d));   // Character v2 (params-only marker persistence)
         // ★ Generic creator dispatch: typeId → its ProceduralObjectManager, so ONE host API + ONE
         // schema-driven panel (docs/specs/creator-modes.md §5.2) drives every procedural creator. Register a
         // new creator here + its schema in creator-registry.ts and it works through createCreator3D/… with no
@@ -1525,10 +1531,22 @@ class ShapeManager {
     public enableRasterTool() {
         this.rasterDrawingService?.setEraserMode('paint');
         this.rasterDrawingService?.enable();
+        this._setRasterEraserLease(false);
     }
 
     public disableRasterTool() {
         this.rasterDrawingService?.disable();
+        this._setRasterEraserLease(false);
+    }
+
+    /** The raster eraser tool's interactive (render-loop) lease: ONE while the eraser is on. enableRasterEraserTool /
+     *  enableRasterClearEraserTool used to take a NEW lease on every call (each eraser click, style change, rail E)
+     *  and only disableRasterEraserTool returned one, so switching to a brush leaked it (render every vsync). */
+    private _rasterEraserLeaseHeld = false;
+    private _setRasterEraserLease(hold: boolean): void {
+        if (hold === this._rasterEraserLeaseHeld) return;
+        this._rasterEraserLeaseHeld = hold;
+        if (hold) this.beginInteractive(); else this.endInteractive();
     }
 
     public setRasterBrushSize(size: number) {
@@ -1543,19 +1561,19 @@ class ShapeManager {
     public enableRasterEraserTool() {
         this.rasterDrawingService?.setEraserMode('erase');
         this.rasterDrawingService?.enable();
-        this.beginInteractive();
+        this._setRasterEraserLease(true);
     }
 
     public enableRasterClearEraserTool() {
         this.rasterDrawingService?.setEraserMode('clear');
         this.rasterDrawingService?.enable();
-        this.beginInteractive();
+        this._setRasterEraserLease(true);
     }
 
     public disableRasterEraserTool() {
         this.rasterDrawingService?.setEraserMode('paint');
         this.rasterDrawingService?.disable();
-        this.endInteractive();
+        this._setRasterEraserLease(false);
     }
 
     // Stroke event subscription helpers
@@ -2035,6 +2053,17 @@ class ShapeManager {
     /** Set the active brush preset by id. */
     public setActiveBrushPreset(id: string): boolean {
         return this.getRasterPaintEngine()?.setActivePreset(id) ?? false;
+    }
+
+    /** PICK a brush (what a brush-list click should call): activates the preset AND leaves the raster eraser tool's
+     *  erase mode, so a brush picked after the eraser paints instead of erasing. setActiveBrushPreset only swaps the
+     *  preset (used for live edits of the active brush, which must not drop erase mode). */
+    public selectRasterBrushPreset(id: string): boolean {
+        const ok = this.rasterDrawingService
+            ? this.rasterDrawingService.selectBrushPreset(id)
+            : this.setActiveBrushPreset(id);
+        if (ok) this._setRasterEraserLease(false);
+        return ok;
     }
 
     /** Get the active brush preset id. */
@@ -3372,6 +3401,12 @@ class ShapeManager {
     public getPlayerSneaking3D(): boolean { return this.scene3d.getPlayerSneaking3D(); }
     /** Toggle-style sneak from the host (e.g. an on-screen button); resets every Play run. No-op when not playing. */
     public setPlayerSneaking3D(on: boolean): void { this.scene3d.setPlayerSneaking3D(on); }
+    /** TOUCH-3 "Navigate" lock (docs/ui/touch-controls.md): true = one finger orbits the 3D camera in every mode
+     *  (City / Edit Mesh / paint included); two fingers then pan + pinch. Persists across mode switches. */
+    public setTouchNavigate3D(on: boolean): void { this.scene3d.setTouchNavigate3D(on); }
+    public getTouchNavigate3D(): boolean { return this.scene3d.getTouchNavigate3D(); }
+    /** Frame the mesh under a client (CSS) point, or everything when nothing is there (what a touch double-tap does). */
+    public frameAtClient3D(clientX: number, clientY: number): boolean { return this.scene3d.frameAtClient3D(clientX, clientY); }
     /** Fires with the new sneak state (for a HUD badge). */
     public get onPlayerSneakChanged3D(): import('../renderer/util/event-emitter').EventEmitter<boolean> { return this.scene3d.onPlayerSneakChanged; }
     /** The active gait while playing: 'walk' | 'run' | 'sneak' (null when not playing). */
@@ -5285,6 +5320,11 @@ class ShapeManager {
     public isProceduralBodySkeleton3D(skeletonId: string): boolean {
         return this.scene3d.getSkeleton(skeletonId)?.isProceduralBody === true;
     }
+    /** "Is a character body" — a v1 procedural body OR a Character v2 body (docs/specs/character-v2.md review fixes).
+     *  Use it where the UI means "a character" (hide Bind Mesh, outliner character grouping); isProceduralBody3D keeps
+     *  meaning "has v1 bodyParams" (the v1 creator panel). */
+    public isCharacterBody3D(meshId: string): boolean { return this.scene3d.isCharacterBody3D(meshId); }
+    public isCharacterBodySkeleton3D(skeletonId: string): boolean { return this.scene3d.isCharacterBodySkeleton3D(skeletonId); }
 
     /** Destroy + drop a mesh's uv-paint texture (frees its GPUTexture). The `_uvPaintTextures` map is the SOLE owner
      *  (DecalManager only reads/creates), so this is the one place that frees them. Use ONLY at true removals — NOT
@@ -7043,11 +7083,12 @@ class ShapeManager {
         this.scene3d?.resetGlobalScene3DSettingsForLoad(); // fog/PS1/SSAO/… back to defaults before the doc's own
         this.world?.resetStyleForLoad();                   // the previous doc's city look (restoreFromSave sets the new one)
         this._cdKits.clear();                            // restoreCDKitsFromSave3D skipped ids it already "had"
+        this.characterV2?.clearForDocumentLoad();         // Character v2 records (rebuilt from markers by restoreProceduralFromSave3D)
         this._garp.clear();
         this.ui.restore([]);                             // UI layers (only cleared when the new doc had some)
         this._uiStopAllClipPlayers();
         this._uiSound?.stopAll();                        // previous doc's (looping) UI sounds kept playing
-
+        this.interactionService?.clearSelectedNodes();   // the 2D selection held the previous doc's (detached) nodes
     }
 
     /** Regenerate ALL procedural objects (City + buildings + foliage) from a loaded save's params-only markers.
@@ -7084,6 +7125,8 @@ class ShapeManager {
         // CD kits are self-describing markers too (worldParams.kind==='cdkit') — rebuild pieces here (BEFORE the
         // proc-texture re-apply that restores uploaded art onto them by container id + piece name).
         const cdKits = this.restoreCDKitsFromSave3D(); _lapStep('cdKits');
+        // Character v2 markers (worldParams.kind==='characterV2') → rebuild the bodies (async: the asset bake is cached).
+        void this.characterV2.restoreFromSave().catch((e) => console.warn('[load] character v2 restore failed', e));
         const _total = _steps.reduce((s, [, ms]) => s + ms, 0);
         debugLog(`[Salsa][load] restoreProceduralFromSave3D breakdown — TOTAL ${Math.round(_total)}ms:\n` +
             _steps.filter(([, ms]) => ms >= 0.5).sort((a, b) => b[1] - a[1]).map(([n, ms]) => `    ${Math.round(ms)}ms  ${n}`).join('\n'));
@@ -7262,6 +7305,12 @@ class ShapeManager {
     public setSceneBudget3D(limits: Partial<SceneBudgetLimits3D> | null): SceneBudgetLimits3D { return this.scene3d.setSceneBudget3D(limits); }
     /** Play collision diagnostics (collision cells, rays through cells vs the per-mesh path, the hood). Null outside Play. */
     public getCollisionStats3D(): ReturnType<Scene3DManager['getCollisionStats3D']> { return this.scene3d.getCollisionStats3D(); }
+    /** Play camera occluders (camera-occluders.ts): 'auto' | 'block' (the camera pulls in for it, like a wall) |
+     *  'ignore' (the camera passes through it, like a lamp post). Persisted on the mesh. */
+    public setMeshCameraBlock3D(meshId: string, mode: 'auto' | 'block' | 'ignore'): boolean { return this.scene3d.setMeshCameraBlock3D(meshId, mode); }
+    public getMeshCameraBlock3D(meshId: string): 'auto' | 'block' | 'ignore' | null { return this.scene3d.getMeshCameraBlock3D(meshId); }
+    /** How the Play camera treats a mesh right now: hard (pulls in) or soft (passed through), and the rule that decided. */
+    public getCameraOccluderClass3D(meshId: string): ReturnType<Scene3DManager['getCameraOccluderClass3D']> { return this.scene3d.getCameraOccluderClass3D(meshId); }
 
     /** Step 2 diagnostics: render-list sizes + structure-walk counters, draw-rank / prewarm counters, structure version. */
     public getFrameScanStats3D(): { renderList: unknown; structure: unknown; structureVersion: number; structureBumps: number } {
@@ -12985,7 +13034,8 @@ class ShapeManager {
         this.webgpuRenderer.setExplicitDocumentPixelSize(null);
         this.webgpuRenderer.setIllustrationMode(false);
         const canvas = this.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
-        if (canvas && this.rasterLayerManager) {
+        // (A 0×0 canvas — not laid out yet — would make every layer texture invalid; keep the current size then.)
+        if (canvas && canvas.width > 0 && canvas.height > 0 && this.rasterLayerManager) {
             this.rasterLayerManager.setSize(canvas.width, canvas.height);
         }
         this.scheduleRender();
@@ -13446,9 +13496,13 @@ class ShapeManager {
         this.persistence.startAutoSave();
     }
 
-    /** Stop auto-saving (engine stays initialized for manual saves). */
+    /** Stop auto-saving (engine stays initialized for manual saves). Also drops an automatic save that is still
+     *  pending (stroke debounce / trailing / deferred): it used to fire after the host had moved on — e.g. while the
+     *  next document loaded — and write into whichever document id was current then. Save first (saveDocument) if
+     *  the pending change must be kept. */
     public disableAutoSave(): void {
         this.persistence?.stopAutoSave();
+        this.persistence?.cancelPendingSaves();
     }
 
     /** Update auto-save configuration while running. */
@@ -13668,6 +13722,43 @@ class ShapeManager {
     }
 
     /**
+     * Replace whatever document is open with a NEW, BLANK one — the ShapeManager outlives every document, so a host
+     * opening a new (never saved) document must call this first, or the previous document's content stays on screen
+     * and its next save writes it into the new document (new-document audit 2026-10-06).
+     *
+     * It runs the same full-replacement restore as opening a saved document (saves are suspended meanwhile, a pending
+     * save of the previous document finishes first) with an empty payload: no 2D shapes or 3D nodes, the default
+     * 'Background' + 'Vector' layers, no animation, default dither / canvas grid / global 3D settings, and every
+     * per-document registry cleared (world / city, characters v1 + v2, kitbash, decals, GARP, UI layers, scripts,
+     * animation library, texture library, GLB store, UV-paint textures, ephemera, procedural creators), plus empty undo
+     * stacks and no selection. A save block left by a previous partial load is lifted.
+     *
+     * @param docId The new document's id: saves go there from now on. Omitted = no document id yet (saves are skipped
+     *              until enableAutoSave / loadDocument / setCurrentDocId sets one) — never the previous document's.
+     * @param name  The new document's name (default 'Untitled').
+     * @param opts.documentSize Bounded artboard size in pixels; null / omitted = infinite canvas.
+     */
+    public async startBlankDocument(docId?: string, name = 'Untitled', opts: { documentSize?: { w: number; h: number } | null } = {}): Promise<void> {
+        // A floating raster paste / transform of the previous document must not be stamped onto the new one's layer,
+        // and its selection mask must not carry over: put the pixels back, then drop the selection.
+        const rasterSel = this.getSelectionEngine();
+        rasterSel?.cancelTransform();
+        try { await rasterSel?.deselectAll(); } catch (e) { console.warn('[startBlankDocument] raster deselect failed', e); }
+        // Synchronously followed by restoreDocumentState's suspend(): no save can start in between, and a save already
+        // running gathered its manifest (and so its doc id) before this line.
+        this.currentDocId = docId ?? '';
+        this.currentDocName = name;
+        const layerSize = this.rasterLayerManager?.getCanvasSize();
+        await this.restoreDocumentState(createBlankDocumentPayload(this.currentDocId, name, {
+            documentSize: opts.documentSize ?? null,
+            canvasSize: layerSize && layerSize.w > 0 && layerSize.h > 0 ? layerSize : undefined,
+        }));
+        this.interactionService?.clearSelectedNodes();
+        this.scene3d?.clearSelection();
+        this.scheduleRender();
+    }
+
+    /**
      * Returns IDs of all 3D mesh nodes whose save-relevant state has changed
      * since the last clearDirtyMeshState3D() call. Use for per-mesh chunked saves.
      */
@@ -13859,6 +13950,11 @@ class ShapeManager {
     public onDeviceLost(fn: GpuDeviceStatusListener): () => void {
         return this.webgpuRenderer.onDeviceStatusChange((info) => { if (info.status === 'lost') fn(info); });
     }
+    /** GPU diagnostics (mobile-parity CRASH-10; docs/ui/gpu-diagnostics.md): the capability tier + why, the per-machine
+     *  caps in force, adapter info, device limits + features, the canvas backing size, the device status, the last
+     *  device loss (persisted: survives a reload), breadcrumbs, still-open GPU operations and uncaptured GPU errors.
+     *  JSON-safe, for a host "GPU info" panel / copy-to-clipboard. */
+    public getGpuDiagnostics3D(): ReturnType<WebGPURenderer['getGpuDiagnostics']> { return this.webgpuRenderer.getGpuDiagnostics(); }
     /** Retry a recovery (e.g. after 'failed', or with autoRecoverDevice off). Resolves true when rendering is back. */
     public recoverDevice(): Promise<boolean> { return this.webgpuRenderer.recoverDevice(); }
     /** Automatic recovery on loss (default on). */

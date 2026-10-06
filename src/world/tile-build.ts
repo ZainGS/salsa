@@ -21,6 +21,7 @@ import { buildTileHlod, type HlodLevel } from './tile-hlod';
 import { setPartRecording } from './meshbuild';
 import { withTileSpeed, type TileSpeedSwitches } from './tile-speed';
 import { snapshotPropParts, instancePropParts, stripPropParts, type PropInstancingOptions, type PropInstancingStats } from './prop-instancing';
+import { cityTextSigns, signTextLayers, SIGN_TEXT_GROUP } from './sign-text-all';
 
 /** One named mesh-group's worth of flat layers for a tile (reassembled into a MeshGroup3D on the main thread). */
 export interface TileLayerGroup { name: string; layers: LayoutPreviewLayer[] }
@@ -85,12 +86,13 @@ export interface TileBuildOptions {
 export const TILE_HALF_OF: Readonly<Record<string, 0 | 1>> = {
     'World Streets': 0, 'World Landmarks': 0, 'World Shotengai': 0, 'World Signage': 0, 'World Awnings': 0,
     'World Furniture': 0, 'World Railway': 0, 'World Skyway': 0, 'World Sky': 0, 'World Pedestrians': 0,
+    [SIGN_TEXT_GROUP]: 0,   // the text plates (shop names read the lots World Streets dressed)
     'Layout': 1, 'Water': 1, 'Road Paint': 1, 'World Biome': 1, 'World Signals': 1, 'World Road Signs': 1,
 };
 const inHalf = (half: 0 | 1 | undefined, name: string): boolean => half === undefined || (TILE_HALF_OF[name] ?? 0) === half;
 
 /** The group order of a whole tile build ('Layout', 'Water', 'Road Paint', then TILE_BUILD_ORDER). */
-const TILE_GROUP_ORDER: readonly string[] = ['Layout', 'Water', 'Road Paint', ...DRESSING_ORDER];
+const TILE_GROUP_ORDER: readonly string[] = ['Layout', 'Water', 'Road Paint', ...DRESSING_ORDER, SIGN_TEXT_GROUP];
 /** P22 splitTile: the two halves' groups (each in build order) merged back into the whole build's group order. */
 export function mergeTileHalves(a: TileLayerGroup[], b: TileLayerGroup[]): TileLayerGroup[] {
     const rank = (name: string): number => {
@@ -158,6 +160,11 @@ function buildTile(params: LayoutParams, tx: number, tz: number, full: boolean, 
             if (inHalf(half, 'Water')) push(`${tag} Water`, buildWater(g)); lap('g:Water');
             if (inHalf(half, 'Road Paint')) push(`${tag} Road Paint`, buildRoadPaint(g)); lap('g:Road Paint');
             for (const name of TILE_BUILD_ORDER) { if (inHalf(half, name)) push(`${tag} ${name}`, buildGroupFor(name, g)); lap('g:' + name.replace(/^World /, '')); }
+            // The TEXT PLATES (STOP lettering, street names, NO PARKING, landmark / shop names) — the centre city adds these
+            // on the main thread (WorldManager._addTextSigns); a tile had none, so every streamed STOP sign / plate was blank.
+            // The labels ride on the layers; the main thread rasterizes + binds them when the tile lands.
+            if (inHalf(half, SIGN_TEXT_GROUP)) push(`${tag} ${SIGN_TEXT_GROUP}`, signTextLayers(cityTextSigns(g, null)));
+            lap('g:Sign Text');
         } else if (opts.massing) push(`${tag} Massing`, buildTileMassing(g));
     } finally { setPartRecording(wasRec); }
     lap('groups');
@@ -175,9 +182,16 @@ function buildTile(params: LayoutParams, tx: number, tz: number, full: boolean, 
     if (parts) instancePropParts(out, parts, opts.propInstancingOpts, opts.propStats);
     else stripPropParts(out);
     lap('instance');
-    if (full && opts.runBoxes !== false) attachRunBoxes(out);   // step 3: collision-cell run boxes (final positions)
+    // (the text plates are decoration on top of their supports — no collision, like the centre's; and they stay in the
+    // 48-byte vertex format, as the centre's textured plates do)
+    const solid = out.filter(grp => !grp.name.endsWith(SIGN_TEXT_GROUP));
+    if (full && opts.runBoxes !== false) attachRunBoxes(solid);   // step 3: collision-cell run boxes (final positions)
     lap('runBoxes');
-    if (full) markPackable(out);   // P22: the renderer may store these packed (it checks the constant tangent itself)
+    if (full) {
+        markPackable(solid);
+        // the plates explicitly NOT packable (so a later markPackable pass leaves them alone too)
+        for (const grp of out) if (!solid.includes(grp)) for (const L of grp.layers) (L.geometry as { packable?: boolean }).packable = false;
+    }   // P22: the renderer may store these packed (it checks the constant tangent itself)
     return out;
 }
 

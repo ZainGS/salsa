@@ -61,7 +61,8 @@ struct MeshInstance {
   normalMatrix:   mat4x4<f32>,
   diffuseColor:   vec4<f32>,
   specularColor:  vec4<f32>,
-  emissiveColor:  vec4<f32>,
+  emissive:       vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:          u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
   textureIndex:   u32,
   normalMapIndex: u32,
   roughness:      f32,
@@ -109,7 +110,7 @@ fn vs_shadow(
   // FOLIAGE WIND (bit 19) — the depth pass applies the SAME displacement as the colour pass, so the cast
   // shadow sways with the plant instead of staying pinned (foliage-quality S1).
   var localPos = position;
-  if ((bitcast<u32>(inst.emissiveColor.a) & 524288u) != 0u) {
+  if ((inst.flags & 524288u) != 0u) {
     let originW = vec3<f32>(inst.modelMatrix[3].x, inst.modelMatrix[3].y, inst.modelMatrix[3].z);
     localPos = localPos + foliageWindOffset(position, originW,
       inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
@@ -128,7 +129,7 @@ fn vs_shadow(
 // shadows as its leaves instead of as a full square (polish-round-3 T4). Every other mesh writes depth untouched.
 @fragment
 fn fs_shadow(in: ShadowOut) {
-  let flags = bitcast<u32>(u_instances[in.idx].emissiveColor.a);
+  let flags = u_instances[in.idx].flags;
   if ((flags & 8192u) != 0u) {
     if (leafCardCoverage(in.uv) < 0.5) { discard; }
   }
@@ -269,9 +270,9 @@ fn vs_main(in: VertexInput, @builtin(instance_index) idx: u32) -> VertexOutput {
   let shininess = inst.specularColor.a;
   let spec = pow(max(dot(worldNormal, H), 0.0), max(shininess, 1.0));
   lit += inst.specularColor.rgb * scene.lightColor.rgb * spec;
-  lit += inst.emissiveColor.rgb;
+  lit += inst.emissive;
 
-  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (bitcast<u32>(inst.emissiveColor.a) & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
+  let colorDepth = select(scene.ps1Config.w, -scene.ps1Config.w, scene.ps1Config.w < 0.0 && (inst.flags & 2147483648u) != 0u);   // < 0 = opt-in scope: only bit-31 meshes
   if (colorDepth > 0.0) { lit = quantizeColor(lit, colorDepth); }
 
   var out: VertexOutput;
@@ -338,7 +339,7 @@ fn fs_main(
   @location(4) worldPos:    vec3<f32>,
 ) -> @location(0) vec4<f32> {
   let inst  = u_instances[instanceIdx];
-  let flags = bitcast<u32>(inst.emissiveColor.a);
+  let flags = inst.flags;
 
   // Sample diffuse texture unconditionally — textureSample requires uniform control flow
   let texColor = textureSample(diffuseTexture, diffuseSampler, uv, i32(inst.textureIndex));

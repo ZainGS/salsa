@@ -20,7 +20,8 @@ struct MeshInstance {
   normalMatrix: mat4x4<f32>,
   diffuseColor: vec4<f32>,
   specularColor: vec4<f32>,
-  emissiveColor: vec4<f32>,
+  emissive:      vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:         u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
   _texIndex:  u32,
   _normIndex: u32,
   _pad0:      u32,

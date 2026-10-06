@@ -25,6 +25,7 @@ import { ScriptRunner } from '../scripting/script-runner';
 import type { ScriptSceneAdapter, ScriptBehavior, ScriptInput } from '../scripting/script-types';
 import { SCRIPT_CONTEXT_DTS, SCRIPT_SNIPPETS, type ScriptSnippet } from '../scripting/script-context-dts';
 import { CharacterController, DEFAULT_CHARACTER, PLAY_JUMP_WINDUP, type CharacterInput, type CharacterConfig } from '../../game/character-controller';
+import { mergeHostPlayInput } from '../../game/play-input';
 import { PlaySettings, type PlaySettingsState } from './play-settings';
 import { buildLocomotionClips, playArmClearance, applyWalkStyle, LOCOMOTION_CLIP, DEFAULT_LOCOMOTION_CLIP_NAMES, JUMP_VARIANT_CLIPS } from './default-locomotion';
 import { buildIdleVariantClips, GLASSES_CHARMS } from './default-idle-variants';
@@ -52,9 +53,11 @@ import { bakeSkyEquirect, DEFAULT_SKY } from '../../renderer/3d/procedural-sky';
 import { SKY_PRESETS, skyPresetNames, type SkyPresetName } from '../../renderer/3d/sky-presets';
 import { SpatialGridXZ, type XZBounds } from '../../game/spatial-grid';
 import { CollisionSnapshot } from '../../game/collision-snapshot';
+import { isVisualOnlyMesh } from '../../game/collision-filter';
 import { evaluateSceneBudget, SCENE_BUDGET_DEFAULTS, type SceneBudgetLimits } from '../../renderer/3d/scene-budget';
 import { GroupBoundsJob } from './group-bounds';
 import { CollisionHood } from '../../game/collision-hood';
+import { classifyCameraOccluder, cameraOccluderScale, isCameraBlockMode, type CameraBlockMode, type CameraOccluderVerdict } from '../../game/camera-occluders';
 import { CollisionCellManager, cellRaycast, newCellRayScratch, type CollisionCell, type CellRayPicker } from '../../game/collision-cells';
 import { buildCellBvhAsync } from '../workers/near-lane';
 
@@ -675,7 +678,8 @@ export class Scene3DManager {
         this.playSettings.onChange = () => this._applyPlaySettingsLive();   // live eye height / auto-player toggle
         this._particles = new Scene3DParticles(ctx);
         this._gp = new Scene3DGreasePencil(ctx);
-        this._blendShapes = new Scene3DBlendShapes(ctx, { getMesh: (id) => this.getMesh(id) });
+        this._blendShapes = new Scene3DBlendShapes(ctx, { getMesh: (id) => this.getMesh(id),
+            patchVertices: (m, start, count) => this.patchMeshVertices3D(m, start, count) });   // Character v2 Phase 1.5
         this._cloth = new Scene3DCloth(ctx, {
             getMesh: (id) => this.getMesh(id),
             getFrameLinkAnim: (id) => this._animation.frameLinkAnims.get(id) ?? null,
@@ -821,6 +825,8 @@ export class Scene3DManager {
             simLodSpringsDue: (skelId) => this.simLodDue('springs', skelId, null),
             syncFocusBgLiveLoop: () => this._syncFocusBgLiveLoop(),
         });
+        // TOUCH-3: a touch double-tap frames the tapped mesh, or everything (docs/ui/touch-controls.md).
+        this._armature.touchDoubleTapHandler = (cx, cy) => { this.frameAtClient3D(cx, cy); };
         // Sync each procedural character's skeleton object-transform from its body mesh's transform
         // every frame, so the gizmo (which moves the body mesh) carries the skeleton + bones with it.
         this.ctx.webgpuRenderer.addPreRenderCallback(() => this._syncCharacterSkeletons(), 'characterSkeletonSync');
@@ -1197,8 +1203,8 @@ export class Scene3DManager {
      *  rebuilt from params on every reload / slider change, so an outline stored on a part was silently lost. */
     private _outlineOwnerId(meshId: string): string {
         const m = this.getMesh(meshId);
-        if (!(m instanceof SkinnedMesh3D) || m.isProceduralBody || !m.skeletonId) return meshId;
-        const body = this.getAllMeshes().find(b => b instanceof SkinnedMesh3D && b.isProceduralBody && b.skeletonId === m.skeletonId);
+        if (!(m instanceof SkinnedMesh3D) || this._isCharacterBody(m) || !m.skeletonId) return meshId;
+        const body = this.getAllMeshes().find(b => b instanceof SkinnedMesh3D && this._isCharacterBody(b) && b.skeletonId === m.skeletonId);
         return body?.id ?? meshId;
     }
 
@@ -1230,7 +1236,7 @@ export class Scene3DManager {
         this._charOutlines = style ? { ...Scene3DManager.CHARACTER_OUTLINE_DEFAULT, ...style } : null;
         let n = 0;
         for (const m of this.getAllMeshes()) {
-            if (!(m instanceof SkinnedMesh3D) || !m.isProceduralBody) continue;
+            if (!this._isCharacterBody(m)) continue;   // v1 procedural body or Character v2 body (review fix runtime#5)
             if (this.setMeshOutline3D(m.id, this._charOutlines)) n++;
         }
         this.ctx.scheduleRender();
@@ -1253,7 +1259,7 @@ export class Scene3DManager {
         if (!this._playCharOutlines || this._charOutlines) return;
         const style: HighlightStyle = { ...Scene3DManager.DEFAULT_OUTLINE, ...Scene3DManager.CHARACTER_OUTLINE_DEFAULT };
         for (const m of this.getAllMeshes()) {
-            if (!(m instanceof SkinnedMesh3D) || !m.isProceduralBody || m.outline) continue;
+            if (!this._isCharacterBody(m) || m.outline) continue;   // v1 or Character v2 body (review fix runtime#5)
             this.renderer3D.setMeshOutline(m.id, style, null);
             this._playOutlined.push(m.id);
         }
@@ -1434,9 +1440,11 @@ export class Scene3DManager {
     patchMeshVertices3D(mesh: Mesh3D, start: number, count: number): boolean { return this.renderer3D?.patchMeshVertices?.(mesh, start, count) ?? false; }
     /** visual-polish #16: the Play player's feet (world space, the last rendered frame) + body height, or null outside
      *  Play. The city's moving contact blobs put one under the player. */
-    get playerFeet3D(): { x: number; y: number; z: number; height: number } | null {
+    get playerFeet3D(): { x: number; y: number; z: number; height: number; groundY: number } | null {
         const f = this._lastPlayerFeet, cc = this._playController;
-        return this._playing && f && cc ? { x: f[0], y: f[1], z: f[2], height: cc.cfg.eyeHeight } : null;
+        // groundY = the standable surface under the feet (≤ feet): the contact blob sits THERE, not at the feet — a
+        // blob at the feet rose with every jump.
+        return this._playing && f && cc ? { x: f[0], y: f[1], z: f[2], height: cc.cfg.eyeHeight, groundY: Math.min(f[1], cc.lastGroundY) } : null;
     }
     private _lastPlayerFeet: [number, number, number] | null = null;
 
@@ -1740,6 +1748,26 @@ export class Scene3DManager {
     disableViewGizmo(): void { return this._armature.disableViewGizmo(); }
 
     disableOrbitControls(): void { return this._armature.disableOrbitControls(); }
+
+    /** TOUCH-3 "Navigate" lock: true = ONE finger orbits the 3D camera in every mode (tool modes included: City / Edit
+     *  Mesh / paint, where one finger otherwise stays with the tool); two fingers then pan + pinch. Persists across
+     *  mode switches. Mouse input is unaffected. See docs/ui/touch-controls.md. */
+    setTouchNavigate3D(on: boolean): void { this._armature.setTouchNavigate3D(on); }
+    getTouchNavigate3D(): boolean { return this._armature.getTouchNavigate3D(); }
+
+    /** Frame the mesh under client (CSS) point (x, y), or every mesh when nothing is there (the touch double-tap).
+     *  Returns true when the camera was reframed. */
+    frameAtClient3D(clientX: number, clientY: number): boolean {
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        let hitId: string | null = null;
+        if (canvas && typeof canvas.getBoundingClientRect === 'function') {
+            const rect = canvas.getBoundingClientRect();
+            const sx = rect.width > 0 ? canvas.width / rect.width : 1;
+            const sy = rect.height > 0 ? canvas.height / rect.height : 1;
+            hitId = this.pick3D((clientX - rect.left) * sx, (clientY - rect.top) * sy, canvas.width, canvas.height)?.meshId ?? null;
+        }
+        return (hitId !== null && this.frameMesh(hitId, 1.4)) || this.frameAllMeshes(1.4);
+    }
 
     /** Re-attach 3D canvas input (orbit/pan/zoom + armature bone drag) to the current canvas after a canvas swap
      *  (Shell↔illustration reinitialize). Call from the host's onCanvasReinitialized, alongside the 2D tool
@@ -2581,6 +2609,7 @@ export class Scene3DManager {
         if (input.jump !== undefined) this._playInput.jump = input.jump;
         if (input.lookYaw !== undefined) this._playInput.lookYaw = input.lookYaw;
         if (input.lookPitch !== undefined) this._playInput.lookPitch = input.lookPitch;
+        if (input.interact !== undefined) this._playInput.interact = input.interact;   // TOUCH-4: the Use button (was dropped)
     }
 
     /** Register the avatar's locomotion clip names (idle/walk/run?/jump?/fall?) + a handler the Play loop calls with
@@ -2725,7 +2754,7 @@ export class Scene3DManager {
         this._locoIdleVariants = []; this._locoIdleNames = [];
         const skel = this.getSkeleton(skelId);
         if (!skel || this._playerClips?.idle !== LOCOMOTION_CLIP.idle) return;
-        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skelId);
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && this._isCharacterBody(m) && m.skeletonId === skelId);
         let glasses = false;
         try { glasses = !!body && this.listAttachments(body.id).some((a) => GLASSES_CHARMS.includes(a.type)); } catch { glasses = false; }
         this._locoIdleVariants = buildIdleVariantClips(skel.data.joints, { armClearance: this._playArmClearance(skel), glasses });
@@ -2822,7 +2851,7 @@ export class Scene3DManager {
      *  skeleton id (gait personality, jump-variant sequence, secondary motion). */
     private _locoCharacterSeed(skelId: string): string {
         if (this.autoPlayer.isRuntimeNode(skelId)) return 'auto-player:' + AUTO_PLAYER_SEED;
-        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skelId);
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && this._isCharacterBody(m) && m.skeletonId === skelId);   // v1 or v2 body (stable id)
         return body?.id ?? skelId;
     }
 
@@ -2844,13 +2873,15 @@ export class Scene3DManager {
      *  without a procedural body or when the fit fails. Cached per body + top (the fit skins the body a few dozen times). */
     private _playArmClearanceCache = new Map<string, { key: string; verts: Float32Array; top: Float32Array | null; deg: number }>();
     private _playArmClearance(skel: Skeleton3D): number {
-        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skel.id) as SkinnedMesh3D | undefined;
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && this._isCharacterBody(m) && m.skeletonId === skel.id) as SkinnedMesh3D | undefined;
         if (!body?.geometry || !body.jointIndices || !body.jointWeights) return 0;
         // The top (if any) joins the fit: sleeves / bare forearms against its torso panel (a bulky jacket).
         const topId = this._character.getClothingMeshId(body.id, 'top');
         const top = topId ? this.getMesh(topId) as SkinnedMesh3D | null : null;
         const topGeo = top instanceof SkinnedMesh3D && top.geometry && top.jointIndices && top.jointWeights ? top : null;
-        const key = `${skel.skinningMethod}:${topGeo ? topGeo.geometry!.vertices.length : 0}`;
+        // + blendVersion: a Character v2 body is re-shaped IN PLACE by its sliders (same vertex array), so the array
+        // identity below alone kept a stale fit (a v1 body has no blend shapes: its blendVersion never moves).
+        const key = `${skel.skinningMethod}:${topGeo ? topGeo.geometry!.vertices.length : 0}:${body.blendVersion}`;
         const hit = this._playArmClearanceCache.get(body.id);
         if (hit && hit.key === key && hit.verts === body.geometry.vertices && hit.top === (topGeo?.geometry?.vertices ?? null)) return hit.deg;
         const joints = skel.data.joints;
@@ -3313,7 +3344,9 @@ export class Scene3DManager {
                 // Merge keyboard (WASD/turn/jump) + gamepad (left stick / A / X) or the host-fed intent. Mouse / right
                 // stick / host look deltas are applied per RENDER frame (crisp at any refresh rate), not here.
                 // readTick (not read): a Space TAP that went down AND up between two ticks still jumps (item 13).
-                const base: CharacterInput = this._keyboard ? this._keyboard.readTick() : { ...this._playInput };
+                // TOUCH-4: the host intent (a virtual joystick / Jump / Use) is MERGED with the keyboard, like the pad —
+                // it used to be ignored whenever the built-in keyboard was attached.
+                const base: CharacterInput = this._keyboard ? mergeHostPlayInput(this._keyboard.readTick(), this._playInput) : { ...this._playInput };
                 base.lookYaw = 0; base.lookPitch = 0;
                 const pad = this._padReading;
                 if (pad?.active) {
@@ -3390,7 +3423,9 @@ export class Scene3DManager {
                 let eye: [number, number, number], tgt: [number, number, number];
                 if (cc.cfg.cameraMode === 'third') {
                     [eye, tgt] = this._thirdPersonCamera(cc, feet, rdt);
+                    this._cameraOccluderFadeTick(cc, eye, rdt);   // soft occluders between the camera and the player dither out
                 } else {
+                    if (this._camFaded.size) this._clearCameraFades();
                     // First-person is rigid to the head (no smoothing).
                     const f = cc.forwardDir();
                     eye = [feet[0], feet[1] + cc.cfg.eyeHeight, feet[2]];
@@ -3441,6 +3476,7 @@ export class Scene3DManager {
         if (this._playSneaking) { this._playSneaking = false; this.onPlayerSneakChanged.emit(false); }
         this._playSneakToggle = false;
         this._playing = false;
+        this._clearCameraFades();   // camera occluder fades: every faded prop whole again
         const fr3 = this.ctx.webgpuRenderer?.getRenderer3D?.();
         if (fr3) fr3.fogCullExempt = null;   // fog horizon: the player exemption ends with Play
         this.renderer3D.setPinnedPointLights([]);   // visual-polish #7c: the player light ends with Play
@@ -3455,6 +3491,12 @@ export class Scene3DManager {
         if (this._prePlayXforms) { this._restoreTransforms(this._prePlayXforms); this._prePlayXforms = null; }
         this._candMeshes.length = 0;   // the picker scratch held refs to (possibly disposed) meshes after Stop
         const cam = this.renderer3D.getCamera();
+        // Stop lands on the vantage you were LOOKING FROM in Play (the follow camera), not the pre-Play editor pose (that
+        // jumped back to a builder view high above the city). Only for a perspective free-nav edit view: an ortho /
+        // locked 2D view keeps its exact pre-Play restore. Captured before anything below moves the camera.
+        const keepPlayView = this._prePlayCam?.mode === 'perspective' && deriveViewRules(this._viewState).freeNavigation;
+        const playPos: [number, number, number] = [cam.position[0], cam.position[1], cam.position[2]];
+        const playTgt: [number, number, number] = [cam.target[0], cam.target[1], cam.target[2]];
         if (this._prePlayFov !== null) { cam.fov = this._prePlayFov; this._prePlayFov = null; }
         if (this._prePlayCam) {
             const p = this._prePlayCam;
@@ -3464,6 +3506,11 @@ export class Scene3DManager {
         }
         this._setEditorSuspended(false);
         this._applyViewState();                                 // land back in the edit view (free3D orbit etc.)
+        if (keepPlayView && playPos.every(Number.isFinite) && playTgt.every(Number.isFinite)) {
+            cam.lookAt(playPos[0], playPos[1], playPos[2], playTgt[0], playTgt[1], playTgt[2]);
+            this._armature.getOrbitController()?.syncFromCamera();   // orbit now pivots on what Play looked at (the player)
+            this._captureCurrentPose();                              // …and the remembered free-cam vantage is this one
+        }
         if (this._viewChangedInPlay) { this._viewChangedInPlay = false; void this._refreshArtboardTexture(); }   // a mode/target switch deferred during Play
         this.onPlayStateChanged.emit();
         this.ctx.scheduleRender();
@@ -3668,26 +3715,145 @@ export class Scene3DManager {
         // built every frame as before (A/B).
         let cand: Mesh3D[] | null = null;
         const candidates = (): Mesh3D[] => cand ??= this._regionCandidates(pivot[0] - reach, pivot[2] - reach, pivot[0] + reach, pivot[2] + reach).slice();
+        // Camera occluders (camera-occluders.ts): the camera rays see only HARD occluders (walls, buildings, ground,
+        // big solids); poles / trees / signs / props / characters are passed through. A/B: cameraSoftOccluders = false.
+        this._camOccScale = cameraOccluderScale(this._playerHeight > 0 ? this._playerHeight : cc.cfg.eyeHeight / 0.9);
         const caster = cc.cfg.cameraCollision
-            ? this._rayCaster(Scene3DManager.lazyCameraCandidates ? candidates : candidates(), /*bvhBudget*/ true)
+            ? this._rayCaster(Scene3DManager.lazyCameraCandidates ? candidates : candidates(), /*bvhBudget*/ true,
+                Scene3DManager.cameraSoftOccluders ? this._cameraBlocksFn : undefined)
             : null;
         const r = this._tpCam.update(dt, { pivot, velX: cc.vel[0], velZ: cc.vel[2], yaw: cc.yaw, pitch: cc.pitch, airborne: !cc.grounded }, cc.cfg, caster);
         return [r.eye, r.target];
     }
 
-    /** A collision RayCaster over a fixed mesh set (the BVH picker; includes non-pickable city decoration). */
-    private _rayCaster(meshes: Mesh3D[] | (() => Mesh3D[]), bvhBudget = Scene3DManager.collisionBvhBudget): RayCaster {
+    /** A/B (camera occluders 2026-10-04): false = the Play camera pulls in for every collision mesh (poles, trees,
+     *  signs, props too), the old behaviour. */
+    static cameraSoftOccluders = true;
+    /** Size thresholds of the occluder size rule for the current avatar (world units). */
+    private _camOccScale = cameraOccluderScale(1.7);
+    /** Per-mesh cached occluder verdicts, recomputed only when an input changes (matrix / geometry / fog class /
+     *  override / parent / scale). Classification never flips per frame, so the camera never pops on a re-read. */
+    private _camOccCache = new WeakMap<Mesh3D, { ver: number; geom: unknown; fc: number; cb: string; parent: unknown; thin: number; v: CameraOccluderVerdict }>();
+    private readonly _cameraBlocksFn = (m: Mesh3D): boolean => this._cameraOccluderVerdict(m).hard;
+    /** The camera occluder verdict of a mesh (cached; see camera-occluders.ts for the rules). */
+    private _cameraOccluderVerdict(m: Mesh3D): CameraOccluderVerdict {
+        const s = this._camOccScale;
+        const e = this._camOccCache.get(m);
+        if (e && e.ver === m.localMatrixVersion && e.geom === m.geometry && e.fc === m.fogClass && e.cb === m.cameraBlock && e.parent === m.parent && e.thin === s.thin) return e.v;
+        const names: string[] = [];
+        let character = m instanceof SkinnedMesh3D;
+        for (let n: { name?: string; parent?: unknown } | null = m, depth = 0; n && depth < 8; n = (n.parent as typeof n) ?? null, depth++) {
+            names.push(n.name ?? '');
+            if (n !== m && n instanceof SkinnedMesh3D) character = true;
+        }
+        let extents: [number, number, number] | null = null;
+        if (!m.cheapBounds && !character) {
+            const c = m.obbCorners;
+            if (c && c.length) {
+                let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+                for (const p of c) {
+                    if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+                    if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1];
+                    if (p[2] < z0) z0 = p[2]; if (p[2] > z1) z1 = p[2];
+                }
+                extents = [x1 - x0, y1 - y0, z1 - z0];
+            }
+        }
+        const v = classifyCameraOccluder({ cameraBlock: m.cameraBlock, names, fogClass: m.fogClass, character, mover: m.cheapBounds, extents }, s, e?.v.hard);
+        this._camOccCache.set(m, { ver: m.localMatrixVersion, geom: m.geometry, fc: m.fogClass, cb: m.cameraBlock, parent: m.parent, thin: s.thin, v });
+        return v;
+    }
+    /** Diagnostics: how the Play camera treats a mesh — hard (pulls the camera in) or soft (passed through), and why. */
+    getCameraOccluderClass3D(meshId: string): CameraOccluderVerdict | null {
+        const m = this.getMesh(meshId);
+        return m ? this._cameraOccluderVerdict(m) : null;
+    }
+    /** Author override of how the Play third-person camera treats a mesh: 'auto' (the rules), 'block' (a wall: the camera
+     *  pulls in in front of it) or 'ignore' (the camera passes through it). Persisted on the mesh. */
+    setMeshCameraBlock3D(meshId: string, mode: CameraBlockMode): boolean {
+        const m = this.getMesh(meshId);
+        if (!m || !isCameraBlockMode(mode)) return false;
+        if (m.cameraBlock !== mode) { m.cameraBlock = mode; m.stateDirty = true; this.ctx.emitSceneGraphChanged(); }
+        return true;
+    }
+    getMeshCameraBlock3D(meshId: string): CameraBlockMode | null { return this.getMesh(meshId)?.cameraBlock ?? null; }
+
+    /** A/B (camera occluders): false = soft occluders between the camera and the player stay solid. */
+    static cameraOccluderFade = true;
+    /** Screen-door coverage a faded occluder eases to (0 = gone, 1 = whole), and the ease rate (1/s). */
+    static CAMERA_FADE_COVERAGE = 0.3;
+    static CAMERA_FADE_RATE = 12;
+    /** Only soft meshes no bigger than this × the follow distance fade: a merged city layer (one mesh for every sign /
+     *  pole of a district) stays whole rather than dissolving the whole street. */
+    static CAMERA_FADE_MAX_EXTENT = 5;
+    /** Meshes this camera has faded → their current coverage. */
+    private readonly _camFaded = new Map<Mesh3D, number>();
+    /** Per third-person frame: the SOFT occluders on the lines from the eye to the player's chest and head fade to
+     *  CAMERA_FADE_COVERAGE (the P17 HLOD dither lane, Mesh3D.hlodFade); ones no longer in the way ease back whole. */
+    private _cameraOccluderFadeTick(cc: CharacterController, eye: [number, number, number], dt: number): void {
+        const S = Scene3DManager, hit = new Set<Mesh3D>();
+        if (S.cameraOccluderFade && S.cameraSoftOccluders && cc.cfg.cameraCollision && this._collisionOn()) {
+            const p = this._lastPlayerFeet ?? cc.pos, H = this._playerHeight > 0 ? this._playerHeight : cc.cfg.eyeHeight / 0.9;
+            const maxE = S.CAMERA_FADE_MAX_EXTENT * cc.cfg.thirdPersonDistance;
+            const ok = (m: Mesh3D): boolean => {
+                if (m instanceof SkinnedMesh3D || m.arraySourceOnly || this._isPlayerPart(m) || this._cameraOccluderVerdict(m).hard) return false;
+                if (m.hlodFade >= 0 && !this._camFaded.has(m)) return false;   // an HLOD tier dissolving: not ours
+                const c = m.obbCorners;
+                if (!c || !c.length) return false;
+                let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+                for (const q of c) { if (q[0] < x0) x0 = q[0]; if (q[0] > x1) x1 = q[0]; if (q[1] < y0) y0 = q[1]; if (q[1] > y1) y1 = q[1]; if (q[2] < z0) z0 = q[2]; if (q[2] > z1) z1 = q[2]; }
+                return Math.max(x1 - x0, y1 - y0, z1 - z0) <= maxE;
+            };
+            const lo = Math.min(eye[0], p[0]), hi = Math.max(eye[0], p[0]), lz = Math.min(eye[2], p[2]), hz = Math.max(eye[2], p[2]);
+            let list: Mesh3D[] | null = null;
+            for (const ty of [p[1] + 0.6 * H, p[1] + 0.9 * H]) {   // the chest and the head
+                const d: [number, number, number] = [p[0] - eye[0], ty - eye[1], p[2] - eye[2]], L = Math.hypot(d[0], d[1], d[2]);
+                if (!(L > 1e-6)) continue;
+                list ??= this._regionCandidates(lo, lz, hi, hz).filter(ok);
+                if (!list.length) break;
+                let rest = list;
+                for (let k = 0; k < 3 && rest.length; k++) {   // up to three soft layers on one line (a pole, a sign, a tree)
+                    const h = this._picker.raycastWorld(eye as unknown as vec3, [d[0] / L, d[1] / L, d[2] / L] as unknown as vec3, rest, true, L * 0.97, true);
+                    if (!h || !(h.distance < L * 0.97)) break;
+                    hit.add(h.mesh);
+                    rest = rest.filter((m) => m !== h.mesh);
+                }
+            }
+        }
+        for (const m of hit) if (!this._camFaded.has(m)) this._camFaded.set(m, 1);
+        const a = 1 - Math.exp(-S.CAMERA_FADE_RATE * Math.max(0, Math.min(dt, 0.1)));
+        for (const [m, c] of this._camFaded) {
+            const goal = hit.has(m) ? S.CAMERA_FADE_COVERAGE : 1;
+            let nc = c + (goal - c) * a;
+            if (Math.abs(nc - goal) < 0.01) nc = goal;
+            if (nc >= 1) { this._camFaded.delete(m); m.hlodFade = -1; m.materialDirty = true; continue; }
+            this._camFaded.set(m, nc);
+            const q = Math.round(nc * 32) / 32;   // quantised: a slot rewrite only when the dither level changes
+            if (m.hlodFade !== q) { m.hlodFade = q; m.materialDirty = true; }
+        }
+    }
+    /** Every camera-faded mesh whole again (Play exit, first person). */
+    private _clearCameraFades(): void {
+        for (const m of this._camFaded.keys()) { m.hlodFade = -1; m.materialDirty = true; }
+        this._camFaded.clear();
+    }
+
+    /** A collision RayCaster over a fixed mesh set (the BVH picker; includes non-pickable city decoration). `blocks`
+     *  (the camera rays): only meshes it accepts can be hit. */
+    private _rayCaster(meshes: Mesh3D[] | (() => Mesh3D[]), bvhBudget = Scene3DManager.collisionBvhBudget, blocks?: (m: Mesh3D) => boolean): RayCaster {
+        const scratch: Mesh3D[] = [];
         return (origin, dir, maxDist) => {
             // P6: a bounded ray inside the collision hood tests only the meshes near the character (same nearest hit);
             // maxDist also lets the picker skip meshes whose box starts beyond reach. P9: `meshes` may be lazy.
-            const list = (Scene3DManager.collisionHood && this._collisionHood?.candidatesFor(origin, dir, maxDist)) || (typeof meshes === 'function' ? meshes() : meshes);
+            let list = (Scene3DManager.collisionHood && this._collisionHood?.candidatesFor(origin, dir, maxDist)) || (typeof meshes === 'function' ? meshes() : meshes);
+            if (blocks) { scratch.length = 0; for (const m of list as Mesh3D[]) if (blocks(m)) scratch.push(m); list = scratch; }
             // Step 3: a ray inside a ready collision cell walks the cell's merged BVH (+ the old path over what the cell
             // does not cover). Same nearest hit, distance and normal (collision-cells.ts).
             const cells = Scene3DManager.STEP3.collisionCells ? this._collCells : null;
             if (cells) {
                 const cell = cells.cellForRay(origin, dir, maxDist);
                 if (cell) {
-                    const r = this._cellRaycast(cell, origin, dir, maxDist, list as Mesh3D[], bvhBudget);
+                    const r = this._cellRaycast(cell, origin, dir, maxDist, list as Mesh3D[], bvhBudget, blocks);
                     if (r !== undefined) return r;
                 }
             }
@@ -3748,10 +3914,10 @@ export class Scene3DManager {
     /** One ray through a ready cell (collision-cells.ts cellRaycast): the cell BVH for the meshes it covers + the
      *  per-mesh path for the rest of `list`, combined by the old rules. undefined = the caller takes the old path. */
     private _cellRaycast(cell: CollisionCell<Mesh3D>, origin: [number, number, number], dir: [number, number, number], maxDist: number,
-        list: Mesh3D[], bvhBudget: boolean): { distance: number; normal: [number, number, number] } | null | undefined {
+        list: Mesh3D[], bvhBudget: boolean, blocks?: (m: Mesh3D) => boolean): { distance: number; normal: [number, number, number] } | null | undefined {
         const pk = this._picker, set = this._collisionSet;
         return cellRaycast(cell.cur!, origin, dir, maxDist, list, pk as unknown as CellRayPicker<Mesh3D>, bvhBudget,
-            (m) => m.visible && !pk.isDetached(m) && (!set || set.has(m)),
+            (m) => m.visible && !pk.isDetached(m) && (!set || set.has(m)) && (!blocks || blocks(m)),
             (m) => this._cellStaticGeometry(m) !== null,
             () => this._collCells?.markStale(cell),
             this._cellScratch, this._cellRayStats);
@@ -3875,9 +4041,12 @@ export class Scene3DManager {
         this._newCollisionHood();
     }
     /** A collision snapshot member: never the Player (body, hair, garments, face decal, charms), never an array
-     *  source-only phantom, and (collisionSkipTileCrowd) not a streamed tile's merged static crowd. */
+     *  source-only phantom, never a VISUAL-ONLY overlay (noCollide / radialFade: contact blobs, light pools, decals —
+     *  the player's own moving blob made it rise forever, rise bug 2026-10-04; collision-filter.ts), and
+     *  (collisionSkipTileCrowd) not a streamed tile's merged static crowd. */
     private _isCollisionMesh(m: Mesh3D): boolean {
-        return !this._isPlayerPart(m) && !m.arraySourceOnly && !(Scene3DManager.collisionSkipTileCrowd && (m.name ?? '').startsWith('world:ped-')
+        return !this._isPlayerPart(m) && !m.arraySourceOnly && !(Scene3DManager.visualOnlyNoCollide && isVisualOnlyMesh(m))
+            && !(Scene3DManager.collisionSkipTileCrowd && (m.name ?? '').startsWith('world:ped-')
             && /^World Tile .* World Pedestrians$/.test((m.parent as { name?: string } | null)?.name ?? ''));
     }
     private _newCollisionHood(): void {
@@ -3922,6 +4091,9 @@ export class Scene3DManager {
     static collisionFollowsStructure = true;
     /** P10.D A/B: false = streamed tiles' static crowd layers are collision geometry too. */
     static collisionSkipTileCrowd = true;
+    /** A/B (rise bug 2026-10-04): false = visual-only meshes (noCollide / radialFade) are collision again (the old,
+     *  broken behaviour: the player stands on its own moving contact blob and rises forever). */
+    static visualOnlyNoCollide = true;
     /** P10.D A/B: every Play collision ray (ground / walls / camera) builds at most MeshPicker.bvhBuildBudgetMs of new
      *  mesh BVHs per frame (false = only the camera bundle is budgeted). */
     static collisionBvhBudget = true;
@@ -3977,7 +4149,7 @@ export class Scene3DManager {
     private _nonPlayerMeshes(): Mesh3D[] {
         const all = this.getAllMeshes();
         // The auto default player's hair / garments / face decal are the player too (else the camera ray hits its hair).
-        return (this._playerMesh || this.autoPlayer.isLive) ? all.filter(m => !this._isPlayerPart(m)) : all;
+        return all.filter(m => !this._isPlayerPart(m) && !(Scene3DManager.visualOnlyNoCollide && isVisualOnlyMesh(m)));
     }
     /** A mesh of the auto default player (body or any overlay part). */
     private _isAutoPlayerPart(m: Mesh3D): boolean { return this.autoPlayer.isRuntimeNode(m.id); }
@@ -5150,7 +5322,18 @@ export class Scene3DManager {
     }
 
     setBlendWeight3D(meshId: string, shapeIndex: number, weight: number): void {
+        if (this._isInternalV2Shape(meshId, shapeIndex)) return;
         this._blendShapes.setWeight(meshId, shapeIndex, weight);
+    }
+    /** A Character v2 body's own 'v2:*' shapes are driven by its sliders (with the matching bone offsets): a generic
+     *  weight edit / removal fought them (vertices moved, bones didn't; the next slider reset it). Refused (review fix
+     *  pipeline#5). */
+    private _isInternalV2Shape(meshId: string, shapeIndex: number): boolean {
+        const m = this.getMesh(meshId);
+        if ((m as { characterKind?: string } | null)?.characterKind !== 'v2') return false;
+        if (!m!.blendShapes[shapeIndex]?.name.startsWith('v2:')) return false;
+        console.warn('[3D] blend shape "' + m!.blendShapes[shapeIndex].name + '" belongs to the Character v2 sliders (sm.characterV2.setSlider)');
+        return true;
     }
 
     getBlendShapes3D(meshId: string): { name: string; weight: number }[] {
@@ -5158,6 +5341,7 @@ export class Scene3DManager {
     }
 
     removeBlendShape3D(meshId: string, shapeIndex: number): void {
+        if (this._isInternalV2Shape(meshId, shapeIndex)) return;
         this._blendShapes.remove(meshId, shapeIndex);
     }
 
@@ -5432,6 +5616,7 @@ export class Scene3DManager {
         if (mesh.material.hasNormalMap && !mesh.normalMapTexture && !mesh.normalMapLibraryId) mesh.material.hasNormalMap = false;
         // Persistent per-object outline: restore onto the mesh + mirror into the renderer's runtime draw cache.
         this._restoreOutline(mesh, state);
+        mesh.cameraBlock = isCameraBlockMode(state.cameraBlock) ? state.cameraBlock : 'auto';   // Play camera occluder override
         if (state.keyframeTracks) mesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
         if (state.frameLinkAnimation3D) this.setFrameLinkAnimation3D(mesh.id, state.frameLinkAnimation3D);
         this._restoreSubmeshes(mesh, state.submeshes);
@@ -5928,6 +6113,142 @@ export class Scene3DManager {
     /** Drop any worker-precomputed garment/hair geometry still primed for a body (see createProceduralCharacter3D). */
     clearPrimedCharacterParts3D(bodyMeshId: string): void { this._character.clearPrimedParts(bodyMeshId); }
 
+    /** Character v2 (src/character-v2, docs/specs/character-v2.md): a rigged SkinnedMesh3D + Skeleton3D from a skinned
+     *  result, added at the scene root — the createProceduralBody3D construction path WITHOUT the v1 body registration
+     *  (no isProceduralBody, no Scene3DCharacter params), so no v1 code path adopts the v2 body. */
+    async createRiggedFromResult3D(
+        result: import('../../renderer/3d/gltf-importer').GltfSkinnedResult, ox: number, oy: number, oz: number, name = 'Character',
+        opts?: { meshId?: string; skeleton?: Skeleton3D },
+    ): Promise<{ mesh: SkinnedMesh3D; skeleton: Skeleton3D }> {
+        // Character v2 review fix runtime#1 (stable ids): the caller may hand a ready skeleton (its id already set — a
+        // restored save keeps its skeleton id) and the mesh id to use; both are applied BEFORE the nodes enter the scene,
+        // so the id registry / picker / renderer caches never see a throwaway id. A taken mesh id falls back to a fresh one.
+        const skeleton = opts?.skeleton ?? await this._createSkeletonFromResult(result);
+        if (opts?.skeleton) this.ctx.sceneGraph.root.addChild(skeleton);
+        const def: CharacterDefinition = { id: 'rig_' + Date.now().toString(36), name, slots: { base_body: 'procedural' } };
+        const mesh = await this._createSkinnedMeshForSlot(result, skeleton, ox, oy, oz, def, 'base_body');
+        if (opts?.meshId && !this.ctx.sceneGraph.findNodeById(opts.meshId)) mesh.setId(opts.meshId);
+        this.ctx.sceneGraph.root.addChild(mesh);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return { mesh, skeleton };
+    }
+    /** Remove a rig made by createRiggedFromResult3D (mesh + skeleton; caches evicted; no undo step). Its per-body
+     *  runtime state goes with it (review fix runtime#7): the idle (its live-render hold), the Play avatar binding, the
+     *  skeleton-sync / spring / NLA trackers. */
+    removeRigged3D(mesh: SkinnedMesh3D, skeleton: Skeleton3D): void {
+        this._dropRiggedRuntimeState(mesh, skeleton, true);
+        mesh.parent?.removeChild(mesh);
+        skeleton.parent?.removeChild(skeleton);
+        this._picker.evictMesh(mesh.id);
+        this.renderer3D.evictMeshCaches([mesh.id]);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+    /** Detach a rig made by createRiggedFromResult3D WITHOUT disposing it (an undoable delete): its idle stops (the
+     *  live-render hold released), it stops being the running Play avatar, its GPU / picker caches are evicted (rebuilt
+     *  on re-attach). The persisted Player binding id is kept, so an undo brings the binding back. */
+    detachRigged3D(mesh: SkinnedMesh3D, skeleton: Skeleton3D): { wasIdle: boolean } {
+        const r = this._dropRiggedRuntimeState(mesh, skeleton, false);
+        mesh.parent?.removeChild(mesh);
+        skeleton.parent?.removeChild(skeleton);
+        this._picker.evictMesh(mesh.id);
+        this.renderer3D.evictMeshCaches([mesh.id]);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return r;
+    }
+    /** Re-attach a rig detached by detachRigged3D (the skeleton at the root, the mesh under `parent`, default the root). */
+    attachRigged3D(mesh: SkinnedMesh3D, skeleton: Skeleton3D, parent?: import('../../scene-graph/shapes/base/node').Node | null, opts?: { idle?: boolean }): void {
+        if (!skeleton.parent) this.ctx.sceneGraph.root.addChild(skeleton);
+        if (!mesh.parent) (parent ?? this.ctx.sceneGraph.root).addChild(mesh);
+        mesh.gpuDirty = true; mesh.skinDirty = true;
+        skeleton.objectTransform.set(mesh.localMatrix as unknown as Float32Array);
+        skeleton.computeWorldMatrices();
+        if (opts?.idle) this.setIdleAnimation(mesh.id, true);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+    /** The per-body runtime state of a rig leaving the scene. MUST run while the mesh is still attached (the idle
+     *  teardown resolves the body by id). `forget` = a permanent removal (drop the trackers + a persisted Player binding). */
+    private _dropRiggedRuntimeState(mesh: SkinnedMesh3D, skeleton: Skeleton3D, forget: boolean): { wasIdle: boolean } {
+        const wasIdle = this.isIdleAnimating(mesh.id);
+        if (wasIdle) this.setIdleAnimation(mesh.id, false);   // releases the idle's live-loop hold + interactive count
+        if (this._playing && this._playerMesh === mesh) {
+            const keep = this._playerMeshId;
+            this.setPlayerObject3D(null);                       // the loco rig released; the auto player takes over
+            if (!forget) this._playerMeshId = keep;
+        } else if (forget && this._playerMeshId === mesh.id) this._playerMeshId = null;
+        if (forget) {
+            this._charSkelSyncVer.delete(mesh.id);
+            this._playArmClearanceCache.delete(mesh.id);
+            for (const m of [this._animation.squashStretch, this._animation.idleBreaks, this._animation.legIdleModes] as Map<string, unknown>[]) m.delete(mesh.id);
+            this._springActiveUntil.delete(skeleton.id);
+            this._animation.nlaBindPoses.delete(skeleton.id);
+        }
+        return { wasIdle };
+    }
+
+    // ── Character providers (Character v2 review fixes runtime#3/#4/#5) ──────────────────────────────────────────────
+    // A character system living OUTSIDE the engine (src/character-v2) registers here so the engine's generic mesh paths
+    // treat its characters as characters without knowing about it: the outliner delete / Ctrl+D route to its own
+    // whole-character operations, and its internal nodes (the v2 save marker) stay out of the outliner.
+    private readonly _characterProviders: Array<{ owns(id: string): boolean; hidden?(id: string): boolean; delete?(id: string): boolean; duplicate?(id: string): boolean }> = [];
+    /** Register a character provider; returns the unregister function. */
+    registerCharacterProvider3D(p: { owns(id: string): boolean; hidden?(id: string): boolean; delete?(id: string): boolean; duplicate?(id: string): boolean }): () => void {
+        this._characterProviders.push(p);
+        return () => { const i = this._characterProviders.indexOf(p); if (i >= 0) this._characterProviders.splice(i, 1); };
+    }
+    private _providerOf(id: string): { owns(id: string): boolean; hidden?(id: string): boolean; delete?(id: string): boolean; duplicate?(id: string): boolean } | null {
+        for (const p of this._characterProviders) if (p.owns(id)) return p;
+        return null;
+    }
+    /** "Is this a character BODY" for the character-level features (outline, scale, Play gait seed, arm clearance): a
+     *  v1 procedural body OR a Character v2 body (a runtime-only `characterKind = 'v2'` its manager sets — never saved).
+     *  The v1-PARAMS paths (setBodyParams, overlay fits, the bodyParams save) keep keying on isProceduralBody. */
+    private _isCharacterBody(m: unknown): boolean {
+        return m instanceof SkinnedMesh3D && (m.isProceduralBody || (m as { characterKind?: string }).characterKind === 'v2');
+    }
+    /** Public form of the character-body predicate (v1 procedural body OR Character v2 body) for hosts (e.g. hiding
+     *  "Bind Mesh", outliner character grouping). isProceduralBody3D keeps meaning "has v1 bodyParams". */
+    isCharacterBody3D(meshId: string): boolean { return this._isCharacterBody(this.getMesh(meshId)); }
+    isCharacterBodySkeleton3D(skeletonId: string): boolean {
+        const s = this.getSkeleton(skeletonId);
+        return !!s && (s.isProceduralBody || (s as { characterKind?: string }).characterKind === 'v2');
+    }
+    /** Give a NEW character the characters-only outline when it is on (what v1's commit path does). */
+    applyCharacterOutline3D(meshId: string): boolean {
+        return this._charOutlines ? this.setMeshOutline3D(meshId, this._charOutlines) : false;
+    }
+    /** Restore a persisted outline (+ rings) onto a mesh exactly (the mesh + the renderer's draw cache). */
+    restoreMeshOutline3D(meshId: string, state: { outline?: HighlightStyle | null; outlineRings?: HighlightStyle[] | null }): boolean {
+        const m = this.getMesh(meshId);
+        if (!m) return false;
+        this._restoreOutline(m, state);
+        this.ctx.scheduleRender();
+        return true;
+    }
+    /** A character's REST changed (Character v2 sliders: joint offsets) while Play may be running. When it is the bound
+     *  Play avatar: the rest pose Stop restores gets the same per-joint rest shift (`restDelta`, 3 floats per joint —
+     *  else Stop put the OLD bone lengths back over the NEW inverse binds), then the avatar is re-bound in place
+     *  (re-measured, camera re-framed, controller re-seated on its feet, the default gait rebuilt for the new legs).
+     *  No-op outside Play or for any other mesh. */
+    refreshPlayerAvatar3D(meshId: string, restDelta?: ArrayLike<number>): boolean {
+        if (!this._playing || this._playerMesh?.id !== meshId) return false;
+        const r = this._locoRest;
+        if (r && restDelta) {
+            const sk = this.getSkeleton(r.skelId);
+            if (sk && sk.id === this._playerSkeletonId()) {
+                const P = r.pose.positions;
+                for (let i = 0; i < P.length && i * 3 + 2 < restDelta.length; i++) {
+                    P[i] = [P[i][0] + restDelta[i * 3], P[i][1] + restDelta[i * 3 + 1], P[i][2] + restDelta[i * 3 + 2]];
+                }
+            }
+        }
+        this.setPlayerObject3D(meshId);
+        return true;
+    }
+
     private async _commitProceduralBody(
         params: Partial<import('./body-generator').BodyParams>,
         result: ReturnType<typeof generateBodyResult>,
@@ -6081,7 +6402,7 @@ export class Scene3DManager {
     /** A procedural character body (the Character group's node) by id, else null. */
     private _characterBody(id: string): SkinnedMesh3D | null {
         const m = this.getMesh(id);
-        return m instanceof SkinnedMesh3D && m.isProceduralBody ? m : null;
+        return m instanceof SkinnedMesh3D && this._isCharacterBody(m) ? m : null;   // v1 or v2 (review fix runtime#2/#5)
     }
     /** After a body's size changed: skeleton now (not next frame — joints / overlays / measurements see it), save-dirty,
      *  render, and — when it is the running Play avatar — re-measure + re-frame it (camera, eye height, capsule). */
@@ -7854,7 +8175,11 @@ export class Scene3DManager {
     createMeshGroup(name = '3D Group'): MeshGroup3D { return this._grouping.createMeshGroup(name); }
 
     /** Delete a mesh group (and un-parent its children to root). Pushes an undo command. */
-    deleteMeshGroup(groupId: string): boolean { return this._grouping.deleteMeshGroup(groupId); }
+    deleteMeshGroup(groupId: string): boolean {
+        const prov = this._providerOf(groupId);   // a provider's group (the Character v2 save marker) → delete the character
+        if (prov?.delete) return prov.delete(groupId);
+        return this._grouping.deleteMeshGroup(groupId);
+    }
 
     getMeshGroup(groupId: string): MeshGroup3D | null { return this._grouping.getMeshGroup(groupId); }
 
@@ -8067,6 +8392,10 @@ export class Scene3DManager {
     }
 
     deleteMesh(nodeId: string): boolean {
+        // A provider's character (Character v2 body) → its own ONE undoable whole-character delete (body + skeleton +
+        // save marker + record); the plain mesh delete orphaned the skeleton + record (review fix runtime#4).
+        const prov = this._providerOf(nodeId);
+        if (prov?.delete) return prov.delete(nodeId);
         const mesh = this.getMesh(nodeId);
         if (!mesh) return false;
         // Deleting a camera drops any cuts that reference it (+ its transient fov). Snapshot the cuts so undo of the
@@ -8107,12 +8436,19 @@ export class Scene3DManager {
      * The new mesh is selected and pushed onto the undo stack.
      */
     duplicateMesh(nodeId: string): Mesh3D | null {
+        // A provider's character (Character v2 body): a REAL character copy, built asynchronously by its provider (one
+        // undo step there) — never a static T-pose statue sharing the live vertex array (review fix runtime#3). Returns
+        // null: the copy is not ready synchronously.
+        const prov = this._providerOf(nodeId);
+        if (prov) { prov.duplicate?.(nodeId); return null; }
         const src = this.getMesh(nodeId);
         if (!src) return null;
 
         const copy = new Mesh3D(this.ctx.interactionService, src.x, src.y, src.z, {
             primitive: 'custom',
-            geometry:  src.geometry,
+            // A blend-shaped source is re-shaped IN PLACE by its weights: never alias its vertex array (the copy moved
+            // with every later weight change of the original).
+            geometry:  src.blendShapes.length ? { ...src.geometry, vertices: src.geometry.vertices.slice() } : src.geometry,
             material:  { ...src.material },
         });
         copy.name = src.name + ' copy';
@@ -8414,6 +8750,7 @@ export class Scene3DManager {
         this._character.clearForDocumentLoad();
         this._kitbash.clearForDocumentLoad();
         this._modelStore.clear();
+        this._textures.resetForDocumentLoad();   // the texture library MERGED across loads (new-document audit 2026-10-06)
         // Document-content registries that restoreGlobalScene3DSettings used to clear UNCONDITIONALLY — which also
         // fired on PARTIAL restores (exitCityMode's lighting restore, sm.authoring.applySceneSettings) and wiped the
         // document's scripts / animation library / asset refs / play settings / player binding (bug-hunt 2026-10-01).
@@ -8430,6 +8767,21 @@ export class Scene3DManager {
         // §P15 stats fix: the GPU-driven records of doc A's meshes must not outlive it (they held the meshes + their
         // geometry, and their read-back counters showed in doc B's HUD); the next frame rebuilds from doc B
         (this.ctx.webgpuRenderer.getRenderer3D() as Renderer3D | null)?.resetGpuScene();
+        // New-document audit 2026-10-06 — more state that outlived its document:
+        // camera preview / look-through (orbit stayed disabled on a stale edit-camera snapshot) and the cut list (the
+        // host's Cameras lane — and the host's save — kept the previous document's cuts, pointing at dead ids).
+        if (this._previewThroughCameras) this.setPreviewThroughCameras3D(false);
+        if (this._lookThroughCamId !== null) this.lookThroughCamera3D(null);
+        if (this._cameraCuts.length) this.setCameraCuts3D([]);
+        // Grease Pencil registry: its nodes leave with the scene graph, but gather() wrote every registered object into
+        // the next document's save (restoreGpStates, the only reset, runs only for a document that has GP objects).
+        this._gp.dispose();
+        // Particle emitters: detached emitters kept ticking (and forcing frames); restored ones re-register.
+        this._particles.dispose();
+        // Host-set street-lamp point lights kept lighting the next document.
+        this.setPointLights3D([]);
+        this.setCandidatePointLights3D([]);
+        this.clearSelection();
     }
 
     /** The engine's global-settings defaults, snapshotted at the START of the first document load (before anything
@@ -9509,12 +9861,15 @@ export class Scene3DManager {
                     const idx = mesh.blendShapes.findIndex(s => s.name === shapeName);
                     if (idx >= 0) {
                         mesh.blendWeights[idx] = w;
-                        mesh.gpuDirty = true;
+                        if (!Mesh3D.blendFastPath) mesh.gpuDirty = true;
                     }
                 }
             }
             if (tracks.blendWeights && Object.keys(tracks.blendWeights).length > 0) {
-                mesh.evaluateBlendShapes();
+                // Phase 1.5: only the changed shapes, uploaded in place (skinned parts too — they used to miss
+                // keyframed weights entirely, nothing set skinDirty here).
+                if (Mesh3D.blendFastPath) this._blendShapes.sync(mesh);
+                else mesh.evaluateBlendShapes();
             }
         }
 
@@ -9756,6 +10111,10 @@ export class Scene3DManager {
      * Returns false if the mesh or skeleton is not found.
      */
     bindMeshToSkeleton3D(meshId: string, skeletonId: string): boolean {
+        // A Character v2 body / skeleton ships frozen weights, and the bind REPLACES the mesh node (its manager kept the
+        // orphan → the next save dropped the character). Refused (review fix runtime#5).
+        const v2 = (n: unknown) => (n as { characterKind?: string } | null)?.characterKind === 'v2';
+        if (v2(this.getMesh(meshId)) || v2(this.getSkeleton(skeletonId))) { console.warn('[3D] Bind Mesh refused: a Character v2 body is already rigged'); return false; }
         return this._armature.bindMeshToSkeleton3D(meshId, skeletonId);
     }
 
@@ -10285,6 +10644,9 @@ export class Scene3DManager {
         // Runtime-only nodes (the Play auto default player: body, skeleton, face decal, hair, garments) never show in
         // the outliner, including during the first spawn (marked runtime before the cache holds them).
         flat = flat.filter(n => !this.autoPlayer.isRuntimeNode(n.id) && !this._character.isRuntimePart(n.id));
+        // A character provider's internal nodes (the Character v2 save marker — deleting that row silently lost the
+        // character) never show either (review fix runtime#4).
+        if (this._characterProviders.length) flat = flat.filter(n => !this._characterProviders.some(p => p.hidden?.(n.id)));
         // DISPLAY-ONLY character grouping: a procedural character adds its parts (body + eye decal + hair + garments
         // + attachments) as FLAT siblings under root, so the outliner shows ~6-9 rows per character. Nest a
         // character's overlay parts under a single collapsible "Character" node (the body). The scene graph is

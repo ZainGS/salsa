@@ -25,6 +25,7 @@ import { chunkCityLayers, chunkMinCell, CHUNK_SKIP_GROUPS, type ChunkOptions } f
 import { withContactShadows, cityContactShadowOptions, isContactDone } from '../../world/contact-shadows';
 import { buildLightSpill } from '../../world/light-spill';
 import { layerInstanceCount, slicePacked, unpackLayerInstances } from '../../world/packed-instances';
+import { cityTextSigns, signTextLayers, signTextByName, signBitmapKey, SIGN_TEXT_GROUP, type SignTextInfo } from '../../world/sign-text-all';
 import { CITY_STYLES } from '../../world/styles';
 import { PED_SHADE } from '../../world/mannequin';
 import type { LayoutParams, WorldGraph, RegionSeed, LayoutPreviewLayer, MoverSpec, Landmark } from '../../world';
@@ -283,6 +284,7 @@ export class WorldManager {
                 override: (on = true) => this.setOverrideGlobalLighting(on), // city drives its own lighting (true) vs inherit global (false)
                 spin: (degPerSec = 6) => this.setTurntable(degPerSec),     // ◉ slow turntable orbit; spin(0) stops
                 pedestrianStyle: (s?: PedestrianStyle) => { if (s) this.setPedestrianStyle(s); return this.pedestrianStyle; },   // ◧ crowd shading: 'flat' | 'default' | 'cel' | 'cel-hd' | 'ink' (live, persisted)
+                crowdStyle: (s?: 'mannequin' | 'character') => { if (s) this.setCrowdStyle(s); return this.crowdStyle; },   // ◧ crowd-characters.md: 'mannequin' | 'character' (rebuilds the crowd, persisted)
                 style: (s: RenderStyle | null) => this.setRenderStyle(s),  // 'cel'|'cel-hd'|'sketch'|'ink'|'gouraud'|null(PBR)
                 pack: (name: string) => this.applyStyle(name),             // one-call style pack: tokyo|oldtown|seaside|noir|toon|retro
                 packs: () => this.styleNames,
@@ -1629,6 +1631,7 @@ export class WorldManager {
         if (r.i < r.groups.length || r.warm) return true;
         for (const g of r.groups) g.visible = true;
         this._centreRestore = null;
+        this._textureSignGroups(r.groups, null);   // plates whose texture landed while the centre was parked
         if (WorldManager.STEP3.refreshReattached) this._redressGroups(r.groups);   // step 3: dressed now, at the world's current glow
         else this._lastGlowNight = -1;   // re-dress the night glow over the re-attached meshes (on the next cycle tick)
         this._tileEpoch++; this._notifyTiles();
@@ -2191,6 +2194,7 @@ export class WorldManager {
             // (GEOM_APPEND_BUDGET per frame) finishes it over the next frames.
             this.scene3d.warmGroupGeometry3D(g, WorldManager.P10.budgetedWarm ? WorldManager.WARM_SLICE / 4 : Infinity);
         }
+        this._textureSignGroups(groups, null);   // plates retired before their texture landed
         this._tileEpoch++;
         this._notifyTiles();   // ONE host notification for the whole re-attached tile
     }
@@ -2264,7 +2268,9 @@ export class WorldManager {
      *  only the instance repack, not the geometry upload. Shared by the sync and async (worker) build paths. */
     private _assembleTile(groups: TileLayerGroup[], full: boolean): MeshGroup3D[] {
         const out: MeshGroup3D[] = [];
+        const signs = this._signTextOfGroups(groups);   // (read before _addTracked: the layers are consumed)
         for (const { name, layers } of groups) this._addTracked(name, layers, out);
+        if (signs) this._textureSignGroups(out, signs);   // the tile's STOP / street-name / road-sign lettering
         if (full) for (const g of out) this.scene3d.warmGroupGeometry3D(g);
         if (out.length) { this._tileEpoch++; this._notifyTiles(); }   // ONE host notification per tile (adds were silent)
         return out;
@@ -2325,11 +2331,13 @@ export class WorldManager {
         // foliage/props. So a streaming tile appears structure-first and decoration fills in, the cost never spikes a
         // frame (workers finish in parallel; this drip-feeds the main-thread work), and proxy-first already shows the
         // flat tile underneath. The tile's Promise resolves when all its groups are assembled.
+        const signs = this._signTextOfGroups(groups);   // the tile's text plates' labels (textured once it has landed)
         return new Promise<MeshGroup3D[]>(resolve => {
             let ctx: ReassembleCtx | null = null;
             const done = (m: MeshGroup3D[]): void => {
                 if (ck !== undefined && ctx && this._tileReassembly.get(ck) === ctx) this._tileReassembly.delete(ck);
                 if (full && m.length) this._noteFullLatency(WorldManager._now() - t0);   // P19: landed (a cancel resolves [])
+                if (signs && m.length) this._textureSignGroups(m, signs);   // STOP / street-name / road-sign lettering
                 resolve(m);
             };
             // P22 nearFirst: a full tile's jobs rank by its distance from the window focus (ground / roads stay first)
@@ -3105,6 +3113,7 @@ export class WorldManager {
         terrainApron: ['World Apron'], apronRadius: ['World Apron'], natureDensity: ['World Apron'],
         edgeWear: ['World Layout', 'World Terraces'],   // E2: kerbs (World Layout) + stairs / copings (World Terraces)
         pedestrianStyle: ['crowdStyle'],   // the crowd's shading — a live material pass (no rebuild)
+        crowdStyle: ['World Pedestrians'],   // crowd-characters.md: mannequin vs baked character archetypes (the crowd records)
     };
 
     /** Re-run ONE group's builder on the existing graph (selective regen). */
@@ -4210,58 +4219,101 @@ export class WorldManager {
     // bound as the mesh texture. Browser-only (headless builds show the plain plate colour).
     private _addTextSigns(graph: WorldGraph): void {
         // Landmark/shop/street-name plates + the signal street-name plates & STOP lettering + regulatory road-sign
-        // plates (NO PARKING / ONE WAY / …) — all rasterized here in one batch.
-        const specs = [...computeTextSigns(graph), ...computeSignalTextSigns(graph, this._regionFilter()),
-            ...buildRoadSigns(graph, this._regionFilter()).textSigns];
+        // plates (NO PARKING / ONE WAY / …) — all rasterized here in one batch (streamed tiles build the same list in
+        // the worker: sign-text-all.ts, and texture it on landing — _textureSignGroups).
+        const specs = cityTextSigns(graph, this._regionFilter());
         if (!specs.length) return;
-        this._add('World Sign Text', specs.map(sp => sp.layer));
-        if (typeof document === 'undefined' || typeof createImageBitmap === 'undefined') return;
-        const group = this._groups[this._groups.length - 1];
-        // BATCH all ~75 bitmaps and apply them in ONE go — resolving them one-by-one used to trigger a
-        // per-arrival repack for many consecutive frames right after every regen (a visible hitch window).
-        // Bitmaps are CACHED by label+colour across regens (STATION / BAKERY / 1ST AVE recur every city),
-        // so a typical slider regen rasterizes zero new canvases.
-        // P5.W4: the NEW canvases (~35 ms on a session's first city, in the reveal frame) rasterize TIME-SLICED from
-        // the next frame on, under the shared slice budget — the plates show their base colour for those few frames,
-        // as they already did while createImageBitmap resolved. A newer sign batch (a regen) abandons this one.
-        const gen = ++this._signGen;
-        const jobs: Promise<{ id: string; bmp: ImageBitmap }>[] = [];
+        const layers = signTextLayers(specs);
+        this._add(SIGN_TEXT_GROUP, layers);
+        this._textureSignGroups([this._groups[this._groups.length - 1]], signTextByName(layers), ++this._signGen);
+    }
+    /** Rasterize + bind the text plates of every SIGN TEXT group in `groups` (the centre's, or a landed / re-attached
+     *  tile's). Each mesh finds its label by its LAYER NAME in `byName` (never by child index — the group may hold
+     *  extra / split meshes), else the label recorded when it was first seen (a re-attached retired tile or parked
+     *  centre); already-textured meshes are skipped. ONE GPU texture per distinct plate in the batch (a tile's ten STOP
+     *  signs share one). `gen` ≥ 0 = a centre batch: a newer centre batch abandons it. Returns the plates queued. */
+    private _textureSignGroups(groups: readonly MeshGroup3D[], byName: Map<string, SignTextInfo> | null, gen = -1): number {
+        const plates: { m: Mesh3D; info: SignTextInfo; key: string }[] = [];
+        for (const g of groups) {
+            if (!(g.name ?? '').endsWith(SIGN_TEXT_GROUP)) continue;
+            for (const ch of g.children) {
+                const m = ch as Mesh3D;
+                const info = byName?.get(m.name ?? '') ?? this._signInfo.get(m);
+                if (!info || !m.material) continue;
+                this._signInfo.set(m, info);
+                if (m.material.hasTexture && m.diffuseTexture) continue;
+                plates.push({ m, info, key: signBitmapKey(info) });
+            }
+        }
+        if (!plates.length || typeof document === 'undefined' || typeof createImageBitmap === 'undefined') return plates.length;
+        const stale = (): boolean => gen >= 0 && gen !== this._signGen;
+        // BATCH all bitmaps and apply them in ONE go — resolving them one-by-one used to trigger a per-arrival repack
+        // for many consecutive frames right after every regen (a visible hitch window). Bitmaps are CACHED by
+        // label+colour across regens and tiles (STOP / STATION / 1ST AVE recur everywhere), so a typical regen or a
+        // landing tile rasterizes few or no new canvases.
+        // P5.W4: the NEW canvases rasterize TIME-SLICED from the next frame on, under the shared slice budget — the
+        // plates show their base colour for those few frames, as they already did while createImageBitmap resolved.
+        const bitmaps = new Map<string, Promise<ImageBitmap | null>>();
         const raster: Array<() => void> = [];
-        specs.forEach((sp, i) => {
-            const mesh = group.children[i] as Mesh3D;
-            if (!mesh) return;
-            const key = sp.label + '|' + sp.layer.color.map(c => c.toFixed(3)).join(',') + (sp.square ? '|sq' : '');
-            const cached = this._signBitmaps.get(key);
-            if (cached) { jobs.push(Promise.resolve({ id: mesh.id, bmp: cached })); return; }
-            jobs.push(new Promise(resolve => raster.push(() => {
-                const hit = this._signBitmaps.get(key);   // (an earlier plate of this batch may have made it)
-                if (hit) { resolve({ id: mesh.id, bmp: hit }); return; }
-                const bmp = this._rasterSign(sp);
-                if (!bmp) { resolve({ id: mesh.id, bmp: null as unknown as ImageBitmap }); return; }
-                void bmp.then(b => { this._signBitmaps.set(key, b); resolve({ id: mesh.id, bmp: b }); });
+        for (const pl of plates) {
+            if (bitmaps.has(pl.key)) continue;
+            const cached = this._signBitmaps.get(pl.key);
+            if (cached) { bitmaps.set(pl.key, Promise.resolve(cached)); continue; }
+            const { key, info } = pl;
+            bitmaps.set(key, new Promise<ImageBitmap | null>(resolve => raster.push(() => {
+                const hit = this._signBitmaps.get(key);   // (another batch may have made it meanwhile)
+                if (hit) { resolve(hit); return; }
+                const bmp = this._rasterSign(info);
+                if (!bmp) { resolve(null); return; }
+                void bmp.then(b => { this._signBitmaps.set(key, b); resolve(b); }, () => resolve(null));
             })));
-        });
+        }
         const apply = (): void => {
-            void Promise.all(jobs).then(results => {
-                if (gen !== this._signGen) return;   // superseded by a newer batch (its meshes were replaced)
-                for (const { id, bmp } of results) if (bmp) void this.scene3d.setMeshTexture(id, bmp);
+            void Promise.all([...bitmaps].map(async ([k, pr]) => [k, await pr] as const)).then(async res => {
+                if (stale()) return;   // superseded by a newer centre batch (its meshes were replaced)
+                const bmp = new Map(res), tex = new Map<string, GPUTexture>();
+                for (const pl of plates) {
+                    const b = bmp.get(pl.key), m = pl.m;
+                    if (!b || (m.material.hasTexture && m.diffuseTexture)) continue;
+                    const t = tex.get(pl.key);
+                    if (t) {   // share the batch's texture (as duplicateMesh does; destroyTextureIfUnshared respects it)
+                        m.diffuseTexture = t; m.material.hasTexture = true; m.textureLibraryId = null; m.materialDirty = true;
+                        continue;
+                    }
+                    // the first plate of a key uploads it (needs the mesh in the scene; a detached one leaves the key to
+                    // the next plate, or to the re-attach)
+                    if (await this.scene3d.setMeshTexture(m.id, b) && m.diffuseTexture) tex.set(pl.key, m.diffuseTexture);
+                }
+                this.scene3d.requestRender3D();
             });
         };
-        if (!raster.length) { apply(); return; }
-        if (typeof requestAnimationFrame === 'undefined') { for (const r of raster) r(); apply(); return; }
+        if (!raster.length) { apply(); return plates.length; }
+        if (typeof requestAnimationFrame === 'undefined') { for (const r of raster) r(); apply(); return plates.length; }
         let k = 0;
         const step = (): void => {
-            if (gen !== this._signGen) return;
+            if (stale()) return;
             const t0 = performance.now(), budget = this._sliceBudgetMs();
             do raster[k++](); while (k < raster.length && performance.now() - t0 < budget);
             if (k < raster.length) requestAnimationFrame(step); else this.scene3d.requestRender3D();
         };
         apply();
         requestAnimationFrame(step);
+        return plates.length;
     }
+    /** Layer name → label for the SIGN TEXT groups of a tile build (null when it has none). */
+    private _signTextOfGroups(groups: readonly TileLayerGroup[]): Map<string, SignTextInfo> | null {
+        let out: Map<string, SignTextInfo> | null = null;
+        for (const g of groups) {
+            if (!g.name.endsWith(SIGN_TEXT_GROUP)) continue;
+            for (const [k, v] of signTextByName(g.layers)) (out ??= new Map()).set(k, v);
+        }
+        return out;
+    }
+    /** The label of every sign-plate mesh seen (re-applied when a retired tile / parked centre re-attaches untextured). */
+    private readonly _signInfo = new WeakMap<Mesh3D, SignTextInfo>();
     private _signGen = 0;
     /** Rasterize one sign plate (label on its colour) → an ImageBitmap promise (null without a 2D context). */
-    private _rasterSign(sp: { label: string; square?: boolean; layer: { color: [number, number, number] } }): Promise<ImageBitmap> | null {
+    private _rasterSign(sp: SignTextInfo): Promise<ImageBitmap> | null {
         {
             const cv = document.createElement('canvas');
             // Square signs (STOP + other square plates) rasterize on a SQUARE canvas so the letters aren't stretched
@@ -4270,7 +4322,7 @@ export class WorldManager {
             cv.width = W; cv.height = H;
             const ctx = cv.getContext('2d');
             if (!ctx) return null;
-            const [r, g, b] = sp.layer.color;
+            const [r, g, b] = sp.color;
             ctx.fillStyle = `rgb(${Math.round(r * 255)},${Math.round(g * 255)},${Math.round(b * 255)})`;
             ctx.fillRect(0, 0, W, H);
             ctx.fillStyle = '#f6f1e2';
@@ -4709,6 +4761,13 @@ export class WorldManager {
         if (this._params && this._params.pedestrianDensity !== d) { this.updateCity({ pedestrianDensity: d }); this._stampWorldParams(); }
     }
     get crowdDensity(): number { return this._params?.pedestrianDensity ?? 1; }
+    /** crowd-characters.md: build the static crowd's near / mid people from the mannequin kit (default) or the baked
+     *  character archetypes (LayoutParams.crowdStyle; rebuilds 'World Pedestrians'; persisted with the params). */
+    setCrowdStyle(s: 'mannequin' | 'character'): void {
+        if (!this._params || this.crowdStyle === s || (s !== 'mannequin' && s !== 'character')) return;
+        this.updateCity({ crowdStyle: s }); this._stampWorldParams();
+    }
+    get crowdStyle(): 'mannequin' | 'character' { return this._params?.crowdStyle === 'character' ? 'character' : 'mannequin'; }
     /** The city's shadow penumbra width (1 = tight … ~2.5 soft). Applied while the City Tool is open. */
     setCityShadowSoftness(v: number): void {
         this._shadowSoft = Math.max(0.5, Math.min(4, v || 1.3));
@@ -5034,6 +5093,11 @@ export class WorldManager {
         // lightbox (full image brightness at night, never blown out); unlit = a poster lit by the scene.
         [/sign-advert-lit/, 0.3, 1.0],
         [/sign-advert/, 0.05, 0.03],
+        // Painted ROAD SIGNS are not lights (2026-10-04): 'roadsign-…' fell into the neon 'sign-' row below (0.6 / 1.7 —
+        // NO PARKING plates AND their poles glowed flat) and the STOP plate into the signal-LAMP row (0.55 / 1.5). Lit by
+        // the scene; the small night value is retro-reflection, so they still read in the dark.
+        [/roadsign-pole/, 0.05, 0.03],
+        [/roadsign-|signal-red-stop|signal-stop-rim|signaltext-stop/, 0.08, 0.3],
         [/shop-room/, 0.3, 1.0],               // C4: the lit room behind an image-interior shop bay (a fluorescent shop)
         [/sign-|screen-|detail-sign|detail-screen|neon|lantern|vending-|busstop-sign|sg-lantern|rail-train-win|lm-accent|lamplights|traffic-holo|traffic-flyer-glow|traffic-skytrain-glow|robot-visor|rail-sky/, 0.6, 1.7],
         [/detail-glass|shop-glass/, 0.1, 0.6],   // was 0.95 — lit shopfronts blew out to white at street level  // shop windows: lit from inside at night

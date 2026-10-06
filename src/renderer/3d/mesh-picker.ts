@@ -99,6 +99,7 @@ export class MeshPicker {
    */
   private _skinnedDeform(mesh: Mesh3D): { verts: Float32Array; modelMat: mat4 } | null {
     if (!(mesh instanceof SkinnedMesh3D)) return null;
+    this._syncBlend(mesh);
     const skel = mesh.skeleton, base = mesh.geometry, ji = mesh.jointIndices, jw = mesh.jointWeights;
     if (!skel || !base || !ji || !jw || skel.skinMatrices.length === 0) return null;
     let cached = this._skinCache.get(mesh.id);
@@ -276,6 +277,7 @@ export class MeshPicker {
    * Skinned / dynamic (gpuDirty) / degenerate cases answer true (always kept).
    */
   meshMayTouchWorldBox(mesh: Mesh3D, minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): boolean {
+    this._syncBlend(mesh);
     const geom = mesh.geometry;
     if (!geom || geom.vertices.length === 0) return true;
     if (mesh.gpuDirty || mesh instanceof SkinnedMesh3D) return true;
@@ -325,7 +327,7 @@ export class MeshPicker {
   /** Box entry slot for list entry i: returns the box OFFSET into c.boxes (i * 6), or -1 when the mesh has no safe box.
    *  Validated per entry by mesh identity + matrix version + geometry, so a scratch array whose contents change is safe. */
   private _listBoxAt(c: ListBoxCache, i: number, mesh: Mesh3D): number {
-    const ver = mesh.localMatrixVersion;
+    const ver = mesh.localMatrixVersion + mesh.blendVersion * 4294967296;   // (a blend-shape change re-derives the box)
     if (c.mesh[i] === mesh && c.ver[i] === ver && c.geom[i] === mesh.geometry && !mesh.gpuDirty) return c.has[i] ? i * 6 : -1;
     const b = this._worldBoxOf(mesh);
     c.mesh[i] = mesh; c.ver[i] = ver; c.geom[i] = mesh.geometry;
@@ -340,6 +342,7 @@ export class MeshPicker {
   private readonly _worldBoxCache = new Map<string, { geom: object; ver: number; b: Float64Array }>();
   private readonly _localBoxOfGeom = new WeakMap<object, Float64Array | null>();
   private _worldBoxOf(mesh: Mesh3D): Float64Array | null {
+    this._syncBlend(mesh);
     if (mesh.gpuDirty || mesh instanceof SkinnedMesh3D) return null;
     const geom = mesh.geometry;
     if (!geom || geom.vertices.length === 0) return null;
@@ -507,7 +510,21 @@ export class MeshPicker {
       baryV:         hitV,
     };
   }
+  /** Character v2 Phase 1.5: a blend-shape change no longer sets gpuDirty (the vertices are patched in place), so the
+   *  geometry-derived caches (BVH, boxes, CPU-skinned copy) key on Mesh3D.blendVersion instead — dropped here when it
+   *  moved and rebuilt LAZILY by the next pick (never per frame / per weight change). */
+  private readonly _blendSeen = new Map<string, number>();
+  private _syncBlend(mesh: Mesh3D): void {
+    const v = mesh.blendVersion;
+    if (v === 0) return;
+    const id = mesh.id;
+    if (this._blendSeen.get(id) === v) return;
+    this._blendSeen.set(id, v);
+    this._bvhCache.delete(id); this._worldBoxCache.delete(id); this._aabbCache.delete(id); this._skinCache.delete(id);
+    if (mesh.geometry) this._localBoxOfGeom.delete(mesh.geometry);
+  }
   evictMesh(meshId: string): void {
+    this._blendSeen.delete(meshId);
     this._worldBoxCache.delete(meshId);
     this._bvhCache.delete(meshId);
     this._aabbCache.delete(meshId);
@@ -528,6 +545,7 @@ export class MeshPicker {
     // Skinned + posed meshes RENDER deformed (skin matrices), but the base geometry is the rest pose. Pick
     // against a CPU-skinned copy so painting/selecting a bent-limb creature lands on the visible surface, not
     // the rest silhouette. At rest this equals base × localMatrix, so nothing changes until the rig is posed.
+    this._syncBlend(mesh);
     const skin = this._skinnedDeform(mesh);
     const modelMat = (skin ? skin.modelMat : mesh.localMatrix) as mat4;
     // P6: world-baked city meshes sit at a pure translation (usually identity) — invert that directly (exact) instead of

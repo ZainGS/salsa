@@ -122,7 +122,7 @@ export function buildRoadSigns(graph: WorldGraph, keep?: ((region: number) => bo
             textSigns.push({
                 label: reg.label,
                 layer: {
-                    name: 'world:roadsign-reg' + idx, color: reg.color, y: gy, emissive: 0.4, singleSided: true,
+                    name: 'world:roadsign-reg' + idx, color: reg.color, y: gy, emissive: 0.08, singleSided: true,   // painted plate, lit by the scene (see WorldManager.GLOW)
                     geometry: signQuad(c, pd, face, hw, hh),
                 },
             });

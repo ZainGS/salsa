@@ -11,6 +11,8 @@
  *    infrastructure owners whose identity other objects hold (the 2D CacheService / PipelineManager stack).
  */
 
+import type { GpuAdapterFacts } from './gpu-diagnostics';
+
 export type GpuDeviceStatus = 'initializing' | 'ok' | 'lost' | 'recovering' | 'failed' | 'unavailable';
 
 export interface GpuDeviceStatusInfo {
@@ -75,7 +77,14 @@ export class WebGPUUnavailableError extends Error {
   }
 }
 
-export interface SalsaDevice { adapter: GPUAdapter; device: GPUDevice; gpuName: string | null }
+export interface SalsaDevice {
+  adapter: GPUAdapter; device: GPUDevice; gpuName: string | null;
+  /** adapter.info (empty strings where the browser hides them). */
+  adapterInfo: GpuAdapterFacts;
+  /** The device has 'indirect-first-instance' (OPTIONAL since 2026-10-06, mobile-parity CRASH-1: without it the
+   *  GPU-driven path is capped off and everything draws on the CPU path). */
+  indirectFirstInstance: boolean;
+}
 
 /** Request the adapter + device with the engine's features and limits. Throws WebGPUUnavailableError. */
 export async function requestSalsaDevice(gpu: GPU | undefined = (globalThis.navigator as Navigator | undefined)?.gpu): Promise<SalsaDevice> {
@@ -84,22 +93,31 @@ export async function requestSalsaDevice(gpu: GPU | undefined = (globalThis.navi
   try { adapter = await gpu.requestAdapter(); } catch { adapter = null; }
   if (!adapter) throw new WebGPUUnavailableError('no-adapter', 'Failed to request WebGPU adapter (No available adapters).');
   let gpuName: string | null = null;
+  const adapterInfo: GpuAdapterFacts = { vendor: '', architecture: '', device: '', description: '' };
   try {
-    const a = adapter as unknown as { info?: { description?: string; vendor?: string; architecture?: string }; requestAdapterInfo?: () => Promise<{ description?: string; vendor?: string; architecture?: string }> };
+    type Info = { description?: string; vendor?: string; architecture?: string; device?: string };
+    const a = adapter as unknown as { info?: Info; requestAdapterInfo?: () => Promise<Info> };
     const info = a.info ?? (typeof a.requestAdapterInfo === 'function' ? await a.requestAdapterInfo() : null);
-    if (info) gpuName = [info.description, info.vendor, info.architecture].filter(Boolean).join(' ') || null;
+    if (info) {
+      gpuName = [info.description, info.vendor, info.architecture].filter(Boolean).join(' ') || null;
+      adapterInfo.vendor = info.vendor ?? ''; adapterInfo.architecture = info.architecture ?? '';
+      adapterInfo.device = info.device ?? ''; adapterInfo.description = info.description ?? '';
+    }
   } catch { /* adapter info optional */ }
   // Raise the buffer-size ceilings to whatever THIS adapter supports (default is a low 256 MB): a tiled world blows
   // past 256 MB. timestamp-query = exact GPU frame times (GpuFrameTimer); chromium-experimental-multi-draw-indirect =
   // the opportunistic GPU-driven main pass (Renderer3D.setGpuDriven).
+  // indirect-first-instance is OPTIONAL (mobile-parity CRASH-1): requiring it failed requestDevice outright on an
+  // adapter without it. Only the GPU-driven bundles need it, and they are capped off when it is missing.
   const lim = adapter.limits;
   const f = (name: string) => adapter!.features.has(name as GPUFeatureName) ? [name as GPUFeatureName] : [];
+  const ifi = f('indirect-first-instance');
   try {
     const device = await adapter.requestDevice({
-      requiredFeatures: ['indirect-first-instance' as GPUFeatureName, ...f('timestamp-query'), ...f('chromium-experimental-multi-draw-indirect')],
+      requiredFeatures: [...ifi, ...f('timestamp-query'), ...f('chromium-experimental-multi-draw-indirect')],
       requiredLimits: { maxBufferSize: lim.maxBufferSize, maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize },
     });
-    return { adapter, device, gpuName };
+    return { adapter, device, gpuName, adapterInfo, indirectFirstInstance: ifi.length > 0 };
   } catch (e) {
     throw new WebGPUUnavailableError('device-failed', `Failed to create the WebGPU device: ${e instanceof Error ? e.message : String(e)}`);
   }

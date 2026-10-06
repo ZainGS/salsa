@@ -124,6 +124,22 @@ export interface GaitSpec {
     /** Head NOD on impact (deg, + = down): a short dip just after each touch-down (a beat late, headLag), on top of the
      *  head's level-holding counter — the weight of the head landing. Absent = none. */
     headNod?: number;
+    // ── SPRING run feel (2026-10-04 pass 2, Jog / Run; play-mode.md §A springier run) — all absent = the output above ──
+    /** Chest counter-yaw as a multiple of the pelvis yaw (default 1.9: the shoulders turn (k − 1)·twist the other way in
+     *  the world). The head's counter follows it, so the head's world yaw stays ≈ 0.1·twist whatever k is. */
+    chestTwist?: number;
+    /** HOLD (0..~0.6): a phase remap (holdWarp / swingWarp) instead of raw sines — the arms, the pelvis / chest twist and
+     *  the swing leg ease INTO their extremes (the reach, the kick, the contact pose) and pass quickly through the
+     *  passing pose. The stance foot is never remapped (it must move at the ground speed: no sliding). 0 = none. */
+    hold?: number;
+    /** Lead-foot flex (deg): extra toes-UP pitch in late swing (peaking ~u 0.8, gone by touch-down) — the foot flexed as
+     *  the shin reaches forward to land. Absent = none. */
+    footReach?: number;
+    // ── RUN POSTURE (2026-10-04 pass 3, Jog / Run; play-mode.md §A springier run) — absent = the output above ──
+    /** Trunk lean (deg) taken at the LOWER BACK, so the whole trunk tips forward as one straight line over a near-upright
+     *  pelvis (the neck / head counter it). The Jog / Run used to lean with `bodyLean` — an ANTERIOR PELVIC TILT, which
+     *  pushed the butt out behind the feet — and `lean` stacked on top of it (a fold at the waist). */
+    trunkLean?: number;
 }
 
 // STOMP (2026-10-03): the Round 8 / item 13 walk, kept as its own clip for custom use (a heavy stomp through swamp
@@ -165,25 +181,37 @@ const WALK: GaitSpec = {
 // skirt-leg-follow gate); a big arm pump (the hand reaching ~chin height in front, the elbow well behind the torso,
 // crossing a little toward the midline); a bigger chest bounce, chest counter-turn and lean, a head nod on each impact.
 // The JOG below is the same model, smaller — the animator blends jog → run by speed.
+//
+// POSTURE (2026-10-04 pass 3, user: "goofy, like a cartoon villain — the hips and butt locked in place"). The lean was
+// an anterior PELVIC TILT (bodyLean 10.5° + tilt: the pelvis 8–12° forward all cycle) with the spine lean stacked on
+// it, and the late reach keys hung off a nominal hip ~9 cm below the float, so the pelvis fit sank the run ~6 cm to
+// reach them: the butt out behind the feet, the knees bent ~50° at mid-stance and ~42° at toe-off. Now the pelvis is
+// near upright (bodyLean 2 + the stride tilt), the trunk tips forward as one line from the lower back (trunkLean, the
+// pelvis → neck line ~10° — Jog ~6.5°), every key hangs off its own hip, and the pelvis rides ~4.5 cm higher: ~37°
+// at mid-stance (the landing compression), a near-straight knee and the hip extended behind at toe-off.
+// The passing keys (u 0.3 / 0.5) sit a little lower and less folded than pass 2's, so the folded shin clears a knee /
+// long dress's hem under the now-upright pelvis (the skirt-leg-follow gate).
 const RUN: GaitSpec = {
-    name: 'Run', period: 0.74, speed: 4.6, duty: 0.22, legK: 0.996, stanceFlex: 0, loadDip: 0, crouch: 0.02, flight: 0.05,
-    lift: 0, liftPeak: 0.5, swingK: 1, reach: -0.115, width: 0.008, heelStrike: 8, toeOff: 56, toeClear: 0,
-    sway: 0.01, roll: 3.5, twist: 11, lean: 9, headDown: 4, arm: 56, armFwd: 18, armOut: 11, armTwist: -6,
-    elbow: 76, elbowSwing: 26, armLag: 0.04,
-    tilt: 2.5, chestSway: 1.8, sideLag: 0.03, headLag: 0.04, forearmLag: 0.05, handLag: 8, protract: 10,
-    bob: -0.045, air: 0.05, pushRise: 0.04, swingKeys: [[0.1, -10, 78], [0.3, 12, 104], [0.5, 50, 98], [0.68, 82, 90], [0.84, 62, 44]],
-    footSwing: 10, landVel: 0.3, heelEnd: 0.18, heelOff: 0.36, bodyLean: 9, armCross: 16, chestBounce: 3, headNod: 3,
+    name: 'Run', period: 0.74, speed: 4.6, duty: 0.22, legK: 0.996, stanceFlex: 0, loadDip: 0, crouch: 0.005, flight: 0.05,
+    lift: 0, liftPeak: 0.5, swingK: 1, reach: -0.13, width: 0.008, heelStrike: 8, toeOff: 56, toeClear: 0,
+    sway: 0.01, roll: 3.5, twist: 14, lean: 2.5, headDown: 4, arm: 62, armFwd: 18, armOut: 14, armTwist: -6,
+    elbow: 72, elbowSwing: 16, armLag: 0.04,
+    tilt: 2.5, chestSway: 1.8, sideLag: 0.03, headLag: 0.04, forearmLag: 0.05, handLag: 8, protract: 12,
+    bob: -0.045, air: 0.05, pushRise: 0.04, swingKeys: [[0.1, -10, 80], [0.3, 10, 112], [0.5, 46, 96], [0.68, 80, 86], [0.84, 64, 38]],
+    footSwing: 10, landVel: 0.3, heelEnd: 0.18, heelOff: 0.36, bodyLean: 2, armCross: 16, chestBounce: 3, headNod: 3,
+    chestTwist: 2.15, hold: 0.45, footReach: 14, trunkLean: 7,
 };
 // Jog (2026-10-04): the energetic model at ~3 m/s — longer contact, a smaller float and compression, the knee driving
 // to ~50°, a smaller arm pump, a lighter lean. Blended in between the walk and the run (play-mode.md §The jog).
 const JOG: GaitSpec = {
-    name: 'Jog', period: 0.76, speed: 3.0, duty: 0.32, legK: 0.994, stanceFlex: 0, loadDip: 0, crouch: 0.015, flight: 0.03,
-    lift: 0, liftPeak: 0.5, swingK: 1, reach: -0.1, width: 0.012, heelStrike: 8, toeOff: 48, toeClear: 0,
-    sway: 0.014, roll: 3.5, twist: 8, lean: 6, headDown: 4, arm: 34, armFwd: 9, armOut: 10, armTwist: -2,
-    elbow: 72, elbowSwing: 18, armLag: 0.045,
+    name: 'Jog', period: 0.76, speed: 3.0, duty: 0.32, legK: 0.994, stanceFlex: 0, loadDip: 0, crouch: 0.004, flight: 0.03,
+    lift: 0, liftPeak: 0.5, swingK: 1, reach: -0.11, width: 0.012, heelStrike: 8, toeOff: 48, toeClear: 0,
+    sway: 0.014, roll: 3.5, twist: 10, lean: 1.5, headDown: 4, arm: 38, armFwd: 9, armOut: 11, armTwist: -2,
+    elbow: 70, elbowSwing: 14, armLag: 0.045,
     tilt: 2, chestSway: 1.8, sideLag: 0.035, headLag: 0.04, forearmLag: 0.06, handLag: 8, protract: 6,
-    bob: -0.032, air: 0.028, pushRise: 0.02, swingKeys: [[0.12, -10, 64], [0.32, 8, 98], [0.54, 34, 94], [0.71, 52, 74], [0.86, 48, 40]],
-    footSwing: 8, landVel: 0.25, heelEnd: 0.2, heelOff: 0.42, bodyLean: 5, armCross: 10, chestBounce: 2.2, headNod: 2,
+    bob: -0.032, air: 0.028, pushRise: 0.03, swingKeys: [[0.12, -10, 64], [0.32, 8, 98], [0.54, 34, 94], [0.71, 52, 74], [0.86, 40, 30]],
+    footSwing: 8, landVel: 0.25, heelEnd: 0.2, heelOff: 0.42, bodyLean: 1.5, armCross: 10, chestBounce: 2.2, headNod: 2,
+    chestTwist: 2.05, hold: 0.3, footReach: 10, trunkLean: 4.5,
 };
 // Sneak: crouched (pelvis ~14 cm down, knees bent), long ground contact, careful low steps, arms held forward.
 const SNEAK: GaitSpec = {
@@ -264,6 +292,17 @@ const deg = (r: number) => (r * 180) / Math.PI;
 const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
 const smooth = (x: number) => { const t = clamp01(x); return t * t * (3 - 2 * t); };
 const smoother = (x: number) => { const t = clamp01(x); return t * t * t * (t * (t * 6 - 15) + 10); };
+
+// ── Phase remaps (2026-10-04, the spring run's `hold`): uneven timing without per-joint keys ──────────────────────
+/** Cyclic phase remap for a cos(TAU·x) signal: slow (rate 1 − h) at its extremes x = 0, 0.5 — the pose HOLDS — fast
+ *  (1 + h) through the zero crossings (the passing pose). Monotonic for h < 1; h = 0 is the identity. */
+export function holdWarp(x: number, h: number): number { return h ? x - h * Math.sin(2 * TAU * x) / (2 * TAU) : x; }
+/** cos(TAU·x) with the extremes held (holdWarp). */
+const heldCos = (x: number, h: number) => Math.cos(TAU * holdWarp(x, h));
+/** Swing-progress remap u ∈ [0,1] → [0,1] with rate 1 at both ends (so the lift-off / touch-down velocity matching is
+ *  untouched), slow around u ≈ 0.25 / 0.75 (the heel kick and the reach are held) and 1 + h at u = 0.5 (the knee
+ *  snaps through the passing pose). Rate 1 + h·(sin²πu − sin²2πu) ≥ 1 − 9h/16 > 0 for h < 16/9. h = 0 = identity. */
+export function swingWarp(u: number, h: number): number { return h ? u + h * (-Math.sin(TAU * u) / (2 * TAU) + Math.sin(2 * TAU * u) / (4 * TAU)) : u; }
 
 // ── Small quaternion / vector kit ([x,y,z,w], the body-generator convention) ─────────────────────────────────────
 const qInv = (q: Quat): Quat => [-q[0], -q[1], -q[2], q[3]];
@@ -435,7 +474,9 @@ function shankAngle(rig: Rig, dz: number, dy: number): number {
  *  mid-swing pitch (`footSwing`), from the toe-off pitch to the heel-strike pitch. */
 function naturalFoot(g: GaitSpec, rig: Rig, q: number, hip: V3): { z: number; y: number; pitch: number; stance: boolean; s: number } {
     if (q < g.duty) { const s = q / g.duty; return { ...naturalStance(g, rig, s), stance: true, s }; }
-    const u = (q - g.duty) / (1 - g.duty);
+    // The spring run's HOLD: the swing leg eases into the heel kick and the reach, snapping through the passing pose
+    // (swingWarp keeps rate 1 at both ends, so the lift-off / touch-down velocity matching below still holds).
+    const uRaw = (q - g.duty) / (1 - g.duty), u = swingWarp(uRaw, g.hold ?? 0);
     const stT = g.duty * g.period, swT = (1 - g.duty) * g.period, e = 1e-3;
     const a = naturalStance(g, rig, 1), a0 = naturalStance(g, rig, 1 - e), b = naturalStance(g, rig, 0), b1 = naturalStance(g, rig, e);
     // Tangents per unit u: the stance velocity at toe-off / heel strike (zero world velocity there), + the touch-down drop.
@@ -445,12 +486,15 @@ function naturalFoot(g: GaitSpec, rig: Rig, q: number, hip: V3): { z: number; y:
     // The keys hang off a NOMINAL hip height (the gait's mean pelvis), not this frame's: a key that rode the pelvis down
     // would lower the landing target, which lowers the pelvis fit (pelvisWave), and so on — a feedback that sank the walk.
     const hipKeyY = rig.hipOff.L[1] - (g.crouch + Math.abs(g.bob ?? 0) + 0.01) * rig.L;
-    // The spring-mass run (`air`) floats the pelvis well above that in flight: the EARLY keys (heel kick, knee drive —
-    // never part of the pelvis fit, which only reads a swing leg from s 0.72) hang off this frame's hip, so the knee
-    // folds and drives as keyed at the top of the float instead of straightening toward a nominal hip below it.
-    const keyY = (ku: number) => (g.air !== undefined && ku < 0.6 ? hip[1] : hipKeyY);
+    // The spring-mass run (`air`) floats the pelvis well above that in flight, so EVERY key hangs off this frame's hip:
+    // the knee folds and drives as keyed at the top of the float instead of straightening toward a nominal hip below
+    // it. (Run posture pass, 2026-10-04: the late reach keys used to hang off the nominal hip, so at the top of the
+    // float the landing leg could not reach its own keyed foot, and the pelvis fit sank the whole run ~6 cm to let it —
+    // the low, bent-kneed "cartoon villain" run. A key relative to its own hip is always within reach, so it no longer
+    // bounds the fit: only the stance legs and the final approach onto the heel do.)
+    const keyY = g.air !== undefined ? hip[1] : hipKeyY;
     const pts: { u: number; z: number; y: number }[] = [{ u: 0, z: a.z, y: a.y }];
-    for (const [ku, th, k] of g.swingKeys ?? []) { const f = legFK(rig, th, k); pts.push({ u: ku, z: hip[2] + f.z, y: keyY(ku) + f.y }); }
+    for (const [ku, th, k] of g.swingKeys ?? []) { const f = legFK(rig, th, k); pts.push({ u: ku, z: hip[2] + f.z, y: keyY + f.y }); }
     pts.push({ u: 1, z: b.z, y: b.y });
     let i = 0;
     while (i < pts.length - 2 && u > pts[i + 1].u) i++;
@@ -467,13 +511,15 @@ function naturalFoot(g: GaitSpec, rig: Rig, q: number, hip: V3): { z: number; y:
     // Foot pitch: relative to the shank, eased from the toe-off value to the heel-strike value, + the mid-swing pitch.
     const phi = (zz: number, yy: number) => shankAngle(rig, zz - hip[2], yy - hip[1]);
     const r0 = a.pitch + phi(a.z, a.y), r1 = b.pitch + phi(b.z, b.y);
-    const rel = r0 + (r1 - r0) * smooth(u) + (g.footSwing ?? 0) * Math.sin(Math.PI * clamp01(u / 0.8));
+    let rel = r0 + (r1 - r0) * smooth(u) + (g.footSwing ?? 0) * Math.sin(Math.PI * clamp01(u / 0.8));
+    // The lead foot FLEXES (toes up) as the shin reaches forward, easing back to the heel-strike pitch by touch-down.
+    if (g.footReach) rel -= g.footReach * Math.pow(Math.sin(Math.PI * clamp01((u - 0.45) / 0.55)), 2);
     const pitch = rel - phi(z, y);
     // Never through the floor: the ankle stays high enough that the heel (toes up) / the ball (toes down) clears it.
     const pr = rad(pitch);
     const drop = rig.a0 * (1 - Math.cos(pr)) + (pitch < 0 ? rig.lh : -rig.lb) * Math.sin(pr);   // lowest point vs a flat foot
     y = Math.max(y, rig.groundY - drop);
-    return { z, y, pitch, stance: false, s: u };
+    return { z, y, pitch, stance: false, s: uRaw };
 }
 
 /** NATURAL pelvis height offsets (from rest, n frames): a smooth wave (±|bob|·L, twice a cycle: + = highest at
@@ -566,7 +612,7 @@ export function loadDipAt(p: number, duty: number): number {
 
 /** Sample the gait at N frames (one cycle). `clr` = the body's extra arm raise (deg, playArmClearance). */
 function sampleGait(g: GaitSpec, rig: Rig, n: number, clr = 0): GaitFrame[] {
-    const yawAt = (p: number) => -g.twist * Math.cos(TAU * p);           // left leg forward at p = 0 → left hip leads
+    const yawAt = (p: number) => -g.twist * heldCos(p, g.hold ?? 0);    // left leg forward at p = 0 → left hip leads (held)
     const rollAt = (p: number) => g.roll * Math.cos(TAU * (p - g.duty / 2));   // left mid-stance → the right (swing) hip drops
     const tiltAt = (p: number) => g.tilt * Math.cos(2 * TAU * (p - 0.08));     // tips forward as each leg takes the weight
     const bodyLean = g.bodyLean ?? 0;                                        // natural model: the whole body leans
@@ -626,26 +672,30 @@ function upperBody(g: GaitSpec, rot: Record<string, Quat>, p: number, hipsQ: Qua
         // foot a beat late, the head held level + forward — its stabilising counter a touch LATE (headLag), so it floats
         // instead of being nailed to the horizon. Gait feel 2026-10-03: the bob is smooth (was |sin|, a kink each step).
         // The natural model's whole-body lean (bodyLean, on the pelvis) is countered by the neck / head only.
-        const bl = g.bodyLean ?? 0;
+        // The run posture's trunkLean tips the trunk as a line at the lower back (pelvis near upright); the head counters it.
+        const tl = g.trunkLean ?? 0, bl = (g.bodyLean ?? 0) + tl;
         const yaw = yawAt(p), roll = rollAt(p), tilt = tiltAt(p);
         const bounceAt = (q: number) => g.flight > 0 ? (g.chestBounce ?? 1.5) * Math.cos(TAU * 2 * (q - g.duty / 2)) : 0.9 * Math.pow(Math.sin(TAU * q), 2);
         const sideAt = (q: number) => -g.chestSway * Math.cos(TAU * (q - g.duty / 2 - g.sideLag));   // − = toward the left (stance) foot
         const bounce = bounceAt(p), side = sideAt(p);
         const ph = p - g.headLag;
         rot.hips = hipsQ;
-        rot.lowerback = qMul(qAxis('z', -roll * 0.8), qAxis('x', g.lean * 0.35 - tilt * 0.8));
+        rot.lowerback = qMul(qAxis('z', -roll * 0.8), qAxis('x', g.lean * 0.35 + tl - tilt * 0.8));
         rot.spine = qMul(qAxis('z', side * 0.5), qAxis('x', g.lean * 0.35 + bounce));
-        rot.chest = qMul(qAxis('y', -yaw * 1.9), qMul(qAxis('z', side * 0.5), qAxis('x', g.lean * 0.3)));
+        const ct = g.chestTwist ?? 1.9;
+        rot.chest = qMul(qAxis('y', -yaw * ct), qMul(qAxis('z', side * 0.5), qAxis('x', g.lean * 0.3)));
         rot.neck = qAxis('x', -(g.lean + bl) * 0.3);
         const headRoll = -(0.2 * rollAt(ph) + sideAt(ph)) * 0.85;
         // The impact nod: a smooth bump over the first 35 % of each half-cycle after a touch-down (p = 0 and 0.5).
         const nodAt = (q: number) => { const u = (((2 * q) % 1) + 1) % 1; return u < 0.35 ? (g.headNod ?? 0) * Math.pow(Math.sin(Math.PI * u / 0.35), 2) : 0; };
-        rot.head = qMul(qAxis('y', yawAt(ph) * 0.9), qMul(qAxis('z', headRoll), qAxis('x', -(g.lean + bl) * 0.55 - bounceAt(ph) * 0.9 + g.headDown + nodAt(ph))));
+        rot.head = qMul(qAxis('y', yawAt(ph) * (g.chestTwist === undefined ? 0.9 : ct - 1)), qMul(qAxis('z', headRoll), qAxis('x', -(g.lean + bl) * 0.55 - bounceAt(ph) * 0.9 + g.headDown + nodAt(ph))));
         // Arms counter-swing the legs (left arm forward while the RIGHT leg is forward, p = 0.5), a touch behind them.
         // OVERLAP: the elbow flex trails the upper arm (forearmLag: it bends most just after the arm's forward extreme,
         // then whips open on the back-swing) and the hand trails the forearm (handLag) — a loose arm, not a rigid pendulum.
-        const sw = -Math.cos(TAU * (p - g.armLag));
-        const swF = -Math.cos(TAU * (p - g.armLag - g.forearmLag));
+        // HOLD (the spring run): the arm eases into its forward / back extremes and whips through the middle.
+        const ho = g.hold ?? 0;
+        const sw = -heldCos(p - g.armLag, ho);
+        const swF = -heldCos(p - g.armLag - g.forearmLag, ho);
         const swV = Math.sin(TAU * (p - g.armLag - g.forearmLag * 0.6));       // + = the left arm swinging forward
         const flex = (x: number) => Math.pow(0.5 + 0.5 * x, 1.6);              // smooth 0 → 1, most bend in front
         const armAt = (base: ArmSpec, s1: number, sF: number, sV: number): ArmSpec => ({

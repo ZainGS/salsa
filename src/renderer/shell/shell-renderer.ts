@@ -921,7 +921,7 @@ struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,        // 0..1 within the card
   @location(1) uvRect: vec4<f32>,    // atlas rect
-  @location(2) info: vec3<f32>,      // hasThumb, hover, alpha
+  @location(2) info: vec4<f32>,      // hasThumb, hover, alpha, titleH (px; 0 = legacy h*0.10)
   @location(3) halfpx: vec2<f32>,    // card half-size (px) for px-accurate window chrome
 };
 
@@ -930,7 +930,7 @@ fn vs(
   @location(0) q: vec2<f32>,                 // unit quad 0..1
   @location(1) ch: vec4<f32>,                // center.xy, half.xy (px)
   @location(2) uvRect: vec4<f32>,
-  @location(3) info: vec4<f32>,              // hasThumb, hover, alpha, _
+  @location(3) info: vec4<f32>,              // hasThumb, hover, alpha, titleH (px)
 ) -> VsOut {
   let corner = q * 2.0 - 1.0;                // -1..1
   let halfW = g.size.x * 0.5;
@@ -949,7 +949,7 @@ fn vs(
   out.pos = vec4<f32>(clip, 0.0, 1.0);
   out.uv = q;
   out.uvRect = uvRect;
-  out.info = info.xyz;
+  out.info = info;
   out.halfpx = ch.zw;
   return out;
 }
@@ -961,7 +961,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let sizePx = in.halfpx * 2.0;
   let px = in.uv * sizePx;
   let b = clamp(min(sizePx.x, sizePx.y) * 0.012, 1.5, 2.5);   // thin 2-tone bevel
-  let titleH = max(9.0, sizePx.y * 0.10);
+  // Title-bar height from the layout (projectCardTitleH); 0 → the legacy proportional bar.
+  let titleH = select(max(9.0, sizePx.y * 0.10), in.info.w, in.info.w > 0.5);
   let xr = sizePx.x - px.x;
   let yb = sizePx.y - px.y;
 
@@ -1955,7 +1956,7 @@ export class ShellRenderer {
         gdata[o+8] = thumb ? 1 : 0;
         gdata[o+9] = it.hover;
         gdata[o+10] = 1;                            // opaque; the scrim drives the cross-fade
-        gdata[o+11] = 0;                            // pad (was zero-fresh before scratch reuse)
+        gdata[o+11] = it.titleH ?? 0;               // title-bar px (0 = shader's legacy h*0.10)
       }
       this.device.queue.writeBuffer(this.gridBuf, 0, gdata, 0, grid.length * gstride);
       gridCount = grid.length;

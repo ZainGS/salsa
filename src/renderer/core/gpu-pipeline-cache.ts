@@ -36,6 +36,8 @@
  * onPipelineWarmup3D.
  */
 
+import { gpuCrumbBegin, gpuCrumbEnd } from './gpu-diagnostics';
+
 export type GPUPipelineKind = 'render' | 'compute';
 
 /** Warm-up priority: lower drains first. NOW is used by on-demand (draw-blocking) requests. */
@@ -170,8 +172,11 @@ export class GPUPipelineCache {
     return device ? GPUPipelineCache._byDevice.get(device) ?? null : null;
   }
 
+  /** The per-machine default of maxConcurrentWarm for new caches (gpu-capabilities.ts warmConcurrency: 2 desktop,
+   *  1 mobile; WebGPURenderer.applyGpuCaps sets it at start-up and on every recovery). */
+  static defaultMaxConcurrentWarm = 2;
   /** Max concurrent WARM (queued) compiles. On-demand requests are not capped. */
-  maxConcurrentWarm = 2;
+  maxConcurrentWarm = GPUPipelineCache.defaultMaxConcurrentWarm;
   /** Log every on-demand / sync compile with its timing. */
   verbose = false;
 
@@ -327,12 +332,14 @@ export class GPUPipelineCache {
     if (h._state === 'failed') return null;
     const t0 = nowMs();
     let p: AnyPipeline;
+    const crumb = gpuCrumbBegin(`sync compile "${h.label}"`);   // CRASH-10: a compile open at a device loss = the suspect
     try {
       const d = h.descriptor();
       p = h.kind === 'render'
         ? this.device.createRenderPipeline(d as GPURenderPipelineDescriptor)
         : this.device.createComputePipeline(d as GPUComputePipelineDescriptor);
-    } catch (err) { this._fail(h, err); return null; }
+    } catch (err) { gpuCrumbEnd(crumb, false); this._fail(h, err); return null; }
+    gpuCrumbEnd(crumb);
     const ms = nowMs() - t0;
     this._stats.syncCompiles++; this._stats.syncMs += ms;
     if (this._frameDepth > 0 || this.verbose || typeof (this.device as unknown as { createRenderPipelineAsync?: unknown }).createRenderPipelineAsync === 'function') console.log(`[Salsa][pipe-cache] sync-compiled "${h.label}" ${this._frameDepth > 0 ? 'IN a live frame (blocking)' : 'outside a live frame'} (+${Math.round(ms)}ms)`);
@@ -390,6 +397,7 @@ export class GPUPipelineCache {
     this._stats.asyncCompiles++;
     const t0 = nowMs();
     let promise: Promise<AnyPipeline>;
+    const crumb = gpuCrumbBegin(`compile "${h.label}"`);   // CRASH-10: a compile open at a device loss = the suspect
     try {
       const d = h.descriptor();
       promise = h.kind === 'render'
@@ -397,11 +405,13 @@ export class GPUPipelineCache {
         : this.device.createComputePipelineAsync(d as GPUComputePipelineDescriptor);
     } catch (err) {
       if (warm) this._inflightWarm--;
+      gpuCrumbEnd(crumb, false);
       this._fail(h, err);
       return;
     }
     promise.then(
       (p) => {
+        gpuCrumbEnd(crumb);
         if (warm) this._inflightWarm--;
         if (this.verbose || priority === PIPELINE_PRIORITY.NOW) {
           console.log(`[Salsa][pipe-cache] async-compiled "${h.label}" (p${priority}, ${Math.round(nowMs() - t0)}ms)`);
@@ -412,6 +422,7 @@ export class GPUPipelineCache {
         this._scheduleDrain();
       },
       (err) => {
+        gpuCrumbEnd(crumb, false);
         if (warm) this._inflightWarm--;
         this._fail(h, err);
         this._scheduleDrain();

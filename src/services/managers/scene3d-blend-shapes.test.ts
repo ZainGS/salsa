@@ -7,14 +7,15 @@ import type { Mesh3D, BlendShape } from '../../scene-graph/shapes/mesh-3d';
 // it directly testable with a fake mesh (no GPUDevice, no scene graph): we assert the base-geometry capture, the
 // weight array bookkeeping (grow/reindex), clamping, and the evaluate/render side effects.
 
-function makeMesh(): Mesh3D & { evaluateBlendShapes: ReturnType<typeof vi.fn> } {
+function makeMesh(): Mesh3D & { evaluateBlendShapes: ReturnType<typeof vi.fn>; applyBlendWeights: ReturnType<typeof vi.fn> } {
   return {
     geometry: { vertices: new Float32Array([0, 0, 0, 1, 1, 1, 2, 2, 2]) },
     baseVertices: null,
     blendShapes: [] as BlendShape[],
     blendWeights: new Float32Array(0),
     evaluateBlendShapes: vi.fn(),
-  } as unknown as Mesh3D & { evaluateBlendShapes: ReturnType<typeof vi.fn> };
+    applyBlendWeights: vi.fn(() => null),   // Phase 1.5 fast path (sync)
+  } as unknown as Mesh3D & { evaluateBlendShapes: ReturnType<typeof vi.fn>; applyBlendWeights: ReturnType<typeof vi.fn> };
 }
 
 function makeEnv(mesh: Mesh3D | null) {
@@ -61,15 +62,15 @@ describe('§5.1 Scene3DBlendShapes (extracted subsystem)', () => {
     expect(mesh.blendWeights[0]).toBe(1);
     sub.setWeight('m', 0, -3);
     expect(mesh.blendWeights[0]).toBe(0);
-    expect(mesh.evaluateBlendShapes).toHaveBeenCalled();
+    expect(mesh.applyBlendWeights).toHaveBeenCalled();   // Phase 1.5: the incremental evaluate
     expect(scheduleRender).toHaveBeenCalled();
   });
 
   it('setWeight() is a no-op for an out-of-range index', () => {
     sub.add('m', 'a', new Float32Array(9));
-    mesh.evaluateBlendShapes.mockClear();
+    mesh.applyBlendWeights.mockClear();
     sub.setWeight('m', 7, 0.5);
-    expect(mesh.evaluateBlendShapes).not.toHaveBeenCalled();
+    expect(mesh.applyBlendWeights).not.toHaveBeenCalled();
   });
 
   it('list() returns name/weight pairs', () => {

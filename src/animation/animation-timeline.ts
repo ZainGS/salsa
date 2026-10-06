@@ -60,6 +60,25 @@ export class AnimationTimeline {
 
   // ── Timeline state ────────────────────────────────────────────────
 
+  /** Back to a new timeline's state (1 frame at 12 fps, loop, range 1..1, default onion skin), playback stopped — for a
+   *  document load / new document. The previous document's frame count, fps, loop mode, play range and onion skin used
+   *  to carry over when the next document had no animation of its own, and were then saved into it. Layer
+   *  registrations are left alone: the document load replaces the layers itself. */
+  public resetForDocumentLoad(): void {
+    if (this.playbackRafId !== null) {
+      cancelAnimationFrame(this.playbackRafId);
+      this.playbackRafId = null;
+    }
+    const wasPlaying = this.state.playbackState !== 'stopped';
+    this.state = {
+      frameCount: 1, currentFrame: 1, fps: 12, loopMode: 'loop', playbackState: 'stopped',
+      playRangeStart: 1, playRangeEnd: 1,
+    };
+    this.onionSkin = { ...DEFAULT_ONION_SKIN };
+    this.pingPongDirection = 1;
+    if (wasPlaying) this.emit({ type: 'playback-state-changed' });
+  }
+
   public getState(): Readonly<TimelineState> {
     return { ...this.state };
   }

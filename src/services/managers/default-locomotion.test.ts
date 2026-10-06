@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { webcrypto } from 'node:crypto';
-import { buildLocomotionClips, legAngles, LOCOMOTION_GAITS, LOCOMOTION_CLIP, landEnvelope, playArmClearance, DEFAULT_LOCOMOTION_CLIP_NAMES, JUMP_VARIANT_CLIPS, gaitPersonality, varyGait, applyWalkStyle } from './default-locomotion';
+import { buildLocomotionClips, legAngles, LOCOMOTION_GAITS, LOCOMOTION_CLIP, landEnvelope, playArmClearance, DEFAULT_LOCOMOTION_CLIP_NAMES, JUMP_VARIANT_CLIPS, gaitPersonality, varyGait, applyWalkStyle, holdWarp, swingWarp } from './default-locomotion';
 import type { SkeletonAnimClip } from '../../types/armature-3d';
 
 const g = globalThis as { crypto?: unknown };
@@ -139,8 +139,8 @@ describe('default locomotion clips (Round 8 gait model)', () => {
 
     it('legAngles: the legs swing in opposition (mirror phase)', () => {
         for (const gait of [LOCOMOTION_GAITS.walk, LOCOMOTION_GAITS.run]) {
-            // 2026-10-04: at toe-off (the energetic run's stance is short and its pelvis leans 9°, so the hip only
-            // extends past the lean in the last frames of the push-off).
+            // 2026-10-04: at toe-off (the energetic run's stance is short; since the run-posture pass its pelvis is near
+            // upright and the hip extends well behind, ~12° in the pelvis frame on the last stance frame).
             const a = legAngles(gait, 0.02), b = legAngles(gait, gait.duty);
             expect(a.thigh).toBeLessThan(-8);    // left leg forward at heel strike
             expect(b.thigh).toBeGreaterThan(5);  // … and extended behind at toe-off
@@ -401,6 +401,7 @@ describe('natural walk / run + the Stomp walk style (2026-10-03)', () => {
             for (const s of ['L', 'R'] as const) for (let f = 0; f < c.endFrame; f++) { const a = footFK(c, s, f).heel[1], b = footFK(c, s, f + 1).heel[1]; if (b - SOLE < 0.025) m = Math.max(m, a - b); }
             return m;
         };
+        console.log('MAXDROP run', maxDrop(clip('Run')).toFixed(4), 'jog', maxDrop(clip('Jog')).toFixed(4));
         expect(maxDrop(clip('Walk'))).toBeLessThan(0.02);
         expect(maxDrop(clip('Stroll'))).toBeLessThan(0.012);
         expect(maxDrop(clip('Stomp'))).toBeGreaterThan(0.03);                // kept as the heavy tread
@@ -434,5 +435,120 @@ describe('natural walk / run + the Stomp walk style (2026-10-03)', () => {
         expect(applyWalkStyle(slots, 'natural', () => true)).toBe(slots);
         expect(applyWalkStyle(slots, 'stomp', () => false)).toBe(slots);                     // the rig lacks it
         expect(applyWalkStyle({ ...slots, walk: 'My Walk' }, 'stomp', () => true).walk).toBe('My Walk');   // authored walk untouched
+    });
+
+    // ── The SPRING run (2026-10-04 pass 2: "more like Link's run — dynamic, readable, weighty") ──
+    /** World yaw (deg) of a joint's sideways (+X) axis through the chain from the hips. */
+    const yawOf = (c: SkeletonAnimClip, f: number, chain: string[]) => {
+        let q = (sample(c, 'hips', 'rotation', f) ?? [0, 0, 0, 1]) as Q;
+        for (const j of chain) q = qmul(q, (sample(c, j, 'rotation', f) ?? [0, 0, 0, 1]) as Q);
+        const d = rot(q, [1, 0, 0]);
+        return Math.atan2(-d[2], d[0]) * 180 / Math.PI;
+    };
+    const springMetrics = (c: SkeletonAnimClip) => {
+        const n = c.endFrame, F = Array.from({ length: n }, (_, f) => f);
+        const pelvis = F.map((f) => yawOf(c, f, []));
+        const chest = F.map((f) => yawOf(c, f, ['lowerback', 'spine', 'chest']));
+        const head = F.map((f) => yawOf(c, f, ['lowerback', 'spine', 'chest', 'neck', 'head']));
+        const pk = pelvis.reduce((b, v, i) => (Math.abs(v) > Math.abs(pelvis[b]) ? i : b), 0);
+        const elbow = F.map((f) => { const q = sample(c, 'lowerarm_L', 'rotation', f) as Q; return 2 * Math.acos(Math.min(1, Math.abs(q[3]))) * 180 / Math.PI; });
+        const heel = Math.max(...F.map((f) => footFK(c, 'L', f).heel[1] - SOLE));
+        const arms = F.map((f) => armPitch(c, f)), lo = Math.min(...arms), hi = Math.max(...arms), mid = (lo + hi) / 2;
+        const held = arms.filter((a) => Math.abs(a - mid) > 0.8 * (hi - lo) / 2).length / n;
+        return { pelvis: pelvis[pk], chest: chest[pk], headMax: Math.max(...head.map(Math.abs)), pelvisMax: Math.abs(pelvis[pk]), elbowMin: Math.min(...elbow), elbowMax: Math.max(...elbow), heel, held };
+    };
+
+    it('spring run: shoulders counter-rotate the pelvis, the head stays steady, a high heel kick, bent elbows, held extremes', () => {
+        const r = springMetrics(clip('Run')), j = springMetrics(clip('Jog')), w = springMetrics(clip('Walk'));
+        // Counter-rotation: at the pelvis's peak yaw the shoulder line is turned clearly the OTHER way.
+        expect(Math.sign(r.chest), 'shoulders vs pelvis').toBe(-Math.sign(r.pelvis));
+        expect(r.pelvisMax, 'pass 1: 11').toBeGreaterThan(12.5);
+        expect(Math.abs(r.chest), 'pass 1: 9.8').toBeGreaterThan(13);
+        expect(Math.abs(r.chest)).toBeGreaterThan(Math.abs(w.chest) * 2);
+        expect(Math.sign(j.chest)).toBe(-Math.sign(j.pelvis));
+        // The head floats: it turns far less than either the pelvis or the shoulders.
+        expect(r.headMax).toBeLessThan(0.45 * Math.abs(r.chest));
+        // Trailing leg: the heel kicks up toward the butt (the heel well above the ground behind).
+        expect(r.heel, 'heel kick height (pass 1: 0.61)').toBeGreaterThan(0.62);
+        expect(j.heel).toBeLessThan(r.heel);
+        // Arms: elbows bent ~70–90° all cycle.
+        expect(r.elbowMin).toBeGreaterThan(65); expect(r.elbowMax).toBeLessThan(95);
+        // Uneven timing: the arm spends more of the cycle near its extremes than a raw sine (0.41 of it). (≥ since the
+        // run-posture pass: an upright pelvis under a trunk leaning from the lower back measures 11 / 22 frames, was 12.)
+        expect(r.held, 'a raw sine: ~0.45 here').toBeGreaterThanOrEqual(0.5);
+    });
+
+    // ── RUN POSTURE (2026-10-04 pass 3: "goofy, like a cartoon villain — the hips and butt locked in place") ──
+    // The run leaned with an anterior PELVIC TILT (bodyLean 10.5° + tilt) plus a spine lean on top, over a pelvis the
+    // late-swing fit had sunk ~6 cm: the butt stuck out behind the feet and the knees never straightened. A runner runs
+    // TALL: the pelvis near upright, the trunk tipped forward as a line, near-straight at push-off.
+    /** World pitch (deg, + = forward) of a chain's Y axis, and world positions of hips / chest / neck at frame f. */
+    const chainAt = (c: SkeletonAnimClip, f: number) => {
+        const hipsT = (sample(c, 'hips', 'translation', f) ?? JOINTS[0].localPosition) as V3;
+        let q = (sample(c, 'hips', 'rotation', f) ?? [0, 0, 0, 1]) as Q;
+        const up = (qq: Q) => { const d = rot(qq, [0, 1, 0]); return Math.atan2(d[2], d[1]) * 180 / Math.PI; };
+        const pelvisTilt = up(q);
+        let p = hipsT; const pos: Record<string, V3> = { hips: hipsT };
+        for (const j of ['lowerback', 'spine', 'chest', 'neck']) { p = add(p, rot(q, JOINTS[idx(j)].localPosition as V3)); pos[j] = p; q = qmul(q, (sample(c, j, 'rotation', f) ?? [0, 0, 0, 1]) as Q); }
+        const ang = (a: V3, b: V3) => Math.atan2(b[2] - a[2], b[1] - a[1]) * 180 / Math.PI;
+        return { pelvisTilt, trunk: ang(pos.hips, pos.neck), fold: ang(pos.chest, pos.neck) - ang(pos.hips, pos.chest), hipsT, neck: pos.neck };
+    };
+    /** World thigh angle from vertical (deg, + = the knee ahead of the hip). */
+    const thighWorld = (c: SkeletonAnimClip, side: 'L' | 'R', f: number) => {
+        const hipsT = (sample(c, 'hips', 'translation', f) ?? JOINTS[0].localPosition) as V3, hipsR = (sample(c, 'hips', 'rotation', f) ?? [0, 0, 0, 1]) as Q;
+        const hip = add(hipsT, rot(hipsR, JOINTS[idx(`upperleg_${side}`)].localPosition as V3));
+        const kn = add(hip, rot(qmul(hipsR, sample(c, `upperleg_${side}`, 'rotation', f) as Q), JOINTS[idx(`lowerleg_${side}`)].localPosition as V3));
+        return Math.atan2(kn[2] - hip[2], hip[1] - kn[1]) * 180 / Math.PI;
+    };
+
+    it('run posture: an upright pelvis, the trunk leaning as a line, tall at mid-stance, hip extended at toe-off (Run + Jog)', () => {
+        for (const [name, g, trunkLo, trunkHi] of [['Run', LOCOMOTION_GAITS.run, 8, 12], ['Jog', LOCOMOTION_GAITS.jog, 5, 8]] as const) {
+            const c = clip(name), n = c.endFrame, F = Array.from({ length: n }, (_, f) => chainAt(c, f));
+            // Pelvis tilt within a few degrees of rest all cycle (the old run: 8–12° anterior, the Jog 5–8°).
+            for (const x of F) { expect(x.pelvisTilt, `${name} pelvis tilt`).toBeGreaterThan(-2); expect(x.pelvisTilt, `${name} pelvis tilt`).toBeLessThan(4.5); }
+            // The trunk (pelvis → neck line) leans forward in range, as one line: no fold between the pelvis and the chest.
+            const meanTrunk = F.reduce((s, x) => s + x.trunk, 0) / n;
+            expect(meanTrunk, `${name} trunk lean`).toBeGreaterThan(trunkLo); expect(meanTrunk, `${name} trunk lean`).toBeLessThan(trunkHi);
+            for (const x of F) expect(Math.abs(x.fold), `${name} pelvis–chest fold`).toBeLessThan(4);
+            // Tall at mid-stance (the old run: 0.865 of the standing pelvis height), the knee a runner's compliance.
+            const mid = Math.round(g.duty / 2 * n);
+            expect(F[mid].hipsT[1] / 0.9, `${name} mid-stance pelvis height`).toBeGreaterThan(0.905);
+            expect(footFK(c, 'L', mid).knee, `${name} mid-stance knee`).toBeGreaterThan(28);
+            expect(footFK(c, 'L', mid).knee, `${name} mid-stance knee`).toBeLessThan(45);
+            // The push-off: the last stance frame — the hip extended (the thigh behind the vertical), the knee nearly
+            // straight, and the pelvis NOT behind the line from the stance ankle to the neck (no butt-out).
+            const to = Math.floor(g.duty * n);
+            expect(thighWorld(c, 'L', to), `${name} toe-off thigh`).toBeLessThan(name === 'Run' ? -12 : -8);
+            expect(footFK(c, 'L', to).knee, `${name} toe-off knee`).toBeLessThan(28);
+            const a = footFK(c, 'L', to).ankle, nk = F[to].neck, h = F[to].hipsT, t = (h[1] - a[1]) / (nk[1] - a[1]);
+            expect(h[2] - (a[2] + t * (nk[2] - a[2])), `${name} pelvis vs the ankle → neck line at toe-off`).toBeGreaterThan(0);
+        }
+    });
+
+    it('run posture: the hips stay alive — pelvis yaw against the shoulders, a swing-side drop, a ballistic bounce', () => {
+        const c = clip('Run'), n = c.endFrame, g = LOCOMOTION_GAITS.run;
+        // Swing-side drop: the pelvis rolls a few degrees, the RIGHT (swing) hip low at the left's mid-stance.
+        const rollAt = (f: number) => { const d = rot((sample(c, 'hips', 'rotation', f) ?? [0, 0, 0, 1]) as Q, [1, 0, 0]); return Math.atan2(d[1], d[0]) * 180 / Math.PI; };
+        const mid = Math.round(g.duty / 2 * n);
+        expect(rollAt(mid), 'left hip up / right (swing) hip down at left mid-stance').toBeGreaterThan(2);
+        expect(rollAt(Math.round((g.duty / 2 + 0.5) * n)) ).toBeLessThan(-2);
+        // The bounce: lowest at mid-stance, highest mid-flight, and a real range.
+        const ys = Array.from({ length: n }, (_, f) => (sample(c, 'hips', 'translation', f) as number[])[1]);
+        const lo = ys.indexOf(Math.min(...ys)), hi = ys.indexOf(Math.max(...ys));
+        expect(Math.abs(((lo / n) % 0.5) - g.duty / 2)).toBeLessThan(0.07);
+        expect((hi / n) % 0.5).toBeGreaterThan(g.duty);
+        expect(Math.max(...ys) - Math.min(...ys)).toBeGreaterThan(0.05);
+    });
+
+    it('phase remaps: identity at 0, monotonic, the swing remap keeps rate 1 at both ends', () => {
+        for (const x of [0, 0.13, 0.5, 0.77]) { expect(holdWarp(x, 0)).toBe(x); expect(swingWarp(x, 0)).toBe(x); }
+        for (const h of [0.3, 0.6]) {
+            let a = holdWarp(0, h), b = swingWarp(0, h);
+            for (let i = 1; i <= 200; i++) { const x = i / 200; expect(holdWarp(x, h)).toBeGreaterThan(a); expect(swingWarp(x, h)).toBeGreaterThan(b); a = holdWarp(x, h); b = swingWarp(x, h); }
+            expect(swingWarp(1, h)).toBeCloseTo(1, 9);
+            expect((swingWarp(1e-4, h) - swingWarp(0, h)) / 1e-4).toBeCloseTo(1, 3);
+            expect((swingWarp(1, h) - swingWarp(1 - 1e-4, h)) / 1e-4).toBeCloseTo(1, 3);
+            expect(holdWarp(0.5, h)).toBeCloseTo(0.5, 9);
+        }
     });
 });

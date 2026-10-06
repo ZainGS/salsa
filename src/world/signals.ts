@@ -10,7 +10,8 @@ import { METAL_PAINTED } from './palette';
 import { Accum3D, partOf } from './meshbuild';
 import { twinAccum, withFarTwin, PROP_TWIN_M } from './lod-accum';
 import { regionAt } from './layout';
-import { cellLevelAt } from './elevation';
+import { cellLevelAt, makeElevation } from './elevation';
+import { makeDomainWarpInto } from './warp';
 import { inShotengai } from './shotengai';
 import { signQuad, type TextSignSpec } from './signtext';
 import { hash2, pointInPolygon } from './util';
@@ -77,10 +78,17 @@ export function buildTrafficLights(graph: WorldGraph, keep?: ((region: number) =
     const border = graph.border;
     const overWater = (x: number, z: number): boolean =>
         cellLevelAt(graph, x, z) < 0 || (border.length >= 3 && !pointInPolygon([x, z], border));   // canal OR past the diorama border (open sea)
+    // RIGID SIGNALS: every head / STOP sign bakes ONE elevation AND one domain-warp offset, both sampled at its pole
+    // foot, and its layers are drape 'baked' + noWarp. The per-vertex 'full' drape lifted each vertex by the kerb under
+    // IT — a STOP plate straddles the kerb line (side = half + 0.02 s, r 0.032 s), so the rim / face / back plate came
+    // out lopsided (the 8 rim radii spread by ~60 % of the radius) and a mast arm kinked where it crossed the kerb; the
+    // per-vertex warp then sheared what was left by ~5 %. Same warp as the drape env (centre: graph.params; a framed
+    // tile: its params carry the world warpSeed). computeSignalTextSigns places the plates with the same rigid frame.
+    const lift = makeElevation(graph), rigid = rigidFrame(graph);
 
     // P9: the housings / poles / visors also build a cheap FAR TWIN (lod-accum.ts); the lamp lenses stay as they are.
     const um = 1 / cityMetresPerUnit(p.radius);
-    const dark = twinAccum(PROP_TWIN_M.signal, um, p.propTwins), stopRed = new Accum3D();
+    const dark = twinAccum(PROP_TWIN_M.signal, um, p.propTwins), stopRed = new Accum3D(), stopRim = new Accum3D();
     // One accumulator per (lamp, bucket, axis) — the phase clock toggles each as a unit.
     const lamps = new Map<string, Accum3D>();
     const lampAcc = (lamp: SignalLamp, bucket: number, axis: 0 | 1): Accum3D => {
@@ -96,8 +104,11 @@ export function buildTrafficLights(graph: WorldGraph, keep?: ((region: number) =
         if (it.type === 'tee') {
             const stem = teeStem(it.arms);
             // guard the actual stop-sign foot (offset onto the curb) — skip if that lands in a canal
-            if (overWater(it.pos[0] + stem[0] * (half + 0.05 * s) - stem[1] * (half + 0.02 * s), it.pos[1] + stem[1] * (half + 0.05 * s) + stem[0] * (half + 0.02 * s))) continue;
-            partOf([dark, stopRed], [it.pos[0], gy, it.pos[1]], stem, () => addStopSign(dark, stopRed, it.pos, stem, half, gy, s)); continue;   // P20: one prop part
+            const sf = stopFoot(it.pos, stem, half, s);
+            if (overWater(sf[0], sf[1])) continue;
+            const sy = gy + lift(sf[0], sf[1]);   // the whole sign at its foot's elevation (rigid)
+            const wp = rigid(it.pos, sf);         // … and shifted by the warp at its foot (rigid)
+            partOf([dark, stopRed, stopRim], [wp[0], sy, wp[1]], stem, () => addStopSign(dark, stopRed, stopRim, wp, stem, half, sy, s)); continue;   // P20: one prop part
         }
         if (it.type !== 'cross') continue;   // full 3-lamp signals only at 4-way crosses; corners get nothing
         const a0 = nrm2(it.arms[0]), bucket = signalBucket(it.pos, p.seed);
@@ -117,7 +128,9 @@ export function buildTrafficLights(graph: WorldGraph, keep?: ((region: number) =
             const poleH = 0.34 * s, r = 0.008 * s, cOff = half + 0.03 * s, armLen = half * 1.7 + 0.05 * s;
             const foot: V3 = [it.pos[0] + (pW[0] - dW[0]) * cOff, gy, it.pos[1] + (pW[2] - dW[2]) * cOff];
             if (overWater(foot[0], foot[2])) continue;   // corner pole in the canal → skip this head
-            const top: V3 = [foot[0], gy + poleH, foot[2]];
+            foot[1] = gy + lift(foot[0], foot[2]);       // rigid head: one elevation + one warp offset at the pole foot (see `lift`)
+            const fw = rigid(foot[0], foot[2]); foot[0] = fw[0]; foot[2] = fw[1];
+            const top: V3 = [foot[0], foot[1] + poleH, foot[2]];
             const armEnd: V3 = [top[0] - pW[0] * armLen, top[1] - 0.01 * s, top[2] - pW[2] * armLen];
             // P20: the head's pieces are prop parts — one per piece, because the full-tier drape lifts what stands on the
             // pavement by the kerb and not what hangs over the road (so the pole, the arm, the brace and the housing each
@@ -172,7 +185,7 @@ export function buildTrafficLights(graph: WorldGraph, keep?: ((region: number) =
     // A traffic-light column and its hoods are painted metal — the one prop a pedestrian stands right
     // next to, so a flat matte silhouette here is very visible. Keeps its own DARK tone as the tint.
     if (!dark.empty) {
-        out.push(...withFarTwin({ name: 'world:signal-housing', color: DARK, y: gy, geometry: dark.geometry(),
+        out.push(...withFarTwin({ name: 'world:signal-housing', color: DARK, y: gy, geometry: dark.geometry(), drape: 'baked', noWarp: true,
             metal: { ...METAL_PAINTED, tint: DARK, scale: metalScaleFor(p.radius) } }, dark, 'signal', PROP_TWIN_M.signal, um));
     }
     // Lamps baked in their t = 0 state (the static city shows a believable mix; the live ticker takes over).
@@ -180,10 +193,13 @@ export function buildTrafficLights(graph: WorldGraph, keep?: ((region: number) =
         if (a.empty) continue;
         const m = /^(red|yellow|green)-(\d)([ab])$/.exec(k)!;
         const lamp = m[1] as SignalLamp, st = signalState(0, Number(m[2]), m[3] === 'b' ? 1 : 0);
-        out.push({ name: `world:signal-${k}`, color: st.lamp === lamp ? SIGNAL_ON[lamp] : SIGNAL_OFF[lamp], y: gy, geometry: a.geometry(), emissive: glow });
+        out.push({ name: `world:signal-${k}`, color: st.lamp === lamp ? SIGNAL_ON[lamp] : SIGNAL_OFF[lamp], y: gy, geometry: a.geometry(), emissive: glow, drape: 'baked', noWarp: true });
     }
-    // The STOP octagons keep the red glow name (night-glow regex) but are NOT phase lamps.
-    if (!stopRed.empty) out.push({ name: 'world:signal-red-stop', color: RED, y: gy, geometry: stopRed.geometry(), emissive: glow });
+    // The STOP octagons keep their layer name (the street-props grammar test) but are NOT lamps: a painted, retro-
+    // reflective plate lit by the scene (WorldManager.GLOW's 'signal-red-stop' row comes BEFORE the lamp row — the
+    // lamp row's 0.55 day self-light made the plate read flat and unlit). Same low emissive here for headless builds.
+    if (!stopRed.empty) out.push({ name: 'world:signal-red-stop', color: RED, y: gy, geometry: stopRed.geometry(), emissive: STOP_PLATE_GLOW, drape: 'baked', noWarp: true });
+    if (!stopRim.empty) out.push({ name: 'world:signal-stop-rim', color: STOP_RIM, y: gy, geometry: stopRim.geometry(), emissive: STOP_PLATE_GLOW, drape: 'baked', noWarp: true });
     return out;
 }
 
@@ -272,19 +288,43 @@ function teeStem(arms: V2[]): V2 {
 /** A red STOP octagon on a short pole at the stem approach of a T, facing the (must-stop) oncoming stem traffic.
  *  `half` = the real asphalt half-gap → the sign sits at the curb, not pushed out into the next cell. */
 const STOP_POLE_H = 0.17;   // pole height (× s) — shared by addStopSign + computeSignalTextSigns so the plate + octagon line up
-function addStopSign(dark: Accum3D, red: Accum3D, pos: V2, stem: V2, half: number, gy: number, s: number): void {
+/** How far in front of the pole (along the stem, × s) the STOP lettering quad is centred (the octagon is at 0.0105). */
+export const STOP_TEXT_AHEAD = 0.0135;
+const STOP_RIM: [number, number, number] = [0.93, 0.92, 0.88];   // the white border round the red face
+const STOP_PLATE_GLOW = 0.08;   // retro-reflective paint, not a light
+/** The STOP octagon is FLAT-TOPPED: an 8-gon ring turned by π/8 (unturned, a vertex sat at the top and the side). */
+const OCT_ROT = Math.PI / 8;
+/** RIGID placement under the domain warp: `fn(p, at)` = p shifted by the warp displacement sampled at `at` (default p).
+ *  The layers that use it are noWarp, so the prop lands exactly where the per-vertex warp puts its foot, unsheared. */
+function rigidFrame(graph: WorldGraph): { (p: V2, at?: V2): V2; (x: number, z: number): V2 } {
+    const warp = makeDomainWarpInto(graph.params), w: [number, number] = [0, 0];
+    return ((a: V2 | number, b?: V2 | number): V2 => {
+        const p: V2 = typeof a === 'number' ? [a, b as number] : a, at = typeof a === 'number' ? p : (b as V2 | undefined) ?? a;
+        warp(at[0], at[1], w);
+        return [p[0] + w[0], p[1] + w[1]];
+    }) as { (p: V2, at?: V2): V2; (x: number, z: number): V2 };
+}
+/** XZ of a T-junction STOP sign's pole foot — ONE definition for addStopSign, its elevation sample and the lettering. */
+function stopFoot(pos: V2, stem: V2, half: number, s: number): V2 {
+    const along = half + 0.05 * s, side = half + 0.02 * s;
+    return [pos[0] + stem[0] * along - stem[1] * side, pos[1] + stem[1] * along + stem[0] * side];
+}
+/** `gy` = the elevation baked at the foot (the layers are drape 'baked'). */
+function addStopSign(dark: Accum3D, red: Accum3D, rim: Accum3D, pos: V2, stem: V2, half: number, gy: number, s: number): void {
     const d: V3 = [stem[0], 0, stem[1]], pW: V3 = [-stem[1], 0, stem[0]];
-    const along = half + 0.05 * s, side = half + 0.02 * s, poleH = STOP_POLE_H * s, r = 0.007 * s;
-    const foot: V3 = [pos[0] + d[0] * along + pW[0] * side, gy, pos[1] + d[2] * along + pW[2] * side];
+    const poleH = STOP_POLE_H * s, r = 0.007 * s;
+    const f2 = stopFoot(pos, stem, half, s), foot: V3 = [f2[0], gy, f2[1]];
     signPost(dark, foot, poleH, r);   // bevelled pole (collar, taper, domed cap)
     // Octagon CENTRED on the pole top (so the pole backs its lower half instead of the sign balancing on a point),
     // nudged just in front along the stem so its face doesn't z-fight the pole.
     const c: V3 = [foot[0] + d[0] * 0.0105 * s, foot[1] + poleH, foot[2] + d[2] * 0.0105 * s];   // clear of the pole's top band
-    red.disc(c, d, 0.032 * s, 8);   // an 8-gon reads as the STOP octagon (STOP text quad added in computeSignalTextSigns)
+    // White border octagon + the red face just in front of it (the STOP text quad is added in computeSignalTextSigns).
+    rim.disc(c, d, 0.032 * s, 8, OCT_ROT);
+    red.disc([c[0] + d[0] * 0.0005 * s, c[1], c[2] + d[2] * 0.0005 * s], d, 0.0285 * s, 8, OCT_ROT);
     // T3.3: a slightly larger dark BACK PLATE (reads as the plate's rim from the front and its back from behind), a
     // vertical back rail, and two clamp straps round the pole.
     const back: V3 = [foot[0] + d[0] * 0.0087 * s, foot[1] + poleH, foot[2] + d[2] * 0.0087 * s];
-    dark.lathe(back, d, [[0.0345 * s, -0.0007 * s], [0.0345 * s, 0.0008 * s]], 8, { caps: [true, true] });
+    dark.lathe(back, d, [[0.0345 * s, -0.0007 * s], [0.0345 * s, 0.0008 * s]], 8, { caps: [true, true], rot: OCT_ROT });
     const up: V3 = [0, 1, 0];
     dark.obox([foot[0] + d[0] * 0.0075 * s, foot[1] + poleH, foot[2] + d[2] * 0.0075 * s], pW, up, d, 0.004 * s, 0.026 * s, 0.0008 * s);
     for (const dy of [-0.016, 0.016]) dark.obox([foot[0], foot[1] + poleH + dy * s, foot[2]], pW, up, d, r * 1.02, 0.0022 * s, r * 1.02);
@@ -316,18 +356,24 @@ export function computeSignalTextSigns(graph: WorldGraph, keep?: ((region: numbe
     const overWater = (x: number, z: number): boolean =>
         cellLevelAt(graph, x, z) < 0 || (border.length >= 3 && !pointInPolygon([x, z], border));   // canal OR past the diorama border (open sea)
     const out: TextSignSpec[] = [];
+    // The plates bake the SAME foot elevation + warp offset as their (rigid: drape 'baked', noWarp) signal / STOP sign —
+    // see buildTrafficLights. Built lazily: a city without signals never pays for the pavement index.
+    let liftFn: ((x: number, z: number) => number) | null = null;
+    const lift = (x: number, z: number): number => (liftFn ??= makeElevation(graph))(x, z);
+    const rigid = rigidFrame(graph);
     let idx = 0;
     for (const it of graph.intersections) {
         if (keep && !keep(regionAt(graph, it.pos[0], it.pos[1]) ?? -1)) continue;
         if (overWater(it.pos[0], it.pos[1]) || inShotengai(graph, it.pos[0], it.pos[1])) continue;
         if (it.type === 'tee') {
             const stem = teeStem(it.arms);
-            const along = half + 0.05 * s, side = half + 0.02 * s, poleH = STOP_POLE_H * s;
-            const fx = it.pos[0] + stem[0] * along - stem[1] * side, fz = it.pos[1] + stem[1] * along + stem[0] * side;
+            const poleH = STOP_POLE_H * s;
+            const [fx, fz] = stopFoot(it.pos, stem, half, s);
             if (overWater(fx, fz)) continue;
+            const fy = gy + lift(fx, fz), [wx, wz] = rigid(fx, fz);
             // Centred on the pole top like the octagon, nudged a hair further in front so the lettering sits ON the plate.
-            const c: V3 = [fx + stem[0] * 0.0135 * s, gy + poleH, fz + stem[1] * 0.0135 * s];
-            out.push({ label: 'STOP', square: true, layer: { name: 'world:signaltext-stop' + idx, color: RED, y: gy, emissive: 0.55, singleSided: true,
+            const c: V3 = [wx + stem[0] * STOP_TEXT_AHEAD * s, fy + poleH, wz + stem[1] * STOP_TEXT_AHEAD * s];
+            out.push({ label: 'STOP', square: true, layer: { name: 'world:signaltext-stop' + idx, color: RED, y: gy, emissive: 0.55, singleSided: true, drape: 'baked', noWarp: true,
                 geometry: signQuad(c, [-stem[1], stem[0]], [stem[0], stem[1]], 0.02 * s, 0.02 * s) } });
             idx++; continue;
         }
@@ -339,8 +385,9 @@ export function computeSignalTextSigns(graph: WorldGraph, keep?: ((region: numbe
         if (overWater(fx, fz)) continue;
         // Centre the plate ON the mast arm (was +0.03·s ABOVE it → a 0.45 m gap that read as "floating"). The arm
         // beam now runs through the plate's middle so it reads as bolted to the cantilever.
-        const c: V3 = [fx - pW[0] * armLen * 0.42, gy + poleH, fz - pW[1] * armLen * 0.42];
-        out.push({ label: signalStreetName(graph, it.pos[0], it.pos[1], d), layer: { name: 'world:signaltext-name' + idx, color: SIGN, y: gy, emissive: 0.5, singleSided: true,
+        const [wx, wz] = rigid(fx, fz);
+        const c: V3 = [wx - pW[0] * armLen * 0.42, gy + lift(fx, fz) + poleH, wz - pW[1] * armLen * 0.42];
+        out.push({ label: signalStreetName(graph, it.pos[0], it.pos[1], d), layer: { name: 'world:signaltext-name' + idx, color: SIGN, y: gy, emissive: 0.5, singleSided: true, drape: 'baked', noWarp: true,
             geometry: signQuad(c, pW, d, 0.05 * s, 0.02 * s) } });
         idx++;
     }

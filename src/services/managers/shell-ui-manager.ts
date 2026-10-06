@@ -37,6 +37,9 @@ import { unzipSync, strFromU8 } from 'fflate';
 import {
   computeShellLayout,
   computeProjectGrid,
+  layoutShellChips,
+  projectCardTitleFontPx,
+  projectCardTitleH,
   hitTestTiles,
   hitTestProjectGrid,
   hitTestProjectGridClose,
@@ -50,6 +53,8 @@ import {
   type ViewerSpec,
 } from '../../renderer/shell/shell-layout';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
+import { syncShellCanvasBacking, shellBackingRatio } from '../../renderer/shell/shell-backing';
+import { DESKTOP_CAPS } from '../../renderer/core/gpu-capabilities';
 
 /** Synthetic tile id for the trailing "＋ Install cart" slot in shell mode. */
 export const SHELL_ADD_CART_ID = '__add_cart__';
@@ -261,6 +266,12 @@ export class ShellUIManager {
   private boundDblClick?: (e: MouseEvent) => void;
   private boundKeyDown?: (e: KeyboardEvent) => void;
   private boundWheel?: (e: WheelEvent) => void;
+  private boundPointerDown?: (e: PointerEvent) => void;
+  private boundPointerUp?: (e: PointerEvent) => void;
+  /** Illustrations grid drag-to-scroll (touch / pen / mouse): the active pointer, its start Y + the scroll at
+   *  start (device px), and whether it passed the drag threshold (a drag swallows the following click). */
+  private gridDrag: { pointerId: number; startY: number; startScroll: number; dragging: boolean } | null = null;
+  private suppressNextClick = false;
   /** Current grid page and zoom (tile-size multiplier). */
   private currentPage = 0;
   private zoom = 0.85;   // default sits a touch zoomed-out
@@ -1233,18 +1244,37 @@ export class ShellUIManager {
   }
 
   /** Illustrations mode: build the curved thumbnail grid (one card per project)
-   *  plus the floating Back / New Project chips, and clamp the scroll. */
+   *  plus the floating Back / New Project chips, and clamp the scroll.
+   *  Cards are a FIXED size (CSS px × DPR, mobile-parity UI-14); chips are sized
+   *  from their measured labels so they never clip. */
   private buildProjectGrid(model: ShellRenderModel): void {
     const c = this.sceneCanvas;
     if (!c) return;
     const W = c.width, H = c.height;
+    // Device px per CSS px of the canvas AS BACKED (CSS size × the capped DPR — UI-16), not window.devicePixelRatio.
+    const dpr = shellBackingRatio(c, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+    const meas = this.measureCtx();
+    const measureIn = (family: string) => (text: string, fontPx: number) => {
+      meas.font = `400 ${fontPx}px ${family}`;
+      return meas.measureText(text).width;
+    };
+
+    // Floating chrome chips first: the grid starts below them (they may wrap on a narrow screen).
+    const pkg = this.dashboardKind === 'packaging';
+    const chipDefs: [string, string][] = [
+      [SHELL_BACK_ID, '‹ Back'],
+      [SHELL_NEW_PROJECT_ID, pkg ? '+ New Product Packaging' : '+ New Project'],
+    ];
+    const chips = layoutShellChips(chipDefs.map(cd => cd[1]), measureIn(FONT_FAMILY), W, H, dpr);
+
     const projects = this.getProjects();
     const ids = projects.map(p => p.id);
+    const top = chips.bottom + 16 * dpr;
     // Clamp scroll to the content height (probe with zero offset first).
-    const probe = computeProjectGrid(W, H, ids, 0);
+    const probe = computeProjectGrid(W, H, ids, 0, dpr, top);
     const maxScroll = Math.max(0, probe.contentHeight - H);
     this.gridScrollY = Math.max(0, Math.min(this.gridScrollY, maxScroll));
-    const grid = computeProjectGrid(W, H, ids, this.gridScrollY);
+    const grid = computeProjectGrid(W, H, ids, this.gridScrollY, dpr, top);
     model.projectGrid = grid.items.map(it => ({
       ...it, hover: this.view.hoveredSlotId === it.id ? 1 : 0,
     }));
@@ -1252,7 +1282,8 @@ export class ShellUIManager {
 
     // Per-card window title: the project name in the green title bar. Only the
     // on-screen cards (label positions/sizes must match the GRID_SHADER chrome:
-    // titleH = h*0.10, bevel t = h*0.045). Light text on the green bar.
+    // titleH = projectCardTitleH, bevel b). Light text on the green bar.
+    const measureTitle = measureIn(TITLEBAR_FONT);
     for (let i = 0; i < grid.items.length; i++) {
       const it = grid.items[i];
       const name = projects[i]?.name;
@@ -1260,11 +1291,12 @@ export class ShellUIManager {
       if (!name || gy + gh < 0 || gy > H) continue;   // skip off-screen
       // Geometry must match the GRID_SHADER title bar (b, titleH, close button).
       const b = Math.min(2.5, Math.max(1.5, Math.min(gw, gh) * 0.012));
-      const titleH = Math.max(9, gh * 0.10);
-      const fontPx = Math.max(9, Math.round(titleH * 0.68));
+      const titleH = projectCardTitleH(it);
       const leftPad = 2 * b + gw * 0.025;
       const xReserve = titleH * 0.70 + 4 * b;         // close button slot
       const availW = Math.max(8, gw - leftPad - xReserve);
+      // 12–16 CSS px; shrinks toward 12 px before the atlas falls back to an ellipsis.
+      const fontPx = projectCardTitleFontPx(name, availW, titleH, dpr, measureTitle);
       model.labels.push({
         id: it.id,
         text: name,
@@ -1277,28 +1309,21 @@ export class ShellUIManager {
       });
     }
 
-    // Floating chrome chips: plain tiles + labels, hit-tested as tiles
-    // (handleClick routes Back / New Project).
+    // Chips: plain tiles + labels, hit-tested as tiles (handleClick routes Back / New Project).
     const theme = this.activeTheme;
-    const fontPx = Math.max(12, Math.round(H * 0.020));
-    const chipH = fontPx * 2.1;
-    const y = H * 0.05;
-    const x0 = W * 0.03;   // align the button's left edge with the grid's sideMargin
-    const chip = (id: string, text: string, x: number, wpx: number) => {
+    chipDefs.forEach(([id, text], i) => {
+      const [x, y, w, h] = chips.rects[i];
       model.tiles.push({
-        id, kind: 'empty', rect: [x, y, wpx, chipH],
+        id, kind: 'empty', rect: [x, y, w, h],
         fill: theme.systemFill, cornerRadius: 0,   // sharp Win9x button
         selected: false, hovered: this.view.hoveredSlotId === id,
       });
       model.labels.push({
-        id, text, centerX: x + wpx / 2, topY: y + chipH * 0.30,
-        maxWidthPx: wpx * 1.4, fontPx, color: [0.13, 0.13, 0.15, 1],   // dark text on the grey button
+        id, text, centerX: x + w / 2,
+        topY: y + Math.max(0, (h - 1.4 * chips.fontPx) / 2),   // atlas cell = 1.4·fontPx tall → centred
+        maxWidthPx: w, fontPx: chips.fontPx, color: [0.13, 0.13, 0.15, 1],   // dark text on the grey button
       });
-    };
-    const pkg = this.dashboardKind === 'packaging';
-    const backW = W * 0.085, npW = W * (pkg ? 0.205 : 0.140);
-    chip(SHELL_BACK_ID, '‹ Back', x0, backW);
-    chip(SHELL_NEW_PROJECT_ID, pkg ? '+ New Product Packaging' : '+ New Project', x0 + backW + W * 0.014, npW);
+    });
   }
 
   /** Change page (clamped) and redraw. */
@@ -1492,18 +1517,14 @@ export class ShellUIManager {
     }
   }
 
-  /** Ensure the canvas backing store matches its CSS size × DPR. The main
-   *  renderer normally owns this, but it is paused while the shell is up. */
+  /** Ensure the canvas backing store matches its CSS size × DPR under the device caps (mobile-parity UI-16: the
+   *  editor's rule — mobile DPR ≤ 1.5 / ≤ ~2.5 MP, desktop uncapped). The main renderer normally owns this, but it
+   *  is suspended while the shell is up (and skips sizing then), so the two never fight over canvas.width. */
   private syncCanvasBackingStore(): void {
     const c = this.sceneCanvas;
     if (!c) return;
     const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
-    const w = Math.max(1, Math.round(c.clientWidth * dpr));
-    const h = Math.max(1, Math.round(c.clientHeight * dpr));
-    if (c.clientWidth > 0 && (c.width !== w || c.height !== h)) {
-      c.width = w;
-      c.height = h;
-    }
+    syncShellCanvasBacking(c, dpr, this.ctx.webgpuRenderer?.getGpuCaps?.() ?? DESKTOP_CAPS);
   }
 
   // ── Interaction ──────────────────────────────────────────────────────
@@ -1520,14 +1541,47 @@ export class ShellUIManager {
   }
 
   private attachInteraction(canvas: HTMLCanvasElement): void {
+    // Illustrations grid: drag (touch / pen / mouse) scrolls vertically — the only way to scroll on a tablet
+    // (#shellCanvas is touch-action:none and has no wheel there). Past an 8 CSS-px threshold it's a drag, and
+    // the click the browser fires on release is swallowed so a scroll doesn't open a card.
+    this.boundPointerDown = (e) => {
+      if (this.view.mode !== 'illustrations' || (e.pointerType === 'mouse' && e.button !== 0)) return;
+      const [, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
+      this.gridDrag = { pointerId: e.pointerId, startY: py, startScroll: this.gridScrollY, dragging: false };
+      this.suppressNextClick = false;
+    };
+    this.boundPointerUp = (e) => {
+      const d = this.gridDrag;
+      if (!d || d.pointerId !== e.pointerId) return;
+      this.gridDrag = null;
+      if (d.dragging) {
+        this.suppressNextClick = e.type === 'pointerup';
+        try { canvas.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
+      }
+    };
     this.boundPointerMove = (e) => {
       const [px, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
+      const drag = this.gridDrag;
+      if (drag && drag.pointerId === e.pointerId && this.view.mode === 'illustrations') {
+        const dy = py - drag.startY;
+        const cssPx = canvas.clientHeight > 0 ? canvas.height / canvas.clientHeight : 1;
+        if (!drag.dragging && Math.abs(dy) > 8 * cssPx) {
+          drag.dragging = true;
+          try { canvas.setPointerCapture(e.pointerId); } catch { /* best-effort */ }
+        }
+        if (drag.dragging) {
+          this.gridScrollY = drag.startScroll - dy;
+          this.rebuildAndRender();   // clamps gridScrollY inside buildProjectGrid
+          return;
+        }
+      }
       this.handleHover(this.hitTest(px, py));
       // Feed normalized pointer (-1..1 from center) to the renderer for parallax.
       const w = canvas.width || 1, h = canvas.height || 1;
       this.renderer?.setPointer((px / w) * 2 - 1, (py / h) * 2 - 1);
     };
     this.boundClick = (e) => {
+      if (this.suppressNextClick) { this.suppressNextClick = false; return; }   // end of a grid drag-scroll
       const [px, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
       // Panel titlebar zoom −/+ buttons (same factor as Ctrl+wheel).
       for (const zb of this.zoomButtons) {
@@ -1562,8 +1616,7 @@ export class ShellUIManager {
       e.preventDefault();
       // Illustrations grid: plain wheel scrolls the grid vertically.
       if (this.view.mode === 'illustrations') {
-        const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
-        this.gridScrollY += (e.deltaY || 0) * dpr;
+        this.gridScrollY += (e.deltaY || 0) * shellBackingRatio(canvas);   // CSS px → canvas device px (as backed)
         this.rebuildAndRender();   // clamps gridScrollY inside buildProjectGrid
         return;
       }
@@ -1576,6 +1629,9 @@ export class ShellUIManager {
       }
     };
     addZonelessListener(canvas, 'pointermove', this.boundPointerMove);
+    addZonelessListener(canvas, 'pointerdown', this.boundPointerDown);
+    addZonelessListener(canvas, 'pointerup', this.boundPointerUp);
+    addZonelessListener(canvas, 'pointercancel', this.boundPointerUp);
     canvas.addEventListener('click', this.boundClick);
     canvas.addEventListener('dblclick', this.boundDblClick);
     addZonelessListener(canvas, 'wheel', this.boundWheel, { passive: false });
@@ -1589,6 +1645,11 @@ export class ShellUIManager {
     const c = this.sceneCanvas;
     if (c) {
       if (this.boundPointerMove) removeZonelessListener(c, 'pointermove', this.boundPointerMove);
+      if (this.boundPointerDown) removeZonelessListener(c, 'pointerdown', this.boundPointerDown);
+      if (this.boundPointerUp) {
+        removeZonelessListener(c, 'pointerup', this.boundPointerUp);
+        removeZonelessListener(c, 'pointercancel', this.boundPointerUp);
+      }
       if (this.boundClick) c.removeEventListener('click', this.boundClick);
       if (this.boundDblClick) c.removeEventListener('dblclick', this.boundDblClick);
       if (this.boundWheel) removeZonelessListener(c, 'wheel', this.boundWheel);
@@ -1598,7 +1659,10 @@ export class ShellUIManager {
     this.transitionActive = false;
     this.resizeObserver?.disconnect();
     this.resizeObserver = undefined;
-    this.boundPointerMove = this.boundClick = this.boundDblClick = undefined;
+    this.boundPointerMove = this.boundPointerDown = this.boundPointerUp = undefined;
+    this.boundClick = this.boundDblClick = undefined;
+    this.gridDrag = null;
+    this.suppressNextClick = false;
     this.boundKeyDown = undefined;
     this.boundWheel = undefined;
   }

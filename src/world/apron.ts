@@ -9,12 +9,9 @@
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { cityMetresPerUnit } from './types';
 import { makeRng, pointInPolygon, hash2, valueNoise2D } from './util';
-import { Accum3D } from './meshbuild';
-import { addRock } from './biome';
+import { rockCluster, rockLayers, type RockPlacement } from './rocks';
 import { buildCityFoliage, type TreePlacement } from './city-foliage';
 import { groundTess, emitGround } from './ground-mesh';
-
-const ROCK_COLOR: [number, number, number] = [0.55, 0.55, 0.58];
 
 /** Grass / earth shades as a GRADIENT (deep forest floor → meadow → dry grass → dirt). Neighbouring cells take
  *  neighbouring shades (they're quantised from a SMOOTH noise), so the ground grades from one to the next in
@@ -66,7 +63,7 @@ export function buildApron(graph: WorldGraph): LayoutPreviewLayer[] {
     // ★ E8: the trees are the REAL instanced city trees (city-foliage.ts — branch-generated, carded, wind), not the
     //   legacy cones + octahedra, so the forest outside the border matches the trees inside it.
     const trees: TreePlacement[] = [];
-    const rock = new Accum3D();
+    const rocks: RockPlacement[] = [];
     const clumpSize = R * 0.6, step = R * 0.1;
     const nT = Math.ceil(apronR / step);
     for (let ix = -nT; ix <= nT; ix++) {
@@ -87,7 +84,9 @@ export function buildApron(graph: WorldGraph): LayoutPreviewLayer[] {
                 const kind = inForest ? (k < 0.55 ? 'conifer' : 'broadleaf') : (k < 0.8 ? 'broadleaf' : 'bush');
                 trees.push({ pos: [x, z], y: gy, kind, scale: inForest ? 1.05 : 0.9 });
             } else if (hash2(ix * 5 + 1, iz * 11 + 2, (p.seed ^ 0x3d5c) >>> 0) < 0.02 * edgeFade) {
-                addRock(rock, [x, gy, z], makeRng((p.seed ^ (ix * 91 + iz * 7)) >>> 0), R / 10);
+                // A rock CLUSTER (rocks.ts), not a lone octahedron: one big field stone + a few small ones.
+                rockCluster(rocks, x, z, gy, makeRng((p.seed ^ (ix * 91 + iz * 7)) >>> 0), 1 / mpu,
+                    (qx, qz) => !inCity(qx, qz) && Math.hypot(qx, qz) < apronR, { bigMin: 0.9, bigMax: 2.4 });
             }
         }
     }
@@ -106,6 +105,6 @@ export function buildApron(graph: WorldGraph): LayoutPreviewLayer[] {
     for (const L of buildCityFoliage(trees, mpu, p.seed, { leafColor: p.leafColor, leafColorVar: p.leafColorVar })) {
         layers.push({ ...L, excludeFromFrame: true });
     }
-    if (!rock.empty) layers.push({ name: 'world:apron-rocks', color: ROCK_COLOR, y: gy, geometry: rock.geometry(), excludeFromFrame: true });
+    layers.push(...rockLayers(rocks, mpu, 'world:apron-rocks', { excludeFromFrame: true }));
     return layers;
 }

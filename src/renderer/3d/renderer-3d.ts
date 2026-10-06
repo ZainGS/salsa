@@ -16,6 +16,7 @@
 
 import { planSpanCompaction, planPoolShrink } from './geom-compaction';
 import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle } from '../core/gpu-pipeline-cache';
+import { gpuCrumb, gpuCrumbBegin, gpuCrumbEnd } from '../core/gpu-diagnostics';
 import { packDualQuatSkin } from './dual-quat-skin';
 import { mat4, vec3 } from 'gl-matrix';
 import { reflectionMatrix, clipPlaneFor, reflectorPlane, planeTimesMat, obliqueProjectionZO } from './planar-reflection';
@@ -758,7 +759,7 @@ export class Renderer3D {
   private _skinnedFlags = new Uint8Array(64);
   private readonly _skCuller = new FrustumCuller();
   /** meshId → bind-space radii + the last world box (cached per pose / model version). */
-  private readonly _skCull = new Map<string, { cr: SkinnedCullRadii; skelId: string; verts: unknown; ji: unknown; jw: unknown;
+  private readonly _skCull = new Map<string, { cr: SkinnedCullRadii; skelId: string; verts: unknown; ji: unknown; jw: unknown; bv: number;
     poseVer: number; matVer: number; viaSkel: boolean; ok: boolean; box: Float64Array; flags: number }>();
   /** skeletonId → joint bind positions + this pose's joint spheres (shared by every part on the skeleton). */
   private readonly _skSpheres = new Map<string, { bindPos: Float32Array; poseVer: number; spheres: Float32Array }>();
@@ -852,6 +853,14 @@ export class Renderer3D {
    *  indirect draw, culled ones included, which costs GPU front-end time on D3D12).
    *  false = the CPU path exactly (nothing of the GPU scene runs). Also off when the device cannot build the scene. */
   static gpuDriven = true;
+  /** PER-MACHINE CAPS (gpu-capabilities.ts, mobile-parity CRASH-8): what this device may run, applied by WebGPURenderer
+   *  at start-up and on every device recovery. They clamp the switches at render time and never change a document
+   *  setting or a stored preference (the getters that feed the save keep returning the authored values). */
+  static readonly caps = { gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true };
+  /** The GPU-driven path is on (the switch AND the device cap). */
+  static get gpuDrivenActive(): boolean { return Renderer3D.gpuDriven && Renderer3D.caps.gpuDriven; }
+  /** P21 shader variants are on (the switch AND the device cap). */
+  static get shaderVariantsActive(): boolean { return Renderer3D.shaderVariants && Renderer3D.caps.shaderVariants; }
   /** LEAN: on a frame where no prepass / overlay reads the CPU's camera lists (outlines, SSAO / SSR, a planar mirror,
    *  hover / per-object outlines, the CPU occlusion cull, a verification), the draw-list loop skips the camera-pass
    *  tail (frustum, ranges, pushes) of GPU-culled records. false = the CPU still builds every list (A/B). */
@@ -873,6 +882,8 @@ export class Renderer3D {
   private _gdMergeOk = false;
   /** The GPU scene could not be created on this device (no compute / indirect support): the CPU path, for good. */
   private _gdFailed = false;
+  /** CRASH-10 breadcrumbs: this renderer submitted its first GPU-driven cull dispatch. */
+  private _gdDispatched = false;
   // GPU CULLING MODE (gpu-cull-auto.ts): 'on' / 'off' / 'auto' (default; a per-machine localStorage preference).
   // In 'auto' the controller picks the path each frame from measured CPU / GPU ms. While it picks the CPU path the GPU
   // scene stays WARM: the loop still stamps and re-checks the records and finish() keeps them, the order and the
@@ -930,7 +941,7 @@ export class Renderer3D {
         if (r._vertexBufferOverrides.has(m.id)) c |= VO;
         else if (r._geomAllocs.get(m.id)?.pk) c |= GD_CODE_PACKED;   // P22: the packed twin + uint16 indices
         // step 8: the shader-variant id (bits 5+), from the material (this runs before the frame's slot writes)
-        if (Renderer3D.shaderVariants && m.submeshes.length === 0) c |= r._svIds.idOf(variantKeyOfMaterial(mat)) << 5;
+        if (Renderer3D.shaderVariantsActive && m.submeshes.length === 0) c |= r._svIds.idOf(variantKeyOfMaterial(mat)) << 5;
         return c;
       },
       texKey: (m, code) => ((code & T) && !(code & AT) ? r.createTextureBindGroup(m) : null),
@@ -996,7 +1007,7 @@ export class Renderer3D {
   private _gdBegin(): void {
     this._gdDrew = false; this._frame.gpuOrphanDraws = 0; this._gdWarm = false;
     Renderer3D._cullModeLoaded();   // the stored GPU culling mode ('off' clears gpuDriven once, at start-up)
-    if (!Renderer3D.gpuDriven) {
+    if (!Renderer3D.gpuDrivenActive) {
       if (this._gdWasOn && this._gd) this._gd.reset();   // stale records must never survive a switch-off
       this._gdWasOn = false; this._gdOn = false;
       const f = this._frame; f.gpuDriven = 0; f.gpuMainDraws = 0; f.gpuMainTris = 0; f.gpuStatsAge = -1; f.gpuRecords = 0; f.msGpuSync = 0;
@@ -1004,6 +1015,7 @@ export class Renderer3D {
     }
     if (!this._gd) {
       if (this._gdFailed) { this._gdOn = false; this._frame.gpuDriven = 0; return; }
+      gpuCrumb('gpu-driven create');
       try { this._gd = new GpuDrivenMain(this._gdHost()); }
       catch (e) { this._gdFailed = true; this._gdOn = false; this._frame.gpuDriven = 0; console.warn('[gpu-driven] unavailable on this device, using the CPU path', e); return; }
     }
@@ -1043,10 +1055,16 @@ export class Renderer3D {
     if (this._gdWarm) { this._frame.msGpuSync = performance.now() - t0; return; }   // auto mode on the CPU path: records kept current, nothing dispatched
     gd.selectSegments();   // sub-bundles: which ones may draw this frame
     gd.captureVerifyExpect();
+    const first = !this._gdDispatched;
+    const tok = first ? gpuCrumbBegin('gpu-driven first dispatch') : 0;
     const enc = this.device.createCommandEncoder({ label: 'GdCullEnc' });
     gd.encode(enc);
     this.device.queue.submit([enc.finish()]);
     gd.afterSubmit();
+    if (first) {   // CRASH-10: did the GPU finish the first cull dispatch? (still open at a loss = the suspect)
+      this._gdDispatched = true;
+      this.device.queue.onSubmittedWorkDone().then(() => gpuCrumbEnd(tok), () => gpuCrumbEnd(tok, false));
+    }
     this._frame.msGpuSync = performance.now() - t0;
   }
 
@@ -1119,7 +1137,7 @@ export class Renderer3D {
     const mode = Renderer3D._cullModeLoaded();
     const ready = !!this._gd?.ready && !this._gdFailed;
     let active: GpuCullPath = 'gpu', reason: GpuCullReason;
-    if (!Renderer3D.gpuDriven) { active = 'cpu'; reason = 'mode-off'; }
+    if (!Renderer3D.gpuDrivenActive) { active = 'cpu'; reason = Renderer3D.gpuDriven ? 'unavailable' : 'mode-off'; }
     else if (!ready || !this._gdOn) { active = 'cpu'; reason = 'unavailable'; }
     else { active = this._cullPathNow; reason = this._cullReasonNow; }
     const st = this._gd?.stats;
@@ -1128,7 +1146,7 @@ export class Renderer3D {
   }
   /** WebGPURenderer, per frame: does the auto mode need the GPU frame timer (auto, the GPU scene running a city)? */
   wantsGpuTiming(): boolean {
-    return Renderer3D._cullModeLoaded() === 'auto' && Renderer3D.gpuDriven && this._gdOn && !!this._gd && this._gd.recordCount >= Renderer3D.CULL_AUTO_MIN_RECORDS;
+    return Renderer3D._cullModeLoaded() === 'auto' && Renderer3D.gpuDrivenActive && this._gdOn && !!this._gd && this._gd.recordCount >= Renderer3D.CULL_AUTO_MIN_RECORDS;
   }
   /** WebGPURenderer, per frame: what the GPU frame timer measures this frame. */
   setGpuTimerSource(t: 'timestamp' | 'estimate' | 'none'): void { this._cullTimer = t; }
@@ -1145,7 +1163,7 @@ export class Renderer3D {
   /** P15 verification: resolves with the next GPU-driven frame's mismatches against the CPU lists (that frame builds
    *  the full lists). missing = drawn by the CPU path, culled by the GPU (an error); extra = the reverse. */
   verifyGpuDriven(): Promise<GdVerifyResult | null> {
-    if (!this._gd || !Renderer3D.gpuDriven) return Promise.resolve(null);
+    if (!this._gd || !Renderer3D.gpuDrivenActive) return Promise.resolve(null);
     return new Promise((res) => this._gd!.requestVerify(res));
   }
   /** P1.2 ORTHO SCREEN-SIZE LOD: under an orthographic camera, distance LOD (drawDistance + nearTwin) compares each
@@ -1416,6 +1434,8 @@ export class Renderer3D {
   // (rgba32float, read via textureLoad — unfilterable) lets a reflective fragment ray-march against scene geometry.
   // SSR reuses the SSAO pass's world-pos G-buffer, so enabling SSR runs that prepass even when AO itself is off.
   private _ssrEnabled = false;
+  /** The requested SSR switch before the device cap (re-applied by applyDeviceCaps). */
+  private _ssrWanted = false;
   // DEPTH-PEELED backface-fill (default ON with SSR): a second prepass keeps the SECOND-nearest surface so the
   // fill can test exact volume membership (front <= rayDepth <= back). setSSRDepthPeeling(false) = the engine
   // escape hatch back to the single-layer thickness heuristic (debug/A-B only — not persisted, no UI).
@@ -1963,10 +1983,11 @@ export class Renderer3D {
   // ── SSAO ───────────────────────────────────────────────────────
   /** Enable/disable SSAO and tune its params. Off (default) allocates nothing and runs no passes. */
   setSSAO(on: boolean, cfg?: Partial<SSAOConfig>): void {
-    this._ssaoEnabled = on;
+    // ssaoConfig.enabled keeps the AUTHORED value (it is saved); the device cap only gates the pass (CRASH-8)
+    this._ssaoEnabled = on && Renderer3D.caps.ssao;
     this._ssaoConfig.enabled = on;
     if (cfg) Object.assign(this._ssaoConfig, cfg, { enabled: on });
-    if (on && !this._ssao) this._ssao = new SSAOPass(this.device, this._swapChainFormat);
+    if (this._ssaoEnabled && !this._ssao) this._ssao = new SSAOPass(this.device, this._swapChainFormat);
     if (this._ssao) Object.assign(this._ssao.config, this._ssaoConfig);
   }
   /** Render the raw AO buffer to screen (verification) — draws over the scene while on. */
@@ -1992,7 +2013,7 @@ export class Renderer3D {
     return this._ssaoWhiteTex!;
   }
   get ssaoConfig(): SSAOConfig { return { ...this._ssaoConfig }; }
-  get ssaoEnabled(): boolean { return this._ssaoEnabled; }
+  get ssaoEnabled(): boolean { return this._ssaoConfig.enabled; }
   get ssaoDebug(): boolean { return this._ssaoDebug; }
 
   /** Ensure the 1×1 scene-color fallback + its sampler exist (bound at group 0 binding 5/6 when no grab is set). */
@@ -2056,6 +2077,8 @@ export class Renderer3D {
    *  prepass) and invalidates the mesh bind groups so the world-pos buffer gets bound. The mesh shader only samples it
    *  when its `ssrEnabled` uniform flag is set — so this is inert until Stage 2 wires the flag. */
   setSSREnabled(on: boolean): void {
+    this._ssrWanted = on;
+    on = on && Renderer3D.caps.ssr;   // the device cap (CRASH-8); the authored value lives in the environment state
     this._iblData[41] = on ? 1 : 0;   // the shader's ssrEnabled flag (safe to rewrite even if unchanged)
     this._writeIBLBuffer();
     if (this._ssrEnabled === on) return;
@@ -2359,7 +2382,7 @@ export class Renderer3D {
     const wasOn = this._taaOn;
     this._taaSet = s;
     let reason: TemporalAAReason = 'ok';
-    if (s.mode === 'off') reason = 'off';
+    if (s.mode === 'off' || !Renderer3D.caps.taa) reason = 'off';   // (the device cap: the preference itself is kept)
     else if (bypass) reason = 'capture';
     else if (this._ps1LoResConfigured() || (s.retroOff && this._taaRetroLook())) reason = 'retro';   // the PS1 lo-res look always wins
     else if (s.inkOff && this.outlineEnabled) reason = 'ink';
@@ -3461,17 +3484,32 @@ export class Renderer3D {
   /** The PCF tier (1 = 3x3, 0 = 5x5). */
   get shadowPcfRadius(): number { return this._shadowPcfRadius; }
 
-  private _shadowsSuspended = false;
+  private _shadowsSuspendedUser = false;
+  /** Suspended by the caller (setShadowsSuspended) OR by the device cap (Renderer3D.caps.shadows false: the map is
+   *  cleared once to "lit" and no shadow depth pass runs; shadowsEnabled and the document keep the authored value). */
+  private get _shadowsSuspended(): boolean { return this._shadowsSuspendedUser || !Renderer3D.caps.shadows; }
   private _shadowSuspendCleared = false;
   /** SUSPEND the shadow pass entirely (extreme zoom-out: shadows are sub-pixel but the depth pass still re-draws
    *  the whole scene). While suspended the map is cleared ONCE to "no occluders" (everything lit — correct for a
    *  view where shadows are invisible) and the per-interval full-scene depth render is skipped. Resume marks the
    *  map stale so the next frame re-renders it. */
   setShadowsSuspended(on: boolean): void {
-    if (this._shadowsSuspended === on) return;
-    this._shadowsSuspended = on;
+    if (this._shadowsSuspendedUser === on) return;
+    const was = this._shadowsSuspended;
+    this._shadowsSuspendedUser = on;
+    if (this._shadowsSuspended === was) return;
     if (on) this._shadowSuspendCleared = false;
     else this._shadowMapStale = true;
+  }
+
+  /** Apply the per-machine caps (Renderer3D.caps, set by WebGPURenderer.applyGpuCaps) to THIS renderer's live state:
+   *  re-gate SSAO / SSR from their authored values, re-derive the GPU-driven state codes, restart the shadow layers. */
+  applyDeviceCaps(): void {
+    this.setSSAO(this._ssaoConfig.enabled);
+    this.setSSREnabled(this._ssrWanted);
+    this._gd?.recode();
+    if (!Renderer3D.caps.shadows) this._shadowSuspendCleared = false;
+    this._shadowMapStale = true; this._cascadeStale = true;
   }
 
   /** Register GPU-instanced array groups — renderer computes instance transforms from params. */
@@ -5371,7 +5409,7 @@ export class Renderer3D {
       // (identified by textureLibraryId). Atlas meshes all share one bind group
       // and can batch across different textures — textureIndex selects the layer.
       const leadIsAtlas = useTexture && !!lead.textureLibraryId && this._atlasLayerMap.has(lead.textureLibraryId);
-      const sv = Renderer3D.shaderVariants;
+      const sv = Renderer3D.shaderVariantsActive;
       const vk = sv ? lead._r3VF : -1;   // step 8: the shader-variant key (the exact instance flags, or -1)
 
       // Scan forward while same group (geometry + pipeline + texture mode all match)
@@ -6175,17 +6213,17 @@ export class Renderer3D {
   /** Step 8: the specialised pipeline for a batched opaque draw with variant key `vk` (-1 = none), or null (the
    *  caller uses the base pipeline: no variant, variants off, or still compiling). */
   private _variantPipe(vk: number, tex: boolean, noCull: boolean, pat: boolean): GPURenderPipeline | null {
-    if (vk < 0 || !Renderer3D.shaderVariants) return null;
+    if (vk < 0 || !Renderer3D.shaderVariantsActive) return null;
     return this.pipeline.variantPipeline((tex ? VB_TEXTURED : 0) | (noCull ? VB_NOCULL : 0) | (pat ? VB_PATTERNED : 0) | (this._shadowsEnabled ? VB_SHADOW : 0), vk, Renderer3D.shaderFastPaths);
   }
   /** Step 8: switch the shader variants (A/B) and read their state: keys in use, compiled pipelines, compile times. */
-  setShaderVariants(o: { enabled?: boolean; max?: number } = {}): { enabled: boolean; keys: number; max: number; registered: number; ready: number; pending: number; failed: number; list: { key: number; base: number; fast: boolean; ready: boolean; ms: number }[] } {
+  setShaderVariants(o: { enabled?: boolean; max?: number } = {}): { enabled: boolean; capped: boolean; keys: number; max: number; registered: number; ready: number; pending: number; failed: number; list: { key: number; base: number; fast: boolean; ready: boolean; ms: number }[] } {
     if (o.max !== undefined && Number.isFinite(o.max)) this._svIds.max = Math.max(0, Math.floor(o.max));
     if (o.enabled !== undefined && !!o.enabled !== Renderer3D.shaderVariants) {
       Renderer3D.shaderVariants = !!o.enabled;
       this._gd?.recode();   // the GPU-driven state codes carry the variant id
     }
-    return { enabled: Renderer3D.shaderVariants, keys: this._svIds.size, max: this._svIds.max, ...this.pipeline.variantStats() };
+    return { enabled: Renderer3D.shaderVariants, capped: !Renderer3D.caps.shaderVariants, keys: this._svIds.size, max: this._svIds.max, ...this.pipeline.variantStats() };
   }
   /** FOG HORIZON silhouette fast path (fog-horizon.ts FOG_HORIZON_FAST): fogged pixels return the fog colour early
    *  while Hard edge + linear fog are on. Pixel-identical; false = the full shading path (A/B). */
@@ -7714,7 +7752,7 @@ export class Renderer3D {
     data[offset + 38] = mat3d.specular.b;
     data[offset + 39] = mat3d.shininess;
 
-    // emissiveColor + flags (floats 40-43)
+    // emissive rgb + flags (floats 40-43; WGSL MeshInstance.emissive vec3<f32> + flags u32: the flags lane is declared u32, CLOTH-3)
     data[offset + 40] = mat3d.emissive.r;
     data[offset + 41] = mat3d.emissive.g;
     data[offset + 42] = mat3d.emissive.b;
@@ -7963,7 +8001,7 @@ export class Renderer3D {
         // This used to stop at 48, leaving the pattern slots (48–55) unwritten for every array instance.
         // Those slots are not optional decoration — several features REPURPOSE them (see _writePatternSlots):
         // windSway/foliageShade store (windHeight, windStiffness, windAmount) and the translucency payload
-        // there, and groundShade its tile/grout/mode. The FLAGS live in emissiveColor.a (inside 32–47), so
+        // there, and groundShade its tile/grout/mode. The FLAGS live in MeshInstance.flags (float 43, inside 32–47), so
         // the shader believed wind and translucency were enabled and then read zeros — meaning only the
         // SOURCE mesh of each ArrayGroup swayed and transmitted light, and every other instance stood dead
         // still. That is why some city trees moved in the wind and most did not.
@@ -8630,6 +8668,7 @@ export class Renderer3D {
       this._skinnedVBs.get(id)?.destroy();       this._skinnedVBs.delete(id);
       this._skCull.delete(id);                   // R6.1 skinned cull radii + box
       this._skinnedIBs.get(id)?.destroy();       this._skinnedIBs.delete(id);
+      this._skBlendVer.delete(id); this._skVBBytes.delete(id); this._skIBBytes.delete(id);   // Phase 1.5 in-place bookkeeping
       // Skin-matrix buffer + bind group are SHARED per skeleton (refcounted): release this mesh's
       // ref; the last mesh out destroys them. The _meshSkelRef guard makes a double-evict of the
       // same mesh id (delete → redo-delete) a no-op instead of a double-decrement.
@@ -9570,7 +9609,7 @@ export class Renderer3D {
     let sk = this._skSpheres.get(skel.id);
     let e = this._skCull.get(m.id);
     const stale = !e || m.skinDirty || e.skelId !== skel.id || e.cr.jointCount !== joints.length
-      || e.verts !== m.geometry.vertices || e.ji !== m.jointIndices || e.jw !== m.jointWeights;
+      || e.verts !== m.geometry.vertices || e.ji !== m.jointIndices || e.jw !== m.jointWeights || e.bv !== m.blendVersion;   // (a morph moves the verts)
     if (stale || !sk || sk.bindPos.length !== joints.length * 3) {
       // (Re)derive the skeleton's bind positions too — a skin change may come with a rebind (new inverse binds).
       const ibs: ArrayLike<number>[] = new Array(joints.length);
@@ -9584,11 +9623,11 @@ export class Renderer3D {
       if (m.skinDirty) this._ensureSkinnedVBIB(m);   // builds the VB once and clears skinDirty (no per-frame rebuild while culled)
       const cr = computeSkinnedCullRadii(m.geometry.vertices, 12, m.jointIndices, m.jointWeights, sk.bindPos);
       if (!e) {
-        e = { cr, skelId: skel.id, verts: m.geometry.vertices, ji: m.jointIndices, jw: m.jointWeights,
+        e = { cr, skelId: skel.id, verts: m.geometry.vertices, ji: m.jointIndices, jw: m.jointWeights, bv: m.blendVersion,
           poseVer: -1, matVer: -1, viaSkel: m.transformViaSkeleton, ok: false, box: new Float64Array(6), flags: 3 };
         this._skCull.set(m.id, e);
       } else {
-        e.cr = cr; e.skelId = skel.id; e.verts = m.geometry.vertices; e.ji = m.jointIndices; e.jw = m.jointWeights; e.poseVer = -1;
+        e.cr = cr; e.skelId = skel.id; e.verts = m.geometry.vertices; e.ji = m.jointIndices; e.jw = m.jointWeights; e.bv = m.blendVersion; e.poseVer = -1;
       }
     }
     if (sk.poseVer !== skel.poseVersion) {
@@ -9682,60 +9721,113 @@ export class Renderer3D {
     this.device.queue.writeBuffer(this._skinnedInstBuf!, 0, data, 0, needFloats);
   }
 
+  /** Character v2 Phase 1.5 A/B. true = a skinned part's GPU buffers are updated IN PLACE: a blend-shape change
+   *  (mesh.blendVersion moved, skinDirty clear) writeBuffers only the dirty vertex range into the existing VB and
+   *  leaves the IB alone; a skinDirty rebuild re-writes the existing VB / IB when the byte size is unchanged and only
+   *  creates buffers when it grew or shrank. false = the old path: every rebuild re-created both buffers, and a blend
+   *  change without skinDirty was turned into a full rebuild. */
+  static skinnedInPlaceUploads = true;
+  /** meshId → the blendVersion its skinned VB holds / the VB and IB byte sizes (in-place reuse). */
+  private readonly _skBlendVer = new Map<string, number>();
+  private readonly _skVBBytes = new Map<string, number>();
+  private readonly _skIBBytes = new Map<string, number>();
+  /** Grow-only staging for a skinned vertex-range upload (72 B per vertex). */
+  private _skStage: ArrayBuffer | null = null;
+  private readonly _skRange = new Int32Array(2);
+  /** Skinned VB/IB upload counters (tests, perf HUD): buffers created / full VB writes / range writes / bytes. */
+  readonly skinnedUploadStats = { creates: 0, fullWrites: 0, rangeWrites: 0, bytes: 0 };
+
+  /** Interleave vertices [lo, hi) of a skinned part into the 72-byte layout (written at vertex 0 of `buf`). */
+  private _packSkinnedVerts(mesh: SkinnedMesh3D, lo: number, hi: number, buf: ArrayBuffer): void {
+    const STRIDE = SKINNED_MESH3D_VERTEX_STRIDE, FPV = STRIDE / 4;  // 18 floats per vertex
+    const f32 = new Float32Array(buf, 0, (hi - lo) * FPV);
+    const u8  = new Uint8Array(buf, 0, (hi - lo) * STRIDE);
+    const src = mesh.geometry.vertices, ji = mesh.jointIndices, jw = mesh.jointWeights;
+    for (let v = lo; v < hi; v++) {
+      const floatBase = (v - lo) * FPV;
+      const byteBase  = (v - lo) * STRIDE;
+      // Standard 12 floats: position(3) + normal(3) + uv(2) + tangent(4)
+      for (let f = 0; f < 12; f++) f32[floatBase + f] = src[v * 12 + f];
+      // Joint indices as uint8 at byte offset 48–51
+      u8[byteBase + 48] = ji[v * 4 + 0] ?? 0;
+      u8[byteBase + 49] = ji[v * 4 + 1] ?? 0;
+      u8[byteBase + 50] = ji[v * 4 + 2] ?? 0;
+      u8[byteBase + 51] = ji[v * 4 + 3] ?? 0;
+      // Joint weights as float32 at byte offset 52 (float index floatBase + 13)
+      f32[floatBase + 13] = jw[v * 4 + 0] ?? 0;
+      f32[floatBase + 14] = jw[v * 4 + 1] ?? 0;
+      f32[floatBase + 15] = jw[v * 4 + 2] ?? 0;
+      f32[floatBase + 16] = jw[v * 4 + 3] ?? 0;
+      f32[floatBase + 17] = 0;   // bytes 68–71: padding
+    }
+  }
+
   /** Build or refresh the per-mesh skinned vertex buffer (72-byte stride). */
   private _ensureSkinnedVBIB(mesh: SkinnedMesh3D): void {
     const numVerts = mesh.geometry.vertices.length / 12;
-    if (!mesh.skinDirty && this._skinnedVBs.has(mesh.id)) return;
-
-    // Build interleaved 72-byte buffer.
+    const id = mesh.id, inPlace = Renderer3D.skinnedInPlaceUploads;
+    const curVB = this._skinnedVBs.get(id);
     const STRIDE = SKINNED_MESH3D_VERTEX_STRIDE;
-    const buf = new ArrayBuffer(numVerts * STRIDE);
-    const f32 = new Float32Array(buf);
-    const u8  = new Uint8Array(buf);
-
-    for (let v = 0; v < numVerts; v++) {
-      const floatBase = v * (STRIDE / 4);  // 18 floats per vertex
-      const byteBase  = v * STRIDE;
-
-      // Standard 12 floats: position(3) + normal(3) + uv(2) + tangent(4)
-      for (let f = 0; f < 12; f++) {
-        f32[floatBase + f] = mesh.geometry.vertices[v * 12 + f];
+    if (!mesh.skinDirty && curVB) {
+      const seen = this._skBlendVer.get(id);
+      if (seen === undefined || seen === mesh.blendVersion) return;
+      // A blend-shape change (Phase 1.5): only the vertex range it moved, into the EXISTING buffer.
+      if (inPlace && this._skVBBytes.get(id) === numVerts * STRIDE) {
+        const r = this._skRange;
+        let lo = 0, hi = numVerts;
+        if (mesh.blendRangeSince(seen, r)) { lo = Math.max(0, r[0]); hi = Math.min(numVerts, r[1]); }
+        if (hi > lo) {
+          const bytes = (hi - lo) * STRIDE;
+          if (!this._skStage || this._skStage.byteLength < bytes) this._skStage = new ArrayBuffer(Math.max(bytes, (this._skStage?.byteLength ?? 0) * 2));
+          this._packSkinnedVerts(mesh, lo, hi, this._skStage);
+          this.device.queue.writeBuffer(curVB, lo * STRIDE, this._skStage, 0, bytes);
+          this.skinnedUploadStats.rangeWrites++; this.skinnedUploadStats.bytes += bytes;
+        }
+        this._skBlendVer.set(id, mesh.blendVersion);
+        return;
       }
-
-      // Joint indices as uint8 at byte offset 48–51
-      u8[byteBase + 48] = mesh.jointIndices[v * 4 + 0] ?? 0;
-      u8[byteBase + 49] = mesh.jointIndices[v * 4 + 1] ?? 0;
-      u8[byteBase + 50] = mesh.jointIndices[v * 4 + 2] ?? 0;
-      u8[byteBase + 51] = mesh.jointIndices[v * 4 + 3] ?? 0;
-
-      // Joint weights as float32 at byte offset 52 (float index floatBase + 13)
-      f32[floatBase + 13] = mesh.jointWeights[v * 4 + 0] ?? 0;
-      f32[floatBase + 14] = mesh.jointWeights[v * 4 + 1] ?? 0;
-      f32[floatBase + 15] = mesh.jointWeights[v * 4 + 2] ?? 0;
-      f32[floatBase + 16] = mesh.jointWeights[v * 4 + 3] ?? 0;
-      // floatBase + 12 covers bytes 48–51 (joint indices, written via u8 above — leave as is)
-      // floatBase + 17 covers bytes 68–71 (padding — stays zero)
+      // (old path / size mismatch: fall through to the full rebuild)
     }
 
-    const vb = this.device.createBuffer({
-      size:  buf.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(vb, 0, buf);
-    this._skinnedVBs.get(mesh.id)?.destroy();
-    this._skinnedVBs.set(mesh.id, vb);
+    // Build interleaved 72-byte buffer.
+    const buf = new ArrayBuffer(numVerts * STRIDE);
+    this._packSkinnedVerts(mesh, 0, numVerts, buf);
+
+    if (inPlace && curVB && this._skVBBytes.get(id) === buf.byteLength) {
+      this.device.queue.writeBuffer(curVB, 0, buf);
+    } else {
+      const vb = this.device.createBuffer({
+        size:  buf.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+      this.skinnedUploadStats.creates++;
+      this.device.queue.writeBuffer(vb, 0, buf);
+      curVB?.destroy();
+      this._skinnedVBs.set(id, vb);
+      this._skVBBytes.set(id, buf.byteLength);
+    }
+    this.skinnedUploadStats.fullWrites++; this.skinnedUploadStats.bytes += buf.byteLength;
 
     // A body-hiding mask (SkinnedMesh3D.drawIndices, same length) replaces the drawn triangles; geometry.indices otherwise.
     const di = mesh.drawIndices;
     const idxData = di && di.length === mesh.geometry.indices.length ? di : mesh.geometry.indices;
-    const ib = this.device.createBuffer({
-      size:  idxData.byteLength,
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(ib, 0, idxData.buffer, idxData.byteOffset, idxData.byteLength);
-    this._skinnedIBs.get(mesh.id)?.destroy();
-    this._skinnedIBs.set(mesh.id, ib);
+    const curIB = this._skinnedIBs.get(id);
+    if (inPlace && curIB && this._skIBBytes.get(id) === idxData.byteLength) {
+      this.device.queue.writeBuffer(curIB, 0, idxData.buffer, idxData.byteOffset, idxData.byteLength);
+    } else {
+      const ib = this.device.createBuffer({
+        size:  idxData.byteLength,
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      });
+      this.skinnedUploadStats.creates++;
+      this.device.queue.writeBuffer(ib, 0, idxData.buffer, idxData.byteOffset, idxData.byteLength);
+      curIB?.destroy();
+      this._skinnedIBs.set(id, ib);
+      this._skIBBytes.set(id, idxData.byteLength);
+    }
+    this.skinnedUploadStats.bytes += idxData.byteLength;
 
+    this._skBlendVer.set(id, mesh.blendVersion);
     mesh.skinDirty = false;
   }
 
@@ -9858,6 +9950,8 @@ export class Renderer3D {
     // Skinned mesh buffers
     this._skinnedVBs.forEach(b => b.destroy());
     this._skinnedIBs.forEach(b => b.destroy());
+    this._skinnedVBs.clear(); this._skinnedIBs.clear();   // (in-place reuse must never write a destroyed buffer)
+    this._skBlendVer.clear(); this._skVBBytes.clear(); this._skIBBytes.clear();
     this._skinMatBufs.forEach(e => e.buf.destroy());
     this._skinnedVCBufs.forEach(b => b.destroy());
     this._skinnedInstBuf?.destroy();

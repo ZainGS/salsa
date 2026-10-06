@@ -18,7 +18,7 @@ import type { SkirtSteer } from './skirt-steer';
 import type { MeshGeometry } from '../../renderer/3d/mesh-generators';
 import { generateHair, type HairParams, type HairResult, type HeadFrame } from './hair-generator';
 import { buildBodyFitFrom, headRegionBBoxOf } from './body-fit';
-import { layerOutfit, type LayerSlot } from './garment-layers';
+import { layerOutfit, limbSidesFromNames, type LayerSlot } from './garment-layers';
 
 export type CharacterGarmentSlot = 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants';
 /** The order the hair's collision soup concatenates garments in (Scene3DCharacter._collisionVertsForHair). */
@@ -127,7 +127,8 @@ export function generateCharacterParts(spec: CharacterPartsSpec): CharacterParts
             const ordered = HAIR_COLLISION_SLOT_ORDER.map((sl) => bySlot.get(sl)).filter((g): g is GarmentPart => !!g);
             // The garments as DRAWN (layered: garment-layers.ts) — what Scene3DCharacter's hair soup reads off the meshes.
             const layered = layerOutfit(Object.fromEntries(garments.map((g) => [g.params.slot, g.result])) as Partial<Record<LayerSlot, GarmentGenResult>>,
-                (s) => s === 'bottom' && (bySlot.get('bottom')?.params as { bottomStyle?: string } | undefined)?.bottomStyle === 'skirt');
+                (s) => s === 'bottom' && (bySlot.get('bottom')?.params as { bottomStyle?: string } | undefined)?.bottomStyle === 'skirt',
+                limbSidesFromNames(s.jointNames));
             const coll = hairCollisionVerts([body.geometry.vertices, ...ordered.map((g) => (layered[g.params.slot as LayerSlot] ?? g.result).geometry.vertices)]);
             hair = { params: spec.hair, garmentParams: ordered.map((g) => g.params), result: generateHair(headFrameFromBBox(bb), spec.hair, coll) };
         }

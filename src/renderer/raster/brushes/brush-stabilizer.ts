@@ -8,7 +8,17 @@
  *  • 'pull-string': simulates dragging a string — brush only moves when string goes taut.
  *
  * Level controls the window size / damping strength (0 = off, 10 = maximum).
+ *
+ * BRUSH-4: 'moving-average' and 'predictive' are TIME-based. Their strength used to be in SAMPLES (a window of
+ * level×2 events / a per-event damping factor), so the lag doubled at 30 fps and halved with 120 Hz coalesced
+ * events. They now use the sample timestamps against a 60 Hz reference frame (REF_FRAME_MS): at exactly 60 Hz
+ * the output is the same as before; at other rates the lag in MILLISECONDS stays the same.
  */
+
+/** The event interval the sample-based tuning was made at (60 Hz). */
+export const REF_FRAME_MS = 1000 / 60;
+/** Absolute upper bound on buffered samples. */
+const MAX_BUFFER = 256;
 
 import { BrushStabilization } from './brush-preset';
 
@@ -31,6 +41,7 @@ export class BrushStabilizer {
   // Ring buffer for moving-average & catmull-rom
   private buffer: StabilizedPoint[] = [];
   private maxWindow: number = 1;
+  private lastPredictiveT = 0;
 
   // Predictive state
   private smoothX = 0;
@@ -108,18 +119,32 @@ export class BrushStabilizer {
 
   // ── Moving Average ────────────────────────────────────────────────
 
+  /**
+   * Time-weighted average over the last `maxWindow` reference frames (level×2 × 16.7 ms): samples with age
+   * a ≥ T = maxWindow × REF_FRAME_MS drop out, and a sample of age `a` weighs (S − a) / REF_FRAME_MS with
+   * S = min(T, oldest age + REF_FRAME_MS) — a linear ramp in TIME. At 60 Hz that is exactly the old
+   * "last level×2 samples, weights 1..N" average (warm-up included); at other event rates the window stays T ms.
+   */
   private pushMovingAverage(raw: StabilizedPoint): StabilizedPoint {
     this.buffer.push(raw);
-    if (this.buffer.length > this.maxWindow) {
-      this.buffer.shift();
-    }
+    const T = this.maxWindow * REF_FRAME_MS;
+    const now = raw.timestamp;
+    // Drop samples whose age reaches the window (tiny epsilon: 60 Hz timestamps that are N frames old in
+    // float arithmetic must drop exactly like the old N-sample window did).
+    while (this.buffer.length > 1 && (now - this.buffer[0].timestamp) >= T - 1e-6) this.buffer.shift();
+    // Count cap: 4x the 60 Hz sample window (room for a 240 Hz pen) — also bounds a clock that doesn't advance.
+    const cap = Math.min(MAX_BUFFER, this.maxWindow * 4);
+    while (this.buffer.length > cap) this.buffer.shift();
 
     // Weighted average: newer points count more
+    const span = Math.min(T, Math.max(0, now - this.buffer[0].timestamp) + REF_FRAME_MS);
     let totalW = 0;
     let sx = 0, sy = 0, sp = 0, stx = 0, sty = 0;
     for (let i = 0; i < this.buffer.length; i++) {
-      const w = i + 1; // linearly increasing weight
       const p = this.buffer[i];
+      const age = Math.max(0, now - p.timestamp);
+      // (span − age) / frame — linear in age; the newest sample always counts.
+      const w = Math.max(1e-6, (span - age) / REF_FRAME_MS);
       sx += p.x * w;
       sy += p.y * w;
       sp += p.pressure * w;
@@ -138,11 +163,33 @@ export class BrushStabilizer {
     };
   }
 
+  /** The pre-BRUSH-4 sample-count moving average — only the catmull-rom warm-up uses it (see there). */
+  private pushMovingAverageSamples(raw: StabilizedPoint): StabilizedPoint {
+    this.buffer.push(raw);
+    if (this.buffer.length > this.maxWindow) {
+      this.buffer.shift();
+    }
+    let totalW = 0;
+    let sx = 0, sy = 0, sp = 0, stx = 0, sty = 0;
+    for (let i = 0; i < this.buffer.length; i++) {
+      const w = i + 1;
+      const p = this.buffer[i];
+      sx += p.x * w; sy += p.y * w; sp += p.pressure * w;
+      stx += (p.tiltX ?? 0) * w; sty += (p.tiltY ?? 0) * w;
+      totalW += w;
+    }
+    return {
+      x: sx / totalW, y: sy / totalW, pressure: sp / totalW, timestamp: raw.timestamp,
+      tiltX: stx / totalW, tiltY: sty / totalW,
+    };
+  }
+
   // ── Predictive (exponential smoothing) ────────────────────────────
 
   private pushPredictive(raw: StabilizedPoint): StabilizedPoint {
-    // Damping factor: level 1 → alpha≈0.6, level 10 → alpha≈0.05
-    const alpha = 1.0 / (1.0 + this.level * 1.5);
+    // Damping factor PER 60 Hz FRAME: level 1 → alpha≈0.6, level 10 → alpha≈0.06. Applied per elapsed time:
+    // alpha_dt = 1 − (1 − alpha)^(dt / REF_FRAME_MS), equal to alpha at 60 Hz.
+    const alphaRef = 1.0 / (1.0 + this.level * 1.5);
 
     if (!this.initialized) {
       this.smoothX = raw.x;
@@ -150,9 +197,16 @@ export class BrushStabilizer {
       this.smoothP = raw.pressure;
       this.smoothTiltX = raw.tiltX ?? 0;
       this.smoothTiltY = raw.tiltY ?? 0;
+      this.lastPredictiveT = raw.timestamp;
       this.initialized = true;
       return raw;
     }
+    const dt = raw.timestamp - this.lastPredictiveT;
+    this.lastPredictiveT = raw.timestamp;
+    // A non-advancing / missing clock falls back to the per-sample factor (the old behaviour).
+    const alpha = dt > 0 && Number.isFinite(dt)
+      ? 1 - Math.pow(1 - alphaRef, Math.min(dt, 1000) / REF_FRAME_MS)
+      : alphaRef;
 
     this.smoothX += (raw.x - this.smoothX) * alpha;
     this.smoothY += (raw.y - this.smoothY) * alpha;
@@ -185,9 +239,10 @@ export class BrushStabilizer {
       this.buffer.shift();
     }
 
-    // Need at least 4 points for Catmull-Rom
+    // Need at least 4 points for Catmull-Rom (warm-up: the original SAMPLE-based average — it shares and
+    // re-pushes into `buffer`, which the spline then reads, so it stays exactly as it was)
     if (this.buffer.length < 4) {
-      return this.pushMovingAverage(raw);
+      return this.pushMovingAverageSamples(raw);
     }
 
     // Use the last 4 points

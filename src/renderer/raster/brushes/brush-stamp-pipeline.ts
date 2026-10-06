@@ -55,6 +55,48 @@ export interface StampParams {
   wetStroke?: boolean;
 }
 
+/** A texel rectangle, max-exclusive. */
+export interface TexelRect { x0: number; y0: number; x1: number; y1: number }
+
+/** Bytes of CPU→GPU uniform staging per batch (BRUSH-1b). ~250 dabs; a fuller batch submits early and goes on. */
+const STAGING_BYTES = 64 * 1024;
+/** Staging reserved per dab (5 stamp uniforms + bleed + one composite rect, 16-byte aligned) — see reserveStaging. */
+const DAB_STAGING_BYTES = 256;
+/** Kept free so the final composite of a flush always has a slot for its rect uniform. */
+const STAGING_HEADROOM = 32;
+
+function unionRect(a: TexelRect | null, b: TexelRect): TexelRect {
+  if (!a) return { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 };
+  return { x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) };
+}
+
+function padRect(r: TexelRect | null, pad: number): TexelRect | null {
+  return r && { x0: r.x0 - pad, y0: r.y0 - pad, x1: r.x1 + pad, y1: r.y1 + pad };
+}
+
+/**
+ * The texel bounds of a dab's stamp dispatch (BRUSH-1). `minX/minY/bw/bh` is the box the stamp shader is
+ * dispatched over (ceil(bw/8) × ceil(bh/8) workgroups starting at minX/minY); the FOOTPRINT is every in-texture
+ * texel a thread of that dispatch can read or write: the box rounded up to whole 8×8 workgroups, clipped to the
+ * texture. Copying / compositing exactly the footprint (instead of the whole canvas) is pixel-identical: the
+ * shader reads `srcTex` and writes `dstTex` only at its own texel, so texels outside the footprint are never
+ * touched. Exported for the CPU-mirror tests. Returns null for a dab entirely off the texture.
+ */
+export function dabDispatchBounds(
+  cx: number, cy: number, radius: number, texW: number, texH: number,
+): { minX: number; minY: number; bw: number; bh: number; footprint: TexelRect } | null {
+  const minX = Math.max(0, Math.floor(cx - radius));
+  const minY = Math.max(0, Math.floor(cy - radius));
+  const maxX = Math.min(texW - 1, Math.ceil(cx + radius));
+  const maxY = Math.min(texH - 1, Math.ceil(cy + radius));
+  const bw = maxX - minX + 1;
+  const bh = maxY - minY + 1;
+  if (bw <= 0 || bh <= 0) return null;
+  const fx1 = Math.min(texW, minX + Math.ceil(bw / 8) * 8);
+  const fy1 = Math.min(texH, minY + Math.ceil(bh / 8) * 8);
+  return { minX, minY, bw, bh, footprint: { x0: minX, y0: minY, x1: fx1, y1: fy1 } };
+}
+
 export class BrushStampPipeline {
   private device: GPUDevice;
   private pipeline!: GPUComputePipeline;
@@ -135,6 +177,44 @@ export class BrushStampPipeline {
   private bleedBGL: GPUBindGroupLayout | null = null;
   private bleedParamBuf: GPUBuffer;
   private bleedParamData = new Float32Array(4); // radius, strength, pad, pad
+
+  // ── BRUSH-1 / 1b: bounded + batched dab recording ──
+  // Every dab records into ONE open encoder (`batchEnc`); its uniforms go through a staging buffer
+  // (copyBufferToBuffer in command order, so many dabs can share one submit without clobbering each
+  // other's uniforms — a plain queue.writeBuffer would land ALL of them before the submit). The wet-stroke
+  // composite is deferred and run once per flush over the union of what changed (`pendingComposite`).
+  private batchEnc: GPUCommandEncoder | null = null;
+  private batchDepth = 0;
+  private stagingBuf: GPUBuffer;
+  private stagingCpu = new ArrayBuffer(STAGING_BYTES);
+  private stagingF32 = new Float32Array(this.stagingCpu);
+  private stagingU32 = new Uint32Array(this.stagingCpu);
+  private stagingCursor = 0;
+  /** Composite rect uniform: originX, originY, width, height (u32). */
+  private compositeRectBuf: GPUBuffer;
+  /** Union of strokeAccumTex texels changed since the last composite (null = none). */
+  private pendingComposite: TexelRect | null = null;
+  /** A full-accum change (per-dab bleed) since the last composite → composite the whole texture. */
+  private pendingCompositeFull = false;
+  private pendingOutput: GPUTexture | null = null;
+  /** Direct-path (erase / blend-mode) dab writes to the stroke's output since the last composite. The old
+   *  full-canvas composite overwrote them; the bounded composite re-covers them so the result stays identical. */
+  private strokeOutputDirty: TexelRect | null = null;
+  /** Union of output-texture texels written this stroke (composites + direct dabs) — the undo patch rect. */
+  private strokeTouched: TexelRect | null = null;
+  // ── End-of-stroke effects (wet edges / end bleed / stroke-texture strip) ──
+  // They rewrite strokeAccumTex AFTER the last dab composite, so endStroke composites the accum into the stroke's
+  // output once more — bounded to everything the accum can hold paint in plus everything the stroke already wrote.
+  /** The texture the stroke paints into (beginStroke's texture; the output of the wet composites). */
+  private strokeTarget: GPUTexture | null = null;
+  /** Union of strokeAccumTex texels that may hold paint this stroke (wet footprints, a strip, bleed spread). */
+  private strokeAccumDirty: TexelRect | null = null;
+  /** A wet dab or a stroke-texture strip put paint in the accum this stroke (the end composite needs one). */
+  private strokeAccumUsed = false;
+  /** The accum was rewritten outside the dab path (clearStrokeAccum + markStrokeAccumWritten — the strip). */
+  private strokeAccumRewritten = false;
+  /** Diagnostics / tests: submits and texels copied+composited (BRUSH-1 traffic counter). */
+  public readonly stats = { submits: 0, copiedTexels: 0, compositedTexels: 0 };
 
   constructor(device: GPUDevice) {
     this.device = device;
@@ -233,6 +313,159 @@ export class BrushStampPipeline {
       size: 16, // 4 floats: radius, strength, pad, pad
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+
+    this.stagingBuf = device.createBuffer({
+      size: STAGING_BYTES,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    this.compositeRectBuf = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  // ── Batching (BRUSH-1b) ───────────────────────────────────────────
+
+  /**
+   * Open a dab batch: every dab until the matching endBatch() records into one command encoder and is
+   * submitted once (the brush engine opens one per pointer frame). Nests; only the outermost end submits.
+   * Anything that reads the painted textures outside the pipeline must happen after endBatch()/flush().
+   */
+  public beginBatch(): void {
+    this.batchDepth++;
+  }
+
+  public endBatch(): void {
+    if (this.batchDepth > 0) this.batchDepth--;
+    if (this.batchDepth === 0) this.flush();
+  }
+
+  /** Submit everything recorded so far (incl. the deferred composite). The batch, if open, stays open. */
+  public flush(): void {
+    const enc = this.batchEnc;
+    if (!enc) return;
+    this.compositePending(enc);
+    if (this.stagingCursor > 0) {
+      this.device.queue.writeBuffer(this.stagingBuf, 0, this.stagingCpu, 0, this.stagingCursor);
+    }
+    this.device.queue.submit([enc.finish()]);
+    this.stats.submits++;
+    this.batchEnc = null;
+    this.stagingCursor = 0;
+  }
+
+  private encoder(): GPUCommandEncoder {
+    return this.batchEnc ??= this.device.createCommandEncoder();
+  }
+
+  /** Make room for `bytes` of staged uniforms in the current submit (submitting early when full). Call
+   *  BEFORE recording a dab so a dab never straddles an encoder swap mid-recording. */
+  private reserveStaging(bytes: number): void {
+    if (this.stagingCursor + bytes > STAGING_BYTES - STAGING_HEADROOM) this.flush();
+  }
+
+  /** Copy `data` into staging and record a copy into `dst` at this point of the command stream. */
+  private stageUniform(enc: GPUCommandEncoder, dst: GPUBuffer, data: Float32Array | Uint32Array): void {
+    const off = this.stagingCursor;
+    const n = data.length;
+    if (off + n * 4 > STAGING_BYTES) throw new Error('BrushStampPipeline: uniform staging overflow');
+    if (data instanceof Float32Array) this.stagingF32.set(data, off >> 2);
+    else this.stagingU32.set(data, off >> 2);
+    enc.copyBufferToBuffer(this.stagingBuf, off, dst, 0, n * 4);
+    this.stagingCursor = off + Math.ceil((n * 4) / 16) * 16;
+  }
+
+  /** Record the deferred wet-stroke composite over everything that changed since the last one. */
+  private compositePending(enc: GPUCommandEncoder): void {
+    const out = this.pendingOutput;
+    if (!out || (!this.pendingComposite && !this.pendingCompositeFull)) {
+      this.pendingOutput = null;
+      return;
+    }
+    let r: TexelRect;
+    if (this.pendingCompositeFull) {
+      r = { x0: 0, y0: 0, x1: out.width, y1: out.height };
+    } else {
+      r = this.pendingComposite!;
+      if (this.strokeOutputDirty) r = unionRect(r, this.strokeOutputDirty);
+    }
+    const x0 = Math.max(0, r.x0), y0 = Math.max(0, r.y0);
+    const x1 = Math.min(out.width, r.x1), y1 = Math.min(out.height, r.y1);
+    this.pendingComposite = null;
+    this.pendingCompositeFull = false;
+    this.pendingOutput = null;
+    this.strokeOutputDirty = null;
+    if (x1 <= x0 || y1 <= y0 || !this.strokeBaseTex || !this.strokeAccumTex) return;
+    const rect = { x0, y0, x1, y1 };
+    this.compositeRecord(enc, this.strokeBaseTex, this.strokeAccumTex, out, rect);
+    this.strokeTouched = unionRect(this.strokeTouched, rect);
+  }
+
+  /** The output-texture texels this stroke wrote (exact; composites + direct dabs), then reset. Pair with
+   *  readStrokeRect for an undo patch. Null when the stroke wrote nothing. */
+  public takeStrokeTouchedRect(): TexelRect | null {
+    this.flush();
+    const r = this.strokeTouched;
+    this.strokeTouched = null;
+    return r;
+  }
+
+  /**
+   * BRUSH-6: read back the BEFORE (the stroke-start snapshot in strokeBaseTex) and AFTER (`texture`) pixels of
+   * `rect` for an undo patch — two small readbacks instead of a full-canvas one. Must be called after the
+   * stroke ends and before the next beginStroke (it records its copies immediately, so a later stroke can't
+   * overwrite strokeBaseTex under it). Null when the stroke base doesn't match `texture`'s size.
+   */
+  public readStrokeRect(
+    texture: GPUTexture, rect: TexelRect,
+  ): Promise<{ x: number; y: number; w: number; h: number; before: Uint8Array; after: Uint8Array }> | null {
+    this.flush();
+    const base = this.strokeBaseTex;
+    if (!base || this.strokeTexW !== texture.width || this.strokeTexH !== texture.height) return null;
+    const x = Math.max(0, Math.floor(rect.x0)), y = Math.max(0, Math.floor(rect.y0));
+    const w = Math.min(texture.width, Math.ceil(rect.x1)) - x;
+    const h = Math.min(texture.height, Math.ceil(rect.y1)) - y;
+    if (w <= 0 || h <= 0) return null;
+    const row = w * 4;
+    const padded = Math.ceil(row / 256) * 256;
+    const mk = () => this.device.createBuffer({ size: padded * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const bBuf = mk(), aBuf = mk();
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: base, origin: { x, y } }, { buffer: bBuf, bytesPerRow: padded }, { width: w, height: h });
+    enc.copyTextureToBuffer({ texture, origin: { x, y } }, { buffer: aBuf, bytesPerRow: padded }, { width: w, height: h });
+    this.device.queue.submit([enc.finish()]);
+    this.stats.submits++;
+    const unpack = (buf: GPUBuffer) => {
+      const src = new Uint8Array(buf.getMappedRange());
+      const out = new Uint8Array(row * h);
+      for (let r = 0; r < h; r++) out.set(src.subarray(r * padded, r * padded + row), r * row);
+      buf.unmap(); buf.destroy();
+      return out;
+    };
+    return Promise.all([bBuf.mapAsync(GPUMapMode.READ), aBuf.mapAsync(GPUMapMode.READ)])
+      .then(() => ({ x, y, w, h, before: unpack(bBuf), after: unpack(aBuf) }));
+  }
+
+  /** Ensure the shared ping texture matches `w×h` (submitting pending work first if it must be reallocated —
+   *  recorded commands may reference the old one). */
+  private ensurePing(w: number, h: number): GPUTexture {
+    if (!this.pingTex || this.pingTexW !== w || this.pingTexH !== h) {
+      this.flush();
+      this.pingTex?.destroy();
+      this.pingTex = this.device.createTexture({
+        size: [w, h],
+        format: 'rgba8unorm',
+        // STORAGE_BINDING: pingTex is SHARED with applyBleed (which binds it as a write storage texture) and
+        // reuse is gated on SIZE only — so every allocation must support storage or a bleed-after-same-size-dab
+        // reuses a storage-less texture → WebGPU validation error.
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
+      });
+      this.pingTexW = w;
+      this.pingTexH = h;
+      this.cachedBindGroup = null;
+      this.cachedBleedBGs = null;
+    }
+    return this.pingTex;
   }
 
   // ── Stroke lifecycle (wet-stroke) ─────────────────────────────────
@@ -245,6 +478,7 @@ export class BrushStampPipeline {
   public beginStroke(texture: GPUTexture): void {
     const w = texture.width;
     const h = texture.height;
+    this.flush();   // anything still recorded belongs to the previous stroke
 
     // Ensure stroke textures match dimensions
     if (!this.strokeBaseTex || this.strokeTexW !== w || this.strokeTexH !== h) {
@@ -258,21 +492,30 @@ export class BrushStampPipeline {
       this.strokeAccumTex = this.device.createTexture({
         size: [w, h],
         format: 'rgba8unorm',
+        // RENDER_ATTACHMENT: cleared with a loadOp:'clear' pass (BRUSH-1b) instead of a CPU zero upload.
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
-               GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+               GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
       });
       this.strokeTexW = w;
       this.strokeTexH = h;
     }
 
-    // Snapshot current canvas → strokeBaseTex
+    // Snapshot current canvas → strokeBaseTex, and clear strokeAccumTex to transparent black — one submit.
     const enc = this.device.createCommandEncoder();
     enc.copyTextureToTexture({ texture }, { texture: this.strokeBaseTex! }, { width: w, height: h });
+    this.recordClear(enc, this.strokeAccumTex!);
     this.device.queue.submit([enc.finish()]);
+    this.stats.submits++;
 
-    // Clear strokeAccumTex to transparent black
-    this.clearTexture(this.strokeAccumTex!, w, h);
-
+    this.pendingComposite = null;
+    this.pendingCompositeFull = false;
+    this.pendingOutput = null;
+    this.strokeOutputDirty = null;
+    this.strokeTouched = null;
+    this.strokeTarget = texture;
+    this.strokeAccumDirty = null;
+    this.strokeAccumUsed = false;
+    this.strokeAccumRewritten = false;
     this.strokeActive = true;
     this.cachedBindGroup = null; // invalidate — textures changed
     this.cachedCompositeKey = null; this.cachedCompositeBG = null;
@@ -280,36 +523,98 @@ export class BrushStampPipeline {
   }
 
   /**
-   * Call at the end of a stroke. Optionally applies wet edges to the stroke
+   * Call at the end of a stroke. Optionally applies the end-of-stroke bleed and wet edges to the stroke
    * accumulation layer, then flattens it onto the canvas.
+   *
+   * The flatten: these passes (and a stroke-texture strip the brush engine rendered into the accum — see
+   * markStrokeAccumWritten) change the accum AFTER the last dab composite, so the accum is composited into the
+   * stroke's output once more. Before 2026-10-06 that composite was missing and the three effects never reached
+   * the canvas (mobile-parity.md §3). It's bounded: the rect is everything the accum can hold paint in (the wet
+   * footprints / the strip, grown by the bleed spread and the wet-edge kernel) united with everything the stroke
+   * already wrote (so a strip that replaced the dab preview also restores the base where the preview was).
+   * Outside that rect accum alpha is 0 and the output already equals the base, so it's byte-identical to a
+   * full-canvas composite. The rect joins strokeTouched, so the undo patch includes the effect. A stroke with no
+   * end effects records nothing here (unchanged); one that put no paint in the accum (an eraser stroke) skips
+   * the passes too, since the accum is discarded.
    */
   public endStroke(
     wetEdges?: { edgeDarkness: number; edgeWidth: number; strength: number },
     bleed?: { radius: number; strength: number },
   ): void {
-    if (this.strokeAccumTex && this.strokeActive) {
+    this.flush();
+    if (this.strokeAccumTex && this.strokeActive && this.strokeAccumUsed) {
+      let effect = this.strokeAccumRewritten;
       if (bleed && bleed.strength > 0) {
         this.applyBleed(this.strokeAccumTex, bleed);
+        // two cross-shaped gathers of `radius` (applyBleed rounds it, min 1): paint spreads ≤ 2·radius per axis
+        // (only when strength ≥ 0.99 — below that transparent texels stay put — but the pad is harmless)
+        this.strokeAccumDirty = padRect(this.strokeAccumDirty, 2 * Math.max(1, Math.round(bleed.radius)));
+        effect = true;
       }
       if (wetEdges && wetEdges.strength > 0) {
         this.applyWetEdges(this.strokeAccumTex, wetEdges);
+        // the shader only rewrites texels that already hold paint; padding by the kernel width is conservative
+        this.strokeAccumDirty = padRect(this.strokeAccumDirty, Math.max(0, Math.ceil(wetEdges.edgeWidth)));
+        effect = true;
       }
+      if (effect) this.compositeStrokeEnd();
     }
     this.strokeActive = false;
+  }
+
+  /** The end-of-stroke flatten (see endStroke): one bounded composite of the accum into the stroke's output. */
+  private compositeStrokeEnd(): void {
+    const out = this.strokeTarget, base = this.strokeBaseTex, accum = this.strokeAccumTex;
+    if (!out || !base || !accum || out.width !== this.strokeTexW || out.height !== this.strokeTexH) return;
+    let r = this.strokeAccumDirty;
+    if (this.strokeTouched) r = unionRect(r, this.strokeTouched);
+    if (!r) return;
+    const x0 = Math.max(0, Math.floor(r.x0)), y0 = Math.max(0, Math.floor(r.y0));
+    const x1 = Math.min(out.width, Math.ceil(r.x1)), y1 = Math.min(out.height, Math.ceil(r.y1));
+    if (x1 <= x0 || y1 <= y0) return;
+    const rect = { x0, y0, x1, y1 };
+    this.reserveStaging(DAB_STAGING_BYTES);
+    this.compositeRecord(this.encoder(), base, accum, out, rect);
+    this.strokeTouched = unionRect(this.strokeTouched, rect);
+    this.flush();
+  }
+
+  /** True when this stroke has put paint in the accum (a wet dab or a strip) — erase-only strokes haven't. */
+  public get strokeHasAccumPaint(): boolean {
+    return this.strokeActive && this.strokeAccumUsed;
   }
 
   // ── Stroke accum texture accessors (for stroke texture renderer) ──
 
   /** Get the stroke accumulation texture (for stroke texture rendering). */
   public getStrokeAccumTex(): GPUTexture | null {
+    this.flush();   // the caller renders into it with its own submit
     return this.strokeActive ? this.strokeAccumTex : null;
   }
 
-  /** Clear the stroke accumulation texture to transparent black. */
+  /** Clear the stroke accumulation texture to transparent black. During a stroke this marks the accum as
+   *  rewritten, so endStroke flattens it (the caller reports what it then draws with markStrokeAccumWritten). */
   public clearStrokeAccum(): void {
+    this.flush();
     if (this.strokeAccumTex && this.strokeTexW > 0 && this.strokeTexH > 0) {
-      this.clearTexture(this.strokeAccumTex, this.strokeTexW, this.strokeTexH);
+      const enc = this.device.createCommandEncoder();
+      this.recordClear(enc, this.strokeAccumTex);
+      this.device.queue.submit([enc.finish()]);
+      this.stats.submits++;
+      if (this.strokeActive) {
+        this.strokeAccumDirty = null;
+        this.strokeAccumRewritten = true;
+      }
     }
+  }
+
+  /** Report that something outside the dab path (the stroke-texture strip) drew into the accum within `rect`
+   *  (texels, max-exclusive; clipped by the end composite). endStroke then composites it onto the canvas. */
+  public markStrokeAccumWritten(rect: TexelRect): void {
+    if (!this.strokeActive) return;
+    this.strokeAccumDirty = unionRect(this.strokeAccumDirty, rect);
+    this.strokeAccumUsed = true;
+    this.strokeAccumRewritten = true;
   }
 
   // ── Public API ────────────────────────────────────────────────────
@@ -324,16 +629,18 @@ export class BrushStampPipeline {
     dstTexture: GPUTexture,
     params: StampParams,
   ): void {
-    const enc = this.device.createCommandEncoder();
-    if (this.stampRecord(enc, srcTexture, dstTexture, params)) {
-      this.device.queue.submit([enc.finish()]);
+    this.beginBatch();
+    try {
+      this.reserveStaging(DAB_STAGING_BYTES);
+      this.stampRecord(this.encoder(), srcTexture, dstTexture, params);
+    } finally {
+      this.endBatch();
     }
   }
 
-  /** Record one dab into `enc` (E5: lets stampWithPingPong batch copy+stamp+bleed+composite into ONE
-   *  submit per dab - was 3-4). Uniform writeBuffers stay on the queue: they are ordered before any
-   *  LATER submit, and the caller submits after recording. Returns false for an off-canvas dab
-   *  (nothing recorded). */
+  /** Record one dab into `enc`. Uniforms are STAGED (copyBufferToBuffer recorded just before the dispatch),
+   *  so any number of dabs can share one encoder/submit (BRUSH-1b). The caller reserves staging first
+   *  (reserveStaging). Returns false for an off-canvas dab (nothing recorded). */
   private stampRecord(
     enc: GPUCommandEncoder,
     srcTexture: GPUTexture,
@@ -342,30 +649,24 @@ export class BrushStampPipeline {
   ): boolean {
     const { cx, cy, radius, color, rotation, mode, aspect, tipTexture } = params;
 
-    const texW = dstTexture.width;
-    const texH = dstTexture.height;
-    const minX = Math.max(0, Math.floor(cx - radius));
-    const minY = Math.max(0, Math.floor(cy - radius));
-    const maxX = Math.min(texW - 1, Math.ceil(cx + radius));
-    const maxY = Math.min(texH - 1, Math.ceil(cy + radius));
-    const bw = maxX - minX + 1;
-    const bh = maxY - minY + 1;
-    if (bw <= 0 || bh <= 0) return false;
+    const b = dabDispatchBounds(cx, cy, radius, dstTexture.width, dstTexture.height);
+    if (!b) return false;
+    const { minX, minY, bw, bh } = b;
 
     // Write uniforms using pre-allocated arrays (zero GC pressure)
     const p = this.paramData;
     p[0] = minX; p[1] = minY; p[2] = radius; p[3] = mode;
     p[4] = rotation; p[5] = cx; p[6] = cy;
     p[7] = (params.lockTransparency ? 1 : 0) | (params.wetStroke ? 2 : 0);
-    this.device.queue.writeBuffer(this.paramBuf, 0, p);
+    this.stageUniform(enc, this.paramBuf, p);
 
     const c = this.colorData;
     c[0] = color[0]; c[1] = color[1]; c[2] = color[2]; c[3] = color[3];
-    this.device.queue.writeBuffer(this.colorBuf, 0, c);
+    this.stageUniform(enc, this.colorBuf, c);
 
     const a = this.aspectData;
     a[0] = aspect[0]; a[1] = aspect[1];
-    this.device.queue.writeBuffer(this.aspectBuf, 0, a);
+    this.stageUniform(enc, this.aspectBuf, a);
 
     // Resolve selection mask: use real mask or dummy 1x1 (no constraint)
     const maskTex = params.selectionMask ?? this.dummyMaskTex;
@@ -377,7 +678,7 @@ export class BrushStampPipeline {
     g[1] = params.grainInvScale?.[1] ?? 0;
     g[2] = params.grainTexture ? (params.grainStrength ?? 0) : 0; // 0 strength when no grain
     g[3] = 0;
-    this.device.queue.writeBuffer(this.grainBuf, 0, g);
+    this.stageUniform(enc, this.grainBuf, g);
 
     // Resolve dual brush texture: use real dual brush or dummy 1x1 (no modulation)
     const dualTex = params.dualBrushTexture ?? this.dummyDualTex;
@@ -388,7 +689,7 @@ export class BrushStampPipeline {
     db[3] = params.dualBrushTileMode ?? 0; // 0=dab-local, 1=canvas-tiling
     db[4] = params.dualBrushRotation ?? 0;
     db[5] = 0; db[6] = 0; db[7] = 0;
-    this.device.queue.writeBuffer(this.dualBrushBuf, 0, db);
+    this.stageUniform(enc, this.dualBrushBuf, db);
 
     // Reuse bind group if textures haven't changed (common case: same stroke)
     if (
@@ -444,90 +745,93 @@ export class BrushStampPipeline {
    *
    * When a stroke is active (beginStroke was called), uses "indirect painting":
    *  - Dabs are stamped onto strokeAccumTex (using max-alpha, not additive blend)
-   *  - After each dab, output = composite(strokeBaseTex, strokeAccumTex)
+   *  - output = composite(strokeBaseTex, strokeAccumTex)
    * This prevents opacity buildup when painting over the same area.
+   *
+   * BRUSH-1: the ping copy and the composite cover only the dab's dispatch footprint (dabDispatchBounds), not
+   * the whole canvas — pixel-identical, since the stamp touches nothing else and the composite is a per-texel
+   * function of (base, accum) whose inputs changed only there. BRUSH-1b: inside a batch (beginBatch/endBatch)
+   * the composite is deferred to ONE pass over the union of the batch's footprints, and the batch is ONE submit;
+   * outside a batch each call is its own one-dab batch.
    */
   public stampWithPingPong(
     texture: GPUTexture,
     params: StampParams,
     perDabBleed?: { radius: number; strength: number },
   ): void {
+    this.beginBatch();
+    try {
+      this.recordDab(texture, params, perDabBleed);
+    } finally {
+      this.endBatch();
+    }
+  }
+
+  private recordDab(
+    texture: GPUTexture,
+    params: StampParams,
+    perDabBleed?: { radius: number; strength: number },
+  ): void {
+    const W = texture.width, H = texture.height;
+    const bounds = dabDispatchBounds(params.cx, params.cy, params.radius, W, H);
+    const fp = bounds?.footprint ?? null;
+    const bleed = !!(perDabBleed && perDabBleed.strength > 0);
     // Erase modes (1,2,3) must bypass wet-stroke: the accum texture starts transparent,
     // so erasing transparent pixels (existing.a * (1-brush) = 0*anything = 0) is a no-op.
     // Erasing also *wants* opacity buildup (repeated strokes erase more), so direct is correct.
     const isEraseMode = params.mode !== 0;
-    if (this.strokeActive && this.strokeBaseTex && this.strokeAccumTex && !isEraseMode) {
-      // ── Indirect painting (wet-stroke) path ──
-      // Ensure ping texture for the accum read
-      if (
-        !this.pingTex ||
-        this.pingTexW !== texture.width ||
-        this.pingTexH !== texture.height
-      ) {
-        this.pingTex?.destroy();
-        this.pingTex = this.device.createTexture({
-          size: [texture.width, texture.height],
-          format: 'rgba8unorm',
-          // STORAGE_BINDING: pingTex is SHARED with applyBleed (which binds it as a write storage texture) and
-          // reuse is gated on SIZE only — so every allocation must support storage or a bleed-after-same-size-dab
-          // reuses a storage-less texture → WebGPU validation error.
-          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
-        });
-        this.pingTexW = texture.width;
-        this.pingTexH = texture.height;
-        this.cachedBindGroup = null;
-      }
+    const wet = this.strokeActive && !!this.strokeBaseTex && !!this.strokeAccumTex && !isEraseMode;
+    if (!fp && !(wet && bleed)) return;   // off-canvas dab: the old full copy + composite changed nothing
 
-      // E5: ONE encoder for the whole dab - copy, stamp, (bleed), composite used to be 3-4 separate
-      // submits; in-encoder pass ordering makes this safe (the stamp reads pingTex before bleed reuses
-      // it as its blur ping). Per-dab GPU submits are the brush-feel bottleneck the audit flagged.
-      const enc = this.device.createCommandEncoder();
-      // Copy current strokeAccumTex → ping (for reading)
-      enc.copyTextureToTexture(
-        { texture: this.strokeAccumTex },
-        { texture: this.pingTex },
-        { width: texture.width, height: texture.height },
-      );
-      // Stamp dab: read from ping (current accum), write to strokeAccumTex
-      // The shader uses max-alpha blending for paint mode when strokeActive
-      this.stampRecord(enc, this.pingTex, this.strokeAccumTex, { ...params, wetStroke: true });
-      // Per-dab bleed: spread paint on the accum layer before compositing
-      if (perDabBleed && perDabBleed.strength > 0) {
-        this.bleedRecord(enc, this.strokeAccumTex, perDabBleed);
+    this.reserveStaging(DAB_STAGING_BYTES);
+    const ping = this.ensurePing(W, H);   // may flush (realloc) — fetch the encoder after
+    const enc = this.encoder();
+
+    if (wet) {
+      // ── Indirect painting (wet-stroke) path ──
+      const accum = this.strokeAccumTex!;
+      // A batch composites into ONE output; a different output texture composites what's pending first.
+      if (this.pendingOutput && this.pendingOutput !== texture) this.compositePending(enc);
+      if (fp) {
+        // Copy the footprint of strokeAccumTex → ping (for reading)
+        const fw = fp.x1 - fp.x0, fh = fp.y1 - fp.y0;
+        enc.copyTextureToTexture(
+          { texture: accum, origin: { x: fp.x0, y: fp.y0 } },
+          { texture: ping, origin: { x: fp.x0, y: fp.y0 } },
+          { width: fw, height: fh },
+        );
+        this.stats.copiedTexels += fw * fh;
+        // Stamp dab: read from ping (current accum), write to strokeAccumTex
+        // The shader uses max-alpha blending for paint mode when strokeActive
+        this.stampRecord(enc, ping, accum, { ...params, wetStroke: true });
+        this.pendingComposite = unionRect(this.pendingComposite, fp);
+        this.strokeAccumDirty = unionRect(this.strokeAccumDirty, fp);
       }
-      // Composite: strokeBaseTex + strokeAccumTex → output texture
-      this.compositeRecord(enc, this.strokeBaseTex, this.strokeAccumTex, texture);
-      this.device.queue.submit([enc.finish()]);
+      // Per-dab bleed: spreads paint over the WHOLE accum layer (kept full-size: bounding it would change the
+      // result), so the next composite must cover the whole texture too.
+      if (bleed) {
+        this.bleedRecord(enc, accum, perDabBleed!);
+        this.pendingCompositeFull = true;
+        this.strokeAccumDirty = { x0: 0, y0: 0, x1: W, y1: H };
+      }
+      this.strokeAccumUsed = true;
+      this.pendingOutput = texture;
       return;
     }
 
-    // ── Legacy direct path (no stroke lifecycle) ──
-    if (
-      !this.pingTex ||
-      this.pingTexW !== texture.width ||
-      this.pingTexH !== texture.height
-    ) {
-      this.pingTex?.destroy();
-      this.pingTex = this.device.createTexture({
-        size: [texture.width, texture.height],
-        format: 'rgba8unorm',
-        // STORAGE_BINDING: pingTex is shared with applyBleed (write storage texture); reuse is size-gated only.
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
-      });
-      this.pingTexW = texture.width;
-      this.pingTexH = texture.height;
-      this.cachedBindGroup = null;
-    }
-
-    // E5: copy + stamp share one submit on the legacy direct path too (was 2).
-    const enc = this.device.createCommandEncoder();
+    // ── Direct path (erase / blend modes / no stroke lifecycle) ──
+    // It reads the output texture, so a deferred wet composite into it must land first.
+    if (this.pendingOutput) this.compositePending(enc);
+    const fw = fp!.x1 - fp!.x0, fh = fp!.y1 - fp!.y0;
     enc.copyTextureToTexture(
-      { texture },
-      { texture: this.pingTex },
-      { width: texture.width, height: texture.height },
+      { texture, origin: { x: fp!.x0, y: fp!.y0 } },
+      { texture: ping, origin: { x: fp!.x0, y: fp!.y0 } },
+      { width: fw, height: fh },
     );
-    this.stampRecord(enc, this.pingTex, texture, params);
-    this.device.queue.submit([enc.finish()]);
+    this.stats.copiedTexels += fw * fh;
+    this.stampRecord(enc, ping, texture, params);
+    this.strokeTouched = unionRect(this.strokeTouched, fp!);
+    if (this.strokeActive) this.strokeOutputDirty = unionRect(this.strokeOutputDirty, fp!);
   }
 
   /**
@@ -539,6 +843,7 @@ export class BrushStampPipeline {
     x: number,
     y: number,
   ): Promise<[number, number, number, number]> {
+    this.flush();   // read what the dabs recorded so far actually wrote
     const px = Math.max(0, Math.min(texture.width - 1, Math.round(x)));
     const py = Math.max(0, Math.min(texture.height - 1, Math.round(y)));
 
@@ -569,6 +874,11 @@ export class BrushStampPipeline {
   }
 
   public destroy(): void {
+    this.batchEnc = null;   // drop anything unsubmitted (the device objects die with us)
+    this.batchDepth = 0;
+    this.stagingCursor = 0;
+    this.stagingBuf.destroy();
+    this.compositeRectBuf.destroy();
     this.paramBuf.destroy();
     this.colorBuf.destroy();
     this.aspectBuf.destroy();
@@ -589,7 +899,8 @@ export class BrushStampPipeline {
   // ── Stroke composite helper ───────────────────────────────────────
 
   /**
-   * Composite strokeAccum onto strokeBase, writing the result to outputTex.
+   * Composite strokeAccum onto strokeBase over `rect` of outputTex (BRUSH-1: bounded — the rect origin/size go
+   * in a staged uniform and the dispatch covers only the rect).
    * Uses standard alpha-over blending: output = base + accum composited on top.
    */
   private compositeRecord(
@@ -597,9 +908,11 @@ export class BrushStampPipeline {
     baseTex: GPUTexture,
     accumTex: GPUTexture,
     outputTex: GPUTexture,
+    rect: TexelRect,
   ): void {
-    const w = outputTex.width;
-    const h = outputTex.height;
+    const w = rect.x1 - rect.x0;
+    const h = rect.y1 - rect.y0;
+    if (w <= 0 || h <= 0) return;
 
     // E5: same three textures every dab of a stroke - rebuild only when one changes.
     const k = this.cachedCompositeKey;
@@ -610,36 +923,37 @@ export class BrushStampPipeline {
           { binding: 0, resource: baseTex.createView() },
           { binding: 1, resource: accumTex.createView() },
           { binding: 2, resource: outputTex.createView() },
+          { binding: 3, resource: { buffer: this.compositeRectBuf } },
         ],
       });
       this.cachedCompositeKey = [baseTex, accumTex, outputTex];
     }
+
+    this.compositeRectData[0] = rect.x0; this.compositeRectData[1] = rect.y0;
+    this.compositeRectData[2] = w; this.compositeRectData[3] = h;
+    this.stageUniform(enc, this.compositeRectBuf, this.compositeRectData);
 
     const pass = enc.beginComputePass();
     pass.setPipeline(this.compositePipeline);
     pass.setBindGroup(0, this.cachedCompositeBG);
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
+    this.stats.compositedTexels += w * h;
   }
+  private compositeRectData = new Uint32Array(4);
 
-  /** Clear a texture to transparent black (0,0,0,0). */
-  private clearTexture(tex: GPUTexture, w: number, h: number): void {
-    const paddedRowBytes = Math.ceil(w * 4 / 256) * 256;
-    const buf = this.device.createBuffer({
-      size: paddedRowBytes * h,
-      usage: GPUBufferUsage.COPY_SRC,
-      mappedAtCreation: true,
+  /** Record a clear of `tex` to transparent black (0,0,0,0) — a loadOp:'clear' render pass (BRUSH-1b; was a
+   *  CPU zero-filled w×h×4 buffer upload every stroke). */
+  private recordClear(enc: GPUCommandEncoder, tex: GPUTexture): void {
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{
+        view: tex.createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
     });
-    new Uint8Array(buf.getMappedRange()).fill(0);
-    buf.unmap();
-    const enc = this.device.createCommandEncoder();
-    enc.copyBufferToTexture(
-      { buffer: buf, bytesPerRow: paddedRowBytes },
-      { texture: tex },
-      { width: w, height: h },
-    );
-    this.device.queue.submit([enc.finish()]);
-    buf.destroy();
+    pass.end();
   }
 
   // ── Composite pipeline construction ───────────────────────────────
@@ -649,12 +963,17 @@ export class BrushStampPipeline {
       @group(0) @binding(0) var baseTex: texture_2d<f32>;    // stroke base (pre-stroke snapshot)
       @group(0) @binding(1) var accumTex: texture_2d<f32>;   // stroke accumulation layer
       @group(0) @binding(2) var output: texture_storage_2d<rgba8unorm, write>;
+      // rect: originX, originY, width, height (BRUSH-1: only the changed region is composited)
+      @group(0) @binding(3) var<uniform> rect: vec4<u32>;
 
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        if (gid.x >= rect.z || gid.y >= rect.w) { return; }
         let dim = textureDimensions(output);
-        if (gid.x >= dim.x || gid.y >= dim.y) { return; }
-        let coords = vec2<i32>(i32(gid.x), i32(gid.y));
+        let px = gid.x + rect.x;
+        let py = gid.y + rect.y;
+        if (px >= dim.x || py >= dim.y) { return; }
+        let coords = vec2<i32>(i32(px), i32(py));
 
         let base = textureLoad(baseTex, coords, 0);
         let stroke = textureLoad(accumTex, coords, 0);
@@ -680,6 +999,7 @@ export class BrushStampPipeline {
         { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       ],
     });
 
@@ -708,18 +1028,8 @@ export class BrushStampPipeline {
     const h = accumTex.height;
 
     // We need a ping texture to read from while writing to accumTex
-    if (!this.pingTex || this.pingTexW !== w || this.pingTexH !== h) {
-      this.pingTex?.destroy();
-      this.pingTex = this.device.createTexture({
-        size: [w, h],
-        format: 'rgba8unorm',
-        // STORAGE_BINDING: pingTex is shared with applyBleed (write storage texture); reuse is size-gated only.
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
-      });
-      this.pingTexW = w;
-      this.pingTexH = h;
-      this.cachedBindGroup = null;
-    }
+    this.flush();
+    this.ensurePing(w, h);
 
     // Copy accumTex → ping for reading
     const cpEnc = this.device.createCommandEncoder();
@@ -835,9 +1145,14 @@ export class BrushStampPipeline {
     accumTex: GPUTexture,
     settings: { radius: number; strength: number },
   ): void {
-    const enc = this.device.createCommandEncoder();
-    this.bleedRecord(enc, accumTex, settings);
-    this.device.queue.submit([enc.finish()]);
+    this.beginBatch();
+    try {
+      this.reserveStaging(DAB_STAGING_BYTES);
+      this.ensurePing(accumTex.width, accumTex.height);   // may flush — fetch the encoder after
+      this.bleedRecord(this.encoder(), accumTex, settings);
+    } finally {
+      this.endBatch();
+    }
   }
 
   /** Record the two blur passes into `enc` (E5: shares the per-dab encoder in stampWithPingPong).
@@ -852,25 +1167,17 @@ export class BrushStampPipeline {
     const w = accumTex.width;
     const h = accumTex.height;
 
+    // The caller has ensured pingTex (ensurePing) BEFORE taking `enc` — reallocating here would destroy a
+    // texture the open encoder may already reference.
     if (!this.pingTex || this.pingTexW !== w || this.pingTexH !== h) {
-      this.pingTex?.destroy();
-      this.pingTex = this.device.createTexture({
-        size: [w, h],
-        format: 'rgba8unorm',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
-               GPUTextureUsage.STORAGE_BINDING,
-      });
-      this.pingTexW = w;
-      this.pingTexH = h;
-      this.cachedBindGroup = null;
-      this.cachedBleedBGs = null;
+      throw new Error('BrushStampPipeline.bleedRecord: ping texture not prepared');
     }
 
     const p = this.bleedParamData;
     p[0] = Math.max(1, Math.round(settings.radius));
     p[1] = Math.max(0, Math.min(1, settings.strength));
     p[2] = 0; p[3] = 0;
-    this.device.queue.writeBuffer(this.bleedParamBuf, 0, p);
+    this.stageUniform(enc, this.bleedParamBuf, p);   // staged: per-dab bleeds can share one submit
 
     if (!this.cachedBleedBGs || this.cachedBleedAccum !== accumTex) {
       // Pass 1 - horizontal blur: accumTex → pingTex; pass 2 - vertical blur + lerp: pingTex → accumTex.

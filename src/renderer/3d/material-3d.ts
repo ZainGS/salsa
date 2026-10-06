@@ -2,7 +2,7 @@
  * Material3D — Per-mesh visual properties for 3D rendering.
  *
  * Maps directly to the MeshInstance uniform in the WGSL shader:
- *   diffuseColor, specularColor, emissiveColor, shininess, flags.
+ *   diffuseColor, specularColor, emissive, shininess, flags.
  */
 
 import { RGBA } from '../../types/rgba';
@@ -483,7 +483,7 @@ export const DEFAULT_MATERIAL: Material3D = {
 };
 
 /**
- * Encode material flags for the shader's emissiveColor.a field.
+ * Encode material flags for the shader's MeshInstance.flags field (instance float 43, the 4th lane after emissive rgb).
  * bit 0:    hasTexture
  * bit 1:    hasNormalMap (triggers per-pixel normal mapping)
  * bits 2-4: renderStyle  (0=default PBR, 1=cel, 2=sketch, 3=ink, 4=gouraud, 5=cel-hd, 6=unlit)
@@ -525,8 +525,10 @@ export const DEFAULT_MATERIAL: Material3D = {
  *                         Material3D.softLighting)
  * bit 29:   skinRamp     (toon-ramp the (soft-)Lambert diffuse into bands + warm shadow tint; params =
  *                         scene.skinRampParams; applied after softLighting; see Material3D.skinRamp)
- * NOTE: flags travel as a raw u32 (setUint32 → bitcast<u32> in WGSL), NOT as an f32 value, so all 32 bits are usable
- * (the earlier "2^24 = last exact-f32 bit" caution only applied to a value stored through the f32 field directly).
+ * NOTE: flags travel as a raw u32 (setUint32 on the CPU; the WGSL field is DECLARED u32, MeshInstance.flags), NOT as an
+ * f32 value, so all 32 bits are usable. Never declare that lane f32 and bitcast it: a value with only bits < 23 set is a
+ * SUBNORMAL f32, which mobile drivers flush to zero (garments lost texture / pattern / style; mobile-parity CLOTH-3).
+ * mesh-instance-layout.test.ts pins the u32 declaration in every WGSL MeshInstance.
  */
 /**
  * SECOND PER-OBJECT FLAGS WORD ("flags2", 2026-10-01, fog horizon P2). All 32 bits of the word above are taken, so

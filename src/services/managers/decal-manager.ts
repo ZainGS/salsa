@@ -239,11 +239,13 @@ export class DecalManager {
 
     /** A decal quad: unit geometry, lit, alpha-cut (crisp edges); the ghost variant is translucent. */
     private _makeDecalQuad(ghost = false): Mesh3D {
-        return new Mesh3D(this.interactionService, 0, 0, 0, {
+        const q = new Mesh3D(this.interactionService, 0, 0, 0, {
             primitive: 'custom', geometry: decalQuadGeometry(),
             material: { diffuse: { r: ghost ? 0.9 : 0.8, g: ghost ? 0.9 : 0.8, b: ghost ? 0.95 : 0.8, a: 1 },
                 roughness: 1, metalness: 0, alphaCutout: true, doubleSided: false, ...(ghost ? { opacity: 0.5 } : {}) },
         });
+        q.noCollide = true;   // a sticker on a surface is never Play collision (rise bug 2026-10-04)
+        return q;
     }
     /** World hit to MESH-LOCAL hit (point through the inverse combined matrix; normal through its 3x3,
      *  renormalized) + the mesh's mean scale (for the size freeze). Null on a degenerate matrix. */

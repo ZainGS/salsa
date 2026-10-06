@@ -54,7 +54,7 @@ describe('frontage dressing (D1)', () => {
     expect(layers.find(L => L.name === 'world:frontage-nobori-pole')!.instances!.length).toBe(nFlags);
     const total = layers.reduce((n, L) => n + tris(L), 0);
     const g = noboriGeometry(), per = [g.flag, g.text, g.pole, g.base].reduce((n, x) => n + x.indices.length / 3, 0);
-    expect(per).toBeLessThan(200);
+    expect(per).toBeLessThan(230);   // 2026-10-04: +~16 tris — glyph blocks split at the cloth's strip seams (no clipping)
     // eslint-disable-next-line no-console
     console.log(`[D1] nobori slots ${plan.of('nobori').length} (flags ${nFlags}, ${per} tris each) · wall-bike slots ${plan.of('bikewall').length} · potted ${plan.of('potted').length} · layers ${layers.length} · ${Math.round(total)} tris`);
     expect(total).toBeLessThan(250_000);

@@ -287,6 +287,56 @@ describe('CharacterController', () => {
             expect(d.grounded).toBe(false);                    // off a ledge: falling, not teleported down
         });
     });
+
+    // Rise bug 2026-10-04 (docs/ui/play-mode.md "Rising forever"): a surface that FOLLOWS the feet (the player's own
+    // contact-shadow blob was collided with) stood the player on it every tick → it rose forever. Safety net: a
+    // grounded character that does not move horizontally cannot step up twice in a row.
+    describe('rise bug 2026-10-04: no step-up chain without horizontal movement', () => {
+        it('a self-following ground under a still player lifts it at most once (old behaviour: forever)', () => {
+            const run = (guard: boolean) => {
+                const prev = CharacterController.stillRiseGuard;
+                CharacterController.stillRiseGuard = guard;
+                try {
+                    const c = new CharacterController({ ...INSTANT, stepHeight: 0.4 });
+                    c.groundSampler = () => c.pos[1] + 0.02;   // always 2 cm above the current feet
+                    for (let i = 0; i < 300; i++) c.update(1 / 60, NO_INPUT);
+                    return c;
+                } finally { CharacterController.stillRiseGuard = prev; }
+            };
+            const fixed = run(true);
+            expect(fixed.pos[1]).toBeLessThanOrEqual(0.02 + 1e-9);   // the one allowed settle
+            expect(fixed.grounded).toBe(true);
+            expect(fixed.stillRisesHeld).toBeGreaterThan(250);
+            expect(run(false).pos[1]).toBeGreaterThan(5);             // the bug the guard catches
+        });
+
+        it('a spawn below the ground still settles onto it once; walking still climbs stairs and kerbs', () => {
+            const s = new CharacterController({ ...INSTANT, stepHeight: 0.4 }, [0, 0, 0]);
+            s.groundSampler = () => 0.15;   // started under a kerb
+            for (let i = 0; i < 10; i++) s.update(1 / 60, NO_INPUT);
+            expect(s.pos[1]).toBeCloseTo(0.15, 6);
+            expect(s.grounded).toBe(true);
+            // A 0.2-high stair every 0.3 (D walks −X): each riser is a step-up WITH horizontal movement.
+            const c = new CharacterController({ ...INSTANT, stepHeight: 0.4 });
+            c.groundSampler = (x) => Math.max(0, Math.floor(-x / 0.3)) * 0.2;
+            for (let i = 0; i < 60; i++) c.update(1 / 60, { ...NO_INPUT, right: 1 });
+            expect(c.pos[1]).toBeCloseTo(Math.floor(-c.pos[0] / 0.3) * 0.2, 6);
+            expect(c.pos[1]).toBeGreaterThan(1);
+            expect(c.stillRisesHeld).toBe(0);
+        });
+
+        it('jumping and landing are unaffected', () => {
+            const c = new CharacterController({ ...INSTANT, jumpSpeed: 5, gravity: 10, stepHeight: 0.4 });
+            c.groundSampler = () => 0;
+            c.update(1 / 60, { ...NO_INPUT, jump: true });
+            let top = 0;
+            for (let i = 0; i < 120; i++) { c.update(1 / 60, NO_INPUT); top = Math.max(top, c.pos[1]); }
+            expect(top).toBeGreaterThan(0.3);
+            expect(c.pos[1]).toBe(0);
+            expect(c.grounded).toBe(true);
+            expect(c.stillRisesHeld).toBe(0);
+        });
+    });
 });
 
 describe('CharacterController — Round 8 gaits + jump feel', () => {

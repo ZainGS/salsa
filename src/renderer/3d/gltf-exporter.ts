@@ -327,7 +327,12 @@ export function exportSceneToGlb(
 
   for (const mesh of meshes) {
     const geom = mesh.geometry;
-    const verts = geom.vertices;
+    // Blend shapes: glTF stores the BASE mesh + the morph targets + the weights, and a viewer (or our importer)
+    // re-applies the weights. geometry.vertices already holds the evaluated morph, so exporting it applied every
+    // non-zero weight twice on re-import — export baseVertices instead (when it lines up with the geometry; with a
+    // modifier stack the evaluated geometry no longer matches the base layout, so the old behaviour stays).
+    const base = mesh.blendShapes.length > 0 ? mesh.baseVertices : null;
+    const verts = base && base.length === geom.vertices.length ? base : geom.vertices;
     const idxBuf = geom.indices;
     if (!verts || verts.length === 0) continue;
 

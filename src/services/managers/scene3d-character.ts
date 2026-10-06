@@ -34,7 +34,7 @@ import { HairParams, generateHair, DEFAULT_HAIR_PARAMS, HeadFrame, TAIL_BONES, D
 import { skirtSteerSignal, steerSkirtWeights, SkirtFollow, type SkirtSteer } from './skirt-steer';
 import { buildHemSwing, applyHemSwing, resetHemSwing, hipsSwingFrame, HemSwing, type HemSwingData } from './skirt-swing';
 import { createHideMaskJob, maskedIndices, type MaskSkinned } from './body-hide-mask';
-import { layerOver, LAYER_OVER, type LayerGarment } from './garment-layers';
+import { layerOver, LAYER_OVER, limbSidesFromNames, LAYER_GAP, type LayerGarment } from './garment-layers';
 import {
     ClothingParams, TopParams, BottomParams, ShoeParams, BodyFit, JointFit, ArmFit,
     generateTop, generateBottom, generateShoe, generateSock, generateUndershirt, generateUnderpants,
@@ -1527,7 +1527,10 @@ export class Scene3DCharacter {
             inners.push({ geometry: { vertices: verts, indices: m.geometry.indices as Uint32Array }, jointIndices: m.jointIndices, jointWeights: m.jointWeights });
         }
         if (!inners.length) return raw;
-        const { garment, moved } = layerOver(raw, inners);
+        // Side mask (the trousers-web fix): a left-leg vertex never layers over / takes weights from the right sock.
+        const body = this.host.getMesh(bodyMeshId);
+        const sides = body instanceof SkinnedMesh3D && body.skeleton ? limbSidesFromNames(body.skeleton.data.joints.map((j) => j.name)) : undefined;
+        const { garment, moved } = layerOver(raw, inners, LAYER_GAP, undefined, false, sides);
         return moved > 0 || garment.jointWeights.some((w, i) => w !== raw.jointWeights[i])
             ? { ...raw, geometry: { ...raw.geometry, vertices: garment.geometry.vertices }, jointIndices: garment.jointIndices, jointWeights: garment.jointWeights }
             : raw;

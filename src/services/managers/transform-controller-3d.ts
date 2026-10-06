@@ -275,6 +275,17 @@ export class TransformController3D {
   private _onPointerDown: (e: PointerEvent) => void;
   private _onPointerMove: (e: PointerEvent) => void;
   private _onPointerUp:   (e: PointerEvent) => void;
+  private _onPointerCancel: (e: PointerEvent) => void;
+
+  // ── Touch (TOUCH-5 / 6 / 8, docs/ui/touch-controls.md) ──
+  /** Movement (CSS px) above which a finger press is a DRAG (orbit / pan), not a tap-to-select. */
+  static TAP_SLOP_PX = 8;
+  /** Gizmo / handle hit-radius multiplier under a finger. */
+  static TOUCH_HIT_SCALE = 2;
+  /** Touch pointers currently down (a 2nd one cancels the gizmo drag / pending tap). */
+  private _touchIds = new Set<number>();
+  /** A finger press waiting for its pointerUP to select (touch selects on UP so an orbit drag never selects). */
+  private _pendingTap: { id: number; clientX: number; clientY: number; shift: boolean } | null = null;
 
   private _canvas: HTMLCanvasElement | null = null;
 
@@ -285,6 +296,7 @@ export class TransformController3D {
     this._onPointerDown = this.handlePointerDown.bind(this);
     this._onPointerMove = this.handlePointerMove.bind(this);
     this._onPointerUp   = this.handlePointerUp.bind(this);
+    this._onPointerCancel = this.handlePointerCancel.bind(this);
   }
 
   get mode(): GizmoMode { return this._mode; }
@@ -346,6 +358,7 @@ export class TransformController3D {
     addZonelessListener(canvas, 'pointerdown', this._onPointerDown, { capture: true });
     addZonelessListener(canvas, 'pointermove', this._onPointerMove, { capture: true });
     addZonelessListener(canvas, 'pointerup',   this._onPointerUp,   { capture: true });
+    addZonelessListener(canvas, 'pointercancel', this._onPointerCancel, { capture: true });
   }
 
   detach(): void {
@@ -353,13 +366,29 @@ export class TransformController3D {
     removeZonelessListener(this._canvas, 'pointerdown', this._onPointerDown, { capture: true });
     removeZonelessListener(this._canvas, 'pointermove', this._onPointerMove, { capture: true });
     removeZonelessListener(this._canvas, 'pointerup',   this._onPointerUp,   { capture: true });
+    removeZonelessListener(this._canvas, 'pointercancel', this._onPointerCancel, { capture: true });
     this._canvas = null;
     this._drag = null;
+    this._touchIds.clear();
+    this._pendingTap = null;
   }
 
   // ── Event handlers ─────────────────────────────────────────────
 
   private handlePointerDown(e: PointerEvent): void {
+    const isTouch = e.pointerType === 'touch';
+    if (isTouch) {
+      this._touchIds.add(e.pointerId ?? 0);
+      // A 2nd finger is a camera gesture (pan / pinch / two-finger orbit): drop the pending tap and CANCEL a gizmo
+      // drag the first finger started (restoring the meshes, re-enabling orbit) so the gesture can take over.
+      if (this._touchIds.size > 1) { this._cancelForSecondFinger(e); return; }
+    }
+    // TOUCH-8: a finger gets fatter gizmo / handle picks for this press (the mouse keeps the exact radius).
+    this.gizmoRenderer.hitScale = isTouch ? TransformController3D.TOUCH_HIT_SCALE : 1;
+    try { this._handlePointerDown(e, isTouch); } finally { this.gizmoRenderer.hitScale = 1; }
+  }
+
+  private _handlePointerDown(e: PointerEvent, isTouch: boolean): void {
     // Plain LEFT click only: Alt+left is ORBIT (every 3D nav scheme), middle = pan, right = look/pan — none of those
     // may select or grab the gizmo (2026-09-29: starting an Alt-orbit on a mesh selected it).
     if (!this._canvas || e.button !== 0 || e.altKey || this.cb.isInputSuppressed?.()) return;
@@ -368,7 +397,6 @@ export class TransformController3D {
     const { x, y } = this.canvasPos(e);
     const { width, height } = this.cb.getCanvasSize();
     const camera = this.cb.getCamera();
-    const meshes = this.cb.getMeshes();
     const selectedIds = this.cb.getSelectedIds();
 
     // In edit mode the MeshEditPointerController owns all clicks — skip gizmo and selection
@@ -586,11 +614,27 @@ export class TransformController3D {
       return;
     }
 
+    // TOUCH-6: a finger SELECTS on pointerUP (if it hasn't moved past TAP_SLOP_PX) — on pointerdown every orbit /
+    // free-look drag would also select whatever was under the finger. The mouse keeps select-on-down.
+    if (isTouch) {
+      this._pendingTap = { id: e.pointerId ?? 0, clientX: e.clientX, clientY: e.clientY, shift: e.shiftKey };
+      return;
+    }
+    this._selectAt(x, y, e.shiftKey);
+  }
+
+  /** Click / tap SELECTION at canvas device-pixel (x, y): emitter icons first, then the mesh raycast, then the
+   *  additional (instanced) pick; Shift toggles. */
+  private _selectAt(x: number, y: number, shiftKey: boolean): void {
+    const { width, height } = this.cb.getCanvasSize();
+    const camera = this.cb.getCamera();
+    const meshes = this.cb.getMeshes();
+    const selectedIds = this.cb.getSelectedIds();
     // No gizmo hit → emitter ICON pick first (icons draw on top of everything, so they win over
     // meshes behind them — the Blender empty/light behavior), then mesh raycast.
     const emitterId = this.cb.pickEmitter?.(x, y, width, height) ?? null;
     if (emitterId) {
-      if (e.shiftKey) {
+      if (shiftKey) {
         const next = new Set(selectedIds);
         if (next.has(emitterId)) next.delete(emitterId);
         else next.add(emitterId);
@@ -607,7 +651,7 @@ export class TransformController3D {
     // after this capture handler) still receives it and begins the stroke.
     if (hit && this.cb.isPickSuppressed?.(hit.mesh.id)) return;
     if (hit) {
-      if (e.shiftKey) {
+      if (shiftKey) {
         const next = new Set(selectedIds);
         if (next.has(hit.mesh.id)) next.delete(hit.mesh.id);
         else next.add(hit.mesh.id);
@@ -615,7 +659,7 @@ export class TransformController3D {
       } else {
         this.cb.setSelectedIds(new Set([hit.mesh.id]));
       }
-    } else if (!e.shiftKey) {
+    } else if (!shiftKey) {
       // Try additional picking (e.g. GPU-instanced array instances invisible to MeshPicker)
       const additionalId = this.cb.pickAdditional?.(x, y, width, height) ?? null;
       if (additionalId) {
@@ -636,6 +680,12 @@ export class TransformController3D {
   }
 
   private handlePointerMove(e: PointerEvent): void {
+    // TOUCH-6: a finger that moved past the slop is a drag (orbit / look / pan), never a tap-select.
+    const tap = this._pendingTap;
+    if (tap && e.pointerType === 'touch' && (e.pointerId ?? 0) === tap.id
+        && Math.hypot(e.clientX - tap.clientX, e.clientY - tap.clientY) > TransformController3D.TAP_SLOP_PX) {
+      this._pendingTap = null;
+    }
     if (!this._canvas || this.cb.isInputSuppressed?.()) return;
     this._ctrlHeld  = e.ctrlKey;
     this._shiftHeld = e.shiftKey;
@@ -713,6 +763,19 @@ export class TransformController3D {
 
   private handlePointerUp(e: PointerEvent): void {
     if (!this._canvas) return;
+    if (e.pointerType === 'touch') {
+      const id = e.pointerId ?? 0;
+      this._touchIds.delete(id);
+      const tap = this._pendingTap;
+      if (tap && tap.id === id) {
+        this._pendingTap = null;
+        // Re-check the gates: Play / an edit mode may have started while the finger was down.
+        if (!this.cb.isInputSuppressed?.() && !this.cb.isInMeshEditMode?.() && !this.cb.isBoneOverlayActive?.()) {
+          const { x, y } = this.canvasPos(e);
+          this._selectAt(x, y, tap.shift);
+        }
+      }
+    }
     this._ctrlHeld  = false;
     this._shiftHeld = false;
 
@@ -764,6 +827,32 @@ export class TransformController3D {
         this.cb.onTransformComplete(dragSnapshot.initialTransforms, after);
       }
       this.cb.onTransformDone?.([...dragSnapshot.initialTransforms.keys()]);
+    }
+  }
+
+  /** Browser-cancelled pointer: forget the finger, drop a pending tap, and CANCEL (restore) a gizmo drag. */
+  private handlePointerCancel(e: PointerEvent): void {
+    const id = e.pointerId ?? 0;
+    if (e.pointerType === 'touch') this._touchIds.delete(id);
+    if (this._pendingTap && this._pendingTap.id === id) this._pendingTap = null;
+    if (this._drag) {
+      try { this._canvas?.releasePointerCapture(id); } catch { /* not captured */ }
+      this.cancelTransform3D();
+    } else if (this._arrayDrag) {
+      this.handlePointerUp(e);   // array spacing has no cheap restore: commit what was dragged (undoable)
+    }
+  }
+
+  /** TOUCH-5: a 2nd finger landed. The tap is off, and a gizmo drag the first finger started is CANCELLED (meshes
+   *  restored, orbit re-enabled) so the two-finger camera gesture takes over cleanly. An array-handle drag commits. */
+  private _cancelForSecondFinger(e: PointerEvent): void {
+    this._pendingTap = null;
+    if (this._drag) {
+      for (const pid of this._touchIds) { try { this._canvas?.releasePointerCapture(pid); } catch { /* not captured */ } }
+      this.cancelTransform3D();
+    } else if (this._arrayDrag) {
+      this.handlePointerUp(e);
+      if (e.pointerType === 'touch') this._touchIds.add(e.pointerId ?? 0);   // that finger is still down
     }
   }
 

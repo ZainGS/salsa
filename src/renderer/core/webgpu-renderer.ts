@@ -4,6 +4,10 @@ import { GpuFrameTimer } from './gpu-frame-timer';
 import { createGpuDeviceHandle, unwrapDevice, type GpuDeviceHandle } from './gpu-device-handle';
 import { GpuDeviceStatusTracker, requestSalsaDevice, requestSalsaDeviceWithRetry, WebGPUUnavailableError, describeWebGPUUnavailable,
   showWebGPUOverlay, hideWebGPUOverlay, sweepGpuFields, type SalsaDevice, type GpuDeviceStatusInfo, type GpuDeviceStatusListener } from './gpu-device-recovery';
+import { resolveGpuCaps, computeCanvasBacking, gpuJson, DESKTOP_CAPS, type GpuCaps, type GpuTier } from './gpu-capabilities';
+import { detectGpuTierNow, recordGpuDeviceLoss, recordGpuError, readLastGpuLoss, readPersistedGpuCrumbs, getGpuCrumbs, getGpuErrors,
+  getOpenGpuOps, isGpuSafeModeStored, gpuCrumb, type GpuAdapterFacts, type GpuLossRecord, type GpuCrumb, type GpuErrorRecord } from './gpu-diagnostics';
+import { TextEffectEngine } from '../raster/effects/text-effect-engine';
 import { ResolutionScaler, sanitizeResolutionScale, type ResolutionScaleSettings, type ResolutionScaleState } from './resolution-scaler';
 import { DEFAULT_TEMPORAL_AA, sanitizeTemporalAA, type TemporalAASettings, type TemporalAAState } from '../3d/temporal-aa';
 import { WebGPURenderStrategy } from "../render-strategies/webgpu-render-strategy";
@@ -497,6 +501,7 @@ export class WebGPURenderer {
   private _boundPointerMove = this.handlePointerMove.bind(this);
   private _boundPointerUp = this.handlePointerUp.bind(this);
   private _boundWheel = this.handleWheel.bind(this);
+  private _boundPointerCancel = (e: PointerEvent) => this._interaction.handlePointerCancel(e);
   /** C1: pointer/wheel/key input lives in RasterInteractionController; the members it reaches back into
    *  are `public` below (relocation, not decoupling — same stance as DocumentStateCoordinator). */
   private _interaction = new RasterInteractionController(this);
@@ -747,6 +752,9 @@ export class WebGPURenderer {
         alphaMode: 'premultiplied',
       });
     } catch { /* context may not be ready yet */ }
+    // setCanvasSize was a no-op while suspended (UI-16): catch up on any resize / DPR / caps change made meanwhile
+    // (the cached CSS + backing size makes this free when nothing changed).
+    if (this.device && this.canvas) this.setCanvasSize(this.getDevice());
     this.scheduleRender();
   }
 
@@ -1025,6 +1033,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       addZonelessListener(this.canvas, 'pointermove', this._boundPointerMove);
       addZonelessListener(this.canvas, 'pointerup', this._boundPointerUp);
       addZonelessListener(this.canvas, 'wheel', this._boundWheel, { passive: false });
+      // TOUCH-5: a cancelled pointer ends (reverts) the gesture; the canvas consumes finger gestures itself (2D
+      // pinch / pan, 3D orbit) so the browser must not pan / zoom the page under it.
+      addZonelessListener(this.canvas, 'pointercancel', this._boundPointerCancel);
+      if (this.canvas.style) this.canvas.style.touchAction = 'none';
   }
 
   // Method to get the GPUDevice
@@ -1119,18 +1131,128 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     this.registerGpuResourceOwner('temporal-aa', () => { this._renderer3D?.resetTemporalHistory(); this._taaSettleLeft = 0; }, 70);
   }
 
+  // ── GPU CAPABILITY TIER + CAPS (gpu-capabilities.ts; mobile-parity CRASH-8 / CRASH-3 / CRASH-10; docs/ui/gpu-diagnostics.md) ──
+  // A PER-MACHINE layer resolved from the adapter + environment at start-up and again before every device rebuild
+  // (a crash loop switches to the 'safe' tier there). It clamps renderer switches; it never writes document settings.
+  private _gpuTier: GpuTier = 'desktop';
+  private _gpuTierReasons: string[] = [];
+  private _gpuCaps: GpuCaps = { ...DESKTOP_CAPS };
+  private _adapter: GPUAdapter | null = null;
+  private _adapterInfo: GpuAdapterFacts | null = null;
+  private _indirectFirstInstance = true;
+  private _gpuTierLogged = false;
+  private _gpuErrorsLogged = 0;
+  private readonly _prevSessionCrumbs = readPersistedGpuCrumbs();
+
+  /** Resolve the tier + caps for a (new) device and apply them. Logs the tier once per page load (and on a change). */
+  private _resolveGpuCaps(got: SalsaDevice, phase: 'start-up' | 'recovery'): void {
+    this._adapter = got.adapter;
+    this._adapterInfo = got.adapterInfo ?? null;
+    this._indirectFirstInstance = got.indirectFirstInstance !== false;
+    const prevTier = this._gpuTier;
+    const t = detectGpuTierNow(this._adapterInfo);
+    this._gpuTier = t.tier; this._gpuTierReasons = t.reasons;
+    const caps = resolveGpuCaps(t.tier, { indirectFirstInstance: this._indirectFirstInstance });
+    this.applyGpuCaps(caps, false);   // (no live renderer / resize here: the rebuild + the caller handle those)
+    if (!this._gpuTierLogged || prevTier !== t.tier) {
+      this._gpuTierLogged = true;
+      const a = this._adapterInfo;
+      console.log(`[Salsa][gpu] tier ${t.tier} (${phase}; ${t.reasons.join(', ')}; adapter ${a ? [a.vendor, a.architecture, a.description].filter(Boolean).join(' / ') || 'hidden' : 'n/a'}`
+        + `${this._indirectFirstInstance ? '' : '; no indirect-first-instance'}) caps ${gpuJson(caps)}`);
+    }
+    gpuCrumb(`tier ${t.tier} (${phase})`);
+  }
+
+  /**
+   * Apply per-machine caps (normally resolved from the tier; exposed for the host / tests). Sets the engine-wide
+   * statics (Renderer3D.caps, TextEffectEngine.htmlInCanvasAllowed, GPUPipelineCache.defaultMaxConcurrentWarm), the
+   * live renderer's state and the canvas backing cap. Never touches document settings or stored preferences.
+   */
+  public applyGpuCaps(caps: GpuCaps, live = true): void {
+    const c = { ...caps };
+    if (!this._indirectFirstInstance) c.gpuDriven = false;   // the GPU-driven bundles need firstInstance
+    this._gpuCaps = c;
+    const rc = Renderer3D.caps;
+    rc.gpuDriven = c.gpuDriven; rc.shaderVariants = c.shaderVariants;
+    rc.shadows = c.shadows; rc.ssao = c.ssao; rc.ssr = c.ssr; rc.taa = c.taa;
+    TextEffectEngine.htmlInCanvasAllowed = c.htmlInCanvas;
+    GPUPipelineCache.defaultMaxConcurrentWarm = Math.max(1, Math.floor(c.warmConcurrency));
+    const pc = this.device ? GPUPipelineCache.peek(this.device) : null;
+    if (pc) pc.maxConcurrentWarm = GPUPipelineCache.defaultMaxConcurrentWarm;
+    if (!live) return;
+    this._renderer3D?.applyDeviceCaps();
+    if (this._canvasSizedFor && this.device) this.setCanvasSize(this.getDevice());   // no-op unless the backing size changes
+  }
+  /** The caps in force (a copy). */
+  public getGpuCaps(): GpuCaps { return { ...this._gpuCaps }; }
+  /** The tier in force ('desktop' | 'mobile' | 'safe') and why. */
+  public getGpuTier(): { tier: GpuTier; reasons: string[] } { return { tier: this._gpuTier, reasons: this._gpuTierReasons.slice() }; }
+
+  /** Everything a host needs to show / copy a GPU report (docs/ui/gpu-diagnostics.md). */
+  public getGpuDiagnostics(): {
+    tier: GpuTier; reasons: string[]; caps: GpuCaps; safeMode: boolean;
+    adapter: GpuAdapterFacts | null; gpuName: string | null;
+    features: string[]; limits: Record<string, number>; adapterLimits: Record<string, number>;
+    canvas: { cssWidth: number; cssHeight: number; width: number; height: number; windowDpr: number };
+    status: GpuDeviceStatusInfo; lastLoss: GpuLossRecord | null;
+    breadcrumbs: GpuCrumb[]; openOps: string[]; errors: GpuErrorRecord[];
+    previousSession: { at: number; crumbs: GpuCrumb[]; open: string[] } | null;
+  } {
+    const lim = (l: GPUSupportedLimits | undefined | null): Record<string, number> => {
+      const o: Record<string, number> = {};
+      if (!l) return o;
+      for (const k in l) { const v = (l as unknown as Record<string, unknown>)[k]; if (typeof v === 'number') o[k] = v; }
+      return o;
+    };
+    let features: string[] = [];
+    try { features = this.device ? [...(this.device.features as unknown as Iterable<string>)].sort() : []; } catch { features = []; }
+    let rect = { width: 0, height: 0 };
+    try { rect = this.canvas?.getBoundingClientRect() ?? rect; } catch { /* no layout */ }
+    return {
+      tier: this._gpuTier, reasons: this._gpuTierReasons.slice(), caps: this.getGpuCaps(), safeMode: isGpuSafeModeStored(),
+      adapter: this._adapterInfo ? { ...this._adapterInfo } : null, gpuName: this._gpuName,
+      features, limits: lim(this.device?.limits), adapterLimits: lim(this._adapter?.limits),
+      canvas: { cssWidth: rect.width, cssHeight: rect.height, width: this.canvas?.width ?? 0, height: this.canvas?.height ?? 0,
+        windowDpr: (typeof window !== 'undefined' && window.devicePixelRatio) || 1 },
+      status: this.getDeviceStatus(), lastLoss: readLastGpuLoss(),
+      breadcrumbs: getGpuCrumbs(), openOps: getOpenGpuOps(), errors: getGpuErrors(),
+      previousSession: this._prevSessionCrumbs,
+    };
+  }
+
   private _watchDevice(real: GPUDevice): void {
     real.lost.then((info) => {
       if (this._deviceHandle && this._deviceHandle.current !== real) return;   // a device we already replaced
       if (this._intentionalDeviceDestroy) return;                               // our own teardown, not a loss
       this._onDeviceLost(info.reason ?? 'unknown', info.message ?? '');
     }, () => { /* never rejects */ });
+    // CRASH-10: uncaptured GPU errors (validation / out-of-memory / internal) are logged with their class and kept
+    // for the diagnostics + the loss record. The browser still logs them too (no preventDefault).
+    try {
+      real.addEventListener('uncapturederror', (ev: Event) => {
+        if (this._deviceHandle && this._deviceHandle.current !== real) return;
+        const err = (ev as GPUUncapturedErrorEvent).error as (GPUError & { constructor?: { name?: string } }) | undefined;
+        const kind = err?.constructor?.name || 'GPUError';
+        const message = err?.message ?? String(err);
+        if (recordGpuError(kind, message) && this._gpuErrorsLogged < 20) {
+          this._gpuErrorsLogged++;
+          console.warn(`[Salsa][gpu] uncaptured ${kind}: ${message}`);
+        }
+      });
+    } catch { /* test doubles without EventTarget */ }
   }
 
   private _onDeviceLost(reason: string, message: string): void {
     if (this._deviceLost) return;
     this._deviceLost = true;
     console.warn(`[Salsa][gpu] device lost (${reason}): ${message}`);
+    // CRASH-10 / CRASH-3: persist what was going on (salsa.gpu.lastLoss) and run the crash-loop guard: 2 losses within
+    // 60 s → safe mode (stored), which the rebuild below picks up (_installNewDevice re-resolves the tier).
+    try {
+      const rec = recordGpuDeviceLoss(reason, message, { adapter: this._adapterInfo, tier: this._gpuTier, caps: this.getGpuCaps() });
+      if (rec.open.length) console.warn('[Salsa][gpu] still open at the loss:', rec.open.join(' | '));
+      if (rec.safeModeTripped) console.warn('[Salsa][gpu] repeated device loss: switching to SAFE mode (salsa.gpu.safeMode; ?salsaSafe=0 clears it)');
+    } catch { /* diagnostics never block the recovery */ }
     // Stop the loop cleanly: no frame is recorded against the dead device (each would throw or log every vsync).
     this._wasLiveBeforeLoss = this.live || this._wasLiveBeforeLoss;
     this.live = false;
@@ -1181,6 +1303,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     this._deviceHandle.retarget(got.device);
     this._gpuName = got.gpuName ?? this._gpuName;
     this._watchDevice(got.device);
+    // The caps BEFORE anything is rebuilt (a crash loop has switched the tier to 'safe' by now)
+    this._resolveGpuCaps(got, 'recovery');
     // The pipeline cache is keyed by the device object; the handle keeps its identity, so drop the dead cache.
     GPUPipelineCache.forget(this.device);
     this._pipelineWarmScheduled = false; this._pipelineWarmStarted = false;
@@ -1195,6 +1319,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       try { await o.rebuild(this.device); }
       catch (e) { throw new Error(`rebuilding '${o.name}' failed: ${e instanceof Error ? e.message : String(e)}`); }
     }
+    this.setCanvasSize(this.getDevice());   // TIER-1: a tier change (safe mode) may change the DPR cap (no-op otherwise)
     this._schedulePipelineWarmup();
   }
 
@@ -1369,6 +1494,11 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   private handlePointerMove(event: PointerEvent) { this._interaction.handlePointerMove(event); }
   private handlePointerUp(event: PointerEvent) { this._interaction.handlePointerUp(event); }
 
+  /** TOUCH-7: pan the 2D view by a CSS-pixel screen delta (finger-locked at any devicePixelRatio). */
+  public touchPan2D(dxCss: number, dyCss: number): void { this._interaction.touchPan2D(dxCss, dyCss); }
+  /** TOUCH-7: zoom the 2D view by `ratio` (> 1 = in) around client (x, y). */
+  public touchZoom2D(ratio: number, clientX: number, clientY: number): void { this._interaction.touchZoom2D(ratio, clientX, clientY); }
+
   // ── Onion Skin Overlay ──────────────────────────────────────────
 
   /**
@@ -1482,8 +1612,17 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     this._rasterSelectionEngine?.setActiveTexture(tex);
   }
 
-  setCanvasSize(device: GPUDevice) {
-    const dpr = Math.max(1, window.devicePixelRatio || 1);
+  /** The CSS size + DPR the backing store was last sized for (TIER-1: skip a no-op resize). */
+  private _canvasSizedFor: { canvas: HTMLCanvasElement; w: number; h: number; dpr: number } | null = null;
+
+  /** Size the canvas backing store to its CSS box × DPR, under the device caps (TIER-1: mobile DPR ≤ 1.5 and
+   *  ≤ ~2.5 MP; desktop uncapped = the old behaviour). Skips everything when nothing changed (the ResizeObserver and
+   *  the window resize both call this, and Android's URL bar fires resizes constantly); `force` = always re-apply.
+   *  A no-op while SUSPENDED (UI-16): the Shell owns the canvas then and sizes it itself (same caps → same size);
+   *  without this the two ResizeObservers fought over canvas.width. resumeRendering()/reinitialize() re-sync. */
+  setCanvasSize(device: GPUDevice, force = false) {
+    if (this._suspended) return;
+    const winDpr = window.devicePixelRatio || 1;
     // Read the canvas's actual rendered size so the pixel buffer matches its
     // CSS container — handles split-view layouts where the canvas is narrower
     // than the window.  Fall back to window dimensions only if the canvas has
@@ -1491,8 +1630,13 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     const rect = this.canvas.getBoundingClientRect();
     const w = rect.width  || window.innerWidth;
     const h = rect.height || window.innerHeight;
-    this.canvas.width  = Math.floor(w * dpr);
-    this.canvas.height = Math.floor(h * dpr);
+    const b = computeCanvasBacking(w, h, winDpr, this._gpuCaps);
+    const last = this._canvasSizedFor;
+    if (!force && last && last.canvas === this.canvas && last.w === w && last.h === h && last.dpr === b.dpr
+        && this.canvas.width === b.width && this.canvas.height === b.height) return;
+    this._canvasSizedFor = { canvas: this.canvas, w, h, dpr: b.dpr };
+    if (this.canvas.width !== b.width) this.canvas.width = b.width;
+    if (this.canvas.height !== b.height) this.canvas.height = b.height;
 
     // DO NOT call rasterLayerManager.setSize here.
     // Raster layer textures hold document pixel data at the document's own
@@ -1517,9 +1661,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       // Size the pixel buffer to the canvas's CSS container, then keep it in
       // sync.  ResizeObserver fires when the container changes (e.g. split-view
       // activation); the window resize listener catches zoom-level / DevTools.
-      this.setCanvasSize(this.getDevice());
-      new ResizeObserver(() => this.setCanvasSize(this.getDevice())).observe(this.canvas);
-      window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
+      // (setCanvasSize is a no-op when nothing changed, so the two sources never resize twice.)
+      this.setCanvasSize(this.getDevice(), true);
+      this._observeCanvasSize();
 
       // Instantiate the staging buffer since device is now available
       this.stagingBuffer = new StrokesStagingBuffer(this.getDevice());
@@ -1537,6 +1681,22 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       this.play();
   }
 
+  private _resizeObserver: ResizeObserver | null = null;
+  private _windowResizeBound: (() => void) | null = null;
+  /** Watch the CURRENT canvas's size (ResizeObserver) + the window (DPR / zoom changes). Re-called by
+   *  reinitialize() for the new canvas (TIER-1: the old observer stayed on the previous canvas). */
+  private _observeCanvasSize(): void {
+    if (typeof ResizeObserver !== 'undefined') {
+      this._resizeObserver ??= new ResizeObserver(() => { if (this.device) this.setCanvasSize(this.getDevice()); });
+      this._resizeObserver.disconnect();
+      this._resizeObserver.observe(this.canvas);
+    }
+    if (!this._windowResizeBound && typeof window !== 'undefined') {
+      this._windowResizeBound = () => { if (this.device) this.setCanvasSize(this.getDevice()); };
+      window.addEventListener('resize', this._windowResizeBound);
+    }
+  }
+
   public async reinitialize(newCanvas: HTMLCanvasElement) {
   // 0) The editor is reclaiming the canvas, so release any foreign (Shell UI)
   //    hard-suspend. reinitialize() restarts the render loop via play() below,
@@ -1545,8 +1705,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   //    restored document never appears (the white-screen-on-reopen bug).
   this._suspended = false;
 
-  // 1) Reset scenegraph :)
-  this.sceneGraph.root.children.length = 0;
+  // 1) Reset scenegraph — through removeChild, so each subtree leaves the id map too. (`children.length = 0` left every
+  //    node of the previous document registered: findNodeById kept resolving detached nodes after a Shell → editor
+  //    swap. The host starts the next document with ShapeManager.startBlankDocument, which clears the rest.)
+  for (const child of [...this.sceneGraph.root.children]) this.sceneGraph.root.removeChild(child);
 
   // 2) Swap canvas everywhere that needs it
   const oldCanvas = this.canvas;
@@ -1559,6 +1721,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     removeZonelessListener(oldCanvas, 'pointermove', this._boundPointerMove);
     removeZonelessListener(oldCanvas, 'pointerup',   this._boundPointerUp);
     removeZonelessListener(oldCanvas, 'wheel',       this._boundWheel);
+    removeZonelessListener(oldCanvas, 'pointercancel', this._boundPointerCancel);
   }
   this.initializeCanvas(newCanvas);
 
@@ -1596,7 +1759,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   });
 
   // 6) Make sure the canvas has the right DPR size and depth buffer
-  this.setCanvasSize(this.getDevice());                   // <- you had this commented out
+  this.setCanvasSize(this.getDevice(), true);             // (forced: a new canvas / context)
+  this._observeCanvasSize();                              // TIER-1: observe the NEW canvas
   this.interactionService.setDepthTextureView(this.device);
 
   // 7) Mark background + world as dirty so they update next frame
@@ -1652,6 +1816,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         this._deviceHandle = createGpuDeviceHandle(got.device);
         this.device = this._deviceHandle.device;
         this._watchDevice(got.device);
+        this._resolveGpuCaps(got, 'start-up');   // CRASH-8: the per-machine caps, before any pipeline / renderer exists
         this._deviceStatus.set({ status: 'ok', reason: null, message: null, gpuName: got.gpuName });
         this._registerRasterEngineOwner();
 

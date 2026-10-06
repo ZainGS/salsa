@@ -36,11 +36,30 @@ export const LAYER_GAP = 0.006;
 // keeps its own weights; only the overlap band follows the layer under it.
 const REACH = 0.08, BLEND = 0.006, MAX_PUSH = 0.08;
 
+/** The skeleton's LEFT / RIGHT limb joints (by the `_L` / `_R` name suffix) — layerOver's side mask. */
+export interface LimbSides { L: ReadonlySet<number>; R: ReadonlySet<number> }
+export function limbSidesFromNames(names: readonly string[]): LimbSides {
+    const L = new Set<number>(), R = new Set<number>();
+    names.forEach((n, i) => { if (n.endsWith('_L')) L.add(i); else if (n.endsWith('_R')) R.add(i); });
+    return { L, R };
+}
+/** 1 = bound mostly (> 50 %) to left-limb joints, 2 = right, 0 = neither (hips / spine / a mixed crotch vert). */
+function sideOf(ji: ArrayLike<number>, jw: ArrayLike<number>, i: number, sides: LimbSides): 0 | 1 | 2 {
+    let l = 0, r = 0;
+    for (let k = 0; k < 4; k++) { const j = ji[i * 4 + k], w = jw[i * 4 + k]; if (sides.L.has(j)) l += w; else if (sides.R.has(j)) r += w; }
+    return l > 0.5 ? 1 : r > 0.5 ? 2 : 0;
+}
+
 /**
  * Push `outer` (a copy is returned; the input is untouched) over `inners`. Returns the moved vertex count too.
  * `movable` (optional) limits it to some vertices (the hair: only head-bound card / cap verts below the nape).
+ * `sides` (optional, the trousers-web fix 2026-10-04): a LEFT-limb outer vertex never layers over a RIGHT-limb inner
+ * surface or takes its weights (and vice versa). Without it the inner hem of a trouser leg, whose normal points at the
+ * other leg, ray-hit the OTHER leg's sock, read as "inside" it, was pushed through it and took its foot / shin weights:
+ * in a stride the two hems were joined by a long web of triangles (measured: 12-16 hem verts at foot_R 1.0 on the left
+ * leg, edges stretched 40-380x on a side split).
  */
-export function layerOver(outer: LayerGarment, inners: LayerGarment[], gap = LAYER_GAP, movable?: (vertex: number) => boolean, alongInner = false): { garment: LayerGarment; moved: number } {
+export function layerOver(outer: LayerGarment, inners: LayerGarment[], gap = LAYER_GAP, movable?: (vertex: number) => boolean, alongInner = false, sides?: LimbSides): { garment: LayerGarment; moved: number } {
     const V = new Float32Array(outer.geometry.vertices), ji = new Uint8Array(outer.jointIndices), jw = new Float32Array(outer.jointWeights);
     const garment: LayerGarment = { geometry: { vertices: V, indices: outer.geometry.indices }, jointIndices: ji, jointWeights: jw };
     if (!inners.length) return { garment, moved: 0 };
@@ -54,16 +73,27 @@ export function layerOver(outer: LayerGarment, inners: LayerGarment[], gap = LAY
         }
     });
     const grid = new TriRayGrid(inners.map((g) => ({ verts: g.geometry.vertices, indices: g.geometry.indices })), 0.03);
+    // Side mask: per inner vertex its limb side, and a ray grid per outer side without the opposite limb's triangles.
+    const innerSide = sides ? inners.map((g) => { const n = g.geometry.vertices.length / 12, a = new Uint8Array(n); for (let i = 0; i < n; i++) a[i] = sideOf(g.jointIndices, g.jointWeights, i, sides); return a; }) : null;
+    const gridWithout = (drop: 1 | 2) => new TriRayGrid(inners.map((g, gi) => {
+        const I = g.geometry.indices, keep: number[] = [];
+        for (let t = 0; t + 2 < I.length; t += 3) if (innerSide![gi][I[t]] !== drop && innerSide![gi][I[t + 1]] !== drop && innerSide![gi][I[t + 2]] !== drop) keep.push(I[t], I[t + 1], I[t + 2]);
+        return { verts: g.geometry.vertices, indices: Uint32Array.from(keep) };
+    }), 0.03);
+    const sideGrids: (TriRayGrid | null)[] = [grid, null, null];   // [neutral, left outer (no right tris), right outer (no left tris)], built on demand
     let moved = 0;
     const acc = new Map<number, number>();
     for (let o = 0; o < V.length / 12; o++) {
         if (movable && !movable(o)) continue;
         const x = V[o * 12], y = V[o * 12 + 1], z = V[o * 12 + 2];
+        const os = sides ? sideOf(ji, jw, o, sides) : 0, opp = os === 1 ? 2 : os === 2 ? 1 : 0;
+        const g = os === 0 ? grid : (sideGrids[os] ??= gridWithout(opp as 1 | 2));
         const cx = Math.floor(x * inv), cy = Math.floor(y * inv), cz = Math.floor(z * inv);
         let best: [number, number] | null = null, bd = REACH * REACH;
         for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) {
             for (const e of map.get(`${cx + a},${cy + b},${cz + c}`) ?? []) {
                 const P = inners[e[0]].geometry.vertices, i = e[1];
+                if (opp && innerSide![e[0]][i] === opp) continue;   // never the other limb's layer
                 const d = (P[i * 12] - x) ** 2 + (P[i * 12 + 1] - y) ** 2 + (P[i * 12 + 2] - z) ** 2;
                 if (d < bd) { bd = d; best = e; }
             }
@@ -79,10 +109,10 @@ export function layerOver(outer: LayerGarment, inners: LayerGarment[], gap = LAY
         const nl = Math.hypot(nx, ny, nz); if (nl < 1e-8) continue;
         nx /= nl; ny /= nl; nz /= nl;
         let d: number;
-        const tOut = grid.raycast(x, y, z, nx, ny, nz, MAX_PUSH);
+        const tOut = g.raycast(x, y, z, nx, ny, nz, MAX_PUSH);
         if (tOut < Infinity) d = -tOut;
         else {
-            const tIn = grid.raycast(x, y, z, -nx, -ny, -nz, gap + BLEND);
+            const tIn = g.raycast(x, y, z, -nx, -ny, -nz, gap + BLEND);
             if (tIn === Infinity) continue;
             d = tIn;
         }
@@ -90,7 +120,7 @@ export function layerOver(outer: LayerGarment, inners: LayerGarment[], gap = LAY
             let push = gap - d, px = x + nx * push, py = y + ny * push, pz = z + nz * push;
             // A second inner surface right behind the first (a skirt waistband's folded rim) — keep going, at most twice more.
             for (let k = 0; k < 2; k++) {
-                const t2 = grid.raycast(px, py, pz, nx, ny, nz, MAX_PUSH);
+                const t2 = g.raycast(px, py, pz, nx, ny, nz, MAX_PUSH);
                 if (t2 === Infinity || push + t2 + gap > 2 * MAX_PUSH) break;
                 push += t2 + gap; px = x + nx * push; py = y + ny * push; pz = z + nz * push;
             }
@@ -113,14 +143,14 @@ export function layerOver(outer: LayerGarment, inners: LayerGarment[], gap = LAY
 
 /** The whole outfit in layer order. `isSkirt(slot)` marks a skirt bottom (never moved). Returns layered copies only for
  *  the garments that changed; the rest are the inputs themselves. */
-export function layerOutfit<T extends LayerGarment>(bySlot: Partial<Record<LayerSlot, T>>, isSkirt: (slot: LayerSlot) => boolean): Partial<Record<LayerSlot, T | LayerGarment>> {
+export function layerOutfit<T extends LayerGarment>(bySlot: Partial<Record<LayerSlot, T>>, isSkirt: (slot: LayerSlot) => boolean, sides?: LimbSides): Partial<Record<LayerSlot, T | LayerGarment>> {
     const out: Partial<Record<LayerSlot, T | LayerGarment>> = { ...bySlot };
     for (const [outerSlot, innerSlots] of LAYER_OVER) {
         const outer = out[outerSlot];
         if (!outer || isSkirt(outerSlot)) continue;
         const inners = innerSlots.map((s) => out[s]).filter((g): g is T | LayerGarment => !!g);
         if (!inners.length) continue;
-        const r = layerOver(outer, inners);
+        const r = layerOver(outer, inners, LAYER_GAP, undefined, false, sides);
         if (r.moved > 0 || weightsChanged(outer, r.garment)) out[outerSlot] = r.garment;
     }
     return out;

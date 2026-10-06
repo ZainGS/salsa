@@ -614,9 +614,28 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
   // per-column sculpt here (a separable vert×horiz sculpt pinches the corners → bony ridges; a sphere can't
   // be made that way). See "ROUND, FULL butt cheeks" further down.
 
-  // Bust: push the chest ring's FRONT forward — a BASELINE so the default body is feminine (not flat), and
-  // `bust` scales it. Projection, not a width scale, so the back/sides stay put.
-  sculpt(6, cFront, Math.max(0, (p.bust ?? 1)) * 0.026);
+  // Bust: a BASELINE so the default body is feminine (not flat), and `bust` scales it. Projection, not a width
+  // scale, so the back/sides stay put.
+  // 2026-10-05 (user: "just makes a bump in the center of the chest and it's quite vertical"): was ONE ring (6)
+  // pushed at cols 4–8 peaking at the sternum (col 6) — a narrow centre wedge that the rings above/below stretched
+  // into a tall diamond. Now TWO lobes at ±30° (cols 4 / 8) with a soft valley between them (centre ≈ 0.6), spread
+  // over the apex ring 6 + the upper slope ring 7, pushed mostly forward plus a little outward so it
+  // reads WIDE across the chest; a fuller bust also settles slightly (apex ring eased down) instead of jutting.
+  {
+    const amt = Math.max(0, (p.bust ?? 1)) * 0.024, extra = Math.max(0, (p.bust ?? 1) - 1);
+    const g = (d: number): number => Math.exp(-(d * d) / (2 * 1.3 * 1.3));
+    const lobe = (d: number): number => (Math.abs(d) >= 5 ? 0 : (g(d - 2) + g(d + 2)) / (1 + g(4)));   // 1 at the lobe peaks
+    for (const [ri, rw, dy] of [[6, 1, -0.006], [7, 0.45, 0]] as const) {   // (ring 5 is the WAIST, well below the bust — untouched; it also carries the trouser waistband)
+      for (let d = -4; d <= 4; d++) {
+        const col = 6 + d, w = lobe(d) * rw;
+        if (w <= 0) continue;
+        const th = (col / RING) * Math.PI * 2, vi = ring[ri][col];
+        ac.pos[vi*3]     += Math.cos(th) * 0.3 * amt * w * tt;    // a little OUTWARD (sideways fullness)
+        ac.pos[vi*3 + 2] += amt * w * tt;                         // mostly FORWARD
+        ac.pos[vi*3 + 1] += dy * extra * w * tt;                  // fuller → settles a touch (rounder underside)
+      }
+    }
+  }
 
   // (Buttocks are inflated AFTER the hip shaping — see inflateCheek below. The belly stays here.)
   sculpt(2, cFront, 0.008);           // a touch of lower-belly fullness so the front pelvis isn't dead flat

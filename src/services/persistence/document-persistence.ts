@@ -164,6 +164,8 @@ export class DocumentPersistence {
   private config: AutoSaveConfig;
   private autoSaveTimer: ReturnType<typeof setInterval> | null = null;
   private strokeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The queued trailing save (runSave's "one more" after a save that had a change arrive mid-write). */
+  private trailingTimer: ReturnType<typeof setTimeout> | null = null;
   private isSaving = false;
   private savePending = false;
   /** >0 while a document is being restored (see suspend()). Blocks EVERY save — automatic AND explicit — because a
@@ -259,6 +261,16 @@ export class DocumentPersistence {
       this.autoSaveTimer = null;
     }
     this.detachFlushListeners();
+  }
+
+  /** Drop every automatic save that has not started yet: the stroke debounce, the queued trailing save and a save
+   *  deferred until Play ends (its promise resolves false). A save already writing finishes. For a host leaving the
+   *  document (after saving it) — a pending one would otherwise fire later against whatever is on screen then. */
+  public cancelPendingSaves(): void {
+    if (this.strokeDebounceTimer !== null) { clearTimeout(this.strokeDebounceTimer); this.strokeDebounceTimer = null; }
+    this.savePending = false;
+    if (this.trailingTimer !== null) { clearTimeout(this.trailingTimer); this.trailingTimer = null; }
+    this.cancelDeferred();
   }
 
   // ── Flush on tab hide / close (audit 2026-09-28 P9) ───────────────
@@ -412,6 +424,13 @@ export class DocumentPersistence {
       const payload = await this.getDocumentState();
       if (this.busyPredicate?.()) { onBusy(); return false; }   // in-game frame — never write it (D-P2)
       if (this.busyEpoch && this.busyEpoch() !== epoch0) { onBusy(); return false; }   // a busy period came and went mid-gather
+      // No document id = no document open yet (ShapeManager.startBlankDocument without an id): nowhere to write. It
+      // must never fall through to some other document's directory.
+      if (!payload.manifest.docId) {
+        console.warn('[DocumentPersistence] Save skipped — no document id is set yet');
+        this.onSaveComplete?.(false);
+        return false;
+      }
       await withDocLock(payload.manifest.docId, () => this.writeToOPFS(payload));
       payload._onWriteComplete?.();
       this.onSaveComplete?.(true);
@@ -428,7 +447,7 @@ export class DocumentPersistence {
         // calling executeSave() directly could run concurrently with a save started in the
         // 100ms gap, and rapid mutation would chain save-after-save instead of collapsing
         // into a single trailing save.
-        setTimeout(() => this.triggerSave(), 100);
+        this.trailingTimer = setTimeout(() => { this.trailingTimer = null; void this.triggerSave(); }, 100);
       }
     }
   }
@@ -762,10 +781,7 @@ export class DocumentPersistence {
 
   public destroy(): void {
     this.stopAutoSave();
-    this.cancelDeferred();
-    if (this.strokeDebounceTimer !== null) {
-      clearTimeout(this.strokeDebounceTimer);
-    }
+    this.cancelPendingSaves();
     this.encodePool?.dispose();
     this.encodePool = null;
     this.encodePoolTried = false;

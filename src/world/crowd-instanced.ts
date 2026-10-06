@@ -34,6 +34,9 @@ import {
 import { crowdPaletteIndex, packCrowdSlots, CROWD_SLOT_BASE, CROWD_PALETTE } from '../renderer/3d/crowd-palette';
 import type { CrowdPerson, CrowdMeta, CrowdGeometry } from './crowd-live';
 import { triRunBoxes } from '../game/collision-cells';
+import { crowdArchetype, crowdArchetypeFor, crowdArchetypeCandidates, CROWD_CHAR_POSES, CC_CODE_SKIN, CC_CODE_PHONE, ccSlotCode,
+    CC_SLOT_TOP, CC_SLOT_HAIR, CC_SLOT_LEGS, CC_SLOT_SHOES, CC_SLOT_SKIRT, type CrowdCharClass, type CrowdCharMesh } from './crowd-character';
+import { PV_ARML, PV_ARMR, PV_LEGL, PV_LEGR, CP_ARML, CP_ARMR, CP_LEGL, CP_LEGR, CP_COUNT } from './mannequin';
 
 /** Near / mid cells per tile edge: the lazily built tiers are resident per cell, so a cell is what the camera pays for.
  *  6 → 50 m at the default scale (a 300 m tile). Cells are TILE-ALIGNED (the centre tile spans [-R, R], tile (tx, tz)
@@ -51,8 +54,10 @@ export const CROWD_KINDS: readonly StaticPerson['kind'][] = ['stroll', 'group', 
 // ── Records ──────────────────────────────────────────────────────────────────────────────────────────────────────
 export const CREC_X = 0, CREC_Y = 1, CREC_Z = 2, CREC_FX = 3, CREC_FZ = 4, CREC_ARCH = 5, CREC_LOOK = 6, CREC_POSE = 7,
     CREC_UMB = 8, CREC_CLOSED = 9, CREC_FLIP = 10, CREC_RAILY = 11, CREC_RAILD = 12, CREC_GROUP = 13, CREC_SEED = 14,
-    CREC_DECK = 15, CREC_KIND = 16, CREC_DX = 17, CREC_DY = 18, CREC_DZ = 19, CREC_CX = 20, CREC_CZ = 21;
-export const CREC_STRIDE = 22;
+    CREC_DECK = 15, CREC_KIND = 16, CREC_DX = 17, CREC_DY = 18, CREC_DZ = 19, CREC_CX = 20, CREC_CZ = 21,
+    /** crowdStyle 'character': the preferred crowd ARCHETYPE (crowd-character.ts) — -1 = a mannequin. */
+    CREC_CHAR = 22;
+export const CREC_STRIDE = 23;
 
 /** Small-cell grid coordinates → one integer key (and back). */
 export const CELL_OFF = 32768;
@@ -189,13 +194,71 @@ export class CrowdCellBuilder {
         const before = new Map<Accum3D, number>();
         for (const a of this.accs.values()) before.set(a, a.vertCount);
         this.touched.length = 0; this.curPerson = i; this.curPart = 0;
-        emitPerson(sink, { o: inp.o, f: inp.f, u: this.rec.u }, look, {
+        const ch = R[o + CREC_CHAR];
+        if (ch >= 0 && ch === ch && this.emitCharacter(i, inp, ch)) { /* the baked character archetype */ }
+        else emitPerson(sink, { o: inp.o, f: inp.f, u: this.rec.u }, look, {
             pose: inp.pose, umbrella: inp.umb, umbrellaClosed: inp.closed, lod: this.lod, flip: inp.flip, pivots: this.people[i].piv,
             ...(inp.rail ? { rail: inp.rail } : {}),
         });
         this.flush();
         const dx = R[o + CREC_DX], dy = R[o + CREC_DY], dz = R[o + CREC_DZ];
         if (dx || dy || dz) for (const a of this.accs.values()) { const b = before.get(a) ?? 0; if (a.vertCount > b) a.offsetFrom(b, dx, dy, dz); }
+    }
+    /** crowdStyle 'character': emit the person as a baked archetype of their class (crowd-character.ts) — the
+     *  record's preferred one, else the next of the class that kept this pose through the bake gate. False = none
+     *  (the caller emits the mannequin). Colours = the person's own look through the archetype's palette slots; the
+     *  per-part index ranges (sink marks) + the joint pivots feed the live crowd's rig groups exactly as a mannequin's. */
+    private emitCharacter(i: number, inp: CrowdEmitInput, pref: number): boolean {
+        const look = inp.look, seed = this.rec.recs[i * CREC_STRIDE + CREC_SEED];
+        let mesh: CrowdCharMesh | null = null, pivots: Float32Array | null = null;
+        for (const a of [pref, ...crowdArchetypeCandidates(crowdClassOfLook(look), seed).filter((x) => x !== pref)]) {
+            const b = crowdArchetype(a).poses.get(inp.pose);
+            if (b) { mesh = this.lod === 0 ? b.near : b.mid; pivots = b.pivots; break; }
+        }
+        if (!mesh || !pivots) return false;
+        const codeAcc = (code: number): Accum3D => {
+            const c: PedColor = code === CC_CODE_SKIN ? 'skin' : code === CC_CODE_PHONE ? 'black'
+                : code === ccSlotCode(CC_SLOT_TOP) ? look.top : code === ccSlotCode(CC_SLOT_HAIR) ? look.hair : code === ccSlotCode(CC_SLOT_LEGS) ? look.legs
+                : code === ccSlotCode(CC_SLOT_SHOES) ? look.shoes : code === ccSlotCode(CC_SLOT_SKIRT) ? (look.skirt ?? look.legs) : 'grey';
+            return this.acc(c);
+        };
+        const k = look.heightM / 1.7, wz = look.build * (0.35 + 0.65 * k), u = this.rec.u, fx = inp.f[0], fz = inp.f[1];
+        const flip = inp.flip, zs = flip ? -1 : 1;
+        // person-local (x fwd, y up, z right) → world: o + (f x + c z) u, c = (-f.z, f.x) (mannequin PersonXf P)
+        const W = (x: number, y: number, z: number): [number, number, number] =>
+            [inp.o[0] + (fx * x - fz * z) * u, inp.o[1] + y * u, inp.o[2] + (fz * x + fx * z) * u];
+        const sw = (p: number): number => !flip ? p : p === CP_ARML ? CP_ARMR : p === CP_ARMR ? CP_ARML : p === CP_LEGL ? CP_LEGR : p === CP_LEGR ? CP_LEGL : p;
+        const P = mesh.pos, N = mesh.nrm, remap = new Map<number, number>();
+        for (let q = 0; q < CP_COUNT; q++) {
+            const part = sw(q), s0 = mesh.partRanges[part], s1 = mesh.partRanges[part + 1];
+            if (s1 <= s0) continue;
+            this.flush(); this.curPart = q;   // (the sink's mark: a mirrored person's left arm is the baked right one)
+            remap.clear();
+            for (let t = s0; t < s1; t += 3) {
+                const tri = [0, 0, 0];
+                for (let c = 0; c < 3; c++) {
+                    const v = mesh.indices[t + c], code = mesh.code[v], a = codeAcc(code), key = v * 64 + code;
+                    let o = remap.get(key);
+                    if (o === undefined) {
+                        const x = P[v * 3] * wz, y = P[v * 3 + 1] * k, z = P[v * 3 + 2] * wz * zs;
+                        const nx = N[v * 3], ny = N[v * 3 + 1], nz = N[v * 3 + 2] * zs;
+                        o = a.vertex(W(x, y, z), [fx * nx - fz * nz, ny, fz * nx + fx * nz], code, 0);
+                        remap.set(key, o);
+                    }
+                    tri[c] = o;
+                }
+                const a = codeAcc(mesh.code[mesh.indices[t]]);
+                if (flip) a.triangle(tri[0], tri[2], tri[1]); else a.triangle(tri[0], tri[1], tri[2]);
+            }
+        }
+        // the live crowd's pivots (PV_* in the same world frame; mirrored people swap sides)
+        const pv = this.people[i].piv;
+        for (let p = 0; p < pivots.length / 3; p++) {
+            const src = !flip ? p : p === PV_ARML ? PV_ARMR : p === PV_ARMR ? PV_ARML : p === PV_LEGL ? PV_LEGR : p === PV_LEGR ? PV_LEGL : p;
+            const w = W(pivots[src * 3] * wz, pivots[src * 3 + 1] * k, pivots[src * 3 + 2] * wz * zs);
+            pv[p * 3] = w[0]; pv[p * 3 + 1] = w[1]; pv[p * 3 + 2] = w[2];
+        }
+        return true;
     }
     /** Merge into the cell geometry + its live-crowd metadata. */
     finish(): CrowdGeometry & { bounds?: Float32Array } {
@@ -261,6 +324,20 @@ export function adoptCrowdCell(res: CrowdCellResult, people: CrowdPerson[], list
     if (res.runBoxes) (g as { runBoxes?: Float32Array }).runBoxes = res.runBoxes;
     g.crowd = { people, ranges, refs: res.refs };
     return g;
+}
+
+// ── crowdStyle 'character' (docs/specs/crowd-characters.md) ─────────────────────────────────────────────────────
+/** The silhouette class of a mannequin look (what a character archetype is matched on). */
+export function crowdClassOfLook(look: PersonLook): CrowdCharClass {
+    const long = look.hairStyle === 'long' || look.hairStyle === 'bob' || look.hairStyle === 'pony' || look.hairStyle === 'bun';
+    return { fem: look.fem, skirt: !!look.skirt, longHair: long };
+}
+/** The archetype a static person prefers in crowdStyle 'character', or -1 = stays a mannequin: poses the archetypes
+ *  are baked in only, no umbrella (the mannequin's umbrella emitters are not re-targeted yet), no yukata / long coat /
+ *  hat (no character garment for them). Cheap (no bake) — the emitter resolves the gate's drops. */
+export function crowdCharacterFor(look: PersonLook, pose: Pose, umb: PedColor | null, seed: number): number {
+    if (umb || !CROWD_CHAR_POSES.includes(pose) || look.garment === 'robe' || look.garment === 'coat' || look.hat !== 'none') return -1;
+    return crowdArchetypeFor(crowdClassOfLook(look), seed);
 }
 
 // ── XFAR variants ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -372,6 +449,7 @@ export function buildPedestriansInstanced(graph: WorldGraph, keep?: ((region: nu
     const id = `crowd:${p.seed}:${p.tileOrigin ? p.tileOrigin.join(',') : 'c'}:${n}:${(++_buildSerial).toString(36)}${Math.floor(Math.random() * 1e9).toString(36)}`;
     const rec: CrowdRecords = { id, recs: new Float64Array(n * CREC_STRIDE), n, u, cell, d1: PED_NEAR_M * u, d2: PED_XFAR_M * u };
     const R = rec.recs;
+    const chars = p.crowdStyle === 'character';
     // xfar layers, keyed by (big cell, deck, variant) in first-seen order (deterministic)
     const groups = new Map<string, { v: XfarVariant; deck: boolean; inst: InstanceXform[] }>();
     // ground footprints (two pseudo-geometries: ground people drape on the full field, deck people on the smooth one)
@@ -384,6 +462,7 @@ export function buildPedestriansInstanced(graph: WorldGraph, keep?: ((region: nu
         R[o + CREC_RAILY] = pp.rail ? pp.rail.y : NaN; R[o + CREC_RAILD] = pp.rail ? pp.rail.d : NaN;
         R[o + CREC_GROUP] = pp.group ?? -1; R[o + CREC_SEED] = sp.seed; R[o + CREC_DECK] = deck ? 1 : 0;
         R[o + CREC_KIND] = Math.max(0, CROWD_KINDS.indexOf(pp.kind));
+        R[o + CREC_CHAR] = chars ? crowdCharacterFor(look, sp.pose, sp.umb, sp.seed) : -1;
         const cx = Math.floor((pp.x + R0) / cell), cz = Math.floor((pp.z + R0) / cell);
         R[o + CREC_CX] = cx; R[o + CREC_CZ] = cz;
         const v = xfarVariant(look, sp.pose, sp.umb, sp.closed, pp.rail, u);

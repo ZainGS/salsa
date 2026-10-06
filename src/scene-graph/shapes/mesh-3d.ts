@@ -256,6 +256,11 @@ export class Mesh3D extends Shape {
    *  a copy): it owns the group's instance slot + material but is never drawn itself (no camera / shadow / outline list),
    *  never collided with. Runtime only. */
   public arraySourceOnly = false;
+  /** VISUAL ONLY (rise bug 2026-10-04): never Play collision — not ground, not a wall, not a camera obstacle. For
+   *  overlays drawn on / above real surfaces: contact-shadow blobs, light pools, decals, particles. A radialFade
+   *  material counts as visual-only too (isVisualOnlyMesh). The player's moving contact blob was collided with: the
+   *  ground ray stood the feet on it, the blob followed the feet up, and the player rose forever. Runtime only. */
+  public noCollide = false;
   /** P8 SHADOW LOD: the size (world units) of this mesh's smallest shadow-relevant feature — a pole's width, a
    *  person's footprint. A shadow map whose texel is coarser than `Renderer3D.SHADOW_LOD_TEXELS` × this cannot resolve
    *  the shadow, so the renderer leaves the mesh out of that map's caster list (the far map and each near cascade
@@ -275,6 +280,10 @@ export class Mesh3D extends Shape {
    *  whenever the draw-list build reaches the fog test, like `lodHidden`). Read by CPU work that only matters for a
    *  drawn mesh (the walkers' pose gate). Runtime only (never serialized). */
   public fogHidden = false;
+  /** Play third-person camera occluder override (src/game/camera-occluders.ts): 'block' = a HARD occluder (the camera
+   *  pulls in in front of it, like a wall), 'ignore' = SOFT (the camera passes through it, like a lamp post), 'auto' =
+   *  the rules (city family / fog class / size: large = hard, small or thin = soft). Serialized when not 'auto'. */
+  public cameraBlock: 'auto' | 'block' | 'ignore' = 'auto';
   /** P17 HLOD cross-fade (material-3d.ts flags2 bit 5): the screen-door coverage 0..1 while a streamed HLOD tile
    *  dissolves in / out over its tier swap; -1 = not fading (drawn whole). Set by the city each frame of a fade (with
    *  materialDirty: the slot rewrite carries it). Runtime only (never serialized). */
@@ -466,6 +475,33 @@ export class Mesh3D extends Shape {
    * are independent of each other and evaluation is idempotent.
    */
   public baseVertices: Float32Array | null = null;
+  /**
+   * Bumped on EVERY blend-shape evaluation (evaluateBlendShapes / applyBlendWeights). Consumers that mirror the morphed
+   * vertices key on it: the renderer re-sends a skinned part's dirty vertex range when it differs from the version it
+   * uploaded (no buffer re-creation, no index upload), and the picker / skinned cull radii re-derive lazily.
+   */
+  public blendVersion = 0;
+  /** @internal Dirty vertex range [lo, hi) of the last 8 blend versions (slot (v & 7) * 2). See blendRangeSince. */
+  public readonly _blendRangeLog = new Int32Array(16);
+  /** Incremental-evaluation state: the weights currently baked into _geometry.vertices, and the identities they
+   *  were baked against (base snapshot, vertex array, delta arrays). Any mismatch falls back to a full evaluation. */
+  private _bsApplied: Float32Array | null = null;
+  private _bsDeltas: Float32Array[] = [];
+  private _bsBase: Float32Array | null = null;
+  private _bsOut: Float32Array | null = null;
+  private _bsIncCount = 0;
+
+  /** A/B switch (Character v2 Phase 1.5). true = the fast path: a weight change through the blend-shape API applies
+   *  only the CHANGED shapes' deltas over their sparse vertex support and the renderer updates the existing GPU
+   *  buffers in place over the dirty range. false = the old path: a full CPU evaluation + skinDirty (a skinned part
+   *  rebuilt and re-created its VB + IB) / gpuDirty (a static mesh rebuilt the whole geometry pool). */
+  static blendFastPath = true;
+  /** Incremental updates accumulate float rounding; after this many a full evaluation from the base re-anchors. */
+  static BLEND_REBASE_EVERY = 64;
+  /** The weight range the blend-shape API clamps to. [0, 1] by default (backward compatible); a host may widen it
+   *  (e.g. [-1, 2] for over-driven sliders). A min / max shape pair stays the recommended slider pattern. */
+  static blendWeightMin = 0;
+  static blendWeightMax = 1;
 
   constructor(
     interactionService: InteractionService,
@@ -576,25 +612,108 @@ export class Mesh3D extends Shape {
    * No-op when no blend shapes are attached.
    */
   evaluateBlendShapes(): void {
-    if (!this.baseVertices) return;
-    if (this.blendShapes.length === 0) {
-      // Restore bind pose
-      this._geometry.vertices.set(this.baseVertices);
-      this._modifiedGeom = null;
-      this.gpuDirty = true;
-      return;
+    if (!this._evaluateBlendFull()) return;
+    this.gpuDirty = true;
+  }
+
+  /**
+   * FAST blend evaluation (Character v2 Phase 1.5): brings _geometry.vertices to base + Σ w·delta like
+   * evaluateBlendShapes, but INCREMENTALLY — only shapes whose weight changed since the last evaluation are applied
+   * (as (w − wApplied)·delta over the shape's sparse vertex support), and it does NOT set gpuDirty. Returns the dirty
+   * vertex range [lo, hi) (null = nothing to do), also logged under the bumped blendVersion for the renderer.
+   * Falls back to a full evaluation (from baseVertices) when the base / vertex array / shape list changed since the
+   * last evaluation, and every BLEND_REBASE_EVERY incremental updates (bounds float drift; results stay within ~1e-6
+   * of the full evaluation). Callers that write _geometry.vertices directly must call evaluateBlendShapes() after.
+   * Static meshes: the caller re-sends the range (Renderer3D.patchMeshVertices) or sets gpuDirty itself.
+   */
+  applyBlendWeights(): [number, number] | null {
+    const base = this.baseVertices;
+    if (!base) return null;
+    const out = this._geometry.vertices, shapes = this.blendShapes, w = this.blendWeights, applied = this._bsApplied;
+    let ok = this._bsBase === base && this._bsOut === out && out.length === base.length && applied !== null
+      && applied.length === shapes.length && this._bsDeltas.length === shapes.length && this._bsIncCount < Mesh3D.BLEND_REBASE_EVERY;
+    for (let si = 0; ok && si < shapes.length; si++) if (this._bsDeltas[si] !== shapes[si].deltaVertices) ok = false;
+    if (!ok) {
+      if (!this._evaluateBlendFull()) return null;
+      return [0, base.length / FLOATS_PER_VERT];
     }
-    const FPERV = FLOATS_PER_VERT; // 12 floats per vertex
-    const nv  = this.baseVertices.length / FPERV;
+    const nv = base.length / FLOATS_PER_VERT;
+    let lo = nv, hi = 0, anyLive = false;
+    for (let si = 0; si < shapes.length; si++) { if (effWeight(w[si] ?? 0) !== 0) { anyLive = true; break; } }
+    if (!anyLive) {
+      // Every weight back at zero: restore the base EXACTLY (no drift) over the union of what was applied.
+      for (let si = 0; si < shapes.length; si++) {
+        if (applied![si] === 0) continue;
+        const sup = blendSupport(shapes[si].deltaVertices, nv);
+        if (sup.lo < lo) lo = sup.lo; if (sup.hi > hi) hi = sup.hi;
+        applied![si] = 0;
+      }
+      if (hi <= lo) return null;
+      out.set(base.subarray(lo * FLOATS_PER_VERT, hi * FLOATS_PER_VERT), lo * FLOATS_PER_VERT);
+      this._bsIncCount = 0;
+      return this._noteBlendRange(lo, hi);
+    }
+    for (let si = 0; si < shapes.length; si++) {
+      const wt = effWeight(w[si] ?? 0), dw = wt - applied![si];
+      if (dw === 0) continue;
+      const delta = shapes[si].deltaVertices, sup = blendSupport(delta, nv), idx = sup.idx;
+      for (let k = 0; k < idx.length; k++) {
+        const vi = idx[k], o12 = vi * FLOATS_PER_VERT, o6 = vi * 6;
+        out[o12]     += dw * delta[o6];
+        out[o12 + 1] += dw * delta[o6 + 1];
+        out[o12 + 2] += dw * delta[o6 + 2];
+        out[o12 + 3] += dw * delta[o6 + 3];
+        out[o12 + 4] += dw * delta[o6 + 4];
+        out[o12 + 5] += dw * delta[o6 + 5];
+      }
+      applied![si] = wt;
+      if (sup.lo < lo) lo = sup.lo; if (sup.hi > hi) hi = sup.hi;
+    }
+    if (hi <= lo) return null;
+    this._bsIncCount++;
+    return this._noteBlendRange(lo, hi);
+  }
+
+  /** The union dirty vertex range [lo, hi) of every blend evaluation after version `since` (into `out`), or false
+   *  when it is not known (more than 8 versions ago) and the caller must treat the whole mesh as dirty. */
+  blendRangeSince(since: number, out: Int32Array | number[]): boolean {
+    const v = this.blendVersion;
+    if (since >= v) { out[0] = 0; out[1] = 0; return true; }
+    if (v - since > 8) return false;
+    let lo = 0x7fffffff, hi = 0;
+    for (let k = since + 1; k <= v; k++) {
+      const s = (k & 7) * 2, a = this._blendRangeLog[s], b = this._blendRangeLog[s + 1];
+      if (a < lo) lo = a; if (b > hi) hi = b;
+    }
+    out[0] = lo; out[1] = Math.max(lo, hi);
+    return true;
+  }
+
+  /** Forget the cached sparse supports / incremental state: call after editing a shape's deltaVertices IN PLACE
+   *  (replacing the array needs nothing). The next evaluation is a full one. */
+  invalidateBlendShapeCache(): void {
+    for (const s of this.blendShapes) BLEND_SUPPORT.delete(s.deltaVertices);
+    this._bsApplied = null;
+  }
+
+  /** Full evaluation from baseVertices (the original semantics; bit-identical to the old dense loop — the sparse
+   *  support only skips vertices whose 6 deltas are all zero). Returns false when there is no base. */
+  private _evaluateBlendFull(): boolean {
+    const base = this.baseVertices;
+    if (!base) return false;
     const out = this._geometry.vertices;
-    out.set(this.baseVertices); // restore bind pose
-    for (let si = 0; si < this.blendShapes.length; si++) {
-      const w = this.blendWeights[si] ?? 0;
-      if (Math.abs(w) < 1e-7) continue;
-      const delta = this.blendShapes[si].deltaVertices; // 6 floats per vertex
-      for (let vi = 0; vi < nv; vi++) {
-        const o12 = vi * FPERV;
-        const o6  = vi * 6;
+    const nv = base.length / FLOATS_PER_VERT;
+    const shapes = this.blendShapes;
+    out.set(base); // restore bind pose
+    const applied = new Float32Array(shapes.length);
+    for (let si = 0; si < shapes.length; si++) {
+      const w = effWeight(this.blendWeights[si] ?? 0);
+      applied[si] = w;
+      if (w === 0) continue;
+      const delta = shapes[si].deltaVertices; // 6 floats per vertex
+      const idx = blendSupport(delta, nv).idx;
+      for (let k = 0; k < idx.length; k++) {
+        const vi = idx[k], o12 = vi * FLOATS_PER_VERT, o6 = vi * 6;
         out[o12]     += w * delta[o6];
         out[o12 + 1] += w * delta[o6 + 1];
         out[o12 + 2] += w * delta[o6 + 2];
@@ -603,8 +722,20 @@ export class Mesh3D extends Shape {
         out[o12 + 5] += w * delta[o6 + 5];
       }
     }
+    this._bsApplied = applied;
+    this._bsDeltas = shapes.map((s) => s.deltaVertices);
+    this._bsBase = base;
+    this._bsOut = out;
+    this._bsIncCount = 0;
+    this._noteBlendRange(0, Math.min(nv, out.length / FLOATS_PER_VERT));
+    return true;
+  }
+
+  private _noteBlendRange(lo: number, hi: number): [number, number] {
+    const v = ++this.blendVersion, s = (v & 7) * 2;
+    this._blendRangeLog[s] = lo; this._blendRangeLog[s + 1] = hi;
     this._modifiedGeom = null;
-    this.gpuDirty = true;
+    return [lo, hi];
   }
 
   get geometryKey(): string {
@@ -956,6 +1087,7 @@ export class Mesh3D extends Shape {
       normalMapLibraryId: this.normalMapLibraryId,
       ...(this.outline ? { outline: this.outline } : {}),
       ...(this.outlineRings?.length ? { outlineRings: this.outlineRings } : {}),
+      ...(this.cameraBlock !== 'auto' ? { cameraBlock: this.cameraBlock } : {}),
       // Multi-material slots (audit 2026-09-28 P8) — were never serialized, so per-slot materials reset on reload.
       ...(this.submeshes.length > 0 ? { submeshes: this.submeshes } : {}),
       glbMeshIndex: this.glbMeshIndex ?? undefined,
@@ -980,6 +1112,32 @@ export class Mesh3D extends Shape {
     };
   }
 
+}
+
+// ── Blend-shape sparse supports (Character v2 Phase 1.5) ────────────────────
+
+/** A weight below 1e-7 in magnitude contributes nothing (the original evaluateBlendShapes skip). */
+function effWeight(w: number): number { return Math.abs(w) < 1e-7 ? 0 : w; }
+
+/** The vertices a shape moves (any of its 6 deltas non-zero) and their [lo, hi) span. Cached per delta array. */
+export interface BlendSupport { idx: Uint32Array; lo: number; hi: number }
+const BLEND_SUPPORT = new WeakMap<Float32Array, BlendSupport>();
+
+/** The sparse support of a delta array over `nv` vertices (cached by array identity; built once, O(nv)). */
+export function blendSupport(delta: Float32Array, nv: number): BlendSupport {
+  const c = BLEND_SUPPORT.get(delta);
+  if (c && (c.idx.length === 0 || c.idx[c.idx.length - 1] < nv)) return c;
+  const n = Math.min(nv, Math.floor(delta.length / 6));
+  let count = 0;
+  const tmp = new Uint32Array(n);
+  for (let v = 0; v < n; v++) {
+    const o = v * 6;
+    if (delta[o] !== 0 || delta[o + 1] !== 0 || delta[o + 2] !== 0 || delta[o + 3] !== 0 || delta[o + 4] !== 0 || delta[o + 5] !== 0) tmp[count++] = v;
+  }
+  const idx = tmp.slice(0, count);
+  const s: BlendSupport = { idx, lo: count ? idx[0] : 0, hi: count ? idx[count - 1] + 1 : 0 };
+  BLEND_SUPPORT.set(delta, s);
+  return s;
 }
 
 // ── Base64 helpers for blend shape serialization ────────────────────────────

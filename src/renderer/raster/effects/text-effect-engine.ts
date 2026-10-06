@@ -15,6 +15,9 @@
  *  as textures. Otherwise, it falls back to OffscreenCanvas 2D rendering.
  */
 
+import { clampTextureExtent } from '../../core/gpu-capabilities';
+import { gpuCrumb } from '../../core/gpu-diagnostics';
+
 // ─── Types ──────────────────────────────────────────────────────
 
 export type TextEffectType =
@@ -302,13 +305,17 @@ export class TextEffectEngine {
 
     const textW = Math.ceil(maxLineWidth);
     const textH = lines.length * lineHeightPx;
-    const canvasW = Math.max(1, textW + padding * 2);
-    const canvasH = Math.max(1, textH + padding * 2);
+    // Clamp to the device's max texture size (mobile-parity CRASH-4): an over-size texture is a validation error /
+    // GPU OOM. Oversized text is drawn scaled down to fit (only ever hit by huge text on a small-limit device).
+    const fit = clampTextureExtent(textW + padding * 2, textH + padding * 2, this.maxTextureDim());
+    const canvasW = fit.width;
+    const canvasH = fit.height;
 
     // Render to OffscreenCanvas
     const canvas = new OffscreenCanvas(canvasW, canvasH);
     const ctx = canvas.getContext('2d')!;
     ctx.clearRect(0, 0, canvasW, canvasH);
+    if (fit.scale < 1) ctx.scale(fit.scale, fit.scale);
     ctx.font = fontStyle;
     ctx.textBaseline = 'top';
     const [r, g, b, a] = config.color;
@@ -406,6 +413,11 @@ export class TextEffectEngine {
       const dprY = canvas.height / Math.max(1, cr.height);
       const w = Math.max(1, Math.ceil((img.width || img.codedWidth || 1) * dprX) + Math.ceil(dprX) + 1);
       const h = Math.max(1, Math.ceil((img.height || img.codedHeight || 1) * dprY) + Math.ceil(dprY) + 1);
+      // The copy writes the element at its full extent, so a texture clamped below it would overflow: past the
+      // device's max texture size, skip the capture (the node keeps its last texture) instead of a GPU error.
+      const maxDim = this.maxTextureDim();
+      if (w > maxDim || h > maxDim) { gpuCrumb(`livetext capture skipped ${w}x${h} > ${maxDim}`); return null; }
+      gpuCrumb('livetext capture (webgpu-native)');
       const gpuTex = this.device.createTexture({ size: [w, h], format: 'rgba8unorm', usage });
       // Guard the copy: a mid-resize transient (cr changed between sizing and the copy) can
       // overflow the texture — swallow that one frame rather than surface an uncaptured error.
@@ -424,43 +436,37 @@ export class TextEffectEngine {
     //    texture from the element's box × host-canvas backing DPR. ──
     const rect = element.getBoundingClientRect();
     const dpr = TextEffectEngine.elementCaptureDpr(element, hostCanvas);
-    const w = Math.ceil(rect.width * dpr) || 1;
-    const h = Math.ceil(rect.height * dpr) || 1;
+    // The bridge draws the element as a scaled quad, so it can be clamped to the max texture size (CRASH-4).
+    const fit = clampTextureExtent(Math.ceil(rect.width * dpr) || 1, Math.ceil(rect.height * dpr) || 1, this.maxTextureDim());
+    const w = fit.width, h = fit.height;
+    gpuCrumb('livetext capture (webgl-bridge)');
     const gpuTex = this.device.createTexture({ size: [w, h], format: 'rgba8unorm', usage });
-    return this.captureElementViaWebGLBridge(element, gpuTex, w, h);
+    const out = this.captureElementViaWebGLBridge(element, gpuTex, w, h);
+    if (!out) gpuTex.destroy();
+    return out;
   }
 
-  /**
-   * WebGL bridge fallback for captureElement.
-   * Used when copyElementImageToTexture isn't available but texElementImage2D is.
-   */
-  private captureElementViaWebGLBridge(
-    element: HTMLElement,
-    gpuTex: GPUTexture,
-    w: number,
-    h: number,
-  ): { texture: GPUTexture; width: number; height: number } {
-    const glCanvas = document.createElement('canvas');
-    glCanvas.width = w;
-    glCanvas.height = h;
-    const gl = glCanvas.getContext('webgl2', {
-      premultipliedAlpha: true,
-      preserveDrawingBuffer: true,
-    })!;
+  /** The device's maxTextureDimension2D (8192 is the WebGPU core default every adapter supports). */
+  private maxTextureDim(): number {
+    const m = (this.device as { limits?: { maxTextureDimension2D?: number } }).limits?.maxTextureDimension2D;
+    return typeof m === 'number' && m > 0 ? m : 8192;
+  }
 
-    // Upload element rendering as a WebGL texture
-    const glTex = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, glTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    (gl as any).texElementImage2D(
-      gl.TEXTURE_2D, 0, gl.RGBA,
-      gl.RGBA, gl.UNSIGNED_BYTE, element,
-    );
+  /** The ONE WebGL2 context (+ program, quad, texture) the bridge reuses for every capture (CRASH-4: one context
+   *  per capture, never released, ran Android out of GPU memory). Shared by every engine; rebuilt if lost. */
+  private static _bridge: {
+    canvas: HTMLCanvasElement; gl: WebGL2RenderingContext; prog: WebGLProgram; vbo: WebGLBuffer; tex: WebGLTexture;
+    aPos: number; uTex: WebGLUniformLocation | null;
+  } | null = null;
 
-    // Draw to the WebGL canvas via fullscreen quad
+  private static bridgeContext(): NonNullable<typeof TextEffectEngine._bridge> | null {
+    const b = TextEffectEngine._bridge;
+    if (b && !b.gl.isContextLost()) return b;
+    TextEffectEngine._bridge = null;
+    const canvas = document.createElement('canvas');
+    canvas.width = 1; canvas.height = 1;
+    const gl = canvas.getContext('webgl2', { premultipliedAlpha: true, preserveDrawingBuffer: true });
+    if (!gl) return null;
     const vsSource = `#version 300 es
       in vec2 a_pos;
       out vec2 v_uv;
@@ -476,7 +482,6 @@ export class TextEffectEngine {
       out vec4 outColor;
       void main() { outColor = texture(u_tex, v_uv); }
     `;
-
     const vs = gl.createShader(gl.VERTEX_SHADER)!;
     gl.shaderSource(vs, vsSource);
     gl.compileShader(vs);
@@ -487,22 +492,57 @@ export class TextEffectEngine {
     gl.attachShader(prog, vs);
     gl.attachShader(prog, fs);
     gl.linkProgram(prog);
-    gl.useProgram(prog);
-
-    const verts = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
     const vbo = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
-    const aPos = gl.getAttribLocation(prog, 'a_pos');
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    const nb = { canvas, gl, prog, vbo, tex, aPos: gl.getAttribLocation(prog, 'a_pos'), uTex: gl.getUniformLocation(prog, 'u_tex') };
+    TextEffectEngine._bridge = nb;
+    gpuCrumb('livetext webgl-bridge context created');
+    return nb;
+  }
 
+  /**
+   * WebGL bridge fallback for captureElement.
+   * Used when copyElementImageToTexture isn't available but texElementImage2D is.
+   */
+  private captureElementViaWebGLBridge(
+    element: HTMLElement,
+    gpuTex: GPUTexture,
+    w: number,
+    h: number,
+  ): { texture: GPUTexture; width: number; height: number } | null {
+    const b = TextEffectEngine.bridgeContext();
+    if (!b) return null;
+    const { gl, canvas: glCanvas } = b;
+    if (glCanvas.width !== w) glCanvas.width = w;
+    if (glCanvas.height !== h) glCanvas.height = h;
+
+    // Upload the element rendering into the shared WebGL texture
+    gl.bindTexture(gl.TEXTURE_2D, b.tex);
+    (gl as any).texElementImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA,
+      gl.RGBA, gl.UNSIGNED_BYTE, element,
+    );
+
+    // Draw to the WebGL canvas via a fullscreen quad
+    gl.useProgram(b.prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, b.vbo);
+    gl.enableVertexAttribArray(b.aPos);
+    gl.vertexAttribPointer(b.aPos, 2, gl.FLOAT, false, 0, 0);
     gl.viewport(0, 0, w, h);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, glTex);
-    gl.uniform1i(gl.getUniformLocation(prog, 'u_tex'), 0);
+    gl.bindTexture(gl.TEXTURE_2D, b.tex);
+    gl.uniform1i(b.uTex, 0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.flush();
 
@@ -512,13 +552,6 @@ export class TextEffectEngine {
       { texture: gpuTex },
       [w, h],
     );
-
-    // Cleanup
-    gl.deleteTexture(glTex);
-    gl.deleteBuffer(vbo);
-    gl.deleteShader(vs);
-    gl.deleteShader(fs);
-    gl.deleteProgram(prog);
 
     return { texture: gpuTex, width: w, height: h };
   }
@@ -585,7 +618,11 @@ export class TextEffectEngine {
    * Results are cached per session.
    */
   private static _htmlInCanvasMode: 'webgpu-native' | 'webgl-bridge' | 'none' | null = null;
+  /** PER-MACHINE CAP (gpu-capabilities.ts htmlInCanvas, mobile-parity CRASH-4): false = mode 'none' (the
+   *  OffscreenCanvas fallback) without probing. Set by WebGPURenderer.applyGpuCaps (false on the mobile tier). */
+  public static htmlInCanvasAllowed = true;
   public static htmlInCanvasMode(): 'webgpu-native' | 'webgl-bridge' | 'none' {
+    if (!TextEffectEngine.htmlInCanvasAllowed) return 'none';   // not cached: a cap change takes effect at once
     if (TextEffectEngine._htmlInCanvasMode !== null) {
       return TextEffectEngine._htmlInCanvasMode;
     }
@@ -597,10 +634,9 @@ export class TextEffectEngine {
         TextEffectEngine._htmlInCanvasMode = 'webgpu-native';
         return 'webgpu-native';
       }
-      // Fall back to WebGL bridge check
-      const c = document.createElement('canvas');
-      const gl = c.getContext('webgl2');
-      if (gl && 'texElementImage2D' in gl) {
+      // Fall back to the WebGL bridge check — on the PROTOTYPE, so the probe creates no WebGL context (CRASH-4:
+      // the tool-activation probe used to create a throwaway WebGL2 context)
+      if (typeof WebGL2RenderingContext !== 'undefined' && 'texElementImage2D' in WebGL2RenderingContext.prototype) {
         TextEffectEngine._htmlInCanvasMode = 'webgl-bridge';
         return 'webgl-bridge';
       }

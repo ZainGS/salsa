@@ -113,6 +113,14 @@ export class VectorObjectUndo {
         return true;
     }
 
+    /** Put every watched node back to its `begin` snapshot WITHOUT recording an undo command — a CANCELLED gesture
+     *  (TOUCH-5: a 2nd finger landed mid-drag). The token is spent. */
+    revert(token: UndoCaptureToken): void {
+        const state = new Map<string, { node: Node; snap: NodeSnap | null }>();
+        for (const [id, e] of token.entries) state.set(id, { node: e.node, snap: e.before });
+        this._apply(token.root, state, true);
+    }
+
     // ── internals ────────────────────────────────────────────────────────────
 
     /** `id` is Shape's minting getter (Node has none); every vector object is a Shape/Group. */
@@ -165,7 +173,7 @@ export class VectorObjectUndo {
             eqOpt(a.x1, b.x1) && eqOpt(a.y1, b.y1) && eqOpt(a.x2, b.x2) && eqOpt(a.y2, b.y2);
     }
 
-    private _apply(root: Node, state: Map<string, { node: Node; snap: NodeSnap | null }>): void {
+    private _apply(root: Node, state: Map<string, { node: Node; snap: NodeSnap | null }>, keepSelection = false): void {
         // Pass 1: detach everything absent in this state.
         for (const { node, snap } of state.values()) {
             if (snap === null && node.parent) node.parent.removeChild(node);
@@ -214,7 +222,7 @@ export class VectorObjectUndo {
             node.updateLocalMatrix();
         }
 
-        this.hooks.clearSelection?.();
+        if (!keepSelection) this.hooks.clearSelection?.();   // a cancelled gesture (revert) keeps the selection
         this.hooks.emitChanged();
         this.hooks.requestRender();
     }

@@ -81,7 +81,8 @@ struct MeshInstance {
   normalMatrix:   mat4x4<f32>,
   diffuseColor:   vec4<f32>,
   specularColor:  vec4<f32>,
-  emissiveColor:  vec4<f32>,
+  emissive:       vec3<f32>,   // emissive rgb (floats 40-42)
+  flags:          u32,         // material flags (float 43, setUint32): DECLARED u32, never f32 + bitcast (subnormal flush on mobile, CLOTH-3)
   textureIndex:   u32,
   normalMapIndex: u32,
   roughness:      f32,
@@ -133,7 +134,7 @@ fn vs_main(
   out.worldNrm = (inst.normalMatrix * vec4<f32>(normal, 0.0)).xyz;
   // SSR-eligibility MATERIAL CODE for the deferred resolve pass (Stage 3b): -1 = matte override (flag bit 25,
   // raw-u32 flags); else roughness in [0,1] plus 2 when metallic. The resolve pass applies the dielectric gate.
-  let flags = bitcast<u32>(inst.emissiveColor.a);
+  let flags = inst.flags;
   let matte = ((flags >> 25u) & 1u) == 1u;
   let code = clamp(inst.roughness, 0.0, 1.0) + select(0.0, 2.0, inst.metalness > 0.05);
   out.matCode = select(code, -1.0, matte);

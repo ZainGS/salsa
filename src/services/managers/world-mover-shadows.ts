@@ -29,6 +29,8 @@ interface BlobSlot {
     mover: MoverRec;
 }
 
+/** Height above the ground (m) at which the Play player's contact blob has shrunk away (hidden). */
+const PLAYER_BLOB_FADE_M = 2.5;
 /** Defaults: the static blobs' opacity (contact-shadows.ts, 0.55), so a parked car and a moving one match. */
 export const MOVER_SHADOW_DEFAULTS = { on: true, strength: 0.55 } as const;
 
@@ -138,6 +140,10 @@ export class WorldMoverShadows {
         const m = g.children[0] as Mesh3D | undefined;
         if (!m) { this.w.scene3d.removeFlatColorMeshGroup(g, true); return; }
         m.cheapBounds = true;   // (transparent → never a shadow caster)
+        // Never Play collision: the player's own blob follows its feet, so standing on it lifted the player forever
+        // (rise bug 2026-10-04; also implied by radialFade — collision-filter.ts — set explicitly so it survives a
+        // material change).
+        m.noCollide = true;
         this._group = g; this._mesh = m; this._buf = buf; this._slots = slots; this._playerSlot = slots.length;
         this.stats.blobs = slots.length;
         this.w.scene3d.notifySceneStructureChanged3D?.();
@@ -181,12 +187,22 @@ export class WorldMoverShadows {
             shown++;
         }
         // the Play player (world feet → city-local)
-        const pf = (this.w.scene3d as unknown as { playerFeet3D?: { x: number; y: number; z: number; height: number } | null }).playerFeet3D;
+        const pf = (this.w.scene3d as unknown as { playerFeet3D?: { x: number; y: number; z: number; height: number; groundY?: number } | null }).playerFeet3D;
         if (pf && this._playerSlot >= 0) {
+            // The blob stays on the GROUND under the player (it used to ride the feet up every jump) and shrinks with
+            // the height above it — a blob shadow reads as "how far up" — hidden past PLAYER_BLOB_FADE_M.
+            const gy = pf.groundY !== undefined && Number.isFinite(pf.groundY) ? Math.min(pf.groundY, pf.y) : pf.y;
             toLocal(cm, pf.x, pf.y, pf.z, this._v);
-            const r = Math.max(size.minBlob, 0.3 / mpu * 1.45);
-            if (buf.set(this._playerSlot, this._v[0], this._v[1] + size.lift, this._v[2], 0, r, r)) written++;
-            shown++;
+            const feetLocalY = this._v[1];
+            toLocal(cm, pf.x, gy, pf.z, this._v);
+            const upM = Math.max(0, (feetLocalY - this._v[1]) * mpu);
+            const k = 1 - Math.min(1, upM / PLAYER_BLOB_FADE_M);
+            if (k <= 0.05) { if (buf.hide(this._playerSlot)) written++; }
+            else {
+                const r = Math.max(size.minBlob, 0.3 / mpu * 1.45) * (0.45 + 0.55 * k);
+                if (buf.set(this._playerSlot, this._v[0], this._v[1] + size.lift, this._v[2], 0, r, r)) written++;
+                shown++;
+            }
         } else if (this._playerSlot >= 0 && buf.hide(this._playerSlot)) written++;
         const d = buf.takeDirty();
         if (d) {

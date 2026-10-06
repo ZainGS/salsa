@@ -3,10 +3,11 @@
  * variants).
  *
  * The main mesh fragment shader (shaders/mesh3d-shaders.ts) is one uber-shader that branches on the 32 material flag
- * bits (`emissiveColor.a`, material-3d.ts encodeMaterialFlags). Every pixel carries the registers and the code of every
- * feature. A VARIANT is the same shader source with the per-instance flags line replaced by a compile-time constant:
+ * bits (`MeshInstance.flags`, a u32 lane; material-3d.ts encodeMaterialFlags). Every pixel carries the registers and the
+ * code of every feature. A VARIANT is the same shader source with the per-instance flags line replaced by a
+ * compile-time constant:
  *
- *   let flags = bitcast<u32>(inst.emissiveColor.a);   ->   const flags = 262144u;
+ *   let flags = inst.flags;   ->   const flags = 262144u;
  *
  * so every flag test folds and the shader compiler strips the unused features (and, with Renderer3D.shaderFastPaths
  * on, the P8 slow paths: `p8Fast` becomes `true`). The mechanism WRAPS the existing sources (a text substitution on the
@@ -59,7 +60,7 @@ export function variantKeyOfMaterial(mat: Material3D): number {
   return variantKeyOfFlags(encodeMaterialFlags(mat));
 }
 
-const FLAGS_LINE = /let\s+flags\s*=\s*bitcast<u32>\(inst\.emissiveColor\.a\);/g;
+const FLAGS_LINE = /let\s+flags\s*=\s*inst\.flags;/g;
 const P8_LINE = /let\s+p8Fast\s*=\s*scene\.cascadeBias\.z\s*>\s*0\.5;/g;
 
 /** The WGSL of a variant: `src` (one of the mesh fragment shaders) with the flags line replaced by the constant, and

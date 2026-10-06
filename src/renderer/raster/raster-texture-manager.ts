@@ -1,5 +1,5 @@
 import { RasterCanvas } from './raster-canvas';
-import { RasterSnapshotManager } from './core/raster-snapshot-manager';
+import { RasterSnapshotManager, RasterRectPatch } from './core/raster-snapshot-manager';
 import { LegacyBrushStamp } from './brushes/legacy-brush-stamp';
 
 /**
@@ -131,6 +131,14 @@ export class RasterTextureManager {
   public async pushSnapshot(): Promise<void> {
     if (!this.texture || this.width === 0 || this.height === 0) return;
     await this.ensureSnapshotMgr().pushSnapshot(this.texture);
+  }
+
+  /** BRUSH-6: push a brush stroke's rect undo patch (see RasterSnapshotManager.pushPatch). `texture` is the
+   *  texture the stroke painted; when it isn't this manager's current one, falls back to a full pushSnapshot. */
+  public async pushStrokePatch(texture: GPUTexture, patch: RasterRectPatch): Promise<void> {
+    if (!this.texture || this.width === 0 || this.height === 0) return;
+    if (texture !== this.texture) return this.pushSnapshot();
+    await this.ensureSnapshotMgr().pushPatch(this.texture, patch);
   }
 
   public async undo(): Promise<boolean> {
