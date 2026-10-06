@@ -9,6 +9,7 @@
  *  • Provide selection bounds for UI overlay (marching ants, transform handles)
  */
 
+import { markRasterCompositeDirty } from '../core/raster-composite-dirty';
 import { RasterSelectionMask, SelectionRect, SelectionPoint } from './raster-selection-mask';
 import type { SelectionMode } from './raster-selection-mask';
 import { RasterTransformEngine, TransformState } from './raster-transform-engine';
@@ -490,6 +491,7 @@ export class RasterSelectionEngine {
     pass.dispatchWorkgroups(Math.ceil(clearW / 8), Math.ceil(clearH / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
+    markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
     paramBuf.destroy();
   }
 

@@ -218,6 +218,8 @@ import {
     getStrokePrediction as _getStrokePrediction, setStrokePrediction as _setStrokePrediction,
     type TouchSmoothing,
 } from '../renderer/raster/brushes/brush-input-settings';
+import { runStrokePredictionSelfTest as _runStrokePredictionSelfTest, type StrokePredictionSelfTestReport } from '../renderer/raster/brushes/stroke-prediction-selftest';
+import { markRasterCompositeDirty as _markRasterCompositeDirty } from '../renderer/raster/core/raster-composite-dirty';
 
 // Re-exported so existing importers (and the host) keep one obvious entry point; the table itself lives
 // in src/world so the CITY generator can read it too (services may import world, never the reverse).
@@ -1567,6 +1569,31 @@ class ShapeManager {
      *  committed). On by default; per machine (localStorage). Mouse strokes never predict. */
     public setStrokePrediction(on: boolean): void { _setStrokePrediction(on); }
     public getStrokePrediction(): boolean { return _getStrokePrediction(); }
+    /** ON-DEVICE check of stroke prediction (OFF by default since 2026-10-06, when the predicted tail hid the committed
+     *  stroke on a tablet GPU): runs the real brush pipeline on this device's GPU against a private scratch texture —
+     *  the same stroke with and without a predicted tail — and reports whether taking the tail back restores the
+     *  committed stroke exactly, plus any GPU validation error. No document is touched. `report.ok` (and
+     *  `report.summary`, one line per brush) says whether setStrokePrediction(true) is safe on this device. Null
+     *  before the renderer has a GPU device. */
+    public async runStrokePredictionSelfTest(): Promise<StrokePredictionSelfTestReport | null> {
+        const device = this.webgpuRenderer?.getDevice?.();
+        return device ? _runStrokePredictionSelfTest(device) : null;
+    }
+
+    /** BRUSH-5 (docs/specs/mobile-parity.md §3): re-composite the 2D raster layers only when, and only where, they
+     *  changed (a persistent composite + dirty rects) instead of blending every layer from scratch every frame.
+     *  OFF by default for now; off = the full composite, exactly as before. Session-wide (all renderers). */
+    public setRasterDirtyCompositing(on: boolean): void {
+        WebGPURenderer.rasterDirtyCompositing = !!on;
+        this.webgpuRenderer?.rasterCompositor?.invalidateIncremental();
+        this.scheduleRender();
+    }
+    public getRasterDirtyCompositing(): boolean { return WebGPURenderer.rasterDirtyCompositing; }
+    /** Tell the incremental raster composite that layer pixels changed outside Salsa's own tools (a host that writes
+     *  a layer texture itself). `rect` in document texels (max-exclusive); omitted = the whole canvas. */
+    public markRasterLayersDirty(rect?: { x0: number; y0: number; x1: number; y1: number }): void {
+        _markRasterCompositeDirty(rect ?? null);
+    }
 
     public setRasterBrushColor(color: string) {
         this.rasterDrawingService?.setBrushColor(hexToRgba(color));
@@ -5647,6 +5674,7 @@ class ShapeManager {
         });
         pass.end();
         device.queue.submit([enc.finish()]);
+        _markRasterCompositeDirty();   // BRUSH-5: layer pixels changed
         this.scheduleRender();
     }
 
@@ -11437,6 +11465,7 @@ class ShapeManager {
             { width: srcW, height: srcH },
         );
         device.queue.submit([enc.finish()]);
+        _markRasterCompositeDirty();   // BRUSH-5: layer pixels changed
         await device.queue.onSubmittedWorkDone();
 
         result.texture.destroy();

@@ -18,6 +18,7 @@
  *   - The final fill write-back is parallel → GPU compute
  */
 
+import { markRasterCompositeDirty } from '../core/raster-composite-dirty';
 import { scanlineFill } from '../scanline-fill';
 
 export interface FloodFillOptions {
@@ -334,6 +335,7 @@ export class FloodFillEngine {
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
+    markRasterCompositeDirty();   // BRUSH-5: the fill can land anywhere on the layer
   }
 
   private ensureFillApplyPipeline(): void {

@@ -1,3 +1,4 @@
+import { markRasterCompositeDirty } from '../../renderer/raster/core/raster-composite-dirty';
 import type { ManagerContext } from './manager-context';
 import { LiveTextNode, type LiveTextOptions } from '../../scene-graph/shapes/live-text';
 import { TextEffectEngine, type TextEffectConfig } from '../../renderer/raster/effects/text-effect-engine';
@@ -274,6 +275,7 @@ export class LiveTextManager {
             { width: srcW, height: srcH },
         );
         device.queue.submit([enc.finish()]);
+        markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
         await device.queue.onSubmittedWorkDone();
 
         // End editing if this node was being edited

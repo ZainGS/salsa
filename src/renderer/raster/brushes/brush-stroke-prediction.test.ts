@@ -192,6 +192,80 @@ describe('stroke prediction never reaches the committed layer', () => {
     }
   });
 
+  // 2026-10-06: on a tablet GPU the tail hid the committed stroke (only the tail's tip was visible, nothing after
+  // pointer-up). The old take-back copied saved texels INTO the layer and the accum with copyTextureToTexture; the
+  // committed stroke never does that. Now the take-back is compute passes only, and a wet stroke's layer is
+  // re-composited from base + accum (the committed stroke) instead of being put back from a saved copy.
+  it('the take-back never copies a texture into the layer or the stroke accum (compute passes only)', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.37);
+    for (const [id, setup] of [['default_round_soft', {}], ['default_eraser', {}]] as Array<[string, Setup]>) {
+      const t = await makeEngine(id, setup);
+      const dev = t.gpu.device as unknown as { createCommandEncoder: () => any };
+      const copyDsts: unknown[] = [];
+      const orig = dev.createCommandEncoder;
+      dev.createCommandEncoder = () => {
+        const enc = orig();
+        const c = enc.copyTextureToTexture.bind(enc);
+        enc.copyTextureToTexture = (s: any, d: any, size: any) => { copyDsts.push(d.texture); c(s, d, size); };
+        return enc;
+      };
+      t.engine.beginStroke(real(0), { pointerType: 'touch' });
+      t.engine.addStrokePoints([1, 2, 3].map(real));
+      const accum = (t.pipe as unknown as { strokeAccumTex: unknown }).strokeAccumTex;
+      expect(t.engine.drawProvisionalStroke(predictedAfter(3))).toBe(true);
+      copyDsts.length = 0;
+      expect(t.engine.clearProvisionalStroke()).toBe(true);
+      expect(copyDsts.includes(t.tex)).toBe(false);
+      expect(copyDsts.includes(accum)).toBe(false);
+      expect(copyDsts.length).toBe(0);                    // the take-back records no texture copy at all
+      // ... and while the tail is drawn, the only copies INTO the layer / accum are none either (saves go out)
+      copyDsts.length = 0;
+      t.engine.addStrokePoints([4, 5, 6].map(real));
+      t.engine.drawProvisionalStroke(predictedAfter(6));
+      expect(copyDsts.includes(t.tex)).toBe(false);
+      expect(copyDsts.includes(accum)).toBe(false);
+      await t.engine.endStroke(real(8));
+    }
+  });
+
+  it('a wet take-back rebuilds the layer from the committed stroke (base + accum), not from a saved copy', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.37);
+    const ref = await makeEngine('default_round_soft', {});
+    ref.engine.beginStroke(real(0), { pointerType: 'touch' });
+    ref.engine.addStrokePoints([1, 2, 3].map(real));
+    const want = ref.tex.data.slice();
+
+    const t = await makeEngine('default_round_soft', {});
+    t.engine.beginStroke(real(0), { pointerType: 'touch' });
+    t.engine.addStrokePoints([1, 2, 3].map(real));
+    expect(t.engine.drawProvisionalStroke(predictedAfter(3))).toBe(true);
+    const rect = (t.pipe as unknown as { provisional: { rect: { x0: number; y0: number; x1: number; y1: number }; savedOut: boolean } }).provisional;
+    expect(rect.savedOut).toBe(false);                    // nothing of the layer was saved for a wet tail
+    // Whatever the layer holds under the tail (here: garbage, as if a GPU had lost or mis-ordered a write) ...
+    for (let y = rect.rect.y0; y < rect.rect.y1; y++) for (let x = rect.rect.x0; x < rect.rect.x1; x++) {
+      t.tex.data.fill(77, (y * EW + x) * 4, (y * EW + x) * 4 + 4);
+    }
+    expect(t.engine.clearProvisionalStroke()).toBe(true);
+    expect(same(t.tex.data, want)).toBe(true);            // ... the committed stroke comes back, byte for byte
+  });
+
+  it('the on-device self-test passes on the mirror (and reports a broken take-back)', async () => {
+    const { runStrokePredictionSelfTest } = await import('./stroke-prediction-selftest');
+    const { BrushStampPipeline } = await import('./brush-stamp-pipeline');
+    const gpu = createCpuDevice();
+    const ok = await runStrokePredictionSelfTest(gpu.device);
+    expect(ok.errors).toEqual([]);
+    expect(ok.cases.map(c => c.ok)).toEqual([true, true, true]);
+    expect(ok.cases.every(c => c.strokeTexels > 0 && c.tailShown.some(n => n > 0))).toBe(true);
+    expect(ok.ok).toBe(true);
+    expect(ok.summary).toContain('PASS');
+    // a device whose take-back does nothing (the tail stays in the layer) must FAIL the self-test
+    vi.spyOn(BrushStampPipeline.prototype, 'clearProvisional').mockReturnValue(false);
+    const bad = await runStrokePredictionSelfTest(createCpuDevice().device, ['default_round_soft']);
+    expect(bad.ok).toBe(false);
+    expect(bad.summary).toContain('FAIL');
+  });
+
   it('nothing to draw outside a stroke / for an empty tail', async () => {
     const t = await makeEngine('default_round_soft', {});
     expect(t.engine.drawProvisionalStroke(predictedAfter(0))).toBe(false);   // no stroke

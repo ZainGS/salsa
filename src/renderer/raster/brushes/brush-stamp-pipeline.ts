@@ -11,6 +11,8 @@
  * One pipeline is created once and reused for every dab — only the uniforms change.
  */
 
+import { markRasterCompositeDirty } from '../core/raster-composite-dirty';
+
 export interface StampParams {
   /** Center X in texel coords. */
   cx: number;
@@ -197,6 +199,9 @@ export class BrushStampPipeline {
   /** A full-accum change (per-dab bleed) since the last composite → composite the whole texture. */
   private pendingCompositeFull = false;
   private pendingOutput: GPUTexture | null = null;
+  /** BRUSH-5: texels of a NON-accum texture (a layer) written by the commands recorded since the last submit.
+   *  Reported to the incremental layer composite (markRasterCompositeDirty) right after flush() submits them. */
+  private recordedDirty: TexelRect | null = null;
   /** Direct-path (erase / blend-mode) dab writes to the stroke's output since the last composite. The old
    *  full-canvas composite overwrote them; the bounded composite re-covers them so the result stays identical. */
   private strokeOutputDirty: TexelRect | null = null;
@@ -217,12 +222,28 @@ export class BrushStampPipeline {
   public readonly stats = { submits: 0, copiedTexels: 0, compositedTexels: 0 };
 
   // ── Provisional (predicted) tail — BRUSH-4 stroke prediction ──
-  // drawProvisional saves the output (and accum) texels under the predicted dabs into small scratch textures,
-  // stamps + composites the dabs through the normal path, and remembers the rect; clearProvisional copies the
-  // saved texels back. Every real entry point (settleProvisional) clears it first, so real work never builds on a
-  // predicted texel and nothing that reads the textures (undo patch, smudge, readbacks) ever sees one.
-  private provisional: { texture: GPUTexture; rect: TexelRect; wet: boolean } | null = null;
+  // drawProvisional saves the texels under the predicted dabs into small scratch textures, stamps + composites the
+  // dabs through the normal path, and remembers the rect; clearProvisional takes the tail back. Every real entry
+  // point (settleProvisional) clears it first, so real work never builds on a predicted texel and nothing that
+  // reads the textures (undo patch, smudge, readbacks) ever sees one.
+  //
+  // The take-back (2026-10-06, after the tail hid the committed stroke on a tablet GPU): it uses ONLY the kinds of
+  // GPU work the committed stroke itself uses, and never copies a texture into the layer or the accum:
+  //  - a WET tail saved only the ACCUM texels; they go back with a compute pass (rectCopy), and the layer is then
+  //    RE-COMPOSITED from base ⊕ accum over the tail rect — the same pass that put the committed stroke there, so
+  //    what comes back is the committed stroke by construction (a wet stroke's layer always equals base ⊕ accum);
+  //  - a DIRECT tail (eraser / blend-mode brush: the dabs wrote the layer itself) saved the layer texels; they go
+  //    back with the same compute pass.
+  // `savedOut`: the layer texels were saved (a direct tail, or a stroke that also wrote the layer directly).
+  private provisional: { texture: GPUTexture; rect: TexelRect; wet: boolean; savedOut: boolean } | null = null;
   private inProvisional = false;
+  /** This stroke stamped real dabs straight into its output (erase / blend modes): its layer is NOT base ⊕ accum. */
+  private strokeDirectWrites = false;
+  private rectCopyPipeline: GPUComputePipeline | null = null;
+  private rectCopyBGL: GPUBindGroupLayout | null = null;
+  private rectCopyBuf: GPUBuffer | null = null;
+  private rectCopyData = new Uint32Array(4);
+  private rectCopyBGs: Array<{ src: GPUTexture; dst: GPUTexture; bg: GPUBindGroup }> = [];
   private scratchOut: GPUTexture | null = null;
   private scratchAccum: GPUTexture | null = null;
   private scratchW = 0;
@@ -367,6 +388,11 @@ export class BrushStampPipeline {
     this.stats.submits++;
     this.batchEnc = null;
     this.stagingCursor = 0;
+    const dirty = this.recordedDirty;
+    if (dirty) {
+      this.recordedDirty = null;
+      markRasterCompositeDirty(dirty);
+    }
   }
 
   private encoder(): GPUCommandEncoder {
@@ -530,6 +556,7 @@ export class BrushStampPipeline {
     this.pendingOutput = null;
     this.strokeOutputDirty = null;
     this.strokeTouched = null;
+    this.strokeDirectWrites = false;
     this.strokeTarget = texture;
     this.strokeAccumDirty = null;
     this.strokeAccumUsed = false;
@@ -655,15 +682,17 @@ export class BrushStampPipeline {
     if (!this.strokeActive || texture !== this.strokeTarget || this.batchDepth > 0 || dabs.length === 0) return false;
     const W = texture.width, H = texture.height;
     let rect: TexelRect | null = null;
-    let wet = false;
+    let wet = false, direct = false;
+    const canWet = !!this.strokeBaseTex && !!this.strokeAccumTex;
     for (const d of dabs) {
       const b = dabDispatchBounds(d.cx, d.cy, d.radius, W, H);
       if (!b) continue;
       rect = unionRect(rect, b.footprint);
-      if (d.mode === 0) wet = true;
+      if (d.mode === 0 && canWet) wet = true; else direct = true;   // (the same test as recordDab)
     }
     if (!rect) return false;
-    wet = wet && !!this.strokeBaseTex && !!this.strokeAccumTex;
+    // The layer texels are saved only when they can't be re-derived as base ⊕ accum afterwards.
+    const savedOut = direct || this.strokeDirectWrites || !wet;
     const w = rect.x1 - rect.x0, h = rect.y1 - rect.y0;
 
     this.flush();                       // the real stroke lands first
@@ -676,15 +705,17 @@ export class BrushStampPipeline {
       strokeAccumRewritten: this.strokeAccumRewritten,
     };
     const enc = this.encoder();
-    enc.copyTextureToTexture({ texture, origin: { x: rect.x0, y: rect.y0 } }, { texture: this.scratchOut! }, { width: w, height: h });
+    if (savedOut) {
+      enc.copyTextureToTexture({ texture, origin: { x: rect.x0, y: rect.y0 } }, { texture: this.scratchOut! }, { width: w, height: h });
+    }
     if (wet) {
       enc.copyTextureToTexture({ texture: this.strokeAccumTex!, origin: { x: rect.x0, y: rect.y0 } }, { texture: this.scratchAccum! }, { width: w, height: h });
     }
-    this.provisionalStats.savedTexels += w * h * (wet ? 2 : 1);
+    this.provisionalStats.savedTexels += w * h * ((wet ? 1 : 0) + (savedOut ? 1 : 0));
     // The composite of the predicted dabs must stay inside `rect` (only its texels are saved): drop the stroke's
     // direct-path dirty rect for this pass (restored below).
     this.strokeOutputDirty = null;
-    this.provisional = { texture, rect, wet };
+    this.provisional = { texture, rect, wet, savedOut };
     this.inProvisional = true;
     try {
       for (const d of dabs) this.recordDab(texture, d);
@@ -700,21 +731,88 @@ export class BrushStampPipeline {
     return true;
   }
 
-  /** Take the provisional tail back: copy the saved texels over it (byte-exact). False when there was none. */
+  /**
+   * Take the provisional tail back (byte-exact). False when there was none. Compute passes only (see the notes at
+   * `provisional`): the saved accum texels are written back, then the layer under the tail is either re-composited
+   * from base ⊕ accum (a wet stroke) or written back from its saved texels (a direct tail).
+   */
   public clearProvisional(): boolean {
     const p = this.provisional;
     if (!p || this.inProvisional) return false;
     this.provisional = null;
     this.flush();
-    const { rect } = p, w = rect.x1 - rect.x0, h = rect.y1 - rect.y0;
+    const { rect } = p;
+    this.reserveStaging(DAB_STAGING_BYTES);
     const enc = this.encoder();
-    enc.copyTextureToTexture({ texture: this.scratchOut! }, { texture: p.texture, origin: { x: rect.x0, y: rect.y0 } }, { width: w, height: h });
-    if (p.wet && this.strokeAccumTex) {
-      enc.copyTextureToTexture({ texture: this.scratchAccum! }, { texture: this.strokeAccumTex, origin: { x: rect.x0, y: rect.y0 } }, { width: w, height: h });
-    }
+    const accum = this.strokeAccumTex, base = this.strokeBaseTex;
+    if (p.wet && accum) this.rectCopyRecord(enc, this.scratchAccum!, accum, rect);
+    if (p.savedOut) this.rectCopyRecord(enc, this.scratchOut!, p.texture, rect);
+    else if (accum && base) this.compositeRecord(enc, base, accum, p.texture, rect);
     this.flush();
     this.provisionalStats.clears++;
     return true;
+  }
+
+  /** Record a compute copy of `src`'s texels at (0,0)..(w,h) into `dst` at `rect` (the provisional take-back). */
+  private rectCopyRecord(enc: GPUCommandEncoder, src: GPUTexture, dst: GPUTexture, rect: TexelRect): void {
+    const w = rect.x1 - rect.x0, h = rect.y1 - rect.y0;
+    if (w <= 0 || h <= 0) return;
+    if (!this.rectCopyPipeline) {
+      const code = /* wgsl */ `
+        @group(0) @binding(0) var rectCopySrc: texture_2d<f32>;
+        @group(0) @binding(1) var rectCopyDst: texture_storage_2d<rgba8unorm, write>;
+        // rect: dst originX, originY, width, height (src is read at 0,0)
+        @group(0) @binding(2) var<uniform> rect: vec4<u32>;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+          if (gid.x >= rect.z || gid.y >= rect.w) { return; }
+          let dim = textureDimensions(rectCopyDst);
+          let px = gid.x + rect.x;
+          let py = gid.y + rect.y;
+          if (px >= dim.x || py >= dim.y) { return; }
+          let c = textureLoad(rectCopySrc, vec2<i32>(i32(gid.x), i32(gid.y)), 0);
+          textureStore(rectCopyDst, vec2<i32>(i32(px), i32(py)), c);
+        }
+      `;
+      this.rectCopyBGL = this.device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ],
+      });
+      this.rectCopyPipeline = this.device.createComputePipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.rectCopyBGL] }),
+        compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' },
+      });
+      this.rectCopyBuf = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    }
+    let entry = this.rectCopyBGs.find(e => e.src === src && e.dst === dst);
+    if (!entry) {
+      if (this.rectCopyBGs.length >= 4) this.rectCopyBGs.length = 0;   // textures were reallocated: start over
+      entry = {
+        src, dst,
+        bg: this.device.createBindGroup({
+          layout: this.rectCopyBGL!,
+          entries: [
+            { binding: 0, resource: src.createView() },
+            { binding: 1, resource: dst.createView() },
+            { binding: 2, resource: { buffer: this.rectCopyBuf! } },
+          ],
+        }),
+      };
+      this.rectCopyBGs.push(entry);
+    }
+    const d = this.rectCopyData;
+    d[0] = rect.x0; d[1] = rect.y0; d[2] = w; d[3] = h;
+    this.stageUniform(enc, this.rectCopyBuf!, d);
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.rectCopyPipeline);
+    pass.setBindGroup(0, entry.bg);
+    pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
+    pass.end();
+    if (dst !== this.strokeAccumTex) this.recordedDirty = unionRect(this.recordedDirty, rect);   // BRUSH-5
   }
 
   /** True while a provisional tail is on the texture. */
@@ -731,11 +829,14 @@ export class BrushStampPipeline {
     const sw = Math.max(this.scratchW, Math.ceil(w / 64) * 64), sh = Math.max(this.scratchH, Math.ceil(h / 64) * 64);
     this.scratchOut?.destroy();
     this.scratchAccum?.destroy();
+    // Read by the take-back compute pass (TEXTURE_BINDING) — the same usage as the per-dab ping texture.
     const mk = () => this.device.createTexture({
-      size: [sw, sh], format: 'rgba8unorm', usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+      size: [sw, sh], format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
     });
     this.scratchOut = mk();
     this.scratchAccum = mk();
+    this.rectCopyBGs.length = 0;
     this.scratchW = sw;
     this.scratchH = sh;
   }
@@ -859,6 +960,11 @@ export class BrushStampPipeline {
     const wgSize = 8;
     pass.dispatchWorkgroups(Math.ceil(bw / wgSize), Math.ceil(bh / wgSize));
     pass.end();
+    // BRUSH-5: a dab stamped straight into a layer (erase / blend modes / no stroke lifecycle). Accum dabs reach
+    // the layer through compositeRecord; the ping texture is never a layer.
+    if (dstTexture !== this.strokeAccumTex && dstTexture !== this.pingTex) {
+      this.recordedDirty = unionRect(this.recordedDirty, b.footprint);
+    }
     return true;
   }
 
@@ -955,6 +1061,7 @@ export class BrushStampPipeline {
     this.stampRecord(enc, ping, texture, params);
     this.strokeTouched = unionRect(this.strokeTouched, fp!);
     if (this.strokeActive) this.strokeOutputDirty = unionRect(this.strokeOutputDirty, fp!);
+    if (!this.inProvisional) this.strokeDirectWrites = true;
   }
 
   /**
@@ -1017,6 +1124,8 @@ export class BrushStampPipeline {
     this.scratchOut?.destroy(); this.scratchOut = null;
     this.scratchAccum?.destroy(); this.scratchAccum = null;
     this.scratchW = 0; this.scratchH = 0;
+    this.rectCopyBGs.length = 0;
+    this.rectCopyBuf?.destroy(); this.rectCopyBuf = null;
     this.dummyMaskTex.destroy();
     this.dummyGrainTex.destroy();
     this.cachedBindGroup = null;
@@ -1067,6 +1176,7 @@ export class BrushStampPipeline {
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
     this.stats.compositedTexels += w * h;
+    this.recordedDirty = unionRect(this.recordedDirty, rect);   // BRUSH-5: the layer changed here
   }
   private compositeRectData = new Uint32Array(4);
 

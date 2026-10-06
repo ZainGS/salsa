@@ -7,6 +7,7 @@
  * On pointerUp: finalizes the move.
  */
 
+import { markRasterCompositeDirty } from '../renderer/raster/core/raster-composite-dirty';
 import { InteractionService } from './interaction-service';
 import { WebGPURenderer } from '../renderer/core/webgpu-renderer';
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
@@ -165,6 +166,7 @@ export class RasterMoveService {
     );
     pass.end();
     device.queue.submit([enc.finish()]);
+    markRasterCompositeDirty();   // BRUSH-5: the whole layer was rewritten (shifted)
     paramBuf.destroy();
   }
 

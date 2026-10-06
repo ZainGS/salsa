@@ -6,6 +6,7 @@
  * active layer at the transformed position using a GPU compute shader.
  */
 
+import { markRasterCompositeDirty } from '../core/raster-composite-dirty';
 import type { SelectionRect } from './raster-selection-mask';
 
 export interface TransformState {
@@ -174,6 +175,7 @@ export class RasterTransformEngine {
     pass.dispatchWorkgroups(Math.ceil(copyW / 8), Math.ceil(copyH / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
+    markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
     paramBuf.destroy();
     tempTex.destroy();
   }
@@ -259,6 +261,7 @@ export class RasterTransformEngine {
     pass.dispatchWorkgroups(Math.ceil(dispW / 8), Math.ceil(dispH / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
+    markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
     paramBuf.destroy();
     tempTex.destroy();
   }

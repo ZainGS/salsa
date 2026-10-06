@@ -1,3 +1,4 @@
+import { markRasterCompositeDirty } from '../core/raster-composite-dirty';
 /**
  * LegacyBrushStamp — the ORIGINAL single-dab compute brush, extracted verbatim from
  * RasterTextureManager (audit B1).
@@ -224,6 +225,8 @@ export class LegacyBrushStamp {
     pass.dispatchWorkgroups(workX, workY);
     pass.end();
     device.queue.submit([enc.finish()]);
+    // BRUSH-5: the texels this dab could write
+    markRasterCompositeDirty({ x0: minX, y0: minY, x1: minX + workX * wgSize, y1: minY + workY * wgSize });
 
     paramBuf.destroy();
     colorBuf.destroy();

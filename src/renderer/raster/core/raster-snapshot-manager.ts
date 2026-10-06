@@ -77,7 +77,12 @@ export class RasterSnapshotManager {
    * resizes) for the full-canvas readback.
    */
   public async pushSnapshot(texture: GPUTexture, dirtyRect?: { x: number; y: number; w: number; h: number }): Promise<void> {
-    bumpGpuPixelEpoch();   // every push follows an edit, coalesced or not (device-lost shadow accuracy)
+    // every push follows an edit, coalesced or not (device-lost shadow accuracy). BRUSH-5: the edit is reported to
+    // the incremental layer composite here as well — the caller's rect, else the whole canvas — so a tool that
+    // pushes a snapshot after writing a layer can never leave the screen stale.
+    bumpGpuPixelEpoch(dirtyRect
+      ? { x0: dirtyRect.x, y0: dirtyRect.y, x1: dirtyRect.x + dirtyRect.w, y1: dirtyRect.y + dirtyRect.h }
+      : 'full');
     return this._push(texture, dirtyRect);
   }
 
@@ -88,7 +93,7 @@ export class RasterSnapshotManager {
    * full push when the stack has no state of this size to sit on.
    */
   public async pushPatch(texture: GPUTexture, patch: RasterRectPatch): Promise<void> {
-    bumpGpuPixelEpoch();
+    bumpGpuPixelEpoch('none');   // (BRUSH-5: the brush pipeline reported the stroke's texels as it wrote them)
     const w = texture.width, h = texture.height;
     const top = this.snapIndex >= 0 ? this.snapshots[this.snapIndex] : undefined;
     const fits = patch.w === w && patch.h === h && patch.rw > 0 && patch.rh > 0
@@ -328,7 +333,8 @@ export class RasterSnapshotManager {
 
   /** Write one rect entry's BEFORE (undo) or AFTER (redo) pixels back. */
   private writeRect(s: RectSnap, bytes: Uint8Array, texture: GPUTexture, resize?: (w: number, h: number) => GPUTexture): void {
-    bumpGpuPixelEpoch();   // undo / redo rewrite the pixels
+    // undo / redo rewrite the pixels (BRUSH-5: only this rect is re-composited)
+    bumpGpuPixelEpoch({ x0: s.x, y0: s.y, x1: s.x + s.rw, y1: s.y + s.rh });
     const target = resize ? resize(s.w, s.h) : texture;
     this.device.queue.writeTexture(
       { texture: target, mipLevel: 0, origin: { x: s.x, y: s.y, z: 0 } },

@@ -11,10 +11,22 @@
  * under-counting is not, so any new path that writes GPU-only pixels without an undo snapshot must call
  * `bumpGpuPixelEpoch()`.
  */
+import { markRasterCompositeDirty, type DirtyTexelRect } from './core/raster-composite-dirty';
+
 let epoch = 0;
 
 /** The current edit count. */
 export function gpuPixelEpoch(): number { return epoch; }
 
-/** Record one edit to GPU-only pixels. */
-export function bumpGpuPixelEpoch(): void { epoch++; }
+/**
+ * Record one edit to GPU-only pixels.
+ *
+ * BRUSH-5: the edit is also reported to the incremental raster-layer composite (raster-composite-dirty.ts), so every
+ * path that already had to call this is covered there too. `dirty`: the texels written (max-exclusive), 'full'
+ * (the default — the whole canvas, always safe) or 'none' (the writer reported its own rects, e.g. a brush stroke's
+ * undo patch, whose pixels the brush pipeline reported dab by dab).
+ */
+export function bumpGpuPixelEpoch(dirty: DirtyTexelRect | 'full' | 'none' = 'full'): void {
+  epoch++;
+  if (dirty !== 'none') markRasterCompositeDirty(dirty === 'full' ? null : dirty);
+}

@@ -1,3 +1,4 @@
+import { markRasterCompositeDirty } from './core/raster-composite-dirty';
 import { RasterCanvas } from './raster-canvas';
 import { RasterSnapshotManager, RasterRectPatch } from './core/raster-snapshot-manager';
 import { LegacyBrushStamp } from './brushes/legacy-brush-stamp';
@@ -112,6 +113,7 @@ export class RasterTextureManager {
     });
     pass.end();
     this.device.queue.submit([encoder.finish()]);
+    markRasterCompositeDirty();   // BRUSH-5: the texture was cleared
     
     // Seed the blank state as the initial snapshot so the first stroke is undoable.
     await this.ensureSnapshotMgr().initialize(this.texture);
@@ -288,6 +290,7 @@ export class RasterTextureManager {
       { width: rectW, height: rectH, depthOrArrayLayers: 1 }
     );
     this.device.queue.submit([enc.finish()]);
+    markRasterCompositeDirty({ x0: nd.x, y0: nd.y, x1: nd.x + rectW, y1: nd.y + rectH });   // BRUSH-5
 
     return tex;
   }

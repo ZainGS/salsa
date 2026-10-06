@@ -3,10 +3,12 @@
  *
  * Textures and buffers are byte arrays; copies, writeBuffer/writeTexture, mapAsync and loadOp:'clear' render
  * passes really move bytes; compute dispatches run CPU ports of the brush shaders (stamp, wet-stroke composite,
- * bleed, end-of-stroke wet edges, the stroke-texture strip) chosen by their WGSL source. Commands execute at
- * submit, in order, like a real queue; writeBuffer / writeTexture execute immediately (queue order). Used by
- * brush-stamp-bounded.test.ts, brush-stroke-end-effects.test.ts and raster-snapshot-patch.test.ts to check that
- * the bounded / batched paths are pixel-identical to the full-canvas ones and that undo round-trips.
+ * bleed, end-of-stroke wet edges, the stroke-texture strip) and of the layer compositor's shaders (blend step, base
+ * opacity, paper grain — the full-canvas ones and their BRUSH-5 region variants) chosen by their WGSL source.
+ * Commands execute at submit, in order, like a real queue; writeBuffer / writeTexture execute immediately (queue
+ * order). Used by brush-stamp-bounded.test.ts, brush-stroke-end-effects.test.ts, raster-snapshot-patch.test.ts and
+ * raster-compositor-dirty.test.ts to check that the bounded / batched / incremental paths are pixel-identical to the
+ * full-canvas ones and that undo round-trips.
  */
 
 export interface CpuTexture {
@@ -215,6 +217,87 @@ export function strokeStripKernel(out: CpuTexture, tex: CpuTexture, p: Float32Ar
   }
 }
 
+// ── Layer compositor (RasterCompositor) ──────────────────────────────────────────────────────────────────────
+
+type V3 = [number, number, number];
+const ch = (f: (d: number, s: number) => number) => (d: V3, s: V3): V3 => [f(d[0], s[0]), f(d[1], s[1]), f(d[2], s[2])];
+const overlayCh = (d: number, s: number) => (d < 0.5 ? 2 * d * s : 1 - 2 * (1 - d) * (1 - s));
+/** The compositor's 12 layer blend modes (LayerBlendMode order), per channel, straight alpha. */
+const LAYER_BLENDS: Array<(d: V3, s: V3) => V3> = [
+  ch((_d, s) => s),                                   // Normal
+  ch((d, s) => d * s),                                // Multiply
+  ch((d, s) => 1 - (1 - d) * (1 - s)),                // Screen
+  ch(overlayCh),                                      // Overlay
+  ch((d, s) => {                                      // SoftLight (W3C)
+    const g = d <= 0.25 ? ((16 * d - 12) * d + 4) * d : Math.sqrt(d);
+    return s <= 0.5 ? d - (1 - 2 * s) * d * (1 - d) : d + (2 * s - 1) * (g - d);
+  }),
+  ch((d, s) => overlayCh(s, d)),                      // HardLight = overlay with swapped args
+  ch((d, s) => (d <= 0 ? 0 : Math.min(1, d / Math.max(1 - s, 0.001)))),          // ColorDodge
+  ch((d, s) => (d >= 1 ? 1 : 1 - Math.min(1, (1 - d) / Math.max(s, 0.001)))),    // ColorBurn
+  ch((d, s) => Math.min(d, s)),                       // Darken
+  ch((d, s) => Math.max(d, s)),                       // Lighten
+  ch((d, s) => Math.min(d + s, 1)),                   // Add
+  ch((d, s) => Math.abs(d - s)),                      // Difference
+];
+
+/** The texels a compositor dispatch of `tx×ty` threads visits: the whole-texture shaders start at (0,0); the region
+ *  variants start at (x0,y0) and stop at (x1,y1). Both drop texels outside `out`. */
+function forCompositorTexels(out: CpuTexture, tx: number, ty: number, region: ArrayLike<number> | null, f: (x: number, y: number) => void): void {
+  const x0 = region ? Math.trunc(region[0]) : 0, y0 = region ? Math.trunc(region[1]) : 0;
+  const x1 = Math.min(out.width, region ? Math.trunc(region[2]) : out.width);
+  const y1 = Math.min(out.height, region ? Math.trunc(region[3]) : out.height);
+  for (let y = y0; y < Math.min(y1, y0 + ty); y++) for (let x = x0; x < Math.min(x1, x0 + tx); x++) f(x, y);
+}
+
+/** CPU port of the compositor's blend step (displacement off — the mirror throws on a displaced layer). */
+export function layerBlendKernel(
+  accum: CpuTexture, layer: CpuTexture, out: CpuTexture, params: Float32Array, tx: number, ty: number, region: ArrayLike<number> | null,
+): void {
+  if (params[4] !== 0 && params[5] >= 0.001) throw new Error('cpu-gpu-mirror: layer displacement is not mirrored');
+  const mode = Math.trunc(params[0]), opacity = params[1], clipped = params[2] > 0.5;
+  const blend = LAYER_BLENDS[mode] ?? LAYER_BLENDS[0];
+  forCompositorTexels(out, tx, ty, region, (x, y) => {
+    const dst = load(accum, x, y), src = load(layer, x, y);
+    let srcA = src[3] * opacity;
+    if (clipped) srcA *= dst[3];
+    if (srcA <= 0.001) { store(out, x, y, dst); return; }
+    const b = blend([dst[0], dst[1], dst[2]], [src[0], src[1], src[2]]);
+    const outA = srcA + dst[3] * (1 - srcA);
+    const rgb = outA > 0.001 ? [0, 1, 2].map(i => (b[i] * srcA + dst[i] * dst[3] * (1 - srcA)) / outA) : [0, 0, 0];
+    store(out, x, y, [...rgb, outA]);
+  });
+}
+
+/** CPU port of the base-layer opacity pass. */
+export function baseOpacityKernel(src: CpuTexture, out: CpuTexture, opacity: number, tx: number, ty: number, region: ArrayLike<number> | null): void {
+  forCompositorTexels(out, tx, ty, region, (x, y) => {
+    const c = load(src, x, y);
+    store(out, x, y, [c[0], c[1], c[2], c[3] * opacity]);
+  });
+}
+
+function sampleR8Repeat(t: CpuTexture, u: number, v: number): number {
+  // bilinear, repeat
+  const x = u * t.width - 0.5, y = v * t.height - 0.5;
+  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+  const wrap = (n: number, m: number) => ((n % m) + m) % m;
+  const g = (xx: number, yy: number) => t.data[wrap(yy, t.height) * t.width + wrap(xx, t.width)] / 255;
+  return (g(x0, y0) * (1 - fx) + g(x0 + 1, y0) * fx) * (1 - fy) + (g(x0, y0 + 1) * (1 - fx) + g(x0 + 1, y0 + 1) * fx) * fy;
+}
+
+/** CPU port of the paper-grain overlay (the grain is sampled at the absolute canvas texel). */
+export function grainOverlayKernel(
+  src: CpuTexture, grain: CpuTexture, out: CpuTexture, p: ArrayLike<number>, tx: number, ty: number, region: ArrayLike<number> | null,
+): void {
+  forCompositorTexels(out, tx, ty, region, (x, y) => {
+    const c = load(src, x, y);
+    const g = sampleR8Repeat(grain, x * p[0], y * p[1]);
+    const m = 1 + (g - 1) * p[2];
+    store(out, x, y, [...[0, 1, 2].map(i => c[i] * m * c[3] + m * (1 - c[3])), 1]);
+  });
+}
+
 function copyTex(src: CpuTexture, so: { x?: number; y?: number } | undefined, dst: CpuTexture, dO: { x?: number; y?: number } | undefined, w: number, h: number) {
   const sx = so?.x ?? 0, sy = so?.y ?? 0, dx = dO?.x ?? 0, dy = dO?.y ?? 0;
   if (sx + w > src.width || sy + h > src.height || dx + w > dst.width || dy + h > dst.height) throw new Error('copy out of bounds');
@@ -258,7 +341,25 @@ export function createCpuDevice() {
     const tx = gx * 8, ty = gy * 8;
     counters.dispatchThreads += tx * ty;
     const code = pipeline.code;
-    if (code.includes('projectOntoSegment')) {   // stroke-texture strip (StrokeTextureRenderer)
+    if (code.includes('blendSoftLight')) {   // layer compositor blend step (params[5] = region in the BRUSH-5 variant)
+      const p = f32(buf(3));
+      layerBlendKernel(tex(0), tex(1), tex(2), p, tx, ty, code.includes('params[5]') ? p.subarray(20, 24) : null);
+    } else if (code.includes('regionOpacity')) {   // base opacity over a region
+      const p = f32(buf(2));
+      baseOpacityKernel(tex(0), tex(1), p[0], tx, ty, p.subarray(4, 8));
+    } else if (code.includes('c.a * opacity')) {   // base opacity, whole texture
+      baseOpacityKernel(tex(0), tex(1), f32(buf(2))[0], tx, ty, null);
+    } else if (code.includes('regionGrain')) {   // paper grain over a region
+      const p = f32(buf(3));
+      grainOverlayKernel(tex(0), tex(1), tex(4), p, tx, ty, p.subarray(4, 8));
+    } else if (code.includes('paperRGB')) {   // paper grain, whole texture
+      grainOverlayKernel(tex(0), tex(1), tex(4), f32(buf(3)), tx, ty, null);
+    } else if (code.includes('rectCopySrc')) {   // provisional take-back: src (0,0)..(w,h) → dst at the rect origin
+      const src = tex(0), dst = tex(1), r = u32(buf(2));
+      for (let y = 0; y < Math.min(r[3], ty); y++) for (let x = 0; x < Math.min(r[2], tx); x++) {
+        store(dst, r[0] + x, r[1] + y, load(src, x, y));
+      }
+    } else if (code.includes('projectOntoSegment')) {   // stroke-texture strip (StrokeTextureRenderer)
       strokeStripKernel(tex(0), tex(1), f32(buf(3)), f32(buf(4)));
     } else if (code.includes('edgeDarkness')) {   // end-of-stroke wet edges
       const p = f32(buf(2));
@@ -304,6 +405,8 @@ export function createCpuDevice() {
 
   const device = {
     queue,
+    pushErrorScope: () => { /* the mirror never raises GPU errors */ },
+    popErrorScope: () => Promise.resolve(null),
     createTexture: (d: { size: any; format: string }) => { const [w, h] = extent(d.size); return mkTex(w, h, d.format); },
     createBuffer: (d: { size: number }) => mkBuf(d.size),
     createSampler: () => ({}),

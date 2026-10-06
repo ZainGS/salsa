@@ -21,6 +21,20 @@ import { CanvasGrainManager } from '../canvas-grain';
 import { DitherEngine, DitherConfig, defaultDitherConfig } from '../effects/dither-engine';
 import type { FrameLinkAnimation } from '../../../animation';
 import { OnionSkinRenderer, type OnionFrame } from '../../../animation/onion-skin-renderer';
+import { RasterDirtyCursor, type DirtyTexelRect } from './raster-composite-dirty';
+
+/** What one compositeIncremental call did. */
+export type IncrementalCompositeResult = 'skip' | 'rect' | 'full';
+
+/** Per-target state of the incremental composite (BRUSH-5). */
+interface IncrementalSlot {
+  /** This target's position in the dirty-rect log. */
+  cursor: RasterDirtyCursor;
+  /** Signature of the inputs the persistent output was last composited from by the REGION passes; null = the
+   *  output is not one of those (never composited / composited by the legacy path / post-processed in place) →
+   *  the next incremental composite is a full one. */
+  sig: string | null;
+}
 
 /** Blend mode enum — matches the uniform values in the shader. */
 export enum LayerBlendMode {
@@ -83,6 +97,45 @@ export class RasterCompositor {
   private _baseOpacityPipeline: GPUComputePipeline | null = null;
   private _baseOpacityBGL: GPUBindGroupLayout | null = null;
   private _baseOpacityBuf: GPUBuffer | null = null;
+  // BRUSH-5: the read copy for the base-opacity pass — was a full-size texture created AND destroyed every frame.
+  private _baseOpacityTmp: GPUTexture | null = null;
+  private _baseOpacityTmpW = 0;
+  private _baseOpacityTmpH = 0;
+
+  // ── Incremental composite (BRUSH-5) — see compositeIncremental. Its own (lazily built) pipelines: the legacy
+  // composite() / compositeAsync() passes above and below are not touched by it. ──
+  private _slots = new Map<string, IncrementalSlot>();
+  private _texIds = new WeakMap<GPUTexture, number>();
+  private _nextTexId = 1;
+  private _blendCode = '';
+  private _regionBroken = false;
+  private _regionBlendPipeline: GPUComputePipeline | null = null;
+  private _regionBlendBGL: GPUBindGroupLayout | null = null;
+  private _regionParams = new Float32Array(24);   // the 5 blend/displacement vec4 + [x0, y0, x1, y1]
+  private _regionStepCache = new WeakMap<GPUTexture, { buf: GPUBuffer; bg: GPUBindGroup; ping: GPUTexture; out: GPUTexture }>();
+  private _regionOpacityPipeline: GPUComputePipeline | null = null;
+  private _regionOpacityBGL: GPUBindGroupLayout | null = null;
+  private _regionOpacityBuf: GPUBuffer | null = null;
+  private _regionOpacityData = new Float32Array(8);   // [opacity,0,0,0], [x0,y0,x1,y1]
+  private _regionOpacityBG: { bg: GPUBindGroup; ping: GPUTexture; out: GPUTexture } | null = null;
+  private _regionGrainPipeline: GPUComputePipeline | null = null;
+  private _regionGrainBGL: GPUBindGroupLayout | null = null;
+  private _regionGrainBuf: GPUBuffer | null = null;
+  private _regionGrainSampler: GPUSampler | null = null;
+  private _regionGrainData = new Float32Array(8);     // [invScaleX, invScaleY, strength, 0], [x0,y0,x1,y1]
+  private _regionGrainBG: { bg: GPUBindGroup; ping: GPUTexture; grain: GPUTexture; out: GPUTexture } | null = null;
+  /** Work counters (diagnostics / tests): composites by kind, and the texels of every texture copy / compute
+   *  dispatch region the compositor recorded (legacy and incremental paths; dither engine + onion skin excluded).
+   *  `bytes`: the texture memory those touch — 4 B per texel read or written (a copy = 8 B/texel, a blend step
+   *  = 12 B/texel, base opacity / grain = 8 B/texel). */
+  public readonly stats = {
+    full: 0, rect: 0, skip: 0, submits: 0, copies: 0, dispatches: 0, copyTexels: 0, dispatchTexels: 0, bytes: 0,
+  };
+  private noteCopy(texels: number): void { this.stats.copies++; this.stats.copyTexels += texels; this.stats.bytes += texels * 8; }
+  /** `reads`: full-size textures the pass reads per texel (it writes one). */
+  private noteDispatch(texels: number, reads: number): void {
+    this.stats.dispatches++; this.stats.dispatchTexels += texels; this.stats.bytes += texels * 4 * (reads + 1);
+  }
 
   // Global canvas grain overlay
   private _grainManager: CanvasGrainManager | null = null;
@@ -292,6 +345,8 @@ export class RasterCompositor {
       { width: Math.min(firstTex.width, w), height: Math.min(firstTex.height, h) },
     );
     this.device.queue.submit([copyEnc.finish()]);
+    this.noteCopy(Math.min(firstTex.width, w) * Math.min(firstTex.height, h));
+    this.stats.submits++;
 
     if (first.opacity < 1.0) {
       this.applyBaseOpacity(outputTexture, first.opacity, w, h);
@@ -358,6 +413,8 @@ export class RasterCompositor {
       { width: Math.min(firstTex.width, w), height: Math.min(firstTex.height, h) },
     );
     this.device.queue.submit([copyEnc.finish()]);
+    this.noteCopy(Math.min(firstTex.width, w) * Math.min(firstTex.height, h));
+    this.stats.submits++;
 
     if (first.opacity < 1.0) {
       this.applyBaseOpacity(outputTexture, first.opacity, w, h);
@@ -446,6 +503,437 @@ export class RasterCompositor {
     pass.dispatchWorkgroups(Math.ceil(layerW / wgSize), Math.ceil(layerH / wgSize));
     pass.end();
     this.device.queue.submit([enc.finish()]);
+    this.noteCopy(w * h);
+    this.noteDispatch(layerW * layerH, 2);
+    this.stats.submits++;
+  }
+
+  // ── Incremental composite (BRUSH-5) ─────────────────────────────
+
+  /**
+   * composite() into a PERSISTENT `outputTexture`, doing only the work that changed since the last call for
+   * `slotKey` (one key per output: the renderer uses 'main' and 'fg'):
+   *  - inputs unchanged and nothing reported dirty → no GPU work at all ('skip');
+   *  - layer pixels reported dirty (raster-composite-dirty.ts) → the composite passes bounded to the union rect
+   *    ('rect'): the base copy, base opacity, every blend step and the paper grain. Each is a function of the same
+   *    texel of its inputs (the grain is sampled at absolute canvas coordinates), so the result is pixel-identical
+   *    to compositing everything;
+   *  - anything else → everything ('full'): the first call, a change to the layer list (texture identity, order,
+   *    visibility, opacity, blend mode, clipping, sizes), to the output texture or the grain, and a whole-canvas
+   *    dirty report.
+   * While a dither (global or per-layer) or a displacement animation is active — they read other texels / the
+   * frame number — every call is a legacy composite() ('full').
+   *
+   * The rect and the full passes here are the SAME region pipelines (a full pass is the rect [0,w)×[0,h)), built
+   * on first use; composite() / compositeAsync() keep their own, untouched. A caller that composites this output
+   * any other way (compositeAsync, composite(), an in-place post-process such as the onion skin) must call
+   * invalidateIncremental(slotKey), which makes the next call here a full one. Sync only.
+   */
+  public compositeIncremental(
+    layers: CompositorLayerInfo[],
+    outputTexture: GPUTexture,
+    slotKey: string,
+  ): IncrementalCompositeResult {
+    const w = outputTexture.width, h = outputTexture.height;
+    if (w === 0 || h === 0) return 'skip';
+    let slot = this._slots.get(slotKey);
+    if (!slot) { slot = { cursor: new RasterDirtyCursor(), sig: null }; this._slots.set(slotKey, slot); }
+    const dirty = slot.cursor.take();   // always consumed: whatever we do below covers it
+    const sig = this._regionBroken ? null : this.incrementalSignature(layers, outputTexture);
+    if (sig === null) {
+      slot.sig = null;
+      this.stats.full++;
+      this.composite(layers, outputTexture);
+      return 'full';
+    }
+    try {
+      if (sig !== slot.sig || dirty === 'full') {
+        slot.sig = null;
+        this._compositeRegion(layers, outputTexture, { x0: 0, y0: 0, x1: w, y1: h });
+        slot.sig = sig;
+        this.stats.full++;
+        return 'full';
+      }
+      if (!dirty) { this.stats.skip++; return 'skip'; }
+      const R = { x0: Math.max(0, dirty.x0), y0: Math.max(0, dirty.y0), x1: Math.min(w, dirty.x1), y1: Math.min(h, dirty.y1) };
+      if (R.x1 <= R.x0 || R.y1 <= R.y0) { this.stats.skip++; return 'skip'; }
+      this._compositeRegion(layers, outputTexture, R);
+      this.stats.rect++;
+      return 'rect';
+    } catch (e) {
+      // A region pipeline could not be built: stay on the legacy composite for good.
+      console.warn('RasterCompositor: incremental composite unavailable, using the full composite', e);
+      this._regionBroken = true;
+      slot.sig = null;
+      this.stats.full++;
+      this.composite(layers, outputTexture);
+      return 'full';
+    }
+  }
+
+  /** The output of `slotKey` (every slot when omitted) was, or is about to be, written by something other than
+   *  compositeIncremental: its next compositeIncremental is a full one. */
+  public invalidateIncremental(slotKey?: string): void {
+    if (slotKey === undefined) { for (const s of this._slots.values()) s.sig = null; return; }
+    const slot = this._slots.get(slotKey);
+    if (slot) slot.sig = null;
+  }
+
+  private texId(t: GPUTexture): number {
+    let id = this._texIds.get(t);
+    if (id === undefined) { id = this._nextTexId++; this._texIds.set(t, id); }
+    return id;
+  }
+
+  /** Everything the composited pixels depend on besides the layers' own pixels, as a string; null when this
+   *  frame can't be composited incrementally (a dither or a displacement animation is active). */
+  private incrementalSignature(layers: CompositorLayerInfo[], out: GPUTexture): string | null {
+    const g = this._ditherConfig;
+    if (g.enabled && g.strength > 0.001) return null;
+    let sig = this.texId(out) + ':' + out.width + 'x' + out.height;
+    for (const l of layers) {
+      if (!l.visible || !l.texture) continue;
+      const d = l.ditherConfig;
+      if (d && d.enabled && d.strength > 0.001) return null;
+      const a = l.frameLinkAnimation;
+      if (a && a.enabled) return null;   // displacement (reads other texels, changes with the frame number)
+      const t = l.texture;
+      sig += '|' + this.texId(t) + ',' + t.width + ',' + t.height + ',' + l.blendMode + ',' + l.opacity + ',' + (l.clipped ? 1 : 0);
+    }
+    const gm = this._grainManager;
+    const grainTex = gm ? gm.getGrainTexture() : null;
+    if (gm && grainTex && gm.getGrainStrength() > 0.001) {
+      const inv = gm.getGrainInvScale();
+      sig += '|g' + this.texId(grainTex) + ',' + gm.getGrainStrength() + ',' + inv[0] + ',' + inv[1];
+    }
+    return sig;
+  }
+
+  /** The composite over `R` only (texels, max-exclusive, inside the output). Mirrors composite() pass for pass —
+   *  minus the dithers and the displacement, which incrementalSignature() rules out. */
+  private _compositeRegion(layers: CompositorLayerInfo[], outputTexture: GPUTexture, R: DirtyTexelRect): void {
+    const w = outputTexture.width;
+    const h = outputTexture.height;
+    const visibleLayers = layers.filter(l => l.visible && l.texture);
+    if (visibleLayers.length === 0) {
+      this._regionClear(outputTexture, R);
+      this._regionGrain(outputTexture, w, h, R);   // the blank canvas IS the paper
+      return;
+    }
+    const first = visibleLayers[0];
+    this._regionCopyBase(first.texture, outputTexture, R);
+    if (first.opacity < 1.0) this._regionBaseOpacity(outputTexture, first.opacity, w, h, R);
+    for (let i = 1; i < visibleLayers.length; i++) {
+      this._regionLayerStep(visibleLayers[i], outputTexture, w, h, R);
+    }
+    this._regionGrain(outputTexture, w, h, R);
+  }
+
+  /** The persistent read-back texture of the region passes (the blend steps, the base opacity and the grain all
+   *  read the output through it, one after the other). */
+  private ensurePing(w: number, h: number): GPUTexture {
+    if (!this.pingTex || this.pingTexW !== w || this.pingTexH !== h) {
+      this.pingTex?.destroy();
+      this.pingTex = this.device.createTexture({
+        size: [w, h],
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+      });
+      this.pingTexW = w;
+      this.pingTexH = h;
+    }
+    return this.pingTex;
+  }
+
+  /** Transparent black over `R` (a fresh GPU buffer is zero-filled). */
+  private _regionClear(tex: GPUTexture, R: DirtyTexelRect): void {
+    const w = R.x1 - R.x0, h = R.y1 - R.y0;
+    if (w <= 0 || h <= 0) return;
+    const paddedRowBytes = Math.ceil(w * 4 / 256) * 256;
+    const buf = this.device.createBuffer({ size: paddedRowBytes * h, usage: GPUBufferUsage.COPY_SRC });
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToTexture(
+      { buffer: buf, bytesPerRow: paddedRowBytes },
+      { texture: tex, origin: { x: R.x0, y: R.y0 } },
+      { width: w, height: h },
+    );
+    this.device.queue.submit([enc.finish()]);
+    this.stats.submits++;
+    buf.destroy();
+  }
+
+  /** Base layer → output over `R` (clipped to the layer's extent, like composite()'s base copy). */
+  private _regionCopyBase(firstTex: GPUTexture, outputTexture: GPUTexture, R: DirtyTexelRect): void {
+    const x1 = Math.min(R.x1, firstTex.width, outputTexture.width);
+    const y1 = Math.min(R.y1, firstTex.height, outputTexture.height);
+    if (x1 <= R.x0 || y1 <= R.y0) return;
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture(
+      { texture: firstTex, origin: { x: R.x0, y: R.y0 } },
+      { texture: outputTexture, origin: { x: R.x0, y: R.y0 } },
+      { width: x1 - R.x0, height: y1 - R.y0 },
+    );
+    this.device.queue.submit([enc.finish()]);
+    this.noteCopy((x1 - R.x0) * (y1 - R.y0));
+    this.stats.submits++;
+  }
+
+  /** applyBaseOpacity over `R`: one submit, reading the output through the persistent ping texture. */
+  private _regionBaseOpacity(tex: GPUTexture, opacity: number, w: number, h: number, R: DirtyTexelRect): void {
+    if (opacity >= 0.999) return;   // (the same threshold as applyBaseOpacity)
+    const rw = R.x1 - R.x0, rh = R.y1 - R.y0;
+    if (rw <= 0 || rh <= 0) return;
+    const ping = this.ensurePing(w, h);
+    if (!this._regionOpacityPipeline) {
+      const code = /* wgsl */ `
+        @group(0) @binding(0) var src: texture_2d<f32>;
+        @group(0) @binding(1) var dst: texture_storage_2d<rgba8unorm, write>;
+        // regionOpacity[0] = [opacity, 0, 0, 0], regionOpacity[1] = [x0, y0, x1, y1] (texels, max-exclusive)
+        @group(0) @binding(2) var<uniform> regionOpacity: array<vec4<f32>, 2>;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+          let dim = textureDimensions(dst);
+          let coords = vec2<i32>(i32(gid.x) + i32(regionOpacity[1].x), i32(gid.y) + i32(regionOpacity[1].y));
+          if (coords.x >= i32(regionOpacity[1].z) || coords.y >= i32(regionOpacity[1].w)) { return; }
+          if (coords.x >= i32(dim.x) || coords.y >= i32(dim.y)) { return; }
+          let c = textureLoad(src, coords, 0);
+          textureStore(dst, coords, vec4<f32>(c.rgb, c.a * regionOpacity[0].x));
+        }
+      `;
+      this._regionOpacityBGL = this.device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ],
+      });
+      this._regionOpacityPipeline = this.device.createComputePipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._regionOpacityBGL] }),
+        compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' },
+      });
+      this._regionOpacityBuf = this.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    }
+    const d = this._regionOpacityData;
+    d[0] = opacity; d[1] = 0; d[2] = 0; d[3] = 0;
+    d[4] = R.x0; d[5] = R.y0; d[6] = R.x1; d[7] = R.y1;
+    this.device.queue.writeBuffer(this._regionOpacityBuf!, 0, d);
+    let cached = this._regionOpacityBG;
+    if (!cached || cached.ping !== ping || cached.out !== tex) {
+      cached = this._regionOpacityBG = {
+        bg: this.device.createBindGroup({
+          layout: this._regionOpacityBGL!,
+          entries: [
+            { binding: 0, resource: ping.createView() },
+            { binding: 1, resource: tex.createView() },
+            { binding: 2, resource: { buffer: this._regionOpacityBuf! } },
+          ],
+        }),
+        ping, out: tex,
+      };
+    }
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture(
+      { texture: tex, origin: { x: R.x0, y: R.y0 } },
+      { texture: ping, origin: { x: R.x0, y: R.y0 } },
+      { width: rw, height: rh },
+    );
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this._regionOpacityPipeline);
+    pass.setBindGroup(0, cached.bg);
+    pass.dispatchWorkgroups(Math.ceil(rw / 8), Math.ceil(rh / 8));
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
+    this.noteCopy(rw * rh);
+    this.noteDispatch(rw * rh, 1);
+    this.stats.submits++;
+  }
+
+  /** The blend shader with a region: `params` grows by [x0, y0, x1, y1] and main() walks the region instead of
+   *  the whole texture. Derived from the legacy source so the blend maths cannot drift apart. */
+  private regionBlendCode(): string {
+    const decl = /var<uniform> params: array<vec4<f32>, 5>;/;
+    const head = /let dim = textureDimensions\(output\);\s*if \(gid\.x >= dim\.x \|\| gid\.y >= dim\.y\) \{ return; \}\s*let ix = i32\(gid\.x\);\s*let iy = i32\(gid\.y\);/;
+    const code = this._blendCode;
+    if (!decl.test(code) || !head.test(code)) {
+      throw new Error('RasterCompositor: the blend shader changed — update regionBlendCode()');
+    }
+    return code
+      .replace(decl, 'var<uniform> params: array<vec4<f32>, 6>;   // params[5] = regionRect [x0, y0, x1, y1]')
+      .replace(head, `let dim = textureDimensions(output);
+        let ix = i32(gid.x) + i32(params[5].x);
+        let iy = i32(gid.y) + i32(params[5].y);
+        if (ix >= i32(params[5].z) || iy >= i32(params[5].w)) { return; }
+        if (ix >= i32(dim.x) || iy >= i32(dim.y)) { return; }`);
+  }
+
+  /** _compositeLayerStep over `R` (clipped to the layer's extent): only the region is read back and blended. */
+  private _regionLayerStep(layer: CompositorLayerInfo, outputTexture: GPUTexture, w: number, h: number, R: DirtyTexelRect): void {
+    const layerTex = layer.texture;
+    const rx1 = Math.min(R.x1, layerTex.width, w);
+    const ry1 = Math.min(R.y1, layerTex.height, h);
+    if (rx1 <= R.x0 || ry1 <= R.y0) return;
+    const rw = rx1 - R.x0, rh = ry1 - R.y0;
+    const ping = this.ensurePing(w, h);
+    if (!this._regionBlendPipeline) {
+      const code = this.regionBlendCode();
+      this._regionBlendBGL = this.device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 96 } },
+        ],
+      });
+      this._regionBlendPipeline = this.device.createComputePipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._regionBlendBGL] }),
+        compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' },
+      });
+    }
+
+    // params[0] = blend, params[1..4] = displacement OFF (type 0; texW/texH kept), params[5] = the region
+    const pd = this._regionParams;
+    pd.fill(0);
+    pd[0] = layer.blendMode; pd[1] = layer.opacity; pd[2] = layer.clipped ? 1.0 : 0.0;
+    pd[10] = this.currentFrame; pd[18] = w; pd[19] = h;
+    pd[20] = R.x0; pd[21] = R.y0; pd[22] = rx1; pd[23] = ry1;
+
+    let entry = this._regionStepCache.get(layerTex);
+    if (!entry || entry.ping !== ping || entry.out !== outputTexture) {
+      const buf = entry?.buf ?? this.device.createBuffer({
+        size: pd.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      entry = {
+        buf,
+        bg: this.device.createBindGroup({
+          layout: this._regionBlendBGL!,
+          entries: [
+            { binding: 0, resource: ping.createView() },
+            { binding: 1, resource: layerTex.createView() },
+            { binding: 2, resource: outputTexture.createView() },
+            { binding: 3, resource: { buffer: buf } },
+          ],
+        }),
+        ping, out: outputTexture,
+      };
+      this._regionStepCache.set(layerTex, entry);
+    }
+    this.device.queue.writeBuffer(entry.buf, 0, pd);
+
+    // Only the region is read back: the shader reads the accumulated result at its own texel only.
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture(
+      { texture: outputTexture, origin: { x: R.x0, y: R.y0 } },
+      { texture: ping, origin: { x: R.x0, y: R.y0 } },
+      { width: rw, height: rh },
+    );
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this._regionBlendPipeline);
+    pass.setBindGroup(0, entry.bg);
+    pass.dispatchWorkgroups(Math.ceil(rw / 8), Math.ceil(rh / 8));
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
+    this.noteCopy(rw * rh);
+    this.noteDispatch(rw * rh, 2);
+    this.stats.submits++;
+  }
+
+  /** applyGrainOverlay over `R`. The grain is sampled at the ABSOLUTE canvas texel, so a sub-rect is seamless. */
+  private _regionGrain(tex: GPUTexture, w: number, h: number, R: DirtyTexelRect): void {
+    if (!this._grainManager) return;
+    const grainTex = this._grainManager.getGrainTexture();
+    if (!grainTex) return;
+    const strength = this._grainManager.getGrainStrength();
+    if (strength <= 0.001) return;
+    const invScale = this._grainManager.getGrainInvScale();
+    const rw = R.x1 - R.x0, rh = R.y1 - R.y0;
+    if (rw <= 0 || rh <= 0) return;
+    const ping = this.ensurePing(w, h);
+    if (!this._regionGrainPipeline) {
+      const code = /* wgsl */ `
+        @group(0) @binding(0) var srcTex: texture_2d<f32>;       // composited paint input
+        @group(0) @binding(1) var grainTex: texture_2d<f32>;     // r8unorm tiling grain
+        @group(0) @binding(2) var grainSamp: sampler;            // repeat sampler
+        // regionGrain[0] = [invScaleX, invScaleY, strength, pad], regionGrain[1] = [x0, y0, x1, y1]
+        @group(0) @binding(3) var<uniform> regionGrain: array<vec4<f32>, 2>;
+        @group(0) @binding(4) var output: texture_storage_2d<rgba8unorm, write>;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+          let dim = textureDimensions(output);
+          let grainParams = regionGrain[0];
+          let coords = vec2<i32>(i32(gid.x) + i32(regionGrain[1].x), i32(gid.y) + i32(regionGrain[1].y));
+          if (coords.x >= i32(regionGrain[1].z) || coords.y >= i32(regionGrain[1].w)) { return; }
+          if (coords.x >= i32(dim.x) || coords.y >= i32(dim.y)) { return; }
+
+          let src = textureLoad(srcTex, coords, 0);
+
+          // The same maths as the full-canvas grain overlay, at the absolute canvas texel
+          let grainUV = vec2<f32>(f32(coords.x), f32(coords.y)) * grainParams.xy;
+          let grainVal = textureSampleLevel(grainTex, grainSamp, grainUV, 0.0).r;
+          let strength = grainParams.z;
+          let modulation = mix(1.0, grainVal, strength);
+          let paperRGB = vec3<f32>(1.0) * modulation;
+          let paintRGB = src.rgb * modulation;
+          let paintA   = src.a;
+          let outRGB = paintRGB * paintA + paperRGB * (1.0 - paintA);
+          textureStore(output, coords, vec4<f32>(outRGB, 1.0));
+        }
+      `;
+      this._regionGrainSampler = this.device.createSampler({
+        magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat',
+      });
+      this._regionGrainBGL = this.device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+          { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+        ],
+      });
+      this._regionGrainPipeline = this.device.createComputePipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._regionGrainBGL] }),
+        compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' },
+      });
+      this._regionGrainBuf = this.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    }
+    const d = this._regionGrainData;
+    d[0] = invScale[0]; d[1] = invScale[1]; d[2] = strength; d[3] = 0;
+    d[4] = R.x0; d[5] = R.y0; d[6] = R.x1; d[7] = R.y1;
+    this.device.queue.writeBuffer(this._regionGrainBuf!, 0, d);
+    let cached = this._regionGrainBG;
+    if (!cached || cached.ping !== ping || cached.grain !== grainTex || cached.out !== tex) {
+      cached = this._regionGrainBG = {
+        bg: this.device.createBindGroup({
+          layout: this._regionGrainBGL!,
+          entries: [
+            { binding: 0, resource: ping.createView() },
+            { binding: 1, resource: grainTex.createView() },
+            { binding: 2, resource: this._regionGrainSampler! },
+            { binding: 3, resource: { buffer: this._regionGrainBuf! } },
+            { binding: 4, resource: tex.createView() },
+          ],
+        }),
+        ping, grain: grainTex, out: tex,
+      };
+    }
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture(
+      { texture: tex, origin: { x: R.x0, y: R.y0 } },
+      { texture: ping, origin: { x: R.x0, y: R.y0 } },
+      { width: rw, height: rh },
+    );
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this._regionGrainPipeline);
+    pass.setBindGroup(0, cached.bg);
+    pass.dispatchWorkgroups(Math.ceil(rw / 8), Math.ceil(rh / 8));
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
+    this.noteCopy(rw * rh);
+    this.noteDispatch(rw * rh, 1);
+    this.stats.submits++;
   }
 
   public destroy(): void {
@@ -463,6 +951,13 @@ export class RasterCompositor {
     this._onionPingTex = null;
     this._baseOpacityBuf?.destroy();
     this._baseOpacityBuf = null;
+    this._baseOpacityTmp?.destroy();
+    this._baseOpacityTmp = null;
+    this._regionOpacityBuf?.destroy();
+    this._regionOpacityBuf = null;
+    this._regionGrainBuf?.destroy();
+    this._regionGrainBuf = null;
+    this._slots.clear();
   }
 
   // ── Per-layer dither helper ─────────────────────────────────────
@@ -600,12 +1095,19 @@ export class RasterCompositor {
   private applyBaseOpacity(tex: GPUTexture, opacity: number, w: number, h: number): void {
     if (opacity >= 0.999) return;
 
-    // Need a temp copy to read from (can't read+write same texture)
-    const tmpTex = this.device.createTexture({
-      size: [w, h],
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
+    // Need a copy to read from (can't read+write same texture). BRUSH-5: kept across frames (it used to be a
+    // full-size texture created and destroyed EVERY frame); the copy + pass are the same as before.
+    if (!this._baseOpacityTmp || this._baseOpacityTmpW !== w || this._baseOpacityTmpH !== h) {
+      this._baseOpacityTmp?.destroy();
+      this._baseOpacityTmp = this.device.createTexture({
+        size: [w, h],
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      this._baseOpacityTmpW = w;
+      this._baseOpacityTmpH = h;
+    }
+    const tmpTex = this._baseOpacityTmp;
     const cpEnc = this.device.createCommandEncoder();
     cpEnc.copyTextureToTexture({ texture: tex }, { texture: tmpTex }, { width: w, height: h });
     this.device.queue.submit([cpEnc.finish()]);
@@ -661,7 +1163,9 @@ export class RasterCompositor {
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    tmpTex.destroy();
+    this.noteCopy(w * h);
+    this.noteDispatch(w * h, 1);
+    this.stats.submits += 2;
   }
 
   // ── Global grain overlay ────────────────────────────────────────────
@@ -731,6 +1235,9 @@ export class RasterCompositor {
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
+    this.noteCopy(w * h);
+    this.noteDispatch(w * h, 1);
+    this.stats.submits += 2;
   }
 
   private ensureGrainOverlayPipeline(): void {
@@ -1055,6 +1562,8 @@ export class RasterCompositor {
         textureStore(output, coords, vec4<f32>(outRGB, outA));
       }
     `;
+
+    this._blendCode = code;   // the incremental composite derives its region variant from it (regionBlendCode)
 
     this.bindGroupLayout = this.device.createBindGroupLayout({
       entries: [

@@ -1,3 +1,4 @@
+import { markRasterCompositeDirty } from './raster-composite-dirty';
 /**
  * RasterTextStamp — GPU compute shader that stamps a text bitmap onto a raster layer texture.
  *
@@ -293,6 +294,7 @@ export class RasterTextStamp {
     pass.dispatchWorkgroups(Math.ceil(srcW / 8), Math.ceil(srcH / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
+    markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
 
     readCopy.destroy();
     paramBuf.destroy();

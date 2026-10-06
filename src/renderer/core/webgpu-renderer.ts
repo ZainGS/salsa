@@ -80,6 +80,7 @@ import { RasterLayerManager } from "../../services/raster-layer-manager";
 import { RasterPaintEngine } from "../raster/core/raster-paint-engine";
 import { RasterCompositor, LayerBlendMode } from "../raster/core/raster-compositor";
 import type { CompositorLayerInfo } from "../raster/core/raster-compositor";
+import { onRasterCompositeDirty } from "../raster/core/raster-composite-dirty";
 import type { FrameLinkAnimation } from '../../animation';
 import { RasterSelectionEngine } from "../raster/selection/raster-selection-engine";
 import { SelectionOverlayRenderer } from "../raster/selection/selection-overlay-renderer";
@@ -906,6 +907,17 @@ export class WebGPURenderer {
     if (!this._rasterCompositor) {
       this._rasterCompositor = new RasterCompositor(this.device);
     }
+    // BRUSH-5: a layer write reported AFTER the frame that would have shown it still gets a frame (only while the
+    // incremental composite is on — off, nothing about scheduling changes). Weak: never keeps the renderer alive.
+    if (!this._rasterDirtyUnsub) {
+      const self = new WeakRef(this);
+      const unsub = onRasterCompositeDirty(() => {
+        const r = self.deref();
+        if (!r) { unsub(); return; }
+        if (WebGPURenderer.rasterDirtyCompositing) r.scheduleRender();
+      });
+      this._rasterDirtyUnsub = unsub;
+    }
 
     // Wire the global paper grain manager (NOT brush grain) to the compositor
     // so paper texture is applied as a post-process on the final composited output.
@@ -1089,6 +1101,25 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   // resources (fresh Renderer3D / GpRenderer3D, raster engines, swept lazy buffers), runs the registered owner hooks (the
   // 2D stack, ShapeManager's managers) and, through the recovery handler ShapeManager installs, restores the document
   // content from its CPU snapshot. Status changes go to onDeviceStatusChange (sm.onDeviceStatusChange for the host).
+
+  /**
+   * BRUSH-5 (docs/specs/mobile-parity.md §3): composite the 2D raster layers INCREMENTALLY — keep the composited
+   * result and re-composite only when a layer changed, and only its dirty rect (RasterCompositor.compositeIncremental
+   * + raster-composite-dirty.ts) — instead of copying and blending every layer from scratch every frame.
+   * false (the default until it is verified on devices) = the full composite every frame, exactly as before.
+   * Also sm.setRasterDirtyCompositing(on). Session-wide.
+   */
+  public static rasterDirtyCompositing = false;
+  private _rasterDirtyUnsub: (() => void) | null = null;
+
+  /** Is the onion skin going to draw into the composited output this frame? (same gates as applyOnionSkinOverlay) */
+  private _onionSkinActive(): boolean {
+    const mgr = this.rasterLayerManager;
+    if (!mgr) return false;
+    const config = mgr.getOnionSkinConfig();
+    if (!config.enabled || (config.framesBefore <= 0 && config.framesAfter <= 0)) return false;
+    return mgr.isAnimationEnabled();
+  }
 
   /** Show the built-in overlay when WebGPU is unavailable at start-up / a recovery fails. Set false before
    *  startWebGPURendering to render your own (getDeviceStatus / onDeviceStatusChange carry the same information). */
@@ -2243,8 +2274,14 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
               const needsAsync = RasterCompositor.needsAsyncComposite(compositorLayers, globalDitherCfg);
 
               if (needsAsync) {
+                this._rasterCompositor.invalidateIncremental('main');
                 await this._rasterCompositor.compositeAsync(compositorLayers, this.rasterTexture);
+              } else if (WebGPURenderer.rasterDirtyCompositing && !this._onionSkinActive()) {
+                // BRUSH-5: only what changed (nothing at all on an idle frame). The onion skin draws into this
+                // output after the composite, so frames with it on take the full path below.
+                this._rasterCompositor.compositeIncremental(compositorLayers, this.rasterTexture, 'main');
               } else {
+                this._rasterCompositor.invalidateIncremental('main');
                 this._rasterCompositor.composite(compositorLayers, this.rasterTexture);
               }
 
@@ -2667,8 +2704,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             const globalDitherCfg = this._rasterCompositor.getDitherConfig();
             const needsAsync = RasterCompositor.needsAsyncComposite(fgLayers, globalDitherCfg);
             if (needsAsync) {
+              this._rasterCompositor.invalidateIncremental('fg');
               await this._rasterCompositor.compositeAsync(fgLayers, this.rasterTextureFG);
+            } else if (WebGPURenderer.rasterDirtyCompositing) {
+              this._rasterCompositor.compositeIncremental(fgLayers, this.rasterTextureFG, 'fg');   // BRUSH-5
             } else {
+              this._rasterCompositor.invalidateIncremental('fg');
               this._rasterCompositor.composite(fgLayers, this.rasterTextureFG);
             }
             // Draw the FG raster quad (same pipeline, same world transform, separate texture)
