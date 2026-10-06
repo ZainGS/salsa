@@ -134,7 +134,7 @@ describe('settings persistence', () => {
     g.localStorage = undefined;
     reloadBrushInputSettings();
     expect(getTouchSmoothing()).toBe('light');
-    expect(getStrokePrediction()).toBe(true);
+    expect(getStrokePrediction()).toBe(false);   // off by default until verified on a real GPU
   });
 
   it('persists to localStorage and reloads; junk values are ignored', () => {

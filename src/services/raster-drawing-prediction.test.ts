@@ -6,12 +6,14 @@
  *    identical with prediction on vs off;
  *  - the finger smoothing cap reaches the engine via beginStroke's pointerType.
  */
-import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { RasterDrawingService, PREDICT_MAX_MS } from './raster-drawing-service';
 import { setStrokePrediction, setTouchSmoothing, reloadBrushInputSettings } from '../renderer/raster/brushes/brush-input-settings';
 import { createCpuDevice, installGpuGlobals, CpuTexture } from '../renderer/raster/cpu-gpu-mirror';
 
 beforeAll(() => installGpuGlobals());
+// Prediction is OFF by default (opt-in until verified on a real GPU): these tests exercise the feature, so turn it on.
+beforeEach(() => { reloadBrushInputSettings(); setStrokePrediction(true); });
 afterEach(() => { reloadBrushInputSettings(); vi.restoreAllMocks(); });
 
 type Handler = (e: any) => unknown;

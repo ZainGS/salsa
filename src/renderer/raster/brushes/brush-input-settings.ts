@@ -30,7 +30,9 @@ const KEY_SMOOTHING = 'salsa.brush.touchSmoothing';
 const KEY_PREDICTION = 'salsa.brush.strokePrediction';
 
 let _smoothing: TouchSmoothing = 'light';
-let _prediction = true;
+// OFF by default (2026-10-07): on a real GPU the provisional tail's restore wiped the committed stroke (only the tip
+// showed). Opt-in via setStrokePrediction(true) until that is fixed and verified on a device.
+let _prediction = false;
 let _loaded = false;
 
 function storage(): Storage | null {
@@ -79,7 +81,7 @@ export function setStrokePrediction(on: boolean): void {
 export function reloadBrushInputSettings(): void {
   _loaded = false;
   _smoothing = 'light';
-  _prediction = true;
+  _prediction = false;
 }
 
 /** Prediction applies to these pointer types only (mouse never predicts: desktop stays byte-identical). */
