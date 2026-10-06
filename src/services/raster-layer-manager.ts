@@ -811,6 +811,9 @@ export class RasterLayerManager {
 
   /** Enable or disable animation mode. When enabled, layers can have per-frame cels. */
   public setAnimationEnabled(enabled: boolean): void {
+    // Turning animation off (the host hides the timeline) also pauses playback: the rAF clock used to keep
+    // advancing frames — and re-rendering — with no timeline on screen to stop it from.
+    if (!enabled) this.timeline.pause();
     this.animationEnabled = enabled;
     if (enabled && this.timeline.getFrameCount() < 2) {
       // Start with a reasonable frame count when animation is first enabled

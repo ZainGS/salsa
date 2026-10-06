@@ -206,6 +206,15 @@ export class DocumentPersistence {
   /** Called when an explicit save (saveNow) has to wait for the editor to go idle — for a host notice. */
   private onDeferred: (() => void) | null = null;
   public setDeferredCallback(fn: (() => void) | null): void { this.onDeferred = fn; }
+  /** When set and it returns true, the automatic TIMED saves (interval, stroke debounce, trailing) WAIT instead of
+   *  running — e.g. raster timeline playback, where a save's read-back + PNG encode is a visible hitch. Unlike the busy
+   *  predicate nothing is dropped: one save runs as soon as it clears (or after MAX_SOFT_DEFER_MS, so a timeline left
+   *  playing can't hold unsaved work forever). Tab-hide / pagehide flushes and explicit saveNow() don't wait. */
+  private deferPredicate: (() => boolean) | null = null;
+  public setDeferPredicate(fn: (() => boolean) | null): void { this.deferPredicate = fn; }
+  private static readonly MAX_SOFT_DEFER_MS = 120_000;
+  private softDeferTimer: ReturnType<typeof setInterval> | null = null;
+  private softDeferSince = 0;
 
   constructor(config?: Partial<AutoSaveConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -251,8 +260,25 @@ export class DocumentPersistence {
     this.attachFlushListeners();
     this.autoSaveTimer = setInterval(() => {
       if (this.busyPredicate?.()) return;   // e.g. Play mode active — don't persist a transient animation frame
-      void this.triggerSave();
+      this.triggerDeferrableSave();
     }, this.config.intervalMs);
+  }
+
+  /** An automatic timed save: runs now, or — while the defer predicate holds — once it clears (see setDeferPredicate).
+   *  Calls made while one is waiting share it. */
+  private triggerDeferrableSave(): void {
+    if (this.softDeferTimer !== null) return;   // one already waiting covers this request
+    if (!this.deferPredicate?.()) { void this.triggerSave(); return; }
+    this.softDeferSince = Date.now();
+    this.softDeferTimer = setInterval(() => {
+      if (this.deferPredicate?.() && Date.now() - this.softDeferSince < DocumentPersistence.MAX_SOFT_DEFER_MS) return;
+      this.clearSoftDefer();
+      void this.triggerSave();
+    }, DocumentPersistence.DEFER_POLL_MS);
+  }
+
+  private clearSoftDefer(): void {
+    if (this.softDeferTimer !== null) { clearInterval(this.softDeferTimer); this.softDeferTimer = null; }
   }
 
   public stopAutoSave(): void {
@@ -270,6 +296,7 @@ export class DocumentPersistence {
     if (this.strokeDebounceTimer !== null) { clearTimeout(this.strokeDebounceTimer); this.strokeDebounceTimer = null; }
     this.savePending = false;
     if (this.trailingTimer !== null) { clearTimeout(this.trailingTimer); this.trailingTimer = null; }
+    this.clearSoftDefer();
     this.cancelDeferred();
   }
 
@@ -305,7 +332,7 @@ export class DocumentPersistence {
       clearTimeout(this.strokeDebounceTimer);
     }
     this.strokeDebounceTimer = setTimeout(() => {
-      void this.triggerSave();
+      this.triggerDeferrableSave();
       this.strokeDebounceTimer = null;
     }, this.config.strokeDebounceMs);
   }
@@ -447,7 +474,7 @@ export class DocumentPersistence {
         // calling executeSave() directly could run concurrently with a save started in the
         // 100ms gap, and rapid mutation would chain save-after-save instead of collapsing
         // into a single trailing save.
-        this.trailingTimer = setTimeout(() => { this.trailingTimer = null; void this.triggerSave(); }, 100);
+        this.trailingTimer = setTimeout(() => { this.trailingTimer = null; this.triggerDeferrableSave(); }, 100);
       }
     }
   }

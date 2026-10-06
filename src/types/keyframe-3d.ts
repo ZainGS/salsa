@@ -33,6 +33,21 @@ export interface Mesh3DKeyframeTracks {
 
 export type TrackName = keyof Mesh3DKeyframeTracks;
 
+/** Shared empty track for `tracks.x ?? EMPTY_TRACK` reads in per-frame code (no fresh `[]` per read). Never mutate. */
+export const EMPTY_TRACK: readonly Keyframe<never>[] = Object.freeze([]);
+
+/** Does this mesh have anything for applyMeshKeyframesAtFrame to apply? (a non-empty track, or any blend-weight
+ *  track entry — the blend-shape sync runs whenever that map has a key) */
+export function hasAnyKeyframes(tracks: Mesh3DKeyframeTracks | Camera3DKeyframeTracks | undefined | null): boolean {
+  if (!tracks) return false;
+  for (const key in tracks) {
+    const v = (tracks as Record<string, unknown>)[key];
+    if (Array.isArray(v)) { if (v.length > 0) return true; }
+    else if (v && typeof v === 'object' && Object.keys(v).length > 0) return true;
+  }
+  return false;
+}
+
 /** Keyframe tracks for the 3D camera. */
 export interface Camera3DKeyframeTracks {
   /** Camera world-space position [x, y, z]. */
@@ -180,12 +195,17 @@ export function interpolateEulerSlerp(a: Vec3Value, b: Vec3Value, t: number, eas
  * Returns null if the track is empty.
  */
 export function sampleTrack<T>(
-  track: Keyframe<T>[],
+  track: readonly Keyframe<T>[],
   frame: number,
   interpolateFn: (a: T, b: T, t: number, easing: KeyframeEasing) => T,
 ): T | null {
   if (!track || track.length === 0) return null;
-  const sorted = track.slice().sort((a, b) => a.frame - b.frame);
+  // Tracks are usually already in frame order (keys are mostly recorded forward), so copy + sort only an unsorted one
+  // — it ran for every track of every mesh on every frame of playback. (Sorting a sorted array changes nothing: the
+  // sort is stable, so the result is the same either way.)
+  let inOrder = true;
+  for (let i = 1; i < track.length; i++) { if (!(track[i - 1].frame <= track[i].frame)) { inOrder = false; break; } }
+  const sorted = inOrder ? track : track.slice().sort((a, b) => a.frame - b.frame);
   if (frame <= sorted[0].frame) return sorted[0].value;
   if (frame >= sorted[sorted.length - 1].frame) return sorted[sorted.length - 1].value;
   for (let i = 0; i < sorted.length - 1; i++) {

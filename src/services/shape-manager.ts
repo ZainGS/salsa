@@ -13307,6 +13307,8 @@ class ShapeManager {
             if (e.type === 'frame-changed') {
                 this.syncRendererFrame();
                 this.scheduleRender();
+            } else if (e.type === 'playback-state-changed') {
+                this.scheduleRender();   // the onion skin is skipped while playing — redraw it once playback stops
             }
         });
         timeline.play();
@@ -13315,6 +13317,7 @@ class ShapeManager {
     /** Pause playback. */
     public pause(): void {
         this.rasterLayerManager?.getTimeline().pause();
+        this.scheduleRender();
     }
 
     /** Stop playback (returns to first frame). */
@@ -13527,6 +13530,9 @@ class ShapeManager {
         p.setBusyPredicate(() => this.scene3d.isPlayModeActive() || this.ui.interactive || this._uiPlayerMode || !!this.webgpuRenderer?.isDeviceLost);
         p.setBusyEpochProvider(() => this._persistBusyEpoch());   // a loss + recovery during the gather → re-save
         p.setDeferredCallback(() => this._notifyPersistDeferred('save'));
+        // Timeline playback: a save reads back every layer + cel and PNG-encodes them — a hitch mid-animation. The
+        // TIMED / stroke autosaves wait until playback stops (then run once); explicit and tab-hide saves don't wait.
+        p.setDeferPredicate(() => !!this.rasterLayerManager?.getTimeline().isPlaying());
         return p;
     }
 

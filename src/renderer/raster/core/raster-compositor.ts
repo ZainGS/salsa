@@ -65,6 +65,12 @@ export interface CompositorLayerInfo {
   frameLinkAnimation?: FrameLinkAnimation;
 }
 
+/** Frame Link displacement type → the shader's dispType (0 = none). A module constant: it was a fresh object literal
+ *  per layer per composite. */
+const FRAME_LINK_TYPE_ID: Readonly<Record<string, number>> = {
+  'wave': 1, 'shake': 2, 'ripple': 3, 'noise': 4, 'turbulence': 5,
+};
+
 export class RasterCompositor {
   private device: GPUDevice;
   private pipeline!: GPUComputePipeline;
@@ -270,14 +276,11 @@ export class RasterCompositor {
       return;
     }
 
-    const typeMap: Record<string, number> = {
-      'wave': 1, 'shake': 2, 'ripple': 3, 'noise': 4, 'turbulence': 5,
-    };
     const dirRad = (anim.direction ?? 0) * Math.PI / 180;
     const flags = (anim.displaceX !== false ? 1 : 0) | (anim.displaceY ? 2 : 0);
 
     // vec4[1]: dispType, amplitude, frequency, speed
-    pd[4]  = typeMap[anim.type] ?? 0;
+    pd[4]  = FRAME_LINK_TYPE_ID[anim.type] ?? 0;
     pd[5]  = anim.amplitude ?? 0;
     pd[6]  = anim.frequency ?? 3;
     pd[7]  = anim.speed ?? 0.15;
@@ -522,7 +525,9 @@ export class RasterCompositor {
    *    visibility, opacity, blend mode, clipping, sizes), to the output texture or the grain, and a whole-canvas
    *    dirty report.
    * While a dither (global or per-layer) or a displacement animation is active — they read other texels / the
-   * frame number — every call is a legacy composite() ('full').
+   * frame number — every call is a legacy composite() ('full'); with a Frame Link displacement as the only obstacle,
+   * that composite is skipped while the frame number, the displacement params and the inputs above are unchanged and
+   * nothing was reported dirty ('skip').
    *
    * The rect and the full passes here are the SAME region pipelines (a full pass is the rect [0,w)×[0,h)), built
    * on first use; composite() / compositeAsync() keep their own, untouched. A caller that composites this output
@@ -541,9 +546,15 @@ export class RasterCompositor {
     const dirty = slot.cursor.take();   // always consumed: whatever we do below covers it
     const sig = this._regionBroken ? null : this.incrementalSignature(layers, outputTexture);
     if (sig === null) {
+      // A Frame Link displacement (and nothing else) rules the region passes out: the legacy full composite runs, but
+      // only when its inputs moved — the frame number, the displacement params, the layer list, or reported pixels.
+      // Renders between two frame changes then reuse the output (it is exactly what composite() wrote last time).
+      const flSig = this.incrementalSignature(layers, outputTexture, true);
+      if (flSig !== null && flSig === slot.sig && !dirty) { this.stats.skip++; return 'skip'; }
       slot.sig = null;
       this.stats.full++;
       this.composite(layers, outputTexture);
+      slot.sig = flSig;
       return 'full';
     }
     try {
@@ -586,19 +597,34 @@ export class RasterCompositor {
   }
 
   /** Everything the composited pixels depend on besides the layers' own pixels, as a string; null when this
-   *  frame can't be composited incrementally (a dither or a displacement animation is active). */
-  private incrementalSignature(layers: CompositorLayerInfo[], out: GPUTexture): string | null {
+   *  frame can't be composited incrementally (a dither or a displacement animation is active).
+   *  `frameLink`: the signature of a LEGACY full composite() whose only obstacle is a Frame Link displacement — the
+   *  same, plus the frame number and every displacement param composite() uploads ('fl' prefix, so it never matches
+   *  a region-pass signature); null when there is no enabled Frame Link or a dither is active. */
+  private incrementalSignature(layers: CompositorLayerInfo[], out: GPUTexture, frameLink = false): string | null {
     const g = this._ditherConfig;
     if (g.enabled && g.strength > 0.001) return null;
     let sig = this.texId(out) + ':' + out.width + 'x' + out.height;
+    let sawFrameLink = false;
     for (const l of layers) {
       if (!l.visible || !l.texture) continue;
       const d = l.ditherConfig;
       if (d && d.enabled && d.strength > 0.001) return null;
-      const a = l.frameLinkAnimation;
-      if (a && a.enabled) return null;   // displacement (reads other texels, changes with the frame number)
       const t = l.texture;
       sig += '|' + this.texId(t) + ',' + t.width + ',' + t.height + ',' + l.blendMode + ',' + l.opacity + ',' + (l.clipped ? 1 : 0);
+      const a = l.frameLinkAnimation;
+      if (a && a.enabled) {
+        if (!frameLink) return null;   // displacement (reads other texels, changes with the frame number)
+        sawFrameLink = true;
+        // Exactly the inputs writeDisplacementParams reads (raw values: the ?? defaults are applied the same way).
+        sig += ',fl' + a.type + ',' + a.amplitude + ',' + a.frequency + ',' + a.speed + ',' + a.direction + ',' + a.phase +
+          ',' + (a.displaceX !== false ? 1 : 0) + (a.displaceY ? 1 : 0) + ',' + a.rippleCenterX + ',' + a.rippleCenterY +
+          ',' + a.noiseOctaves + ',' + a.noiseLacunarity + ',' + a.noisePersistence + ',' + a.shakeSeed;
+      }
+    }
+    if (frameLink) {
+      if (!sawFrameLink) return null;
+      sig = 'fl' + this.currentFrame + '#' + sig;
     }
     const gm = this._grainManager;
     const grainTex = gm ? gm.getGrainTexture() : null;

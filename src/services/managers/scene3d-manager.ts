@@ -108,7 +108,7 @@ import {
   Mesh3DKeyframeTracks, TrackName, KeyframeEasing, Keyframe,
   Camera3DKeyframeTracks, CameraTrackName,
   sampleTrack, setKeyframe, removeKeyframe,
-  cloneKeyframeTracks,
+  cloneKeyframeTracks, hasAnyKeyframes, EMPTY_TRACK,
   interpolateVec3, interpolateVec4, interpolateScalar, interpolateEulerSlerp,
   FrameLinkAnimation3D, DEFAULT_FRAME_LINK_ANIMATION_3D, evalFrameLink3D,
 } from '../../types/keyframe-3d';
@@ -9760,24 +9760,30 @@ export class Scene3DManager {
      * the previous subscription first (idempotent).
      */
     attachKeyframesToTimeline(): void {
-        this._keyframeUnsub?.();
-        this._keyframeUnsub = undefined;
+        this.detachKeyframesFromTimeline();
         if (!this._tryAttachKeyframesToTimeline()) {
             // Timeline not ready yet — poll via pre-render callback until it is
             const retry = () => {
                 if (this._tryAttachKeyframesToTimeline()) {
                     this.ctx.webgpuRenderer.removePreRenderCallback(retry);
+                    if (this._keyframeAttachRetry === retry) this._keyframeAttachRetry = undefined;
                 }
                 return false; // never requests a render itself
             };
+            this._keyframeAttachRetry = retry;
             this.ctx.webgpuRenderer.addPreRenderCallback(retry);
         }
     }
+
+    /** A pending attach retry (attach called before the timeline existed) — dropped by a re-attach / detach, so two
+     *  attaches in a row can't leave two retries that each subscribe (two keyframe passes per frame). */
+    private _keyframeAttachRetry?: () => boolean;
 
     /** @internal — attempts to subscribe; returns true if successful. */
     private _tryAttachKeyframesToTimeline(): boolean {
         const timeline = this.ctx.rasterLayerManager?.getTimeline();
         if (!timeline) return false;
+        this._keyframeUnsub?.();
         this._keyframeUnsub = timeline.on((e: any) => {
             if (e.type === 'frame-changed') {
                 this.applyAllKeyframesAtFrame(e.frame ?? timeline.getCurrentFrame());
@@ -9790,20 +9796,32 @@ export class Scene3DManager {
     detachKeyframesFromTimeline(): void {
         this._keyframeUnsub?.();
         this._keyframeUnsub = undefined;
+        if (this._keyframeAttachRetry) {
+            this.ctx.webgpuRenderer.removePreRenderCallback(this._keyframeAttachRetry);
+            this._keyframeAttachRetry = undefined;
+        }
     }
 
     /**
      * Interpolate and apply all keyframe tracks for every mesh at the given frame.
      */
     applyAllKeyframesAtFrame(frame: number): void {
+        // Runs on EVERY timeline frame (playback) — only meshes with something to apply: a keyframe track or a Frame
+        // Link. Camera nodes always run (with no FOV track they drop a stale evaluated FOV).
+        const fla = this._animation.frameLinkAnims;
+        let animated = false;
         for (const mesh of this.getAllMeshes()) {
+            const has = hasAnyKeyframes(mesh.keyframeTracks) || fla.has(mesh.id);
+            if (!has && !mesh.isCamera) continue;
             this.applyMeshKeyframesAtFrame(mesh.id, frame);
+            if (has) animated = true;
         }
         this.applyCameraKeyframesAtFrame(frame);
         // Mesh transforms changed — tell the renderer to re-upload instance matrices.
         // Without this, _instancesDirty stays false and uploadMeshInstances returns early,
-        // leaving the GPU with stale model/normal matrices.
-        this.renderer3D.markInstancesDirty();
+        // leaving the GPU with stale model/normal matrices. (Not when nothing is keyframed: a full re-upload per frame
+        // for nothing.)
+        if (animated || this._previewThroughCameras || hasAnyKeyframes(this._cameraKeyframeTracks)) this.renderer3D.markInstancesDirty();
         // Cinematic preview: the camera nodes have just been moved to their frame pose above — now point the render
         // camera through whichever one is active at this frame (runs AFTER, so it overrides the legacy camera track).
         if (this._previewThroughCameras) this._applyCameraPreviewAt(frame);
@@ -9812,11 +9830,11 @@ export class Scene3DManager {
     applyCameraKeyframesAtFrame(frame: number): void {
         const t = this._cameraKeyframeTracks;
         const cam = this.renderer3D.getCamera();
-        const pos = sampleTrack(t.position ?? [], frame, interpolateVec3);
+        const pos = sampleTrack(t.position ?? EMPTY_TRACK, frame, interpolateVec3);
         if (pos) cam.setPosition(pos[0], pos[1], pos[2]);
-        const tgt = sampleTrack(t.target ?? [], frame, interpolateVec3);
+        const tgt = sampleTrack(t.target ?? EMPTY_TRACK, frame, interpolateVec3);
         if (tgt) cam.setTarget(tgt[0], tgt[1], tgt[2]);
-        const fov = sampleTrack(t.fov ?? [], frame, interpolateScalar);
+        const fov = sampleTrack(t.fov ?? EMPTY_TRACK, frame, interpolateScalar);
         if (fov !== null) cam.fov = fov * Math.PI / 180;
     }
 
@@ -9825,32 +9843,32 @@ export class Scene3DManager {
         if (!mesh) return;
         const tracks = mesh.keyframeTracks;
 
-        const pos = sampleTrack(tracks.position ?? [], frame, interpolateVec3);
+        const pos = sampleTrack(tracks.position ?? EMPTY_TRACK, frame, interpolateVec3);
         if (pos) { mesh.x = pos[0]; mesh.y = pos[1]; mesh.z = pos[2]; }
 
         // Camera nodes slerp their rotation so pans arc smoothly (euler-lerp wobbles on big turns); everything
         // else keeps the cheaper component-wise lerp (unchanged behaviour for characters/props).
-        const rot = sampleTrack(tracks.rotation ?? [], frame, mesh.isCamera ? interpolateEulerSlerp : interpolateVec3);
+        const rot = sampleTrack(tracks.rotation ?? EMPTY_TRACK, frame, mesh.isCamera ? interpolateEulerSlerp : interpolateVec3);
         if (rot) { mesh.rotationX = rot[0]; mesh.rotationY = rot[1]; mesh.rotation = rot[2]; }
 
         // Camera nodes: sample the optional FOV track (radians) into a transient map read by the preview driver for
         // an in-shot zoom. Not persisted here — the KEYFRAMES persist on the mesh; this is just the evaluated value.
         if (mesh.isCamera) {
-            const fov = sampleTrack(tracks.fov ?? [], frame, interpolateScalar);
+            const fov = sampleTrack(tracks.fov ?? EMPTY_TRACK, frame, interpolateScalar);
             if (fov !== null) this._animatedCamFov.set(mesh.id, fov);
             else this._animatedCamFov.delete(mesh.id);
         }
 
-        const scale = sampleTrack(tracks.scale ?? [], frame, interpolateVec3);
+        const scale = sampleTrack(tracks.scale ?? EMPTY_TRACK, frame, interpolateVec3);
         if (scale) { mesh.scaleX = scale[0]; mesh.scaleY = scale[1]; mesh.scaleZ = scale[2]; }
 
-        const color = sampleTrack(tracks.diffuseColor ?? [], frame, interpolateVec4);
+        const color = sampleTrack(tracks.diffuseColor ?? EMPTY_TRACK, frame, interpolateVec4);
         if (color) mesh.setDiffuseColor(color[0], color[1], color[2], color[3]);
 
-        const opacity = sampleTrack(tracks.opacity ?? [], frame, interpolateScalar);
+        const opacity = sampleTrack(tracks.opacity ?? EMPTY_TRACK, frame, interpolateScalar);
         if (opacity !== null) mesh.setOpacity(opacity);
 
-        const vis = sampleTrack(tracks.visible ?? [], frame, (a, _b, _t) => a);
+        const vis = sampleTrack(tracks.visible ?? EMPTY_TRACK, frame, (a, _b, _t) => a);
         if (vis !== null) mesh.visible = vis;
 
         // Blend shape weight tracks

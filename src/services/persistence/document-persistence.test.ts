@@ -184,6 +184,77 @@ describe('busy predicate (Play / UI preview / Player mode — audit P11)', () =>
   });
 });
 
+// Timeline playback: the timed / stroke autosaves wait (a save reads back + PNG-encodes every layer and cel — a hitch
+// mid-animation) and run ONCE when playback stops. Nothing is dropped; explicit saves don't wait.
+describe('defer predicate (raster timeline playback)', () => {
+  it('a stroke-debounced save waits while playing and runs once playback stops', async () => {
+    vi.useFakeTimers();
+    const gather = failingProvider();
+    const p = make(gather);
+    let playing = true;
+    p.setDeferPredicate(() => playing);
+    p.notifyStrokeEnd();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(gather).not.toHaveBeenCalled();
+    p.notifyStrokeEnd();                                 // a second request while one waits shares it
+    await vi.advanceTimersByTimeAsync(5000);
+    playing = false;                                     // paused
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(gather).toHaveBeenCalledTimes(1);
+  });
+
+  it('the interval save waits while playing, then saves', async () => {
+    vi.useFakeTimers();
+    const gather = failingProvider();
+    const p = new DocumentPersistence({ intervalMs: 30_000, strokeDebounceMs: 0 });
+    p.setStateProvider(gather);
+    let playing = true;
+    p.setDeferPredicate(() => playing);
+    p.startAutoSave();
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(gather).not.toHaveBeenCalled();
+    playing = false;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(gather).toHaveBeenCalledTimes(1);
+    p.destroy();
+  });
+
+  it('a timeline left playing still saves after the deferral cap', async () => {
+    vi.useFakeTimers();
+    const gather = failingProvider();
+    const p = make(gather);
+    p.setDeferPredicate(() => true);
+    p.notifyStrokeEnd();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(gather).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(gather).toHaveBeenCalledTimes(1);
+    p.destroy();
+  });
+
+  it('explicit saveNow does not wait for playback', async () => {
+    const gather = failingProvider();
+    const p = make(gather);
+    p.setDeferPredicate(() => true);
+    await p.saveNow();
+    expect(gather).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancelPendingSaves drops a waiting save', async () => {
+    vi.useFakeTimers();
+    const gather = failingProvider();
+    const p = make(gather);
+    let playing = true;
+    p.setDeferPredicate(() => playing);
+    p.notifyStrokeEnd();
+    await vi.advanceTimersByTimeAsync(1000);
+    p.cancelPendingSaves();
+    playing = false;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(gather).not.toHaveBeenCalled();
+  });
+});
+
 // ── Real write → read round trip against an in-memory OPFS ─────────────────────────────────────────────────────
 import { installFakeOPFS } from './opfs-fake';
 

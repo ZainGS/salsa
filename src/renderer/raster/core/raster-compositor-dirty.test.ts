@@ -333,20 +333,49 @@ describe('incremental layer composite == full composite, after every step', () =
     expect(w.frame('after invalidate-all')).toBe('full');
   });
 
-  it('a displacement animation (frame-linked) always takes the full legacy composite — never the incremental one', async () => {
+  // A displacement reads other texels and moves with the frame number, so it never takes the region passes: it is the
+  // legacy full composite — but only when the frame, its params, the layer list or the layers' pixels changed.
+  // (The CPU mirror has no displacement port, so these run at amplitude 0: the pixels stay comparable while every
+  // decision input is exercised.)
+  it('a displacement animation (Frame Link) takes the full legacy composite, skipped while nothing it reads changed', async () => {
     const w = await makeWorld(6, 64, 48, 2);
-    const list = () => w.list().map((l, i) => i === 1
-      ? { ...l, frameLinkAnimation: { enabled: true, type: 'wave', amplitude: 0, frequency: 3, speed: 0.1 } as never }
-      : l);
-    const fresh = () => w.gpu.mkTex(64, 48, 'rgba8unorm');
-    for (let i = 0; i < 3; i++) {
-      expect(w.inc.compositeIncremental(list(), asGpu(w.out), 'main')).toBe('full');   // even with nothing dirty
-      const f = fresh();
+    let anim = { enabled: true, type: 'wave', amplitude: 0, frequency: 3, speed: 0.1 };
+    const list = () => w.list().map((l, i) => i === 1 ? { ...l, frameLinkAnimation: anim as never } : l);
+    const step = (label: string): string => {
+      const kind = w.inc.compositeIncremental(list(), asGpu(w.out), 'main');
+      const f = w.gpu.mkTex(64, 48, 'rgba8unorm');
       w.ref.composite(list(), asGpu(f));
-      expect(same(w.out.data, f.data)).toBe(true);
-    }
-    expect(w.frame('animation gone')).toBe('full');
-    expect(w.frame('idle')).toBe('skip');
+      if (!same(w.out.data, f.data)) throw new Error(`stale composite after "${label}" (${kind})`);
+      return kind;
+    };
+    w.inc.currentFrame = w.ref.currentFrame = 1;
+    expect(step('first')).toBe('full');
+    const submits = w.inc.stats.submits;
+    expect(step('same frame again')).toBe('skip');
+    expect(step('and again')).toBe('skip');
+    expect(w.inc.stats.submits).toBe(submits);                      // a skip records no GPU work at all
+    w.inc.currentFrame = w.ref.currentFrame = 2;
+    expect(step('next frame')).toBe('full');
+    expect(step('next frame, idle')).toBe('skip');
+    // a layer edit (pixels reported dirty) — even a small rect re-composites everything: displacement reads around it
+    const px = new Uint8Array(4 * 4 * 4).fill(200);
+    w.device.queue.writeTexture({ texture: asGpu(w.layers[0].tex), origin: { x: 3, y: 3 } }, px, { bytesPerRow: 16 }, { width: 4, height: 4 });
+    markRasterCompositeDirtyXYWH(3, 3, 4, 4);
+    expect(step('layer edit')).toBe('full');
+    expect(step('after the edit, idle')).toBe('skip');
+    anim = { ...anim, speed: 0.2 };                                   // a Frame Link param
+    expect(step('param change')).toBe('full');
+    expect(step('param change, idle')).toBe('skip');
+    w.layers[0].opacity = 0.5;                                        // layer metadata
+    expect(step('opacity')).toBe('full');
+    anim = { ...anim, enabled: false };
+    expect(step('animation off')).toBe('full');                     // back on the region passes: a full one first
+    expect(step('idle')).toBe('skip');
+    anim = { ...anim, enabled: true };
+    expect(step('animation back on')).toBe('full');
+    w.inc.invalidateIncremental('main');                            // the output was written some other way
+    expect(step('invalidated')).toBe('full');
+    expect(step('invalidated, idle')).toBe('skip');
   });
 
   it('the main and the foreground composite each see every write (one log, a cursor per output)', async () => {

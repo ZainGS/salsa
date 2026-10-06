@@ -1144,7 +1144,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     if (!mgr) return false;
     const config = mgr.getOnionSkinConfig();
     if (!config.enabled || (config.framesBefore <= 0 && config.framesAfter <= 0)) return false;
-    return mgr.isAnimationEnabled();
+    return mgr.isAnimationEnabled() && !mgr.getTimeline().isPlaying();
   }
 
   /** Show the built-in overlay when WebGPU is unavailable at start-up / a recovery fails. Set false before
@@ -1590,6 +1590,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     if (!this.rasterLayerManager.isAnimationEnabled()) return;
 
     const timeline = this.rasterLayerManager.getTimeline();
+    // Not while the timeline plays (as in most animation tools): ghosts of neighbouring frames are a drawing aid, and
+    // each one costs a full-canvas copy + blend per frame. ShapeManager re-renders when playback stops.
+    if (timeline.isPlaying()) return;
     const currentFrame = timeline.getCurrentFrame();
     const frameCount = timeline.getFrameCount();
     const selectedId = this.rasterLayerManager.getSelectedLayerId();

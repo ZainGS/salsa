@@ -271,6 +271,11 @@ export class AnimationTimeline {
     this.emit({ type: 'playback-state-changed' });
   }
 
+  /** Is playback running? (cheap — no state copy, unlike getState()) */
+  public isPlaying(): boolean {
+    return this.state.playbackState === 'playing';
+  }
+
   public togglePlayPause(): void {
     if (this.state.playbackState === 'playing') {
       this.pause();
