@@ -1,7 +1,8 @@
 /**
  * raster-touch-pinch.test.ts: TOUCH-5 / TOUCH-7 / TOUCH-8 in the 2D canvas input (RasterInteractionController) with a
  * real InteractionService over a fake canvas (no GPU). Synthetic touch vs mouse pointer events:
- *  - two-finger PINCH zooms around the finger midpoint and two-finger drag PANS (finger-locked at DPR 2);
+ *  - two-finger PINCH zooms around the finger midpoint and two-finger drag PANS (finger-locked at a 2× backing store;
+ *    canvas-pixel-ratio.test.ts covers a CAPPED backing ≠ devicePixelRatio);
  *  - a 2nd finger CANCELS (reverts) the 1-finger drag, without an undo entry;
  *  - the 2D pinch stands down while a 3D orbit controller owns touch;
  *  - the false double-click (two fingers within 300 ms) is gone; the mouse rule is unchanged;
@@ -17,7 +18,7 @@ import type { WebGPURenderer } from './webgpu-renderer';
 type Init = Partial<{ pointerId: number; pointerType: string; button: number; clientX: number; clientY: number }>;
 
 function fakeCanvas(): HTMLCanvasElement {
-    // DPR 2: 800×600 CSS, 1600×1200 backing store.
+    // A 2× backing store: 800×600 CSS, 1600×1200 backing (the ratio the maths use is canvas.width / CSS width).
     return {
         width: 1600, height: 1200, clientWidth: 800, clientHeight: 600, style: {},
         getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 600, right: 800, bottom: 600 }),
@@ -114,14 +115,20 @@ describe('2D two-finger pinch + pan (TOUCH-7)', () => {
         expect(ctrl.isPinching).toBe(true);
     });
 
-    it('the mouse path is untouched by the touch tracking (a mouse pan still works)', () => {
+    it('the mouse path is untouched by the touch tracking (a mouse pan still works, pointer-locked)', () => {
         const { ctrl, r, is } = setup();
         is.isPanToolSelected = true;
         ctrl.handlePointerDown(ev({ pointerType: 'mouse', clientX: 100, clientY: 100 }));
         expect(r.mode.kind).toBe('panning');
         const p0 = { ...is.getPanOffset() };
+        const grabbed = worldAt(is, 100, 100);
         ctrl.handlePointerMove(ev({ pointerType: 'mouse', clientX: 110, clientY: 100 }));
-        expect(is.getPanOffset().x).toBeCloseTo(p0.x + 20, 9);   // the existing (clientDelta × 2) rule
+        // Pan units = backing px × 2: 10 CSS px × backing ratio 2 × 2. (The old bare "clientDelta × 2" = +20 moved the
+        // content HALF the pointer at this 2× backing, the same bug as 2/3 of the finger on a DPR-capped tablet.)
+        expect(is.getPanOffset().x).toBeCloseTo(p0.x + 40, 9);
+        const now = worldAt(is, 110, 100);
+        expect(now.x).toBeCloseTo(grabbed.x, 6);
+        expect(now.y).toBeCloseTo(grabbed.y, 6);
         ctrl.handlePointerUp(ev({ pointerType: 'mouse', clientX: 110, clientY: 100 }));
         expect(r.mode.kind).toBe('idle');
     });

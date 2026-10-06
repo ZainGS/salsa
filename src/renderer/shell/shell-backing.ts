@@ -9,6 +9,7 @@
  * ratio (`canvas.width / CSS width`), not `window.devicePixelRatio` — the two differ once the cap applies.
  */
 import { computeCanvasBacking, type GpuCaps } from '../core/gpu-capabilities';
+import { canvasPixelRatio } from '../util/canvas-pixel-ratio';
 
 /** The canvas fields the backing helpers read / write (a real canvas, or a test fake). */
 export interface ShellBackingCanvas {
@@ -41,9 +42,8 @@ export function syncShellCanvasBacking(c: ShellBackingCanvas, dpr: number, caps:
   return true;
 }
 
-/** Device px per CSS px of the canvas as actually backed (`canvas.width / CSS width`); `fallbackDpr` before layout. */
+/** Device px per CSS px of the canvas as actually backed (`canvas.width / CSS width`); `fallbackDpr` before layout.
+ *  The ONE shared rule with the editor: delegates to `canvasPixelRatio` (renderer/util/canvas-pixel-ratio.ts). */
 export function shellBackingRatio(c: ShellBackingCanvas, fallbackDpr = 1): number {
-  const cssW = c.clientWidth > 0 ? c.clientWidth : cssBox(c).w;
-  if (cssW > 0 && c.width > 0) return c.width / cssW;
-  return fallbackDpr > 0 && Number.isFinite(fallbackDpr) ? fallbackDpr : 1;
+  return canvasPixelRatio(c, fallbackDpr);
 }

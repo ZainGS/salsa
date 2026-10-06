@@ -18,6 +18,8 @@ import {
   LINEAR_CURVE,
 } from './brush-preset';
 import { BrushStabilizer, StabilizedPoint } from './brush-stabilizer';
+import { stabilizationForPointer } from './brush-input-settings';
+import type { BrushStabilization } from './brush-preset';
 import { BrushStampPipeline, StampParams, TexelRect } from './brush-stamp-pipeline';
 import { BrushTipGenerator } from './brush-tip';
 import { CanvasGrainManager } from '../canvas-grain';
@@ -162,6 +164,7 @@ export class BrushEngine {
   public setPreset(preset: BrushPreset): void {
     this.preset = preset;
     this.stabilizer.configure(preset.stabilization);
+    this.configuredStabilization = preset.stabilization;
 
     // Pre-load image tips async if needed
     if (preset.tip.type === 'image') {
@@ -253,13 +256,24 @@ export class BrushEngine {
 
   // ── Stroke lifecycle ──────────────────────────────────────────────
 
+  /** The stabilization the stabilizer is configured with (the preset's own, or a touch-capped copy). */
+  private configuredStabilization: BrushStabilization | null = null;
+
   /**
    * Call at pointerdown. Sets up state for a new stroke.
+   * `opts.pointerType` (the PointerEvent's) selects the smoothing: a finger ('touch') caps the preset's stabilizer
+   * at the per-machine touch-smoothing level (brush-input-settings.ts); pen / mouse / unset use the preset as is.
    */
-  public beginStroke(texture: GPUTexture, firstPoint: PointerInput): void {
+  public beginStroke(texture: GPUTexture, firstPoint: PointerInput, opts?: { pointerType?: string }): void {
     if (!this.preset) {
       console.warn('BrushEngine: no preset set');
       return;
+    }
+
+    const stab = stabilizationForPointer(this.preset.stabilization, opts?.pointerType);
+    if (stab !== this.configuredStabilization) {
+      this.stabilizer.configure(stab);
+      this.configuredStabilization = stab;
     }
 
     this.targetTexture = texture;
@@ -336,6 +350,7 @@ export class BrushEngine {
    */
   public endStroke(finalPoint: PointerInput): void {
     if (!this.isActive) return;
+    this.stampPipeline.clearProvisional();   // a predicted tail never reaches the committed stroke
     this.stampPipeline.flush();   // dabs batched so far land before the end-of-stroke passes
 
     const flushed = this.stabilizer.flush({
@@ -392,6 +407,76 @@ export class BrushEngine {
 
   public get strokeActive(): boolean {
     return this.isActive;
+  }
+
+  // ── Provisional (predicted) tail — BRUSH-4 stroke prediction ──────
+
+  /** Upper bound on dabs in one provisional tail (bounded dispatches; a longer tail is cut short). */
+  public static readonly MAX_PROVISIONAL_DABS = 96;
+  /** Non-null while drawProvisional collects dabs instead of stamping them. */
+  private _provisionalDabs: StampParams[] | null = null;
+
+  /**
+   * Can the live stroke's preset draw a provisional tail? Not for SMUDGE (each dab samples the canvas and the
+   * pickup colour carries into the next dab — a predicted dab would leak into the real stroke's colour) nor
+   * PER-DAB BLEED (it spreads paint over the whole accum: a provisional pass would be full-canvas work). Erase and
+   * blend-mode brushes ARE supported: the provisional pass saves and restores the texels it touches on any path.
+   */
+  public get provisionalSupported(): boolean {
+    const p = this.preset;
+    if (!p) return false;
+    if (p.smudge?.enabled) return false;
+    if (p.bleed?.enabled && p.bleed.perDab) return false;
+    return true;
+  }
+
+  /**
+   * Draw a PROVISIONAL tail for `points` (predicted pointer samples, after the last real one): they run through the
+   * stabilizer, spacing and dynamics exactly like real points, but the dabs go to BrushStampPipeline.drawProvisional
+   * (shown until the next clearProvisional / real dab / stroke end, then restored byte-exactly) and every bit of
+   * stroke state they touched (stabilizer, last dab, spacing remainder, velocity, strip vertices, dirty rect) is put
+   * back. So the committed stroke, its undo patch and anything saved are the same as with no prediction.
+   * Returns true when a tail was drawn.
+   */
+  public drawProvisional(points: readonly PointerInput[]): boolean {
+    this.stampPipeline.clearProvisional();
+    if (!this.isActive || !this.targetTexture || !this.preset || points.length === 0 || !this.provisionalSupported) return false;
+    const saved = {
+      lastDabX: this.lastDabX, lastDabY: this.lastDabY, lastDabTime: this.lastDabTime,
+      lastDabPressure: this.lastDabPressure, lastDabTiltX: this.lastDabTiltX, lastDabTiltY: this.lastDabTiltY,
+      currentVelocity: this.currentVelocity, distanceSinceLastDab: this.distanceSinceLastDab,
+      vertices: this.strokeVertices.length,
+      dirty: this._dirty ? { ...this._dirty } : null, maxDabRadius: this._maxDabRadius,
+      stab: this.stabilizer.saveState(),
+    };
+    const dabs: StampParams[] = [];
+    this._provisionalDabs = dabs;
+    try {
+      for (const p of points) {
+        if (dabs.length >= BrushEngine.MAX_PROVISIONAL_DABS) break;
+        this.addPoint(p);
+      }
+    } finally {
+      this._provisionalDabs = null;
+      this.lastDabX = saved.lastDabX; this.lastDabY = saved.lastDabY; this.lastDabTime = saved.lastDabTime;
+      this.lastDabPressure = saved.lastDabPressure; this.lastDabTiltX = saved.lastDabTiltX; this.lastDabTiltY = saved.lastDabTiltY;
+      this.currentVelocity = saved.currentVelocity; this.distanceSinceLastDab = saved.distanceSinceLastDab;
+      this.strokeVertices.length = saved.vertices;
+      this._dirty = saved.dirty; this._maxDabRadius = saved.maxDabRadius;
+      this.stabilizer.restoreState(saved.stab);
+    }
+    if (dabs.length > BrushEngine.MAX_PROVISIONAL_DABS) dabs.length = BrushEngine.MAX_PROVISIONAL_DABS;
+    return this.stampPipeline.drawProvisional(this.targetTexture, dabs);
+  }
+
+  /** Take the provisional tail back (byte-exact). True when one was showing. */
+  public clearProvisional(): boolean {
+    return this.stampPipeline.clearProvisional();
+  }
+
+  /** True while a provisional tail is on the texture. */
+  public get hasProvisional(): boolean {
+    return this.stampPipeline.hasProvisional;
   }
 
   public destroy(): void {
@@ -632,6 +717,13 @@ export class BrushEngine {
       dualBrushTileMode: dual?.tileMode === 'canvas-tiling' ? 1 : 0,
       dualBrushRotation: dualRotation,
     };
+
+    // Stroke prediction: collect the dab for the provisional pass instead of stamping it (no smudge pickup — the
+    // provisional pass excludes smudge and per-dab bleed presets, see provisionalSupported).
+    if (this._provisionalDabs) {
+      if (this._provisionalDabs.length < BrushEngine.MAX_PROVISIONAL_DABS) this._provisionalDabs.push(params);
+      return;
+    }
 
     const bl = this.preset?.bleed;
     const bleedPerDab = (bl?.enabled && bl.perDab)

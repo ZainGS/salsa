@@ -216,6 +216,20 @@ export class BrushStampPipeline {
   /** Diagnostics / tests: submits and texels copied+composited (BRUSH-1 traffic counter). */
   public readonly stats = { submits: 0, copiedTexels: 0, compositedTexels: 0 };
 
+  // ── Provisional (predicted) tail — BRUSH-4 stroke prediction ──
+  // drawProvisional saves the output (and accum) texels under the predicted dabs into small scratch textures,
+  // stamps + composites the dabs through the normal path, and remembers the rect; clearProvisional copies the
+  // saved texels back. Every real entry point (settleProvisional) clears it first, so real work never builds on a
+  // predicted texel and nothing that reads the textures (undo patch, smudge, readbacks) ever sees one.
+  private provisional: { texture: GPUTexture; rect: TexelRect; wet: boolean } | null = null;
+  private inProvisional = false;
+  private scratchOut: GPUTexture | null = null;
+  private scratchAccum: GPUTexture | null = null;
+  private scratchW = 0;
+  private scratchH = 0;
+  /** Diagnostics / tests: provisional draws, and the texels they saved + restored. */
+  public readonly provisionalStats = { draws: 0, clears: 0, savedTexels: 0 };
+
   constructor(device: GPUDevice) {
     this.device = device;
 
@@ -332,6 +346,7 @@ export class BrushStampPipeline {
    * Anything that reads the painted textures outside the pipeline must happen after endBatch()/flush().
    */
   public beginBatch(): void {
+    this.settleProvisional();
     this.batchDepth++;
   }
 
@@ -404,6 +419,7 @@ export class BrushStampPipeline {
   /** The output-texture texels this stroke wrote (exact; composites + direct dabs), then reset. Pair with
    *  readStrokeRect for an undo patch. Null when the stroke wrote nothing. */
   public takeStrokeTouchedRect(): TexelRect | null {
+    this.settleProvisional();
     this.flush();
     const r = this.strokeTouched;
     this.strokeTouched = null;
@@ -419,6 +435,7 @@ export class BrushStampPipeline {
   public readStrokeRect(
     texture: GPUTexture, rect: TexelRect,
   ): Promise<{ x: number; y: number; w: number; h: number; before: Uint8Array; after: Uint8Array }> | null {
+    this.settleProvisional();
     this.flush();
     const base = this.strokeBaseTex;
     if (!base || this.strokeTexW !== texture.width || this.strokeTexH !== texture.height) return null;
@@ -478,6 +495,7 @@ export class BrushStampPipeline {
   public beginStroke(texture: GPUTexture): void {
     const w = texture.width;
     const h = texture.height;
+    this.settleProvisional();
     this.flush();   // anything still recorded belongs to the previous stroke
 
     // Ensure stroke textures match dimensions
@@ -541,6 +559,7 @@ export class BrushStampPipeline {
     wetEdges?: { edgeDarkness: number; edgeWidth: number; strength: number },
     bleed?: { radius: number; strength: number },
   ): void {
+    this.settleProvisional();
     this.flush();
     if (this.strokeAccumTex && this.strokeActive && this.strokeAccumUsed) {
       let effect = this.strokeAccumRewritten;
@@ -588,6 +607,7 @@ export class BrushStampPipeline {
 
   /** Get the stroke accumulation texture (for stroke texture rendering). */
   public getStrokeAccumTex(): GPUTexture | null {
+    this.settleProvisional();
     this.flush();   // the caller renders into it with its own submit
     return this.strokeActive ? this.strokeAccumTex : null;
   }
@@ -595,6 +615,7 @@ export class BrushStampPipeline {
   /** Clear the stroke accumulation texture to transparent black. During a stroke this marks the accum as
    *  rewritten, so endStroke flattens it (the caller reports what it then draws with markStrokeAccumWritten). */
   public clearStrokeAccum(): void {
+    this.settleProvisional();
     this.flush();
     if (this.strokeAccumTex && this.strokeTexW > 0 && this.strokeTexH > 0) {
       const enc = this.device.createCommandEncoder();
@@ -615,6 +636,108 @@ export class BrushStampPipeline {
     this.strokeAccumDirty = unionRect(this.strokeAccumDirty, rect);
     this.strokeAccumUsed = true;
     this.strokeAccumRewritten = true;
+  }
+
+  // ── Provisional (predicted) tail — BRUSH-4 stroke prediction ─────
+
+  /**
+   * Draw `dabs` (the predicted tail) onto the live stroke's texture for ONE frame, so they can be taken back
+   * exactly by clearProvisional(). The texels of the output (and, for wet dabs, the stroke accum) under the
+   * dabs' union footprint are copied into small scratch textures first; the dabs then go through the normal
+   * recording path (ping copy, stamp, bounded composite) and are submitted. All of the stroke's bookkeeping
+   * (pending composite, touched / undo rect, accum-dirty rect) is restored afterwards, so the predicted dabs never
+   * count toward the stroke. Cost: one copy of the footprint per texture, the dabs, one bounded composite — no
+   * full-canvas work. Returns false (nothing drawn) outside a stroke on `texture`, inside an open batch, or when
+   * every dab is off the texture. A previous provisional tail is cleared first.
+   */
+  public drawProvisional(texture: GPUTexture, dabs: readonly StampParams[]): boolean {
+    this.settleProvisional();
+    if (!this.strokeActive || texture !== this.strokeTarget || this.batchDepth > 0 || dabs.length === 0) return false;
+    const W = texture.width, H = texture.height;
+    let rect: TexelRect | null = null;
+    let wet = false;
+    for (const d of dabs) {
+      const b = dabDispatchBounds(d.cx, d.cy, d.radius, W, H);
+      if (!b) continue;
+      rect = unionRect(rect, b.footprint);
+      if (d.mode === 0) wet = true;
+    }
+    if (!rect) return false;
+    wet = wet && !!this.strokeBaseTex && !!this.strokeAccumTex;
+    const w = rect.x1 - rect.x0, h = rect.y1 - rect.y0;
+
+    this.flush();                       // the real stroke lands first
+    this.ensureScratch(w, h);           // (may reallocate — nothing recorded references the old ones)
+    this.ensurePing(W, H);
+    const saved = {
+      pendingComposite: this.pendingComposite, pendingCompositeFull: this.pendingCompositeFull,
+      pendingOutput: this.pendingOutput, strokeOutputDirty: this.strokeOutputDirty, strokeTouched: this.strokeTouched,
+      strokeAccumDirty: this.strokeAccumDirty, strokeAccumUsed: this.strokeAccumUsed,
+      strokeAccumRewritten: this.strokeAccumRewritten,
+    };
+    const enc = this.encoder();
+    enc.copyTextureToTexture({ texture, origin: { x: rect.x0, y: rect.y0 } }, { texture: this.scratchOut! }, { width: w, height: h });
+    if (wet) {
+      enc.copyTextureToTexture({ texture: this.strokeAccumTex!, origin: { x: rect.x0, y: rect.y0 } }, { texture: this.scratchAccum! }, { width: w, height: h });
+    }
+    this.provisionalStats.savedTexels += w * h * (wet ? 2 : 1);
+    // The composite of the predicted dabs must stay inside `rect` (only its texels are saved): drop the stroke's
+    // direct-path dirty rect for this pass (restored below).
+    this.strokeOutputDirty = null;
+    this.provisional = { texture, rect, wet };
+    this.inProvisional = true;
+    try {
+      for (const d of dabs) this.recordDab(texture, d);
+      this.flush();
+    } finally {
+      this.inProvisional = false;
+      this.pendingComposite = saved.pendingComposite; this.pendingCompositeFull = saved.pendingCompositeFull;
+      this.pendingOutput = saved.pendingOutput; this.strokeOutputDirty = saved.strokeOutputDirty;
+      this.strokeTouched = saved.strokeTouched; this.strokeAccumDirty = saved.strokeAccumDirty;
+      this.strokeAccumUsed = saved.strokeAccumUsed; this.strokeAccumRewritten = saved.strokeAccumRewritten;
+    }
+    this.provisionalStats.draws++;
+    return true;
+  }
+
+  /** Take the provisional tail back: copy the saved texels over it (byte-exact). False when there was none. */
+  public clearProvisional(): boolean {
+    const p = this.provisional;
+    if (!p || this.inProvisional) return false;
+    this.provisional = null;
+    this.flush();
+    const { rect } = p, w = rect.x1 - rect.x0, h = rect.y1 - rect.y0;
+    const enc = this.encoder();
+    enc.copyTextureToTexture({ texture: this.scratchOut! }, { texture: p.texture, origin: { x: rect.x0, y: rect.y0 } }, { width: w, height: h });
+    if (p.wet && this.strokeAccumTex) {
+      enc.copyTextureToTexture({ texture: this.scratchAccum! }, { texture: this.strokeAccumTex, origin: { x: rect.x0, y: rect.y0 } }, { width: w, height: h });
+    }
+    this.flush();
+    this.provisionalStats.clears++;
+    return true;
+  }
+
+  /** True while a provisional tail is on the texture. */
+  public get hasProvisional(): boolean { return this.provisional !== null; }
+
+  /** Every real entry point calls this first: a provisional tail never survives into real work or a readback. */
+  private settleProvisional(): void {
+    if (this.provisional && !this.inProvisional) this.clearProvisional();
+  }
+
+  /** Grow-only scratch textures for the provisional save (sizes rounded up to 64 texels). */
+  private ensureScratch(w: number, h: number): void {
+    if (this.scratchOut && this.scratchAccum && w <= this.scratchW && h <= this.scratchH) return;
+    const sw = Math.max(this.scratchW, Math.ceil(w / 64) * 64), sh = Math.max(this.scratchH, Math.ceil(h / 64) * 64);
+    this.scratchOut?.destroy();
+    this.scratchAccum?.destroy();
+    const mk = () => this.device.createTexture({
+      size: [sw, sh], format: 'rgba8unorm', usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+    });
+    this.scratchOut = mk();
+    this.scratchAccum = mk();
+    this.scratchW = sw;
+    this.scratchH = sh;
   }
 
   // ── Public API ────────────────────────────────────────────────────
@@ -843,6 +966,7 @@ export class BrushStampPipeline {
     x: number,
     y: number,
   ): Promise<[number, number, number, number]> {
+    this.settleProvisional();
     this.flush();   // read what the dabs recorded so far actually wrote
     const px = Math.max(0, Math.min(texture.width - 1, Math.round(x)));
     const py = Math.max(0, Math.min(texture.height - 1, Math.round(y)));
@@ -889,6 +1013,10 @@ export class BrushStampPipeline {
     this.strokeBaseTex = null;
     this.strokeAccumTex?.destroy();
     this.strokeAccumTex = null;
+    this.provisional = null;
+    this.scratchOut?.destroy(); this.scratchOut = null;
+    this.scratchAccum?.destroy(); this.scratchAccum = null;
+    this.scratchW = 0; this.scratchH = 0;
     this.dummyMaskTex.destroy();
     this.dummyGrainTex.destroy();
     this.cachedBindGroup = null;

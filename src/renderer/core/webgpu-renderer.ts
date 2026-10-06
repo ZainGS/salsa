@@ -40,6 +40,7 @@ import { StrokesStagingBuffer } from "../caches/buffers/strokes-staging-buffer";
 import { SdfTextDrawingService } from "../../services/drawing/sdftext-drawing-service";
 import { ScalingSide } from "../util/interaction-types";
 import { getScalingSide, isNearRotationHandle, canvasPxToWorld, HIT } from "../util/handles";
+import { canvasPixelRatio } from "../util/canvas-pixel-ratio";
 import { CURSORS, ShapeDimensions, Vec2 } from "../../types/interaction";
 import { pointInPolygon, polygonsIntersect } from "../util/geometry";
 import { SelectionService } from "../../services/selection-service";
@@ -329,6 +330,19 @@ export class WebGPURenderer {
   public removePreRenderCallback(cb: () => boolean): void {
     const idx = this.preRenderCallbacks.indexOf(cb);
     if (idx >= 0) this.preRenderCallbacks.splice(idx, 1);
+  }
+
+  /** Callbacks run once per frame right AFTER the raster layers were composited (both the main and the foreground
+   *  composite are submitted by then), whether or not this frame composited anything. The raster brush's stroke
+   *  prediction (BRUSH-4) draws its provisional tail into the layer in a pre-render callback and takes it back
+   *  here, so the tail is on screen for exactly this frame and never in a layer between frames. */
+  private postRasterCompositeCallbacks: Array<() => void> = [];
+  public addPostRasterCompositeCallback(cb: () => void): void {
+    if (!this.postRasterCompositeCallbacks.includes(cb)) this.postRasterCompositeCallbacks.push(cb);
+  }
+  public removePostRasterCompositeCallback(cb: () => void): void {
+    const idx = this.postRasterCompositeCallbacks.indexOf(cb);
+    if (idx >= 0) this.postRasterCompositeCallbacks.splice(idx, 1);
   }
 
   /** How many pre-render callbacks are registered (diagnostic: watch for leaks — a number that climbs
@@ -1493,6 +1507,11 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   private handlePointerDown(event: PointerEvent) { this._interaction.handlePointerDown(event); }
   private handlePointerMove(event: PointerEvent) { this._interaction.handlePointerMove(event); }
   private handlePointerUp(event: PointerEvent) { this._interaction.handlePointerUp(event); }
+
+  /** Backing px per CSS px of the main canvas AS BACKED (`canvas.width / CSS width`): the ratio for every CSS ↔
+   *  canvas-px conversion. NOT window.devicePixelRatio, which differs once the TIER-1 mobile cap applies (a DPR-2
+   *  tablet backs at 1.5); that is only the fallback before layout. Equal to the DPR on desktop (uncapped). */
+  public getCanvasPixelRatio(): number { return canvasPixelRatio(this.canvas); }
 
   /** TOUCH-7: pan the 2D view by a CSS-pixel screen delta (finger-locked at any devicePixelRatio). */
   public touchPan2D(dxCss: number, dyCss: number): void { this._interaction.touchPan2D(dxCss, dyCss); }
@@ -2666,6 +2685,14 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
               passEncoder.setIndexBuffer(this.rasterWorldQuadIB, 'uint16');
               passEncoder.drawIndexed(6, 1, 0, 0, 0);
             }
+          }
+        }
+
+        // Raster composites (main + foreground) are submitted: run the post-composite hooks (BRUSH-4 prediction
+        // takes its provisional tail back out of the layer here).
+        if (this.postRasterCompositeCallbacks.length > 0) {
+          for (const cb of [...this.postRasterCompositeCallbacks]) {
+            try { cb(); } catch (e) { console.warn('post-raster-composite callback failed', e); }
           }
         }
 

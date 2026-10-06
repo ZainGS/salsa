@@ -34,6 +34,15 @@ export interface StabilizedPoint {
   tiltY?: number;
 }
 
+/** Opaque smoothing state (BrushStabilizer.saveState / restoreState). */
+export interface StabilizerState {
+  buffer: StabilizedPoint[];
+  lastPredictiveT: number;
+  smooth: [number, number, number, number, number];
+  initialized: boolean;
+  anchor: [number, number, number, number, number];
+}
+
 export class BrushStabilizer {
   private method: BrushStabilization['method'];
   private level: number;
@@ -79,6 +88,32 @@ export class BrushStabilizer {
     this.maxWindow = Math.max(1, Math.round(this.level * 2));
     this.stringLength = config.pullStringLength ?? 30;
     this.reset();
+  }
+
+  /** The current config (method + level as configured). */
+  public getConfig(): { method: BrushStabilization['method']; level: number } {
+    return { method: this.method, level: this.level };
+  }
+
+  /**
+   * Snapshot / restore the smoothing STATE (not the config) — the stroke-prediction pass (BrushEngine.drawProvisional)
+   * runs predicted points through the stabilizer and then puts it back exactly, so the real stroke never sees them.
+   */
+  public saveState(): StabilizerState {
+    return {
+      buffer: this.buffer.slice(), lastPredictiveT: this.lastPredictiveT,
+      smooth: [this.smoothX, this.smoothY, this.smoothP, this.smoothTiltX, this.smoothTiltY],
+      initialized: this.initialized,
+      anchor: [this.anchorX, this.anchorY, this.anchorP, this.anchorTiltX, this.anchorTiltY],
+    };
+  }
+
+  public restoreState(s: StabilizerState): void {
+    this.buffer = s.buffer.slice();
+    this.lastPredictiveT = s.lastPredictiveT;
+    [this.smoothX, this.smoothY, this.smoothP, this.smoothTiltX, this.smoothTiltY] = s.smooth;
+    this.initialized = s.initialized;
+    [this.anchorX, this.anchorY, this.anchorP, this.anchorTiltX, this.anchorTiltY] = s.anchor;
   }
 
   /**

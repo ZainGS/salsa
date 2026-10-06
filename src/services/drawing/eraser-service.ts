@@ -208,16 +208,10 @@ export class EraserService {
         return points;
     }
 
+    /** offsetX/Y are CSS px: normalise by the CSS size (InteractionService.toWorldCoordsFromCanvas), never the BACKING
+     *  size — canvas.width erased at (CSS / backing) of the pointer, i.e. up-left of the finger on a DPR-capped tablet. */
     private transformMouseCoordinatesToWorldSpace(x: number, y: number): [number, number] {
-        const ndcX = (x / this.interactionService.canvas.width) * 2 - 1;
-        const ndcY = (y / this.interactionService.canvas.height) * -2 + 1;
-
-        const inverseWorldMatrix = mat4.create();
-        mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
-
-        const transformed = vec3.fromValues(ndcX, ndcY, 0);
-        vec3.transformMat4(transformed, transformed, inverseWorldMatrix);
-
-        return [transformed[0], transformed[1]];
+        const w = this.interactionService.toWorldCoordsFromCanvas(x, y);
+        return [w.x, w.y];
     }
 }

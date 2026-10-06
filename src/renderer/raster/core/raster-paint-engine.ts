@@ -171,15 +171,32 @@ export class RasterPaintEngine {
 
   // ── Stroke lifecycle (called by RasterDrawingService) ─────────────
 
-  public beginStroke(input: PointerInput): void {
+  /** `opts.pointerType`: the stroke's PointerEvent.pointerType — a finger ('touch') gets the touch smoothing cap
+   *  (brush-input-settings.ts); pen / mouse / unset use the preset's stabilizer unchanged. */
+  public beginStroke(input: PointerInput, opts?: { pointerType?: string }): void {
     if (!this.activeTexture) {
       console.warn('RasterPaintEngine: no active texture');
       return;
     }
     this.brushEngine.setStrokeColor(...this.brushColor);
     this.brushEngine.setAspectCorrection(this.aspectCorrection);
-    this.brushEngine.beginStroke(this.activeTexture, input);
+    this.brushEngine.beginStroke(this.activeTexture, input, opts);
     this.scheduleRender();
+  }
+
+  /**
+   * BRUSH-4 stroke prediction: draw `points` (predicted samples ahead of the last real one) as a PROVISIONAL tail
+   * on the live stroke — visible until clearProvisionalStroke() (or the next real points / the stroke end), then
+   * restored byte-exactly. Never part of the layer, the undo patch or saved data. True when a tail was drawn
+   * (false: no stroke, a smudge / per-dab-bleed preset, or nothing on the canvas).
+   */
+  public drawProvisionalStroke(points: readonly PointerInput[]): boolean {
+    return this.brushEngine.drawProvisional(points);
+  }
+
+  /** Take the provisional tail back. True when one was showing. */
+  public clearProvisionalStroke(): boolean {
+    return this.brushEngine.clearProvisional();
   }
 
   public addStrokePoint(input: PointerInput): void {

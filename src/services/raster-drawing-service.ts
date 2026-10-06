@@ -6,6 +6,18 @@ import { EventEmitter } from "../renderer/util/event-emitter";
 import { RasterPaintEngine } from "../renderer/raster/core/raster-paint-engine";
 import { PointerInput } from "../renderer/raster/brushes/brush-engine";
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
+import { getStrokePrediction, predictionAppliesTo } from '../renderer/raster/brushes/brush-input-settings';
+
+/** Stroke prediction limits (BRUSH-4): a predicted sample more than this far ahead of the last real one (ms) is
+ *  dropped — about 1.5 frames at 60 Hz, the input-to-display gap worth hiding; further out the predictor overshoots
+ *  turns and stops. */
+export const PREDICT_MAX_MS = 25;
+/** At most this many predicted samples per event (a 240 Hz pen gives ~6 in PREDICT_MAX_MS). */
+export const PREDICT_MAX_EVENTS = 8;
+/** Absolute cap on how far (CSS px) a predicted sample may be from the last real one. */
+export const PREDICT_MAX_PX = 64;
+/** Slack (CSS px) on top of the speed-based limit, so a finger at rest still allows the predictor's jitter. */
+export const PREDICT_SLACK_PX = 4;
 
 export class RasterDrawingService {
   private interactionService: InteractionService;
@@ -25,7 +37,15 @@ export class RasterDrawingService {
   private moveBound = (e: PointerEvent) => this.move(e);
   private upBound = (e: PointerEvent) => this.end(e);
   /** Pre-render hook while a stroke is live: stamps the queued coalesced samples (BRUSH-4). */
-  private drainBound = (): boolean => { this.drainPending(); return false; };
+  private drainBound = (): boolean => { this.drainPending(true); return false; };
+  /** Post-composite hook while a predicting stroke is live: takes the provisional tail back out of the layer. */
+  private clearProvisionalBound = (): void => { this.getPaintEngine()?.clearProvisionalStroke?.(); };
+
+  // BRUSH-4 prediction: this stroke may predict (touch / pen + setting + renderer hooks); the latest event's
+  // filtered predicted samples (drawn by the next frame's drain, then discarded); the last real sample in CSS px.
+  private predictStroke = false;
+  private predicted: PointerInput[] = [];
+  private lastCss: { x: number; y: number; t: number } | null = null;
 
   // BRUSH-3 stroke ownership: the pointer the stroke is locked to, and whether we hold an interactive lease.
   private activePointerId: number | null = null;
@@ -223,15 +243,63 @@ export class RasterDrawingService {
 
   /** Feed the queued points to the engine as ONE dab batch (BRUSH-1b/4). Runs as a pre-render callback, so a
    *  frame's coalesced samples are stamped right before the frame that shows them. */
-  private drainPending(): void {
-    if (this.pending.length === 0) return;
-    const pts = this.pending;
-    this.pending = [];
-    try {
-      this.getPaintEngine()?.addStrokePoints(pts);
-    } catch (e) {
-      console.warn('RasterDrawingService: stroke points failed', e);
+  private drainPending(fromFrame = false): void {
+    const engine = this.getPaintEngine();
+    // A provisional tail still showing (normally the post-composite hook took it back) goes before any real dab.
+    if (this.predictStroke) engine?.clearProvisionalStroke?.();
+    if (this.pending.length > 0) {
+      const pts = this.pending;
+      this.pending = [];
+      try {
+        engine?.addStrokePoints(pts);
+      } catch (e) {
+        console.warn('RasterDrawingService: stroke points failed', e);
+      }
     }
+    // BRUSH-4 prediction: the frame's provisional tail, ahead of the real points just stamped. Only from the frame
+    // callback (so the post-composite hook removes it after this frame's composite), and used once.
+    if (fromFrame && this.predicted.length > 0) {
+      const pred = this.predicted;
+      this.predicted = [];
+      if (this.predictStroke && getStrokePrediction()) {
+        try { engine?.drawProvisionalStroke?.(pred); }
+        catch (e) { console.warn('RasterDrawingService: stroke prediction failed', e); }
+      }
+    }
+  }
+
+  /**
+   * BRUSH-4: the event's predicted samples (getPredictedEvents), filtered: each must be later than the last real
+   * sample by at most PREDICT_MAX_MS, and no further from it than the recent speed allows (2 × speed × Δt +
+   * PREDICT_SLACK_PX, never past PREDICT_MAX_PX) — the first implausible one ends the list. Empty when the API is
+   * missing or the stroke doesn't predict.
+   */
+  private collectPredicted(
+    ev: PointerEvent, last: { x: number; y: number; t: number }, ref: { x: number; y: number; t: number } | null,
+    origin: { left: number; top: number }, map: (x: number, y: number) => { x: number; y: number },
+    lastPressure: number, lastTs: number,
+  ): PointerInput[] {
+    if (!this.predictStroke || !getStrokePrediction() || typeof ev.getPredictedEvents !== 'function') return [];
+    let list: PointerEvent[];
+    try { list = ev.getPredictedEvents() ?? []; } catch { return []; }
+    if (!list.length) return [];
+    const speed = ref && last.t > ref.t ? Math.hypot(last.x - ref.x, last.y - ref.y) / (last.t - ref.t) : 0;   // CSS px/ms
+    const out: PointerInput[] = [];
+    for (const p of list) {
+      if (out.length >= PREDICT_MAX_EVENTS) break;
+      const dt = (p.timeStamp ?? 0) - last.t;
+      if (!(dt > 0) || dt > PREDICT_MAX_MS) break;
+      const cx = p.clientX - origin.left, cy = p.clientY - origin.top;
+      const d = Math.hypot(cx - last.x, cy - last.y);
+      if (!Number.isFinite(d) || d > Math.min(PREDICT_MAX_PX, 2 * speed * dt + PREDICT_SLACK_PX)) break;
+      const tex = map(cx, cy);
+      const pr = p.pressure;
+      out.push({
+        x: tex.x, y: tex.y, pressure: typeof pr === 'number' && pr > 0 ? pr : lastPressure,
+        timestamp: Math.max(lastTs, p.timeStamp), tiltX: p.tiltX ?? 0, tiltY: p.tiltY ?? 0,
+      });
+    }
+    return out;
   }
 
   // ── Stroke lifecycle ──────────────────────────────────────────────
@@ -253,6 +321,12 @@ export class RasterDrawingService {
     }
     this.pending = [];
     this.lastTs = -Infinity;
+    this.predicted = [];
+    // BRUSH-4 prediction: touch / pen only (mouse never — desktop stays byte-identical), when the setting is on and
+    // the renderer can take the tail back after its composite (the post-composite hook).
+    this.predictStroke = predictionAppliesTo(ev.pointerType) && getStrokePrediction()
+      && typeof this.renderer.addPreRenderCallback === 'function'
+      && typeof this.renderer.addPostRasterCompositeCallback === 'function';
 
     const o = this.canvasOrigin();
     const map = this.texelMapper();
@@ -261,6 +335,7 @@ export class RasterDrawingService {
     this.lastTex = tex;
     this.lastPressure = pressure;
     const timestamp = this.eventTime(ev);
+    this.lastCss = { x: ev.clientX - o.left, y: ev.clientY - o.top, t: timestamp };
 
     // Safety net: layer textures get reallocated on resize/restore, which can
     // leave the paint engine pointing at a stale texture (invisible strokes).
@@ -287,8 +362,10 @@ export class RasterDrawingService {
       }
 
       const input: PointerInput = { x: tex.x, y: tex.y, pressure, timestamp, tiltX: ev.tiltX ?? 0, tiltY: ev.tiltY ?? 0 };
-      engine.beginStroke(input);
+      // pointerType: a finger stroke gets the touch smoothing cap (brush-input-settings.ts); pen / mouse don't.
+      engine.beginStroke(input, { pointerType: ev.pointerType });
       this.renderer.addPreRenderCallback?.(this.drainBound, 'raster-brush-stroke');
+      if (this.predictStroke) this.renderer.addPostRasterCompositeCallback?.(this.clearProvisionalBound);
     } else {
       // Fallback to legacy path
       this.stampAtLegacy(tex.x, tex.y, pressure);
@@ -325,11 +402,18 @@ export class RasterDrawingService {
       const samples: PointerEvent[] = coalesced && coalesced.length ? coalesced : [ev];
       tex = this.lastTex ?? { x: 0, y: 0 };
       pressure = this.lastPressure;
+      const ref = this.lastCss;
+      let last = ref;
       for (const e of samples) {
         tex = map(e.clientX - o.left, e.clientY - o.top);
         pressure = e.pressure ?? 1;
-        this.pending.push({ x: tex.x, y: tex.y, pressure, timestamp: this.eventTime(e), tiltX: e.tiltX ?? 0, tiltY: e.tiltY ?? 0 });
+        const ts = this.eventTime(e);
+        this.pending.push({ x: tex.x, y: tex.y, pressure, timestamp: ts, tiltX: e.tiltX ?? 0, tiltY: e.tiltY ?? 0 });
+        last = { x: e.clientX - o.left, y: e.clientY - o.top, t: ts };
       }
+      this.lastCss = last;
+      // BRUSH-4: this event's predicted samples replace the previous event's (drawn once by the next frame).
+      if (this.predictStroke && last) this.predicted = this.collectPredicted(ev, last, ref, o, map, pressure, this.lastTs);
       // No render loop to drain us (no pre-render hook, or rendering stalled) → stamp now rather than grow.
       if (!this.renderer.addPreRenderCallback || this.pending.length >= RasterDrawingService.MAX_PENDING) this.drainPending();
       else this.renderer.scheduleRender?.();
@@ -372,9 +456,13 @@ export class RasterDrawingService {
     const pointerId = this.activePointerId;
     this.activePointerId = null;
 
-    // Stamp whatever is still queued, then stop draining.
-    this.drainPending();
+    // Stamp whatever is still queued (a provisional tail is taken back first and never redrawn), then stop draining.
+    this.predicted = [];
+    this.drainPending();   // (takes a still-showing tail back first; BrushEngine.endStroke would too)
+    this.predictStroke = false;
+    this.lastCss = null;
     this.renderer.removePreRenderCallback?.(this.drainBound);
+    this.renderer.removePostRasterCompositeCallback?.(this.clearProvisionalBound);
     const canvas = this.interactionService.canvas;
     if (pointerId !== null) {
       try { if (canvas.hasPointerCapture?.(pointerId)) canvas.releasePointerCapture(pointerId); } catch { /* gone */ }

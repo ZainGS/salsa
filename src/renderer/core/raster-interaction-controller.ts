@@ -61,6 +61,7 @@ import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
+import { canvasPixelRatio } from '../util/canvas-pixel-ratio';
 
 /** One pointerdown, for the double-click test. */
 export interface PressSample { t: number; type: string; x: number; y: number }
@@ -110,11 +111,11 @@ export class RasterInteractionController {
     /** True while a two-finger 2D gesture (or a swallowed 3D-owned one) is in progress. */
     get isPinching(): boolean { return this._pinch !== null; }
 
-    /** Backing-store pixels per CSS pixel (the pan units are backing pixels × 2 — see InteractionService.adjustPan). */
-    private _cssToBacking(rect: DOMRect): number {
-        const c = this.r.canvas;
-        const k = rect.width > 0 ? c.width / rect.width : 1;
-        return Number.isFinite(k) && k > 0 ? k : 1;
+    /** Backing-store pixels per CSS pixel AS BACKED (the pan units are backing pixels × 2 — see
+     *  InteractionService.adjustPan). The real `canvas.width / rect.width`, NOT window.devicePixelRatio: the mobile
+     *  backing store is DPR-capped (TIER-1), so a DPR-2 tablet backs at 1.5. Shared rule: canvasPixelRatio(). */
+    private _cssToBacking(rect: { width: number }): number {
+        return canvasPixelRatio(this.r.canvas, 1, rect.width);
     }
 
     /** PAN the 2D view by a CSS-pixel screen delta so the content follows the finger exactly (any devicePixelRatio).
@@ -281,10 +282,12 @@ export class RasterInteractionController {
       // Invert to zoom in on scroll up
       const zoomDelta = event.deltaY * -0.001; 
 
-      // Get mouse position relative to the canvas center (screen-space origin)
+      // Mouse position relative to the canvas center, in BACKING px (adjustZoom doubles it into pan units = backing
+      // px × 2, like touchZoom2D). CSS px alone anchored the zoom off the cursor whenever backing ≠ CSS (TIER-1 cap).
       const rect = this.r.canvas.getBoundingClientRect();
-      const mouseX = event.clientX - (rect.left + rect.width / 2);
-      const mouseY = event.clientY - (rect.top  + rect.height / 2);
+      const k = this._cssToBacking(rect);
+      const mouseX = (event.clientX - (rect.left + rect.width / 2)) * k;
+      const mouseY = (event.clientY - (rect.top  + rect.height / 2)) * k;
 
       // Adjust the zoom factor and pan offset
       this.r.interactionService.adjustZoom(
@@ -1008,8 +1011,11 @@ export class RasterInteractionController {
     switch (this.r.mode.kind) {
       case 'panning': {
         const [lx, ly] = this.r.mode.lastClient;
-        const dx = (event.clientX - lx) * 2;
-        const dy = (event.clientY - ly) * 2;
+        // Pan units are backing px × 2 (adjustPan), so a CSS delta scales by the ACTUAL backing ratio: the bare
+        // (delta × 2) moved the content 1/ratio of the pointer, e.g. 2/3 of the finger on a DPR-capped tablet.
+        const k = this._cssToBacking(rect) * 2;   // this move's rect (read above)
+        const dx = (event.clientX - lx) * k;
+        const dy = (event.clientY - ly) * k;
 
         this.r.interactionService.adjustPan(
             dx, 

@@ -213,6 +213,11 @@ import { EphemeraService } from './ephemera/ephemera-service';
 import { EphemeraOverlay } from './ephemera/ephemera-overlay';
 import { GROUND_SURFACES, resolveGroundRecipe, type GroundSurfaceName, type GroundSurfaceSpec } from '../world/ground-surfaces';
 import type { EphemeraElement, EphemeraElementSheet, IEphemeraGenerator, EphemeraCategory, EphemeraPlacement } from './ephemera/ephemera-types';
+import {
+    getTouchSmoothing as _getTouchSmoothing, setTouchSmoothing as _setTouchSmoothing,
+    getStrokePrediction as _getStrokePrediction, setStrokePrediction as _setStrokePrediction,
+    type TouchSmoothing,
+} from '../renderer/raster/brushes/brush-input-settings';
 
 // Re-exported so existing importers (and the host) keep one obvious entry point; the table itself lives
 // in src/world so the CITY generator can read it too (services may import world, never the reverse).
@@ -1552,6 +1557,16 @@ class ShapeManager {
     public setRasterBrushSize(size: number) {
         this.rasterDrawingService?.setBrushRadiusPx(size);
     }
+
+    /** Raster brush smoothing for FINGER strokes (docs/ui/touch-controls.md §5): 'light' (default) caps the brush's
+     *  stabilizer at ~16.7 ms of lag, 'off' = no smoothing, 'normal' = the brush's own value. Pen + mouse always use
+     *  the brush's value. Per machine (localStorage); applies from the next stroke. */
+    public setTouchSmoothing(mode: TouchSmoothing): void { _setTouchSmoothing(mode); }
+    public getTouchSmoothing(): TouchSmoothing { return _getTouchSmoothing(); }
+    /** Raster stroke prediction for touch + pen (getPredictedEvents → a provisional tail shown for one frame, never
+     *  committed). On by default; per machine (localStorage). Mouse strokes never predict. */
+    public setStrokePrediction(on: boolean): void { _setStrokePrediction(on); }
+    public getStrokePrediction(): boolean { return _getStrokePrediction(); }
 
     public setRasterBrushColor(color: string) {
         this.rasterDrawingService?.setBrushColor(hexToRgba(color));
