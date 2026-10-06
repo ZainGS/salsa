@@ -3008,8 +3008,20 @@ fn fs_main(
 
   // RENDER DEBUG (render-debug.ts; ibl.dbgShade, 0 = off: the normal path below runs unchanged). A uniform value, so
   // these early returns keep the control flow uniform for the samples and derivatives below.
+  // Modes 4-6 localise the RENDER-1 rainbow (constant colour = mode 2 still shows it, magenta = mode 3 does not):
+  // 4 = the flat instance index as a colour (red = past the end of u_instances), 5 = instance 0's colour (constant
+  // index: is the storage read itself bad?), 6 = the vertex-stage colour (smooth varyings, no fragment-side read).
   if (ibl.dbgShade > 1.5) {
-    if (ibl.dbgShade > 2.5) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
+    let dbgM = u32(ibl.dbgShade + 0.5);
+    if (dbgM == 3u) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
+    if (dbgM == 4u) {
+      // Branch-free on the (varying) index so the samples / derivatives below stay in uniform control flow.
+      let dbgH = (instanceIdx + 1u) * 2654435761u;
+      let dbgC = vec3<f32>(f32((dbgH >> 8u) & 255u), f32((dbgH >> 16u) & 255u), f32((dbgH >> 24u) & 255u)) / 255.0;
+      return vec4<f32>(select(dbgC, vec3<f32>(1.0, 0.0, 0.0), instanceIdx >= arrayLength(&u_instances)), 1.0);
+    }
+    if (dbgM == 5u) { return vec4<f32>(u_instances[0].diffuseColor.rgb, 1.0); }
+    if (dbgM == 6u) { return vec4<f32>(gouraudColor.rgb, 1.0); }
     return vec4<f32>(inst.diffuseColor.rgb, 1.0);
   }
 
@@ -3907,8 +3919,20 @@ fn fs_main(
 
   // RENDER DEBUG (render-debug.ts; ibl.dbgShade, 0 = off: the normal path below runs unchanged). A uniform value, so
   // these early returns keep the control flow uniform for the samples and derivatives below.
+  // Modes 4-6 localise the RENDER-1 rainbow (constant colour = mode 2 still shows it, magenta = mode 3 does not):
+  // 4 = the flat instance index as a colour (red = past the end of u_instances), 5 = instance 0's colour (constant
+  // index: is the storage read itself bad?), 6 = the vertex-stage colour (smooth varyings, no fragment-side read).
   if (ibl.dbgShade > 1.5) {
-    if (ibl.dbgShade > 2.5) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
+    let dbgM = u32(ibl.dbgShade + 0.5);
+    if (dbgM == 3u) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
+    if (dbgM == 4u) {
+      // Branch-free on the (varying) index so the samples / derivatives below stay in uniform control flow.
+      let dbgH = (instanceIdx + 1u) * 2654435761u;
+      let dbgC = vec3<f32>(f32((dbgH >> 8u) & 255u), f32((dbgH >> 16u) & 255u), f32((dbgH >> 24u) & 255u)) / 255.0;
+      return vec4<f32>(select(dbgC, vec3<f32>(1.0, 0.0, 0.0), instanceIdx >= arrayLength(&u_instances)), 1.0);
+    }
+    if (dbgM == 5u) { return vec4<f32>(u_instances[0].diffuseColor.rgb, 1.0); }
+    if (dbgM == 6u) { return vec4<f32>(gouraudColor.rgb, 1.0); }
     return vec4<f32>(inst.diffuseColor.rgb, 1.0);
   }
 

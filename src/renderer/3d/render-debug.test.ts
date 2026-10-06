@@ -121,6 +121,9 @@ describe('render debug flag set', () => {
     it('shading priority magenta > constant colour > unlit; load ops / alpha follow their flags', () => {
         setRenderDebug({ noLighting: true }); expect(renderDebugShadeMode()).toBe(1);
         setRenderDebug({ noTextures: true }); expect(renderDebugShadeMode()).toBe(2);
+        setRenderDebug({ dbgVertexColour: true }); expect(renderDebugShadeMode()).toBe(6);
+        setRenderDebug({ dbgInstanceZero: true }); expect(renderDebugShadeMode()).toBe(5);
+        setRenderDebug({ dbgInstanceIndex: true }); expect(renderDebugShadeMode()).toBe(4);
         setRenderDebug({ solidMesh: true }); expect(renderDebugShadeMode()).toBe(3);
         setRenderDebug({ clampTexLayers: true }); expect(renderDebugShaderBits()).toBe(1);
         setRenderDebug({ clearColorLoads: true }); expect(rdColorLoad()).toBe('clear'); expect(rdDepthLoad()).toBe('load');

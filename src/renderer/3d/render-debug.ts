@@ -62,6 +62,13 @@ export type RenderDebugFlags = {
   noTextures: boolean;
   /** Mesh fragment shader: solid magenta. Garbage that remains is geometry / depth / raster, not shading. */
   solidMesh: boolean;
+  /** Mesh fragment shader: the flat per-object (instance) index as a colour; one solid colour per object when healthy,
+   *  red where the index is past the end of the instance buffer. */
+  dbgInstanceIndex: boolean;
+  /** Mesh fragment shader: the FIRST object's colour, read with a constant index (tests the storage read itself). */
+  dbgInstanceZero: boolean;
+  /** Mesh fragment shader: the colour computed in the vertex stage (no fragment-side instance read). */
+  dbgVertexColour: boolean;
   /** Every 3D pass that LOADS depth / stencil clears it instead (overlays lose depth occlusion). */
   clearDepthStencilLoads: boolean;
   /** Every 3D pass that LOADS colour clears it instead. Breaks the picture (an overlay pass wipes the scene); the point
@@ -77,6 +84,9 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'forceOpaqueAlpha', label: 'Opaque canvas alpha' },
   { key: 'solidMesh', label: 'Solid magenta meshes' },
   { key: 'noTextures', label: 'No mesh textures (constant colour)' },
+  { key: 'dbgInstanceIndex', label: 'Mesh colour = object index' },
+  { key: 'dbgInstanceZero', label: 'Mesh colour = first object (fixed read)' },
+  { key: 'dbgVertexColour', label: 'Mesh colour = vertex stage' },
   { key: 'clampTexLayers', label: 'Clamp texture layer indices' },
   { key: 'noLighting', label: 'No mesh lighting (unlit)' },
   { key: 'noMeshEditOverlays', label: 'No mesh-edit / UV-paint overlays' },
@@ -159,10 +169,13 @@ export function setRenderDebug(patch: Partial<RenderDebugFlags> & { reset?: bool
 
 export function getRenderDebug(): RenderDebugFlags { return { ...RD.f }; }
 
-/** The mesh fragment shader debug mode (IBLUniforms.dbgShade): 0 = off, 1 = unlit, 2 = constant colour, 3 = magenta. */
+/** The mesh fragment shader debug mode (IBLUniforms.dbgShade): 0 = off, 1 = unlit, 2 = constant colour, 3 = magenta,
+ *  4 = instance index colour, 5 = instance 0's colour, 6 = vertex-stage colour. */
 export function renderDebugShadeMode(): number {
   if (!RD.on) return 0;
-  return RD.f.solidMesh ? 3 : RD.f.noTextures ? 2 : RD.f.noLighting ? 1 : 0;
+  const f = RD.f;
+  return f.solidMesh ? 3 : f.dbgInstanceIndex ? 4 : f.dbgInstanceZero ? 5 : f.dbgVertexColour ? 6
+    : f.noTextures ? 2 : f.noLighting ? 1 : 0;
 }
 
 /** The mesh fragment shader debug bits (IBLUniforms.dbgFlags): 1 = clamp the texture-array layer indices. */
