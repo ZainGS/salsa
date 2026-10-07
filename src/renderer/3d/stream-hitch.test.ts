@@ -226,3 +226,83 @@ describe('P16 upload ledger', () => {
     expect(r._geomSlice()).toBe((w.Renderer3D as unknown as { UPLOAD_GEOM_SLICE: number }).UPLOAD_GEOM_SLICE);
   });
 });
+
+/** Every LIVE record (placed meshes, placed array-group copies, parked group ranges) on the modelled GPU buffer equals
+ *  the CPU mirror, all 60 floats. Returns the number of differing slots (+ the first few for the failure message). */
+function staleRecords(w: Awaited<ReturnType<typeof world>>): { n: number; ex: string[] } {
+  const r = w.r;
+  const gpu = new Uint32Array(w.dev.mem.get(r.instanceStorageBuffer)!.buffer);
+  const cpu = new Uint32Array(r._instanceDataBuf.buffer, r._instanceDataBuf.byteOffset, r._instanceDataBuf.length);
+  const slots = new Map<number, string>();
+  for (const [id, s] of r._meshInstanceSlots as Map<string, number>) slots.set(s, 'mesh ' + id.slice(0, 6));
+  for (const [gid, f] of r._arrayGroupFirstSlot as Map<string, number>) { const n = r._arrayGroupSlotCount.get(gid) ?? 0; for (let k = 0; k < n; k++) slots.set(f + k, `group ${gid.slice(0, 6)}#${k}`); }
+  for (const [a, b, o] of r._slotAlloc.ownedRanges() as Array<[number, number, string]>) if (r._parkedGroups.has(o)) for (let s = a; s < a + b; s++) slots.set(s, `parked ${o.slice(0, 6)}`);
+  let n = 0; const ex: string[] = [];
+  for (const [s, what] of slots) {
+    for (let k = 0; k < FPI; k++) if (gpu[s * FPI + k] !== cpu[s * FPI + k]) { n++; if (ex.length < 6) ex.push(`${what} slot ${s} float ${k}`); break; }
+  }
+  return { n, ex };
+}
+
+const offsOf = (g: { arrayParams: unknown }): [number, number, number][] => (g.arrayParams as { offsets: [number, number, number][] }).offsets;
+
+describe('array-group instance records reach the GPU whatever the group state (placed / parked / sliced)', () => {
+  it('re-dress while the groups are PARKED, then a re-show that GROWS the instance buffer mid-placement: GPU == CPU', async () => {
+    // The live bug (city look switch after far views): _tryIncrementalInstances captured the CPU mirror, then
+    // _syncArrayGroupSlots grew the instance buffer (a NEW mirror array), _repackGroupsOf packed the groups into the
+    // new one, and the touched-run upload (runs merge gaps of up to 256 slots, so they span group ranges) wrote the
+    // OLD array's stale group records over them: ~6000 copies kept their previous material on the GPU.
+    const w = await world(21);
+    const tiles = [0, 1, 2, 3, 4, 5, 6, 7].map((t) => w.tile(t));
+    const srcIds = new Set(tiles.flatMap((t) => t.groups.map((g) => g.sourceId)));
+    const all = tiles.flatMap((t) => t.meshes), groups = tiles.flatMap((t) => t.groups);
+    const plain = all.filter((m) => !srcIds.has(m.id));
+    for (let f = 0; f < 3; f++) frame(w, all, groups);                       // everything placed (full repack)
+    expect(staleRecords(w).n).toBe(0);
+    for (let f = 0; f < 2; f++) frame(w, plain, groups);                     // the sources hide (LOD): their groups PARK
+    expect(w.r._parkedGroups.size).toBe(groups.length);
+    for (const m of all) if (srcIds.has(m.id)) { m.material.roughness = 0.123; m.material.metalness = 0.77; m.materialDirty = true; }   // the look switch
+    // the sources come back with their detail re-dressed a bit larger (new group objects, +25% copies): the total still
+    // fits the buffer (no grow at the frame start) but not the fragmented free space, so the grow happens INSIDE
+    // _syncArrayGroupSlots, after the incremental path captured its CPU mirror
+    const { ArrayGroup3D } = await import('../../scene-graph/shapes/array-group-3d');
+    const groups2 = groups.map((g) => {
+      const o = offsOf(g); const n = Math.ceil(o.length * 1.25);
+      return new ArrayGroup3D(isvc, g.sourceId, { mode: 'explicit', offsets: Array.from({ length: n }, (_, k) => [o[0][0] + (k % 10) * 1.1, 0, o[0][2] + Math.floor(k / 10) * 1.1] as [number, number, number]) });
+    });
+    STREAM_HITCH_LIMITS.groupPackInstances = 1 << 20;   // every group placed this frame (the sliced packs are covered above)
+    const cap0 = w.r.instanceCapacity, grows0 = w.r.getPerfCounters().instanceGrows, full0 = w.r.getPerfCounters().fullRepacks;
+    expect(all.length + groups2.reduce((n, g) => n + offsOf(g).length, 0)).toBeLessThan(cap0);
+    frame(w, all, groups2);
+    expect(w.r.getPerfCounters().instanceGrows).toBeGreaterThan(grows0);    // the scenario: a grow inside the placement
+    expect(w.r.getPerfCounters().fullRepacks).toBe(full0);                   // ...on the incremental path (no repack storm)
+    let st = staleRecords(w);
+    expect(st.n, st.ex.join(', ')).toBe(0);
+    for (let f = 0; f < 6; f++) { frame(w, all, groups2); st = staleRecords(w); expect(st.n, `frame ${f}: ${st.ex.join(', ')}`).toBe(0); }
+    // every copy carries its source's NEW material on the GPU
+    const gpu = new Float32Array(w.dev.mem.get(w.r.instanceStorageBuffer)!.buffer);
+    for (const g of groups2) {
+      const f0 = w.r._arrayGroupFirstSlot.get(g.id); expect(f0).toBeDefined();
+      for (let k = 0; k < offsOf(g).length; k++) { expect(gpu[(f0 + k) * FPI + 46]).toBeCloseTo(0.123, 5); expect(gpu[(f0 + k) * FPI + 47]).toBeCloseTo(0.77, 5); }
+    }
+  });
+
+  it('re-placing a parked group (a reclaim) uploads its current CPU record', async () => {
+    const w = await world(4);
+    const t = w.tile(0);
+    const srcIds = new Set(t.groups.map((g) => g.sourceId));
+    const plain = t.meshes.filter((m) => !srcIds.has(m.id));
+    for (let f = 0; f < 3; f++) frame(w, t.meshes, t.groups);
+    for (let f = 0; f < 2; f++) frame(w, plain, t.groups);                   // park
+    expect(w.r._parkedGroups.size).toBe(t.groups.length);
+    // lose the GPU copy of the parked ranges (whatever overwrote them): the reclaim must not trust the GPU side
+    const gpu = new Float32Array(w.dev.mem.get(w.r.instanceStorageBuffer)!.buffer);
+    for (const [a, b, o] of w.r._slotAlloc.ownedRanges() as Array<[number, number, string]>) if (w.r._parkedGroups.has(o)) gpu.fill(-1, a * FPI, (a + b) * FPI);
+    const rec0 = w.r.getPerfCounters().groupReclaims, packs0 = w.r.getPerfCounters().groupPacks;
+    frame(w, t.meshes, t.groups);                                            // re-show, nothing changed: a reclaim
+    expect(w.r.getPerfCounters().groupReclaims - rec0).toBe(t.groups.length);
+    expect(w.r.getPerfCounters().groupPacks).toBe(packs0);                   // no re-pack: only the re-placed slots go up
+    const st = staleRecords(w);
+    expect(st.n, st.ex.join(', ')).toBe(0);
+  });
+});

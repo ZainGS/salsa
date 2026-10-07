@@ -148,6 +148,12 @@ export class SlotRangeAllocator {
     for (const r of this._byStart.values()) out.push([r.start, r.count]);
     return out.sort((a, b) => a[0] - b[0]);
   }
+  /** Parked ranges as [start, count, owner] (tests / diagnostics). */
+  ownedRanges(): Array<[number, number, string]> {
+    const out: Array<[number, number, string]> = [];
+    for (const [o, r] of this._owned) out.push([r.start, r.count, o]);
+    return out;
+  }
   /** Number of unowned free-range entries (the P5 list grows by one per freed slot; the indexed form stays maximal). */
   get freeEntries(): number { return this._free.length + this._byStart.size; }
 

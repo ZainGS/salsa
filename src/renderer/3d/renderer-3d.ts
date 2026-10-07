@@ -6911,7 +6911,8 @@ export class Renderer3D {
   }
 
   /** P5: grow the instance buffer to hold `count` slots (+50%) WITHOUT a repack: copy the old buffer on the GPU, grow
-   *  the CPU mirror, rebind (the mesh bind group follows the buffer reference). Slot maps, the allocator's ranges and
+   *  the CPU mirror (★ a NEW _instanceDataBuf array: a caller holding the old one must re-read it before any later
+   *  write or upload; see the touched-run upload in _tryIncrementalInstances), rebind (the mesh bind group follows the buffer reference). Slot maps, the allocator's ranges and
    *  the atlas indices all stay valid. The old buffer is destroyed once this frame's work was submitted. */
   private _growInstanceBuffer(count: number): void {
     const old = this.instanceStorageBuffer!, oldCap = this.instanceCapacity;
@@ -7374,15 +7375,21 @@ export class Renderer3D {
     if (incDirtySources.size) this._repackGroupsOf(incDirtySources);   // P4.3: instanced copies of a re-dressed source
     if (incDeferred) this.onDeferredWork?.();
     // Upload only the touched slots as coalesced runs (same trick as the transforms fast path).
+    // ★ From the CURRENT mirror, never `buf`: _syncArrayGroupSlots may have grown the instance buffer, which REPLACES
+    // _instanceDataBuf (`buf` is then the pre-grow copy), and _repackGroupsOf packed the groups into the new array. A
+    // run merges gaps of up to 256 slots, so it spans group ranges: uploading it from `buf` wrote the stale pre-repack
+    // group records over the fresh ones (the city look switch after far views: ~6000 copies kept their old material
+    // on the GPU, black with the shader split on). Every write to `buf` above happened before the grow, which copied it.
+    const upBuf = this._instanceDataBuf!;
     if (touched.length) {
       touched.sort((a, b) => a - b);
       let runLo = touched[0], prev = touched[0];
       for (let i = 1; i < touched.length; i++) {
         const s = touched[i];
-        if (s > prev + 256) { this.device.queue.writeBuffer(this.instanceStorageBuffer, runLo * MESH_INSTANCE_STRIDE, buf, runLo * fpi, (prev - runLo + 1) * fpi); this._noteInstBytes((prev - runLo + 1) * MESH_INSTANCE_STRIDE); runLo = s; }
+        if (s > prev + 256) { this.device.queue.writeBuffer(this.instanceStorageBuffer, runLo * MESH_INSTANCE_STRIDE, upBuf, runLo * fpi, (prev - runLo + 1) * fpi); this._noteInstBytes((prev - runLo + 1) * MESH_INSTANCE_STRIDE); runLo = s; }
         prev = s;
       }
-      this.device.queue.writeBuffer(this.instanceStorageBuffer, runLo * MESH_INSTANCE_STRIDE, buf, runLo * fpi, (prev - runLo + 1) * fpi);
+      this.device.queue.writeBuffer(this.instanceStorageBuffer, runLo * MESH_INSTANCE_STRIDE, upBuf, runLo * fpi, (prev - runLo + 1) * fpi);
       this._noteInstBytes((prev - runLo + 1) * MESH_INSTANCE_STRIDE);
     }
     let live = arraySlots, anyGeo = false; for (const m of meshes) { live += Math.max(1, m.submeshes.length); if (m.gpuDirty) anyGeo = true; }
@@ -7656,6 +7663,7 @@ export class Renderer3D {
     }
     // Pass 3: place wanted groups that have no range.
     const pack = this._gsPack; pack.clear();
+    const reclaimed = this._gsReclaimed; reclaimed.length = 0;   // [start, count, ...] of the parked ranges claimed back
     // P16 slicedGroupPacks: a group that needs a FRESH pack (not a parked reclaim) waits when this frame's packs are past
     // STREAM_HITCH_LIMITS.groupPackInstances, nearest in-view first. A waiting group has no range, so it is not drawn
     // (never with stale slots) and _groupSetDirty keeps the next frames on this path until it is placed.
@@ -7667,7 +7675,7 @@ export class Renderer3D {
       const src = this._meshById.get(g.sourceId)!;
       let start = -1;
       const pk = this._parkedGroups.get(g.id);
-      if (pk && this._parkedStillValid(pk, g, src, N)) { start = this._slotAlloc.claimOwned(g.id, N); if (start >= 0) this._perf.groupReclaims++; }
+      if (pk && this._parkedStillValid(pk, g, src, N)) { start = this._slotAlloc.claimOwned(g.id, N); if (start >= 0) { this._perf.groupReclaims++; reclaimed.push(start, N); } }
       this._parkedGroups.delete(g.id);
       if (start < 0) {
         this._slotAlloc.disown(g.id);
@@ -7684,6 +7692,25 @@ export class Renderer3D {
     this._groupSetDirty = false;
     this._groupsPending = defer !== null && defer.size > 0;   // P16: groups still waiting → this path again next frame
     if (this._groupsPending) { streamHitchStats.groupPacksDeferred += defer!.size; streamHitchStats.groupPackFramesDeferred++; this.onDeferredWork?.(); }
+    // A reclaimed range is not re-packed (its CPU record is still exact: _parkedStillValid), but it IS re-uploaded:
+    // only its N slots, adjacent ranges merged, from the CURRENT mirror (a grow above may have replaced it). The GPU
+    // copy of a parked range is never trusted, so a re-placed group always draws its current CPU record.
+    if (reclaimed.length) {
+      const data = this._instanceDataBuf!;
+      if (reclaimed.length > 2) {   // sort the [start, count] pairs by start, then merge touching ranges
+        const idx: number[] = []; for (let i = 0; i < reclaimed.length; i += 2) idx.push(i);
+        idx.sort((a, b) => reclaimed[a] - reclaimed[b]);
+        const srt: number[] = []; for (const i of idx) srt.push(reclaimed[i], reclaimed[i + 1]);
+        reclaimed.length = 0; for (const v of srt) reclaimed.push(v);
+      }
+      let lo = reclaimed[0], hi = lo + reclaimed[1];
+      for (let i = 2; i <= reclaimed.length; i += 2) {
+        if (i < reclaimed.length && reclaimed[i] === hi) { hi += reclaimed[i + 1]; continue; }
+        this.device.queue.writeBuffer(this.instanceStorageBuffer!, lo * MESH_INSTANCE_STRIDE, data, lo * fpi, (hi - lo) * fpi); this._noteInstBytes((hi - lo) * MESH_INSTANCE_STRIDE);
+        if (i < reclaimed.length) { lo = reclaimed[i]; hi = lo + reclaimed[i + 1]; }
+      }
+      reclaimed.length = 0;
+    }
     if (pack.size) {
       this._packArrayGroupInstances(undefined, pack);
       this._perf.groupPacks += pack.size;
@@ -7694,7 +7721,7 @@ export class Renderer3D {
     return true;
   }
   /** P16 slicedGroupPacks: the wanted, unplaced groups that would need a fresh pack this frame past the instance budget
-   *  (null = everything fits). Parked groups that reclaim their range cost nothing and are never deferred; the first
+   *  (null = everything fits). Parked groups that reclaim their range cost no pack (only their slots' upload) and are never deferred; the first
    *  group always goes (a single huge group is never starved). Order: in view first, then by camera distance. */
   private _groupPackDeferrals(want: Set<string>, byId: Map<string, ArrayGroup3D>, skipPack: Set<string>): Set<string> | null {
     const first = this._arrayGroupFirstSlot;
@@ -7722,6 +7749,7 @@ export class Renderer3D {
     return out.size ? out : null;
   }
   private readonly _gsCands: ArrayGroup3D[] = [];
+  private readonly _gsReclaimed: number[] = [];
   /** P16: wanted array groups still waiting for their pack (keeps the frames on the incremental path, not the fast one). */
   private _groupsPending = false;
   private readonly _gsPrio = new Map<ArrayGroup3D, number>();
