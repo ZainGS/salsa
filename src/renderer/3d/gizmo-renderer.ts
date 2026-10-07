@@ -6,6 +6,9 @@
  *
  * Gizmo is drawn after all 3D meshes with depth compare = 'always' so it is
  * always visible regardless of mesh occlusion (standard behavior for editor gizmos).
+ * Within the gizmo, triangles are painter-sorted far → near on the CPU, and the rotate
+ * rings split into a near half (full colour, grabbable) and a thin, dim far half — see
+ * "Rotate-ring view model" below.
  *
  * Also provides CPU-side hit testing for axis/plane picking during drag.
  */
@@ -309,53 +312,228 @@ function addScaleCube(
   for (const fi of faceIdxs) idxs.push(cubeBase + fi);
 }
 
+// ── Rotate-ring view model (front / back halves + painter's order) ───────────
+//
+// The rotate rings used to be drawn as three whole 270° washers in a fixed X→Y→Z order with depth-always,
+// so the far half of one ring painted over the near half of another (an "impossible figure"). Now each ring
+// is split per vertex into a NEAR half (full colour + width, grabbable) and a FAR half (thin + dim, NOT
+// grabbable), and the gizmo's triangles are painter-sorted back to front so where two rings cross the nearer
+// segment wins. A CPU sort, not a depth test: the gizmo draws inside the scene pass on the scene's depth
+// attachment (it can't be cleared mid-pass), and painter order also composites the translucent far halves
+// correctly, which a depth buffer would not. ~1k triangles per frame, so the sort is negligible.
+
+/** Gizmo-local camera info (gizmo-local = after the inverse gizmo model matrix: centre at origin, ring radius 1). */
+export interface GizmoViewLocal {
+  /** Unit vector from the gizmo centre toward the camera (ortho: minus the view direction). */
+  toCam: [number, number, number];
+  /** Camera position in gizmo-local units (perspective), or null for an orthographic camera (parallel rays). */
+  camPos: [number, number, number] | null;
+}
+
 /**
- * Append a partial washer arc around the given axis.
- *
- * sweepAngle controls how much of the circle to draw (default 3π/2 = 270°,
- * the Spline-style open arc). The ring has wall thickness so it reads clearly
- * from any camera angle.
+ * The camera expressed in gizmo-local space. `invModel` is the inverse of the gizmo model matrix
+ * (translate · [rotate] · uniform scale). Perspective: toCam = normalize(local camera position). Ortho: toCam =
+ * minus the local view direction (target − position), the same for every point.
+ */
+export function computeGizmoViewLocal(
+  mode: 'perspective' | 'orthographic',
+  camPos: ArrayLike<number>,
+  camTarget: ArrayLike<number>,
+  invModel: mat4,
+): GizmoViewLocal {
+  const m = invModel;
+  if (mode === 'perspective') {
+    const x = camPos[0], y = camPos[1], z = camPos[2];
+    const lx = m[0] * x + m[4] * y + m[8] * z + m[12];
+    const ly = m[1] * x + m[5] * y + m[9] * z + m[13];
+    const lz = m[2] * x + m[6] * y + m[10] * z + m[14];
+    const len = Math.hypot(lx, ly, lz);
+    if (len > 1e-6) return { toCam: [lx / len, ly / len, lz / len], camPos: [lx, ly, lz] };
+    // Camera AT the gizmo centre: no meaningful split — fall through to the view direction.
+  }
+  // Direction toward the camera = position − target (a direction: no translation).
+  const dx = camPos[0] - camTarget[0], dy = camPos[1] - camTarget[1], dz = camPos[2] - camTarget[2];
+  let lx = m[0] * dx + m[4] * dy + m[8] * dz;
+  let ly = m[1] * dx + m[5] * dy + m[9] * dz;
+  let lz = m[2] * dx + m[6] * dy + m[10] * dz;
+  const len = Math.hypot(lx, ly, lz);
+  if (len > 1e-9) { lx /= len; ly /= len; lz /= len; } else { lx = 0; ly = 0; lz = 1; }
+  return { toCam: [lx, ly, lz], camPos: null };
+}
+
+/** Facing of a gizmo-local ring point: its offset from the centre dotted with the centre→camera direction
+ *  (> 0 = the near half, < 0 = the far half; a ring seen face-on sits at 0 everywhere = all near). */
+export function ringPointFacing(p: ArrayLike<number>, view: GizmoViewLocal): number {
+  return p[0] * view.toCam[0] + p[1] * view.toCam[1] + p[2] * view.toCam[2];
+}
+
+/** Facing at or below which a ring point is fully "far" (thin + dim). */
+const RING_BACK_EDGE  = -0.12;
+/** Facing at or above which a ring point is fully "near". Slightly negative so a face-on ring (facing ≈ 0
+ *  everywhere, also in perspective) stays fully near, and a ring tilting away grows its far arc continuously. */
+const RING_FRONT_EDGE = -0.03;
+/** A hit counts as "on the near half" (grabbable) at or above this facing — the middle of the fade band. */
+export const RING_HIT_MIN_FACING = (RING_BACK_EDGE + RING_FRONT_EDGE) * 0.5;
+
+/** 0 (far half) … 1 (near half), smooth across a narrow band so the near/far switch never pops a segment. */
+export function ringFrontness(facing: number): number {
+  const t = Math.min(1, Math.max(0, (facing - RING_BACK_EDGE) / (RING_FRONT_EDGE - RING_BACK_EDGE)));
+  return t * t * (3 - 2 * t);
+}
+
+/** True when a gizmo-local ring point is on the near (grabbable, full-colour) half. */
+export function isRingPointFront(p: ArrayLike<number>, view: GizmoViewLocal): boolean {
+  return ringPointFacing(p, view) >= RING_HIT_MIN_FACING;
+}
+
+const RING_FRONT_HALF_W = 0.030;   // gizmo-local half width of the near half (radius 1 ≈ 18% of the half-height)
+const RING_BACK_HALF_W  = 0.013;   // far half: under half the width…
+const RING_BACK_ALPHA   = 0.30;    // …and ~30% alpha
+const RING_SEGMENTS     = 64;
+const SILHOUETTE_HALF_W = 0.007;
+const COL_SILHOUETTE: Color4 = [0.85, 0.85, 0.85, 0.22];
+
+/** Unit direction toward the camera from gizmo-local point (px,py,pz) — per point in perspective. */
+function toCamAt(view: GizmoViewLocal, px: number, py: number, pz: number): [number, number, number] {
+  if (!view.camPos) return view.toCam;
+  const dx = view.camPos[0] - px, dy = view.camPos[1] - py, dz = view.camPos[2] - pz;
+  const l = Math.hypot(dx, dy, dz);
+  return l > 1e-9 ? [dx / l, dy / l, dz / l] : view.toCam;
+}
+
+/**
+ * Append a camera-facing ribbon along a closed circle (centre c, in-plane unit basis u/v, radius r).
+ * `style(p)` returns [halfWidth, color] per sample, so a ring can fade/thin along its length. The ribbon's
+ * width direction is ⟂ to both the tangent and the direction to the camera, so it keeps its on-screen
+ * width from any angle (an edge-on ring reads as a solid line, like the old washer walls did).
+ */
+function addCameraFacingCircle(
+  verts: number[],
+  idxs: number[],
+  c: [number, number, number],
+  u: [number, number, number],
+  v: [number, number, number],
+  r: number,
+  view: GizmoViewLocal,
+  style: (p: [number, number, number]) => [number, Color4],
+  segments = RING_SEGMENTS,
+): void {
+  const N = segments;
+  const pts: [number, number, number][] = [];
+  const nrm: ([number, number, number] | null)[] = [];
+  for (let i = 0; i < N; i++) {
+    const th = (i / N) * Math.PI * 2;
+    const cs = Math.cos(th), sn = Math.sin(th);
+    const p: [number, number, number] = [
+      c[0] + r * (cs * u[0] + sn * v[0]), c[1] + r * (cs * u[1] + sn * v[1]), c[2] + r * (cs * u[2] + sn * v[2]),
+    ];
+    const t: [number, number, number] = [-sn * u[0] + cs * v[0], -sn * u[1] + cs * v[1], -sn * u[2] + cs * v[2]];
+    const w = toCamAt(view, p[0], p[1], p[2]);
+    const nx = t[1] * w[2] - t[2] * w[1], ny = t[2] * w[0] - t[0] * w[2], nz = t[0] * w[1] - t[1] * w[0];
+    const nl = Math.hypot(nx, ny, nz);
+    pts.push(p);
+    // Degenerate where the tangent points straight at the camera (the ends of an edge-on ring): borrow a neighbour's.
+    nrm.push(nl > 1e-4 ? [nx / nl, ny / nl, nz / nl] : null);
+  }
+  const firstOk = nrm.findIndex(n => n !== null);
+  if (firstOk < 0) return;   // every sample degenerate (zero radius) — nothing visible to draw
+  for (let k = 0; k < N; k++) {
+    const i = (firstOk + k) % N;
+    const prev = nrm[(i + N - 1) % N];
+    if (!nrm[i]) { nrm[i] = prev ?? nrm[firstOk]; continue; }
+    // Keep the side consistent around the loop (cross() flips sign through a degenerate sample → no bow-ties).
+    const n = nrm[i]!;
+    if (prev && n[0] * prev[0] + n[1] * prev[1] + n[2] * prev[2] < 0) nrm[i] = [-n[0], -n[1], -n[2]];
+  }
+  const base = verts.length / 7;
+  for (let i = 0; i < N; i++) {
+    const p = pts[i], n = nrm[i]!;
+    const [hw, col] = style(p);
+    pushVert(verts, p[0] + n[0] * hw, p[1] + n[1] * hw, p[2] + n[2] * hw, col);
+    pushVert(verts, p[0] - n[0] * hw, p[1] - n[1] * hw, p[2] - n[2] * hw, col);
+  }
+  for (let i = 0; i < N; i++) {
+    const a = base + i * 2, b = base + ((i + 1) % N) * 2;
+    idxs.push(a, a + 1, b, b, a + 1, b + 1);
+  }
+}
+
+/**
+ * Append a full rotate ring around the given axis (gizmo-local radius 1). The near half (facing the camera)
+ * draws at full colour + width; the far half thin and dim (see ringFrontness). The far half is not
+ * grabbable either — hitRotateRing filters by the same facing test.
  */
 function addRotateRing(
   verts: number[],
   idxs: number[],
   axis: 'x' | 'y' | 'z',
   color: Color4,
-  segments = 40,
-  sweepAngle = Math.PI * 1.5,  // 270° — leaves one quadrant open
+  view: GizmoViewLocal,
 ): void {
-  const radius = 1.0;
-  const halfW  = 0.028;
-  const halfT  = 0.025;
-  const innerR = radius - halfW;
-  const outerR = radius + halfW;
+  // In-plane basis (same parametrisation the old washer used: x → (y,z), y → (x,z), z → (x,y)).
+  const u: [number, number, number] = axis === 'x' ? [0, 1, 0] : [1, 0, 0];
+  const v: [number, number, number] = axis === 'z' ? [0, 1, 0] : [0, 0, 1];
+  addCameraFacingCircle(verts, idxs, [0, 0, 0], u, v, 1, view, (p) => {
+    const k = ringFrontness(ringPointFacing(p, view));
+    const hw = RING_BACK_HALF_W + (RING_FRONT_HALF_W - RING_BACK_HALF_W) * k;
+    return [hw, [color[0], color[1], color[2], color[3] * (RING_BACK_ALPHA + (1 - RING_BACK_ALPHA) * k)]];
+  });
+}
 
-  const [ax, ay, az] = axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1];
-  const base = verts.length / 7;
+/**
+ * Faint outline of the gizmo sphere (its silhouette as seen from the camera) — anchors the 3D read of the
+ * rings. A guide only: not hit-tested. Perspective uses the true horizon circle of the unit sphere.
+ */
+function addGizmoSilhouette(verts: number[], idxs: number[], view: GizmoViewLocal): void {
+  const w = view.toCam;
+  const d = view.camPos ? Math.hypot(view.camPos[0], view.camPos[1], view.camPos[2]) : Infinity;
+  if (d <= 1.0001) return;   // camera inside the gizmo sphere: no silhouette
+  const off = Number.isFinite(d) ? 1 / d : 0;
+  const r = Math.sqrt(Math.max(0, 1 - off * off));
+  // Any orthonormal basis of the plane ⟂ toCam.
+  const ref: [number, number, number] = Math.abs(w[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  let u: [number, number, number] = [w[1] * ref[2] - w[2] * ref[1], w[2] * ref[0] - w[0] * ref[2], w[0] * ref[1] - w[1] * ref[0]];
+  const ul = Math.hypot(u[0], u[1], u[2]);
+  u = [u[0] / ul, u[1] / ul, u[2] / ul];
+  const v: [number, number, number] = [w[1] * u[2] - w[2] * u[1], w[2] * u[0] - w[0] * u[2], w[0] * u[1] - w[1] * u[0]];
+  addCameraFacingCircle(verts, idxs, [w[0] * off, w[1] * off, w[2] * off], u, v, r, view,
+    () => [SILHOUETTE_HALF_W, COL_SILHOUETTE]);
+}
 
-  for (let i = 0; i <= segments; i++) {
-    const theta = (i / segments) * sweepAngle;
-    const cos = Math.cos(theta);
-    const sin = Math.sin(theta);
-
-    let bx: number, by: number, bz: number;
-    if (axis === 'x')      { bx = 0; by = cos; bz = sin; }
-    else if (axis === 'y') { bx = cos; by = 0; bz = sin; }
-    else                   { bx = cos; by = sin; bz = 0; }
-
-    pushVert(verts, bx * innerR + ax * halfT, by * innerR + ay * halfT, bz * innerR + az * halfT, color);
-    pushVert(verts, bx * innerR - ax * halfT, by * innerR - ay * halfT, bz * innerR - az * halfT, color);
-    pushVert(verts, bx * outerR + ax * halfT, by * outerR + ay * halfT, bz * outerR + az * halfT, color);
-    pushVert(verts, bx * outerR - ax * halfT, by * outerR - ay * halfT, bz * outerR - az * halfT, color);
+/**
+ * Painter's sort: reorder the triangles in idxs[fromIdx…] far → near (by centroid distance to the camera;
+ * ortho: by centroid depth along the view axis). With depth-always + alpha blend this makes the nearer
+ * gizmo part win wherever two overlap on screen. Triangles are flat-coloured, so the order WITHIN one
+ * solid part is invisible — only the order between parts matters.
+ */
+export function sortGizmoTrianglesBackToFront(
+  verts: ArrayLike<number>,
+  idxs: number[],
+  view: GizmoViewLocal,
+  fromIdx = 0,
+): void {
+  const triCount = Math.floor((idxs.length - fromIdx) / 3);
+  if (triCount < 2) return;
+  const keys = new Float64Array(triCount);
+  const order = new Array<number>(triCount);
+  const cp = view.camPos, w = view.toCam;
+  for (let t = 0; t < triCount; t++) {
+    const i0 = idxs[fromIdx + t * 3] * 7, i1 = idxs[fromIdx + t * 3 + 1] * 7, i2 = idxs[fromIdx + t * 3 + 2] * 7;
+    const cx = (verts[i0] + verts[i1] + verts[i2]) / 3;
+    const cy = (verts[i0 + 1] + verts[i1 + 1] + verts[i2 + 1]) / 3;
+    const cz = (verts[i0 + 2] + verts[i1 + 2] + verts[i2 + 2]) / 3;
+    keys[t] = cp
+      ? (cx - cp[0]) ** 2 + (cy - cp[1]) ** 2 + (cz - cp[2]) ** 2   // farther from the eye = larger
+      : -(cx * w[0] + cy * w[1] + cz * w[2]);                       // farther along the view axis = larger
+    order[t] = t;
   }
-
-  for (let i = 0; i < segments; i++) {
-    const a = base + i * 4;
-    const b = a + 4;
-    idxs.push(a+0, a+2, b+0,  b+0, a+2, b+2);
-    idxs.push(a+1, b+1, a+3,  b+1, b+3, a+3);
-    idxs.push(a+2, a+3, b+2,  a+3, b+3, b+2);
-    idxs.push(a+0, b+0, a+1,  a+1, b+0, b+1);
+  order.sort((a, b) => keys[b] - keys[a] || a - b);   // far first; stable for ties
+  const src = idxs.slice(fromIdx, fromIdx + triCount * 3);
+  for (let k = 0; k < triCount; k++) {
+    const t = order[k];
+    idxs[fromIdx + k * 3]     = src[t * 3];
+    idxs[fromIdx + k * 3 + 1] = src[t * 3 + 1];
+    idxs[fromIdx + k * 3 + 2] = src[t * 3 + 2];
   }
 }
 
@@ -488,7 +666,11 @@ function addPlaneHandle(
 
 // ── Build full gizmo geometry ──────────────────────────────────────
 
-function buildGizmoGeometry(mode: GizmoMode, hovered: GizmoAxis, dragging: GizmoAxis = null): {
+/**
+ * Gizmo geometry in gizmo-local space. `view` (the camera in gizmo-local space) drives the rotate rings'
+ * near/far split and the painter's sort of every mode's triangles (so the nearer handle wins on overlap).
+ */
+export function buildGizmoGeometry(mode: GizmoMode, hovered: GizmoAxis, dragging: GizmoAxis, view: GizmoViewLocal): {
   verts: Float32Array;
   idxs: Uint32Array;
   vertCount: number;
@@ -501,6 +683,7 @@ function buildGizmoGeometry(mode: GizmoMode, hovered: GizmoAxis, dragging: Gizmo
   const cy = hovered === 'y' ? COL_HOVER : COL_Y;
   const cz = hovered === 'z' ? COL_HOVER : COL_Z;
 
+  let sortFrom = 0;
   if (mode === 'move') {
     addArrow(verts, idxs, 'x', cx);
     addArrow(verts, idxs, 'y', cy);
@@ -513,14 +696,18 @@ function buildGizmoGeometry(mode: GizmoMode, hovered: GizmoAxis, dragging: Gizmo
     addScaleCube(verts, idxs, 'y', cy);
     addScaleCube(verts, idxs, 'z', cz);
   } else {
-    // rotate — when actively dragging, show only the active arc
+    // rotate — faint sphere outline first (always underneath), then the rings (sorted below).
+    addGizmoSilhouette(verts, idxs, view);
+    sortFrom = idxs.length;
+    // When actively dragging, show only the active ring.
     const showX = dragging === null || dragging === 'x';
     const showY = dragging === null || dragging === 'y';
     const showZ = dragging === null || dragging === 'z';
-    if (showX) addRotateRing(verts, idxs, 'x', cx);
-    if (showY) addRotateRing(verts, idxs, 'y', cy);
-    if (showZ) addRotateRing(verts, idxs, 'z', cz);
+    if (showX) addRotateRing(verts, idxs, 'x', cx, view);
+    if (showY) addRotateRing(verts, idxs, 'y', cy, view);
+    if (showZ) addRotateRing(verts, idxs, 'z', cz, view);
   }
+  sortGizmoTrianglesBackToFront(verts, idxs, view, sortFrom);
 
   const vertCount = verts.length / 7;
   const idxCount  = idxs.length;
@@ -1011,12 +1198,15 @@ function hitAxisCylinder(
  */
 const HIT_RING_HALF_T = 0.10; // generous picking half-thickness (visual is 0.04)
 
-function hitRotateRing(
-  lO: vec3,
-  lD: vec3,
+export function hitRotateRing(
+  lO: ArrayLike<number>,
+  lD: ArrayLike<number>,
   axis: 'x' | 'y' | 'z',
   /** TOUCH-8 hit-radius multiplier: widens the washer + its wall thickness (1 = the mouse band). */
   hs = 1,
+  /** Camera in gizmo-local space. When given, only hits on the ring's NEAR half count (the far half is drawn
+   *  thin + dim and must not be grabbed through the sphere) — same facing test as the drawing. */
+  view: GizmoViewLocal | null = null,
 ): number | null {
   const ringInner = 1 - (1 - HIT_RING_INNER) * hs;
   const ringOuter = 1 + (HIT_RING_OUTER - 1) * hs;
@@ -1025,8 +1215,18 @@ function hitRotateRing(
   const [c0, c1] = axis === 'x' ? [1, 2] : axis === 'y' ? [0, 2] : [0, 1];
 
   let bestT: number | null = null;
+  const ringPt = [0, 0, 0];
   const tryT = (t: number) => {
-    if (t > 1e-4 && (bestT === null || t < bestT)) bestT = t;
+    if (!(t > 1e-4 && (bestT === null || t < bestT))) return;
+    if (view) {
+      // The ring point under the hit: the hit's in-plane direction at radius 1 (axis component 0).
+      const px = lO[c0] + t * lD[c0], py = lO[c1] + t * lD[c1];
+      const r = Math.hypot(px, py);
+      if (r < 1e-9) return;
+      ringPt[c0] = px / r; ringPt[c1] = py / r; ringPt[axIdx] = 0;
+      if (!isRingPointFront(ringPt, view)) return;
+    }
+    bestT = t;
   };
 
   // Test 1: ring faces (face-on view) — plane intersection at axis_coord=0
@@ -1895,8 +2095,9 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     uData.set(model as Float32Array, 16);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uData);
 
-    // Build and upload gizmo geometry
-    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry(mode, hovered, dragging);
+    // Build and upload gizmo geometry (camera in gizmo-local space → ring near/far split + painter's order)
+    const view = GizmoRenderer.viewLocal(camera, model);
+    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry(mode, hovered, dragging, view);
     if (idxCount === 0) return;
 
     this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
@@ -2216,10 +2417,11 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
         tryHit('yz', hitPlane(lO, lD, 'yz', hs));
       }
     } else {
-      // rotate
-      tryHit('x', hitRotateRing(lO, lD, 'x', hs));
-      tryHit('y', hitRotateRing(lO, lD, 'y', hs));
-      tryHit('z', hitRotateRing(lO, lD, 'z', hs));
+      // rotate — near halves only (the far halves are drawn thin + dim and aren't grabbable)
+      const view = GizmoRenderer.viewLocal(camera, model, invModel);
+      tryHit('x', hitRotateRing(lO, lD, 'x', hs, view));
+      tryHit('y', hitRotateRing(lO, lD, 'y', hs, view));
+      tryHit('z', hitRotateRing(lO, lD, 'z', hs, view));
     }
 
     return bestAxis;
@@ -2367,6 +2569,12 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
   // ── Helpers ────────────────────────────────────────────────────
 
+  /** The camera in gizmo-local space for a gizmo model matrix (pass its inverse when already computed). */
+  static viewLocal(camera: Camera3D, model: mat4, invModel?: mat4 | null): GizmoViewLocal {
+    const inv = invModel ?? mat4.invert(mat4.create(), model) ?? mat4.create();
+    return computeGizmoViewLocal(camera.mode, camera.position, camera.target, inv);
+  }
+
   /** Extract pure rotation matrix from a mesh's localMatrix (strips scale and translation). */
   private extractRotationMatrix(mesh: Mesh3D): mat4 {
     const mm = mesh.localMatrix as unknown as Float32Array;
@@ -2414,7 +2622,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     uData.set(model as Float32Array, 16);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uData);
 
-    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry('move', hovered, dragging);
+    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry('move', hovered, dragging, GizmoRenderer.viewLocal(camera, model));
     if (idxCount === 0) return;
 
     this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
@@ -2486,7 +2694,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     uData.set(model as Float32Array, 16);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uData);
 
-    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry('rotate', hovered, dragging);
+    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry('rotate', hovered, dragging, GizmoRenderer.viewLocal(camera, model));
     if (idxCount === 0) return;
 
     this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
@@ -2527,9 +2735,10 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     }
 
     const hs = this.hitScale;   // TOUCH-8: ×2 under a finger
-    tryHit('x', hitRotateRing(lO, lD, 'x', hs));
-    tryHit('y', hitRotateRing(lO, lD, 'y', hs));
-    tryHit('z', hitRotateRing(lO, lD, 'z', hs));
+    const view = GizmoRenderer.viewLocal(camera, model, invModel);   // near halves only (matches the drawing)
+    tryHit('x', hitRotateRing(lO, lD, 'x', hs, view));
+    tryHit('y', hitRotateRing(lO, lD, 'y', hs, view));
+    tryHit('z', hitRotateRing(lO, lD, 'z', hs, view));
 
     return bestAxis;
   }
