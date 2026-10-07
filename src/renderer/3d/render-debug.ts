@@ -62,6 +62,11 @@ export type RenderDebugFlags = {
   noTextures: boolean;
   /** Mesh fragment shader: solid magenta. Garbage that remains is geometry / depth / raster, not shading. */
   solidMesh: boolean;
+  /** Mesh fragment shader: solid mid grey (0.5, 0.5, 0.5). With solidWhite: does the remaining garbage depend on the
+   *  colour value (rainbow on grey but not on magenta = per-channel noise that clips away at 0 / 1)? */
+  solidGrey: boolean;
+  /** Mesh fragment shader: solid white (1, 1, 1). */
+  solidWhite: boolean;
   /** Mesh fragment shader: the flat per-object (instance) index as a colour; one solid colour per object when healthy,
    *  red where the index is past the end of the instance buffer. */
   dbgInstanceIndex: boolean;
@@ -69,6 +74,22 @@ export type RenderDebugFlags = {
   dbgInstanceZero: boolean;
   /** Mesh fragment shader: the colour computed in the vertex stage (no fragment-side instance read). */
   dbgVertexColour: boolean;
+  /** Mesh fragment shader: the interpolated world normal varying as a colour (n * 0.5 + 0.5, not renormalised). One
+   *  flat colour per cube face when healthy; noise = the normal varying itself is bad (the lit path is the only reader
+   *  of it, so noLighting cannot tell bad maths from a bad varying). */
+  dbgNormal: boolean;
+  /** Mesh fragment shader, lit path: paint NaN / Inf pixels bright GREEN and out-of-range ones (> 4 or < -0.01) bright
+   *  CYAN. Tests the unclamped lit colour and the final colour; combines with every other switch. */
+  dbgNanCheck: boolean;
+  /** Mesh fragment shader, lit path: guard the operations whose result is undefined for some inputs (normalize of a
+   *  zero vector, pow of a negative base, unit-vector dots past 1, a zero-width smoothstep) with defined
+   *  equivalents. A fix CANDIDATE: off = today's maths exactly. */
+  safeLightingMath: boolean;
+  /** Mesh fragment shader (shadow-receiving pipelines): skip the sun-shadow receive (shadow multiplier 1). */
+  noShadowReceive: boolean;
+  /** Mesh fragment shader (shadow-receiving pipelines): output the raw shadow factor as grey; red = above 1,
+   *  blue = below 0, green = NaN / Inf. */
+  dbgShadowFactor: boolean;
   /** Every 3D pass that LOADS depth / stencil clears it instead (overlays lose depth occlusion). */
   clearDepthStencilLoads: boolean;
   /** Every 3D pass that LOADS colour clears it instead. Breaks the picture (an overlay pass wipes the scene); the point
@@ -83,12 +104,19 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'forceFullRes', label: 'Force full resolution (no lo-res / TAA)' },
   { key: 'forceOpaqueAlpha', label: 'Opaque canvas alpha' },
   { key: 'solidMesh', label: 'Solid magenta meshes' },
+  { key: 'solidGrey', label: 'Solid grey meshes' },
+  { key: 'solidWhite', label: 'Solid white meshes' },
   { key: 'noTextures', label: 'No mesh textures (constant colour)' },
   { key: 'dbgInstanceIndex', label: 'Mesh colour = object index' },
   { key: 'dbgInstanceZero', label: 'Mesh colour = first object (fixed read)' },
   { key: 'dbgVertexColour', label: 'Mesh colour = vertex stage' },
+  { key: 'dbgNormal', label: 'Mesh colour = world normal' },
   { key: 'clampTexLayers', label: 'Clamp texture layer indices' },
   { key: 'noLighting', label: 'No mesh lighting (unlit)' },
+  { key: 'dbgNanCheck', label: 'Highlight NaN / Inf pixels' },
+  { key: 'safeLightingMath', label: 'Safe lighting math' },
+  { key: 'noShadowReceive', label: 'No shadow receive' },
+  { key: 'dbgShadowFactor', label: 'Mesh colour = shadow factor' },
   { key: 'noMeshEditOverlays', label: 'No mesh-edit / UV-paint overlays' },
   { key: 'noRearEdges', label: 'No mesh-edit rear edges' },
   { key: 'noBackground3D', label: 'No 3D background (focus bg)' },
@@ -170,18 +198,24 @@ export function setRenderDebug(patch: Partial<RenderDebugFlags> & { reset?: bool
 export function getRenderDebug(): RenderDebugFlags { return { ...RD.f }; }
 
 /** The mesh fragment shader debug mode (IBLUniforms.dbgShade): 0 = off, 1 = unlit, 2 = constant colour, 3 = magenta,
- *  4 = instance index colour, 5 = instance 0's colour, 6 = vertex-stage colour. */
+ *  4 = instance index colour, 5 = instance 0's colour, 6 = vertex-stage colour, 7 = solid grey, 8 = solid white,
+ *  9 = world normal colour. One mode at a time: the solid colours win, then the read tests, then unlit. */
 export function renderDebugShadeMode(): number {
   if (!RD.on) return 0;
   const f = RD.f;
-  return f.solidMesh ? 3 : f.dbgInstanceIndex ? 4 : f.dbgInstanceZero ? 5 : f.dbgVertexColour ? 6
+  return f.solidMesh ? 3 : f.solidWhite ? 8 : f.solidGrey ? 7
+    : f.dbgInstanceIndex ? 4 : f.dbgInstanceZero ? 5 : f.dbgVertexColour ? 6 : f.dbgNormal ? 9
     : f.noTextures ? 2 : f.noLighting ? 1 : 0;
 }
 
-/** The mesh fragment shader debug bits (IBLUniforms.dbgFlags): 1 = clamp the texture-array layer indices. */
+/** The mesh fragment shader debug bits (IBLUniforms.dbgFlags): 1 = clamp the texture-array layer indices,
+ *  2 = NaN / Inf highlight (dbgNanCheck), 4 = safe lighting maths (safeLightingMath), 8 = no shadow receive,
+ *  16 = shadow factor as colour. */
 export function renderDebugShaderBits(): number {
   if (!RD.on) return 0;
-  return RD.f.clampTexLayers ? 1 : 0;
+  const f = RD.f;
+  return (f.clampTexLayers ? 1 : 0) | (f.dbgNanCheck ? 2 : 0) | (f.safeLightingMath ? 4 : 0)
+    | (f.noShadowReceive ? 8 : 0) | (f.dbgShadowFactor ? 16 : 0);
 }
 
 /** The canvas context alpha mode: 'premultiplied' (the default), 'opaque' under forceOpaqueAlpha. */

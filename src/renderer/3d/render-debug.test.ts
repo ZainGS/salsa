@@ -126,6 +126,18 @@ describe('render debug flag set', () => {
         setRenderDebug({ dbgInstanceIndex: true }); expect(renderDebugShadeMode()).toBe(4);
         setRenderDebug({ solidMesh: true }); expect(renderDebugShadeMode()).toBe(3);
         setRenderDebug({ clampTexLayers: true }); expect(renderDebugShaderBits()).toBe(1);
+        setRenderDebug({ reset: true, dbgNormal: true }); expect(renderDebugShadeMode()).toBe(9);
+        setRenderDebug({ dbgVertexColour: true }); expect(renderDebugShadeMode()).toBe(6);   // the read tests beat the normal
+        setRenderDebug({ solidGrey: true }); expect(renderDebugShadeMode()).toBe(7);
+        setRenderDebug({ solidWhite: true }); expect(renderDebugShadeMode()).toBe(8);   // white beats grey
+        setRenderDebug({ solidMesh: true }); expect(renderDebugShadeMode()).toBe(3);    // magenta beats both
+        setRenderDebug({ reset: true, dbgNanCheck: true }); expect(renderDebugShaderBits()).toBe(2);
+        expect(renderDebugShadeMode()).toBe(0);   // the bits are independent of the shading mode
+        setRenderDebug({ safeLightingMath: true }); expect(renderDebugShaderBits()).toBe(6);
+        setRenderDebug({ clampTexLayers: true, dbgNanCheck: false }); expect(renderDebugShaderBits()).toBe(5);
+        setRenderDebug({ reset: true, noShadowReceive: true }); expect(renderDebugShaderBits()).toBe(8);
+        setRenderDebug({ dbgShadowFactor: true }); expect(renderDebugShaderBits()).toBe(24);
+        setRenderDebug({ reset: true });
         setRenderDebug({ clearColorLoads: true }); expect(rdColorLoad()).toBe('clear'); expect(rdDepthLoad()).toBe('load');
         setRenderDebug({ clearDepthStencilLoads: true }); expect(rdDepthLoad()).toBe('clear');
         setRenderDebug({ forceOpaqueAlpha: true }); expect(rdCanvasAlphaMode()).toBe('opaque');
@@ -241,6 +253,44 @@ describe('render debug in the mesh fragment shaders', () => {
             expect(src.match(/if \(ibl\.dbgShade > 1\.5\) \{/g)?.length, name).toBe(1);
             expect(src.match(/if \(ibl\.dbgShade > 0\.5\) \{/g)?.length, name).toBe(1);
             expect(src.includes('return vec4<f32>(1.0, 0.0, 1.0, 1.0);'), name).toBe(true);
+        }
+    });
+
+    it('solid grey / white / world-normal modes sit in the uniform early block; NaN check wraps every lit return', () => {
+        for (const [name, src] of fragments) {
+            expect(src, name).toContain('if (dbgM == 7u) { return vec4<f32>(0.5, 0.5, 0.5, 1.0); }');
+            expect(src, name).toContain('if (dbgM == 8u) { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }');
+            expect(src, name).toContain('if (dbgM == 9u) { return dbgFinal(vec4<f32>(worldNormal * 0.5 + 0.5, 1.0), 0u); }');
+            // the early block (modes 2-9) comes before every texture sample / derivative of the normal path
+            const early = src.indexOf('if (ibl.dbgShade > 1.5) {');
+            const fsMain = src.indexOf('fn fs_main(');
+            expect(early, name).toBeGreaterThan(fsMain);
+            const firstSampleInMain = src.slice(fsMain).search(/textureSample|fwidth\(|dpdx\(|patternMask\(|windowsPattern\(|gr_uvMetres\(|uvWorldAxes\(/);
+            expect(firstSampleInMain, name).toBeGreaterThan(-1);
+            expect(early, name).toBeLessThan(fsMain + firstSampleInMain);
+            // ONE lit return, through dbgFinal with the pre-clamp state; no bare return of the lit colour is left
+            expect(src.match(/return dbgFinal\(finalColor, rdPre\);/g)?.length, name).toBe(1);
+            expect(src.includes('return finalColor;'), name).toBe(false);
+            expect(src, name).toContain('if ((u32(ibl.dbgFlags) & 2u) != 0u) { rdPre = rdState(vec4<f32>(lit, 1.0)); }');
+            // NaN / Inf is detected on the exponent bits (a self-compare may be folded away)
+            expect(src, name).toContain('bitcast<vec4<u32>>(v) & vec4<u32>(0x7f800000u)');
+            expect(src, name).toMatch(/fn dbgFinal\(c: vec4<f32>, pre: u32\) -> vec4<f32> \{\s*if \(\(u32\(ibl\.dbgFlags\) & 2u\) == 0u\) \{ return c; \}/);
+        }
+    });
+
+    it('safeLightingMath is read only through select() (off = the original maths, never a branch)', () => {
+        for (const [name, src] of fragments) {
+            expect(src, name).toContain('var<private> rdSafeMath: bool = false;');
+            expect(src.match(/rdSafeMath = \(u32\(ibl\.dbgFlags\) & 4u\) != 0u;/g)?.length, name).toBe(1);
+            const uses = src.split(/\r?\n/).filter((l) => l.includes('rdSafeMath') && !l.trim().startsWith('//')
+                && !l.includes('var<private> rdSafeMath') && !/rdSafeMath = \(u32/.test(l));
+            expect(uses.length, name).toBeGreaterThanOrEqual(3);   // rdPow, rdNormalize, rdDot01 (+ the cascade band in the shadow variants)
+            for (const l of uses) expect(l, name).toMatch(/select\(.*rdSafeMath\)/);
+            // the guarded sites of the default PBR path use the helpers
+            expect(src, name).toContain('var N = rdNormalize(worldNormal);');
+            expect(src, name).toContain('let H     = rdNormalize(L + V);');
+            expect(src, name).toContain('let NdotH = rdDot01(N, H);');
+            expect(src, name).toContain('let rimF = rdPow(1.0 - max(dot(N, V), 0.0), 3.0);');
         }
     });
 

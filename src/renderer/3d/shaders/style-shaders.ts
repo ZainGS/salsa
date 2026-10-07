@@ -13,6 +13,25 @@
 
 export const STYLE_WGSL_FUNCTIONS = /* wgsl */ `
 
+// RENDER DEBUG safeLightingMath (render-debug.ts; ibl.dbgFlags bit 2 = value 4). The mesh fragment shaders set this
+// at the top of fs_main; every other module that splices these functions leaves it false, which keeps the original
+// maths. Used ONLY through select(), so it never shapes control flow (uniformity) and off = exactly today's result.
+var<private> rdSafeMath: bool = false;
+// pow with a base that may dip below 0 by rounding (1 - dot of unit vectors): pow(x, y) is undefined for x < 0
+// (often exp2(y * log2(x)) = NaN on mobile GPUs, while desktop compilers expand small integer powers to x * x * x).
+fn rdPow(x: f32, y: f32) -> f32 {
+  return select(pow(x, y), pow(max(x, 1e-6), y), rdSafeMath);
+}
+// normalize of a vector that may be (near) zero: normalize(0) is undefined (NaN / Inf on some GPUs).
+fn rdNormalize(v: vec3<f32>) -> vec3<f32> {
+  return select(normalize(v), v * inverseSqrt(max(dot(v, v), 1e-12)), rdSafeMath);
+}
+// a dot of two unit vectors, which rounding can push a few ulp past 1; safe mode clamps it into 0..1.
+fn rdDot01(a: vec3<f32>, b: vec3<f32>) -> f32 {
+  let d = max(dot(a, b), 0.0);
+  return select(d, min(d, 1.0), rdSafeMath);
+}
+
 // ── Cel shading ──────────────────────────────────────────────────
 // Stepped diffuse (3 bands) + hard specular cutoff → cartoon / anime look.
 fn cel_lighting(
@@ -26,7 +45,7 @@ fn cel_lighting(
     let NdotL   = max(dot(N, L), 0.0);
     let stepped = floor(NdotL * 3.0 + 0.01) / 3.0;   // 3 hard bands: shadow / mid / lit
     lit += diffuse * lightRgb * lightI * stepped;
-    let H    = normalize(L + V);
+    let H    = rdNormalize(L + V);
     let spec = step(0.97, pow(max(dot(N, H), 0.0), max(shininess, 1.0)));
     lit += specular * lightRgb * spec;
     lit += emissive;
@@ -47,7 +66,7 @@ fn cel_hd_lighting(
     let NdotL   = max(dot(N, L), 0.0);
     let stepped = floor(NdotL * 3.0 + 0.01) / 3.0;             // same 3 hard diffuse bands as cel
     lit += diffuse * lightRgb * lightI * stepped;
-    let H    = normalize(L + V);
+    let H    = rdNormalize(L + V);
     let spec = pow(max(dot(N, H), 0.0), max(shininess, 1.0));  // SMOOTH highlight (no hard step) → glossy
     lit += specular * lightRgb * spec * step(0.0001, NdotL);   // only on the lit side
     lit += emissive;
@@ -86,7 +105,7 @@ fn toon_lighting(
     let sl     = dot(shadow, vec3<f32>(0.2126, 0.7152, 0.0722));
     shadow     = max(mix(vec3<f32>(sl), shadow, 1.0 + sat), vec3<f32>(0.0));
     var lit    = mix(shadow, diffuse, band) * (ambientRgb * ambientI + lightRgb * lightI);
-    let H      = normalize(L + V);
+    let H      = rdNormalize(L + V);
     let sp     = pow(max(dot(N, H), 0.0), max(shininess, 1.0));
     if (hdSpec) { lit += specular * lightRgb * sp * step(0.0001, NdotL); }
     else        { lit += specular * lightRgb * step(0.97, sp); }
@@ -100,7 +119,7 @@ fn toon_lighting(
 fn rim_param(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, rp: vec4<f32>) -> vec3<f32> {
     let edge = 1.0 - max(dot(N, V), 0.0);
     let w    = clamp(rp.y, 0.02, 1.0);
-    let soft = pow(edge, mix(8.0, 1.5, w));
+    let soft = rdPow(edge, mix(8.0, 1.5, w));
     let hard = smoothstep(1.0 - w - 0.03, 1.0 - w + 0.03, edge);
     let m    = mix(soft, hard, clamp(rp.z, 0.0, 1.0));
     let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
@@ -162,7 +181,7 @@ fn ink_lighting(
     // Rim darkening at silhouette (where N·V → 0)
     let NdotV    = max(dot(N, V), 0.0);
     let rim      = 1.0 - NdotV;
-    let rimFactor = pow(rim, 4.0);
+    let rimFactor = rdPow(rim, 4.0);
     base = mix(base, diffuse * 0.05, rimFactor);
 
     return base;
@@ -199,7 +218,7 @@ fn cd_lighting(
         rainbow = rainbow + spectral_zucconi6(uu * 2400.0 / f32(k));
     }
     rainbow = clamp(rainbow, vec3<f32>(0.0), vec3<f32>(1.0));
-    let fres = pow(1.0 - abs(dot(N, V)), 3.0);
+    let fres = rdPow(1.0 - abs(dot(N, V)), 3.0);
     var col = vec3<f32>(0.26, 0.28, 0.33);
     col = col + pow(max(0.0, dot(reflect(-L, N), V)), 24.0) * 0.5;   // specular glint
     col = col + fres * 0.18;

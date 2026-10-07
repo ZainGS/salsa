@@ -51,12 +51,29 @@ struct IBLUniforms {
   ssrDepthPeel: f32,                 // 1 = backface-fill uses the depth-peel BACK layer (volume membership test)
   ssrFallbackShadow: f32,            // silhouette-solidify strength 0..1 (0 = off) - back-layer borrowing opacity
   ssrDeferred: f32,                  // 1 = sample the half-res resolve pass result (Stage 3b); 0 = inline trace
-  dbgShade: f32,                     // RENDER DEBUG (render-debug.ts): 0 = off, 1 = unlit, 2 = constant colour, 3 = magenta
-  dbgFlags: f32,                     // RENDER DEBUG bits (render-debug.ts): 1 = clamp the texture-array layer indices
+  dbgShade: f32,                     // RENDER DEBUG (render-debug.ts): 0 = off, 1 = unlit, 2 = constant colour, 3 = magenta, 4-6 read tests, 7 grey, 8 white, 9 normal
+  dbgFlags: f32,                     // RENDER DEBUG bits (render-debug.ts): 1 = clamp the texture-array layer indices, 2 = NaN / Inf highlight, 4 = safe lighting maths
   _fpad5: f32,
 };
 
 @group(0) @binding(2) var<uniform> ibl: IBLUniforms;
+
+// RENDER DEBUG dbgNanCheck (render-debug.ts; ibl.dbgFlags value 2): the lit path's final colour goes through dbgFinal.
+// NaN / Inf is tested on the BITS (exponent all ones), never with x != x, which a compiler may fold to false.
+// rdState: 0 = fine, 1 = out of range (a channel above 4 or below -0.01), 2 = NaN or Inf in any channel.
+fn rdState(v: vec4<f32>) -> u32 {
+  let e = bitcast<vec4<u32>>(v) & vec4<u32>(0x7f800000u);
+  let nonFinite = any(e == vec4<u32>(0x7f800000u));
+  let outOfRange = any(v > vec4<f32>(4.0)) || any(v < vec4<f32>(-0.01));
+  return select(select(0u, 1u, outOfRange), 2u, nonFinite);
+}
+// Off (bit clear, a uniform test): returns c untouched. On: GREEN where c or the earlier state pre (rdState of the
+// unclamped lit colour, 0 when not measured) is NaN / Inf, CYAN where it is only out of range.
+fn dbgFinal(c: vec4<f32>, pre: u32) -> vec4<f32> {
+  if ((u32(ibl.dbgFlags) & 2u) == 0u) { return c; }
+  let st = max(pre, rdState(c));
+  return select(select(c, vec4<f32>(0.0, 1.0, 1.0, 1.0), st == 1u), vec4<f32>(0.0, 1.0, 0.0, 1.0), st == 2u);
+}
 // Prefiltered specular environment (P1b): the sky convolved with the GGX lobe per roughness (mip chain), + the
 // environment-independent split-sum BRDF LUT (rg = scale, bias). Sampled with EXPLICIT LOD (textureSampleLevel) so
 // the specular branch stays uniformity-safe inside envSpecular's non-uniform call site. 1x1 dummies when not baked.
@@ -3011,6 +3028,9 @@ fn fs_main(
   // Modes 4-6 localise the RENDER-1 rainbow (constant colour = mode 2 still shows it, magenta = mode 3 does not):
   // 4 = the flat instance index as a colour (red = past the end of u_instances), 5 = instance 0's colour (constant
   // index: is the storage read itself bad?), 6 = the vertex-stage colour (smooth varyings, no fragment-side read).
+  // RENDER DEBUG safeLightingMath (ibl.dbgFlags value 4; rdSafeMath is declared with rdPow / rdNormalize in
+  // STYLE_WGSL_FUNCTIONS). Read only through select(), so off keeps every result exactly as before.
+  rdSafeMath = (u32(ibl.dbgFlags) & 4u) != 0u;
   if (ibl.dbgShade > 1.5) {
     let dbgM = u32(ibl.dbgShade + 0.5);
     if (dbgM == 3u) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
@@ -3022,6 +3042,11 @@ fn fs_main(
     }
     if (dbgM == 5u) { return vec4<f32>(u_instances[0].diffuseColor.rgb, 1.0); }
     if (dbgM == 6u) { return vec4<f32>(gouraudColor.rgb, 1.0); }
+    // 7 / 8 = solid grey / white (does the rainbow depend on the colour value?); 9 = the raw interpolated world normal
+    // (one flat colour per cube face when healthy; through dbgFinal, so with dbgNanCheck on a NaN normal is green).
+    if (dbgM == 7u) { return vec4<f32>(0.5, 0.5, 0.5, 1.0); }
+    if (dbgM == 8u) { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }
+    if (dbgM == 9u) { return dbgFinal(vec4<f32>(worldNormal * 0.5 + 0.5, 1.0), 0u); }
     return vec4<f32>(inst.diffuseColor.rgb, 1.0);
   }
 
@@ -3029,7 +3054,7 @@ fn fs_main(
 
   let L = normalize(-scene.lightDirection.xyz);
   // Orthographic view = PARALLEL rays: constant camera forward instead of a finite eye (see the worldPos4 site).
-  let V = select(normalize(scene.cameraPosition.xyz - worldPos), -normalize(vec3<f32>(scene.viewProjection[0].z, scene.viewProjection[1].z, scene.viewProjection[2].z)), scene.cameraPosition.w > 0.5);
+  let V = select(rdNormalize(scene.cameraPosition.xyz - worldPos), -normalize(vec3<f32>(scene.viewProjection[0].z, scene.viewProjection[1].z, scene.viewProjection[2].z)), scene.cameraPosition.w > 0.5);
 
   // PS1 affine texture mapping — blend perspective-correct uv toward the
   // non-perspective (linear) uvAffine by affineStrength, so textures warp on
@@ -3112,10 +3137,10 @@ fn fs_main(
   }
 
   // Resolve surface normal
-  var N = normalize(worldNormal);
+  var N = rdNormalize(worldNormal);
   if (hasNormalMap) {
     let mapN = normalSample.xyz * 2.0 - 1.0;
-    N = normalize(worldTangent * mapN.x + worldBitangent * mapN.y + worldNormal * mapN.z);
+    N = rdNormalize(worldTangent * mapN.x + worldBitangent * mapN.y + worldNormal * mapN.z);
   }
 
   // PATTERN RELIEF + GRAIN (modes 1-6): a micro normal perturbation from the procedural mask gradient so seams
@@ -3398,11 +3423,11 @@ fn fs_main(
     let albedo    = patBase;
     let F0        = mix(vec3<f32>(0.04), albedo, metalness);
 
-    let H     = normalize(L + V);
-    let NdotL = max(dot(N, L), 0.0);
-    let NdotV = max(dot(N, V), 0.0);
-    let NdotH = max(dot(N, H), 0.0);
-    let HdotV = max(dot(H, V), 0.0);
+    let H     = rdNormalize(L + V);
+    let NdotL = rdDot01(N, L);
+    let NdotV = rdDot01(N, V);
+    let NdotH = rdDot01(N, H);
+    let HdotV = rdDot01(H, V);
 
     let D  = D_GGX(NdotH, roughness);
     let G  = G_Smith(NdotV, NdotL, roughness);
@@ -3451,7 +3476,7 @@ fn fs_main(
   if (hairSheen) {
     let tl = length(worldTangent);
     let strandT = worldTangent / max(tl, 1e-4);
-    let Hs   = normalize(L + V);
+    let Hs   = rdNormalize(L + V);
     let tDotH = dot(strandT, Hs);
     let sinTH = sqrt(max(0.0, 1.0 - tDotH * tDotH));
     let sheenAmt = pow(sinTH, max(1.0, inst.specularColor.a)) * max(dot(N, L), 0.0);
@@ -3466,7 +3491,7 @@ fn fs_main(
       // Parameterised rim (setRimLight3D): width / hardness / colour — a crisp toon edge light.
       lit = lit + rim_param(N, V, L, scene.rimParams);
     } else {
-      let rimF = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+      let rimF = rdPow(1.0 - max(dot(N, V), 0.0), 3.0);
       let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
       lit = lit + rimF * backlit * 0.42 * scene.lightColor.rgb;
     }
@@ -3487,7 +3512,7 @@ fn fs_main(
   if (sparkleOn || starSparkle) {
     var spk = 0.0;
     if (starSparkle) { spk = sparkleStar(worldPos, N, scene.ps1Config2.z, 45.0); }          // ✦ anime star bling
-    else             { spk = sparkleGlint(worldPos, N, normalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
+    else             { spk = sparkleGlint(worldPos, N, rdNormalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
     lit = lit + spk * scene.lightColor.rgb * scene.lightDirection.w * 3.5;
   }
 
@@ -3511,7 +3536,7 @@ fn fs_main(
       let att = clamp(1.0 - d / max(lp.w, 1e-3), 0.0, 1.0);
       let ndl = max(dot(N, dv / max(d, 1e-4)), 0.0);
       plAdd = plAdd + lc.rgb * (lc.a * att * att * (0.3 + 0.7 * ndl));
-      let plH = normalize(dv / max(d, 1e-4) + V);
+      let plH = rdNormalize(dv / max(d, 1e-4) + V);
       plSpec = plSpec + lc.rgb * (lc.a * att * pow(max(dot(N, plH), 0.0), 48.0) * plGloss * 1.6);
     }
     plPost = patBase * plAdd + plSpec;
@@ -3519,6 +3544,10 @@ fn fs_main(
   //__SHADOW_APPLY__
   lit = lit + plPost;   // lamp light is never sun/moon-shadowed (see the point-light block)
 
+  // RENDER DEBUG dbgNanCheck (ibl.dbgFlags value 2): also test the UNCLAMPED lit colour - clamp() of a NaN is
+  // indeterminate (0, 1 or NaN depending on the GPU), so the final colour alone can hide it. Uniform branch.
+  var rdPre = 0u;
+  if ((u32(ibl.dbgFlags) & 2u) != 0u) { rdPre = rdState(vec4<f32>(lit, 1.0)); }
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
 
   if (hasTexture && !texOverBase && renderStyle != 7u) {   // texOverBase already composited pre-lighting; cd (7)
@@ -3580,7 +3609,7 @@ fn fs_main(
       finalColor = vec4<f32>(quantizeColor(finalColor.rgb, cd), finalColor.a);
     }
   }
-  return finalColor;
+  return dbgFinal(finalColor, rdPre);
 }
 `;
 
@@ -3922,6 +3951,9 @@ fn fs_main(
   // Modes 4-6 localise the RENDER-1 rainbow (constant colour = mode 2 still shows it, magenta = mode 3 does not):
   // 4 = the flat instance index as a colour (red = past the end of u_instances), 5 = instance 0's colour (constant
   // index: is the storage read itself bad?), 6 = the vertex-stage colour (smooth varyings, no fragment-side read).
+  // RENDER DEBUG safeLightingMath (ibl.dbgFlags value 4; rdSafeMath is declared with rdPow / rdNormalize in
+  // STYLE_WGSL_FUNCTIONS). Read only through select(), so off keeps every result exactly as before.
+  rdSafeMath = (u32(ibl.dbgFlags) & 4u) != 0u;
   if (ibl.dbgShade > 1.5) {
     let dbgM = u32(ibl.dbgShade + 0.5);
     if (dbgM == 3u) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
@@ -3933,6 +3965,11 @@ fn fs_main(
     }
     if (dbgM == 5u) { return vec4<f32>(u_instances[0].diffuseColor.rgb, 1.0); }
     if (dbgM == 6u) { return vec4<f32>(gouraudColor.rgb, 1.0); }
+    // 7 / 8 = solid grey / white (does the rainbow depend on the colour value?); 9 = the raw interpolated world normal
+    // (one flat colour per cube face when healthy; through dbgFinal, so with dbgNanCheck on a NaN normal is green).
+    if (dbgM == 7u) { return vec4<f32>(0.5, 0.5, 0.5, 1.0); }
+    if (dbgM == 8u) { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }
+    if (dbgM == 9u) { return dbgFinal(vec4<f32>(worldNormal * 0.5 + 0.5, 1.0), 0u); }
     return vec4<f32>(inst.diffuseColor.rgb, 1.0);
   }
 
@@ -3998,8 +4035,8 @@ fn fs_main(
 
   let L = normalize(-scene.lightDirection.xyz);
   // Orthographic view = PARALLEL rays: constant camera forward instead of a finite eye (see the worldPos4 site).
-  let V = select(normalize(scene.cameraPosition.xyz - worldPos), -normalize(vec3<f32>(scene.viewProjection[0].z, scene.viewProjection[1].z, scene.viewProjection[2].z)), scene.cameraPosition.w > 0.5);
-  var N = normalize(worldNormal);
+  let V = select(rdNormalize(scene.cameraPosition.xyz - worldPos), -normalize(vec3<f32>(scene.viewProjection[0].z, scene.viewProjection[1].z, scene.viewProjection[2].z)), scene.cameraPosition.w > 0.5);
+  var N = rdNormalize(worldNormal);
 
   // PATTERN RELIEF + GRAIN (modes 1-6, incl. window-reveal groove) — see the main FS for the rationale.
   if (patMode >= 1u && patMode <= 6u) {
@@ -4234,11 +4271,11 @@ fn fs_main(
     let albedo    = patBase;
     let F0        = mix(vec3<f32>(0.04), albedo, metalness);
 
-    let H     = normalize(L + V);
-    let NdotL = max(dot(N, L), 0.0);
-    let NdotV = max(dot(N, V), 0.0);
-    let NdotH = max(dot(N, H), 0.0);
-    let HdotV = max(dot(H, V), 0.0);
+    let H     = rdNormalize(L + V);
+    let NdotL = rdDot01(N, L);
+    let NdotV = rdDot01(N, V);
+    let NdotH = rdDot01(N, H);
+    let HdotV = rdDot01(H, V);
 
     let D  = D_GGX(NdotH, roughness);
     let G  = G_Smith(NdotV, NdotL, roughness);
@@ -4289,7 +4326,7 @@ fn fs_main(
       // Parameterised rim (setRimLight3D): width / hardness / colour — a crisp toon edge light.
       lit = lit + rim_param(N, V, L, scene.rimParams);
     } else {
-      let rimF = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+      let rimF = rdPow(1.0 - max(dot(N, V), 0.0), 3.0);
       let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
       lit = lit + rimF * backlit * 0.42 * scene.lightColor.rgb;
     }
@@ -4308,7 +4345,7 @@ fn fs_main(
   if (sparkleOn || starSparkle) {
     var spk = 0.0;
     if (starSparkle) { spk = sparkleStar(worldPos, N, scene.ps1Config2.z, 45.0); }          // ✦ anime star bling
-    else             { spk = sparkleGlint(worldPos, N, normalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
+    else             { spk = sparkleGlint(worldPos, N, rdNormalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
     lit = lit + spk * scene.lightColor.rgb * scene.lightDirection.w * 3.5;
   }
 
@@ -4332,7 +4369,7 @@ fn fs_main(
       let att = clamp(1.0 - d / max(lp.w, 1e-3), 0.0, 1.0);
       let ndl = max(dot(N, dv / max(d, 1e-4)), 0.0);
       plAdd = plAdd + lc.rgb * (lc.a * att * att * (0.3 + 0.7 * ndl));
-      let plH = normalize(dv / max(d, 1e-4) + V);
+      let plH = rdNormalize(dv / max(d, 1e-4) + V);
       plSpec = plSpec + lc.rgb * (lc.a * att * pow(max(dot(N, plH), 0.0), 48.0) * plGloss * 1.6);
     }
     plPost = patBase * plAdd + plSpec;
@@ -4372,7 +4409,7 @@ fn fs_main(
     // Reflectivity vs view angle. A higher BASE (0.30) means panes catch the sky even head-on (not only at
     // grazing angles), and the softer exponent (2.0 vs 4.0) widens the falloff so mid-angle facades read as
     // glass too — fixes "window effects only show up at very low viewing angles".
-    let fres = 0.30 + 0.70 * pow(1.0 - max(dot(N, V), 0.0), 2.0);
+    let fres = 0.30 + 0.70 * rdPow(1.0 - max(dot(N, V), 0.0), 2.0);
     // PER-PANE VARIATION — real glazing is never perfectly coplanar, so neighbouring panes catch the sky
     // at slightly different angles. Without it a curtain wall reads as one printed gradient.
     let pane = 0.92 + 0.16 * pg_hash21(floor(worldPos.xz * 6.3 + vec2<f32>(worldPos.y * 4.1)));
@@ -4385,6 +4422,10 @@ fn fs_main(
   //__SHADOW_APPLY__
   lit = lit + plPost;   // lamp light is never sun/moon-shadowed (see the point-light block)
 
+  // RENDER DEBUG dbgNanCheck (ibl.dbgFlags value 2): also test the UNCLAMPED lit colour - clamp() of a NaN is
+  // indeterminate (0, 1 or NaN depending on the GPU), so the final colour alone can hide it. Uniform branch.
+  var rdPre = 0u;
+  if ((u32(ibl.dbgFlags) & 2u) != 0u) { rdPre = rdState(vec4<f32>(lit, 1.0)); }
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
   // RADIAL FADE (bit 17): soft circular alpha falloff from the UV centre — the packaging stage
   // CONTACT-SHADOW blob (a dark ground quad grounding the box; edges dissolve to nothing).
@@ -4433,7 +4474,7 @@ fn fs_main(
     }
     finalColor = vec4<f32>(mix(finalColor.rgb, scene.fogColor.rgb, fogFactor), finalColor.a);
   }
-  return finalColor;
+  return dbgFinal(finalColor, rdPre);
 }
 `;
 
@@ -4539,7 +4580,8 @@ fn sampleShadowCascaded(worldPos: vec3<f32>) -> f32 {
   for (var i = 0; i < n; i++) {
     let c = sampleCascade(i, worldPos);
     if (c.y > 0.5) {
-      let t = smoothstep(1.0 - band, 1.0, cascadeEdge(i, worldPos));
+      // (safeLightingMath: a zero blend band is smoothstep(1, 1, x), undefined; widen it to 1e-4.)
+      let t = smoothstep(1.0 - select(band, max(band, 1e-4), rdSafeMath), 1.0, cascadeEdge(i, worldPos));
       if (t <= 0.0) { return c.x; }
       var nxt = vec2<f32>(1.0, 0.0);
       if (i + 1 < n) { nxt = sampleCascade(i + 1, worldPos); }
@@ -4559,8 +4601,18 @@ const SHADOW_APPLY_WGSL = /* wgsl */ `
   // HUE of the shadow (blue day, violet dusk, indigo night) without changing its darkness. 0 = neutral (original).
   let shTintRaw = toon_unpack_rgb8(scene.styleParams.w);
   let shTint = select(vec3<f32>(1.0), shTintRaw / max(dot(shTintRaw, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-3), scene.styleParams.w > 0.5);
-  let shadowMul = mix(vec3<f32>(scene.resolution.z) * shTint, vec3<f32>(1.0), shadowFactor);
+  // RENDER DEBUG (ibl.dbgFlags, uniform): 8 = skip the shadow receive (shadowMul 1); 16 = show shadowFactor as grey
+  // (red where it is above 1, blue where below 0, green where NaN / Inf - none of which a healthy map produces).
+  let rdSh = u32(ibl.dbgFlags);
+  let shadowMul = select(mix(vec3<f32>(scene.resolution.z) * shTint, vec3<f32>(1.0), shadowFactor), vec3<f32>(1.0), (rdSh & 8u) != 0u);
   lit = lit * shadowMul + emissiveRGB * (vec3<f32>(1.0) - shadowMul);
+  if ((rdSh & 16u) != 0u) {
+    let rdSfBad = (bitcast<u32>(shadowFactor) & 0x7f800000u) == 0x7f800000u;
+    var rdSf = vec3<f32>(clamp(shadowFactor, 0.0, 1.0));
+    rdSf = select(rdSf, vec3<f32>(1.0, 0.0, 0.0), shadowFactor > 1.0001);
+    rdSf = select(rdSf, vec3<f32>(0.0, 0.0, 1.0), shadowFactor < -0.0001);
+    lit = select(rdSf, vec3<f32>(0.0, 1.0, 0.0), rdSfBad);
+  }
 `;
 
 // Marker substitution that ASSERTS the marker was present. String.replace silently no-ops if the marker text
