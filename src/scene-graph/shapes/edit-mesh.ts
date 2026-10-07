@@ -12,9 +12,10 @@
  *
  * Topology model (docs/specs/edit-mesh-topology.md): the vertices are the SHARED topology vertices (a cube has 8)
  * and the faces are polygons (a cube has 6 quads). Attributes that differ per face corner live on the corner — the
- * half-edge whose destination is the corner's vertex (`EditHalfEdge.uv`); `EditVertex.uv` is the per-vertex
- * fallback (legacy meshes, and corners without their own UV). Shading comes from `EditFace.smooth` (flat = the face
- * normal) + `EditHalfEdge.isSharp`. `compile()` derives the GPU mesh (edit-mesh-render.ts): split where corner
+ * half-edge whose destination is the corner's vertex (`EditHalfEdge.uv` / `.color` / `.normal`); `EditVertex.uv` and
+ * `EditVertex.color` are the per-vertex fallbacks (legacy meshes, and corners without their own value). Shading comes
+ * from `EditFace.smooth` (flat = the face normal) + `EditHalfEdge.isSharp`, unless a corner carries a CUSTOM split
+ * normal (`EditHalfEdge.normal` — an import's authored normals, kept until that region is edited). `compile()` derives the GPU mesh (edit-mesh-render.ts): split where corner
  * attributes differ, triangulate the n-gons. Meshes enter Edit Mesh through `EditMesh.fromGeometry` (welded,
  * tris → quads — edit-mesh-weld.ts).
  */
@@ -23,6 +24,8 @@ import type { MeshGeometry } from '../../renderer/3d/mesh-generators';
 import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { buildRenderMesh, patchRenderMesh, type RenderGeometry, type RenderState } from './edit-mesh-render';
 import { weldGeometry, type WeldOptions } from './edit-mesh-weld';
+import { buildBevel, bevelLimit, bevelGuides, type BevelSpec, type BevelGuide } from './edit-mesh-bevel';
+export type { BevelSpec, BevelGuide } from './edit-mesh-bevel';
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -75,20 +78,35 @@ export interface EditHalfEdge {
   isSharp?: boolean;
   /** UV of the FACE CORNER at `vertex` in `face` (undefined = the vertex's own `uv`). */
   uv?: [number, number];
+  /** Colour of the face corner (undefined = the vertex's `color`). Paint Face Colour writes these, so a face paints
+   *  without bleeding into its neighbours through the shared vertices. */
+  color?: [number, number, number, number];
+  /** CUSTOM split normal of the face corner (undefined = computed: the face normal, or the smooth fan's average). Set
+   *  from an import's authored normals (fromGeometry); cleared (with its whole smooth fan) once the region is edited. */
+  normal?: [number, number, number];
 }
 
 /**
- * One face's vertex loop as topology ops build it, plus its per-corner UVs and shading flag. The attributes ride on
- * the array object, so an op that keeps a face (filter / splice / in-place index rewrite) keeps them; an op that
- * builds a new face states them (or leaves them off → vertex UVs, flat).
+ * One face's vertex loop as topology ops build it, plus its per-corner UVs / colours / custom normals and shading flag.
+ * The attributes ride on the array object, so an op that keeps a face (filter / splice / in-place index rewrite) keeps
+ * them; an op that builds a new face states them (or leaves them off → vertex UVs / colours, computed normals, flat).
  */
-export type FaceList = number[] & { uvs?: Array<[number, number] | undefined>; smooth?: boolean };
+export type FaceList = number[] & {
+  uvs?: Array<[number, number] | undefined>;
+  cols?: Array<[number, number, number, number] | undefined>;
+  nrms?: Array<[number, number, number] | undefined>;
+  smooth?: boolean;
+};
 
 /** Flat data format passed between modifiers — no half-edge adjacency. */
 export interface EditMeshData {
   vertices: Array<{ x: number; y: number; z: number; color: [number, number, number, number] }>;
-  /** `uvs[k]` = corner k's own UV (absent = the vertex's); `smooth` = smooth shading. */
-  faces: Array<{ verts: number[]; uvs?: Array<[number, number] | undefined>; smooth?: boolean }>;
+  /** `uvs[k]` / `cols[k]` / `nrms[k]` = corner k's own UV / colour / custom normal (absent = the vertex's UV / colour,
+   *  a computed normal); `smooth` = smooth shading. */
+  faces: Array<{
+    verts: number[]; uvs?: Array<[number, number] | undefined>; smooth?: boolean;
+    cols?: Array<[number, number, number, number] | undefined>; nrms?: Array<[number, number, number] | undefined>;
+  }>;
   /** Per-vertex UVs (the corner fallback). */
   uvs: Array<[number, number]>;
   /** Undirected vertex pairs of sharp edges. */
@@ -96,18 +114,27 @@ export interface EditMeshData {
 }
 
 type UV = [number, number];
+export type RGBA = [number, number, number, number];
+export type N3 = [number, number, number];
 
-/** A FaceList over `verts` (the same array object) with the given corner UVs / shading. */
-export function faceList(verts: number[], uvs?: Array<UV | undefined> | null, smooth?: boolean): FaceList {
+/** A FaceList over `verts` (the same array object) with the given corner UVs / shading / corner colours / custom
+ *  normals (each list only kept when some corner has a value). */
+export function faceList(
+  verts: number[], uvs?: Array<UV | undefined> | null, smooth?: boolean,
+  cols?: Array<RGBA | undefined> | null, nrms?: Array<N3 | undefined> | null,
+): FaceList {
   const f = verts as FaceList;
   if (uvs && uvs.some((u) => u !== undefined)) f.uvs = uvs.map((u) => (u ? [u[0], u[1]] as UV : undefined));
   if (smooth) f.smooth = true;
+  if (cols && cols.some((c) => c !== undefined)) f.cols = cols.map((c) => (c ? [c[0], c[1], c[2], c[3]] as RGBA : undefined));
+  // (custom normals are stored with −0 as +0: a JSON save cannot keep −0, and the render-vertex sharing keys on bits)
+  if (nrms && nrms.some((c) => c !== undefined)) f.nrms = nrms.map((c) => (c ? [c[0] + 0, c[1] + 0, c[2] + 0] as N3 : undefined));
   return f;
 }
 
-/** `f` with its vertex indices mapped (attributes kept, corner for corner). */
-function remapFace(f: FaceList, fn: (vi: number) => number): FaceList {
-  return faceList(f.map(fn), f.uvs, f.smooth);
+/** `f` with its vertex indices mapped (every attribute kept, corner for corner — incl. custom normals). */
+export function remapFace(f: FaceList, fn: (vi: number) => number): FaceList {
+  return faceList(f.map(fn), f.uvs, f.smooth, f.cols, f.nrms);
 }
 
 function lerpUV(a: UV | undefined, b: UV | undefined, t: number): UV | undefined {
@@ -119,6 +146,17 @@ function avgUV(list: Array<UV | undefined>): UV | undefined {
   let u = 0, v = 0, n = 0;
   for (const p of list) if (p) { u += p[0]; v += p[1]; n++; }
   return n ? [u / n, v / n] : undefined;
+}
+
+function lerpCol(a: RGBA, b: RGBA, t: number): RGBA {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t];
+}
+
+function avgCol(list: RGBA[]): RGBA {
+  const n = list.length || 1;
+  let r = 0, g = 0, b = 0, a = 0;
+  for (const c of list) { r += c[0]; g += c[1]; b += c[2]; a += c[3]; }
+  return [r / n, g / n, b / n, a / n];
 }
 
 // ── Modifier interface ─────────────────────────────────────────────────────────
@@ -154,10 +192,15 @@ export class MirrorModifier implements Modifier {
       color: v.color as [number, number, number, number],
     }));
 
-    // Reverse winding on mirrored faces (flip normals to face outward); corner UVs reverse with their corners.
+    // Reverse winding on mirrored faces (flip normals to face outward); corner UVs / colours reverse with their
+    // corners, custom normals are reflected across the mirror plane.
+    const ax = this.axis === 'x' ? 0 : this.axis === 'y' ? 1 : 2;
+    const reflect = (n: N3 | undefined): N3 | undefined => { if (!n) return undefined; const r: N3 = [n[0], n[1], n[2]]; r[ax] = -r[ax]; return r; };
     const mirroredFaces = mesh.faces.map(f => ({
       verts: [...f.verts].reverse().map(i => i + offset),
       uvs: f.uvs ? [...f.uvs].reverse() : undefined,
+      cols: f.cols ? [...f.cols].reverse() : undefined,
+      nrms: f.nrms ? [...f.nrms].reverse().map(reflect) : undefined,
       smooth: f.smooth,
     }));
     const sharp = mesh.sharpEdges ?? [];
@@ -284,7 +327,9 @@ export class DisplaceModifier implements Modifier {
       }
       return { x: v.x + dx, y: v.y + dy, z: v.z + dz, color: v.color as [number, number, number, number] };
     });
-    return { vertices: out, faces: mesh.faces, uvs: mesh.uvs, sharpEdges: mesh.sharpEdges };
+    // (custom normals no longer describe the displaced surface → computed)
+    const faces = mesh.faces.map(f => (f.nrms ? { ...f, nrms: undefined } : f));
+    return { vertices: out, faces, uvs: mesh.uvs, sharpEdges: mesh.sharpEdges };
   }
 
   toJSON(): object {
@@ -326,14 +371,35 @@ export class EditMesh {
     }
     const { geom, state } = buildRenderMesh(data);
     this.lastCompileSourceVerts = geom.sourceVerts;
+    this._cnCleared = [];
+    // half-edge → its build corner (faces in order, corners from each face's first vertex — _getFaceList's walk)
+    let heCorner: Int32Array | null = null;
+    if (!modded) {
+      heCorner = new Int32Array(this.halfEdges.length).fill(-1);
+      let c = 0;
+      for (const face of this.faces) {
+        let h = face.halfEdge, guard = 0;
+        do { heCorner[h] = c++; h = this.halfEdges[h].next; } while (h !== face.halfEdge && ++guard <= 1000);
+      }
+    }
     // mobile-parity 7.3d: remember what this compile was made from, so a vertex drag can patch it in place
     // (patchCompiledPositions). A modifier stack maps vertices to outputs non-trivially → no incremental path.
     this._ic = modded ? null : {
       geom, verts: this.vertices, faces: this.faces, halfEdges: this.halfEdges,
-      nv: this.vertices.length, nf: this.faces.length, nh: this.halfEdges.length, state,
+      nv: this.vertices.length, nf: this.faces.length, nh: this.halfEdges.length, state, attrVersion: this.attrVersion,
+      heCorner: heCorner!,
     };
     return geom;
   }
+
+  /** Half-edges whose custom normal a vertex move cleared since the last compile (the drag patch applies them). */
+  private _cnCleared: number[] = [];
+
+  /**
+   * Bumped whenever corner attributes change outside a topology rebuild (custom normals cleared by a vertex move,
+   * corner colours painted, shading flags) — an in-place patch of an older compile is refused after it.
+   */
+  attrVersion = 0;
 
   /** Incremental-compile state of the last compile() (null = none / a modifier stack was applied). */
   private _ic: IncrementalCompile | null = null;
@@ -348,17 +414,33 @@ export class EditMesh {
    * may be enabled.
    *
    * Returns the rewritten OUTPUT-vertex spans flattened as [start, count, start, count, ...] in ascending order
-   * ([] = nothing moved), or null when the incremental path does not apply (the caller recompiles).
+   * ([] = nothing moved), or null when the incremental path does not apply (the caller recompiles). A quad whose
+   * diagonal flipped (concave drag) rewrites its index range of `geom.indices` in place too: those ranges are in
+   * {@link lastPatchIndexSpans} (re-send them with the vertex spans).
    */
   patchCompiledPositions(geom: MeshGeometry): number[] | null {
+    this.lastPatchIndexSpans = [];
     const ic = this._ic;
     if (!ic || ic.geom !== geom || ic.verts !== this.vertices || ic.faces !== this.faces || ic.halfEdges !== this.halfEdges
-        || this.vertices.length !== ic.nv || this.faces.length !== ic.nf || this.halfEdges.length !== ic.nh) return null;
+        || this.vertices.length !== ic.nv || this.faces.length !== ic.nf || this.halfEdges.length !== ic.nh
+        || ic.attrVersion !== this.attrVersion) return null;
     for (const mod of this.modifiers) if (mod.enabled) return null;
     const out = geom.vertices as Float32Array;
     if (!(out instanceof Float32Array) || out.length !== (ic.state.rvStart.length - 1) * FLOATS_PER_VERT) return null;
-    return patchRenderMesh(ic.state, this.vertices, out);
+    const idx = geom.indices instanceof Uint32Array ? geom.indices : undefined;
+    let cleared: Int32Array | undefined;
+    if (this._cnCleared.length) {
+      cleared = new Int32Array(this._cnCleared.length);
+      for (let i = 0; i < cleared.length; i++) { const c = ic.heCorner[this._cnCleared[i]]; if (!(c >= 0)) return null; cleared[i] = c; }
+    }
+    const spans = patchRenderMesh(ic.state, this.vertices, out, idx, cleared);
+    if (spans) { this.lastPatchIndexSpans = ic.state.idxSpans; this._cnCleared = []; }
+    return spans;
   }
+
+  /** The index ranges (flattened [start, count, ...], index units) the last {@link patchCompiledPositions} rewrote in
+   *  place — a quad whose diagonal flipped. [] = only vertices changed. */
+  lastPatchIndexSpans: number[] = [];
 
   /**
    * Bake modifiers up to and including `index`: evaluate that prefix of the stack,
@@ -422,8 +504,11 @@ export class EditMesh {
     const r = weldGeometry(geom, opts);
     const mesh = new EditMesh();
     mesh.vertices = r.vertices.map(v => ({ x: v.x, y: v.y, z: v.z, color: v.color, halfEdge: -1, uv: v.uv }));
-    mesh._buildTopology(r.faces.map(f => faceList(f.verts, f.uvs, f.smooth)), { keepFlags: false });
+    // Every corner keeps the geometry's own normal as a CUSTOM split normal (an import's authored normals render bit
+    // for bit; a region's are recomputed once it is edited — see the custom-normal rules on EditHalfEdge.normal).
+    mesh._buildTopology(r.faces.map(f => faceList(f.verts, f.uvs, f.smooth, null, f.nrms)), { keepFlags: false });
     mesh._markPairs(r.sharpEdges, 'isSharp');
+    mesh._normalizeCustomNormals();
     return mesh;
   }
 
@@ -611,14 +696,17 @@ export class EditMesh {
 
   // ── Destructive operations ────────────────────────────────────────────────
 
-  /** Move a vertex by (dx, dy, dz). Applies proportional falloff when enabled. */
+  /** Move a vertex by (dx, dy, dz). Applies proportional falloff when enabled. The faces around every moved vertex
+   *  lose their custom normals (recomputed — with their smooth fans). */
   moveVertex(vIdx: number, dx: number, dy: number, dz: number): void {
     const v = this.vertices[vIdx];
     if (!v) return;
     if (!this.proportionalEditEnabled) {
       v.x += dx; v.y += dy; v.z += dz;
+      if (dx || dy || dz) this.clearCustomNormalsAround([vIdx]);
       return;
     }
+    const moved: number[] = [];
     const ox = v.x, oy = v.y, oz = v.z;
     const r = this.proportionalEditRadius;
     for (let i = 0; i < this.vertices.length; i++) {
@@ -633,7 +721,9 @@ export class EditMesh {
         default:       weight = (1 - t) * (1 - t); break;
       }
       vi.x += dx * weight; vi.y += dy * weight; vi.z += dz * weight;
+      if (weight && (dx || dy || dz)) moved.push(i);
     }
+    this.clearCustomNormalsAround(moved);
   }
 
   /**
@@ -647,6 +737,7 @@ export class EditMesh {
     const faceVerts = [...src];
     const normal = this._computeFaceNormal(fIdx);
     const U = (k: number): UV | undefined => this._fuv(src, k % faceVerts.length);
+    const C = (k: number): RGBA => this._fcol(src, k % faceVerts.length);
 
     const newVertBase = this.vertices.length;
     for (const vi of faceVerts) {
@@ -664,8 +755,8 @@ export class EditMesh {
     const n = faceVerts.length;
     const newVerts = faceVerts.map((_, k) => newVertBase + k);
 
-    // Replace original face with the extruded top (same corner UVs)
-    faceLists[fIdx] = faceList(newVerts, src.uvs, src.smooth);
+    // Replace original face with the extruded top (same corner UVs / colours)
+    faceLists[fIdx] = faceList(newVerts, src.uvs, src.smooth, src.cols);
 
     // Add side quads for each edge of the original face (UVs of the edge's two corners, stretched up the wall)
     const newFaceStart = faceLists.length;
@@ -674,7 +765,8 @@ export class EditMesh {
       const b = faceVerts[(k + 1) % n];
       const bNew = newVerts[(k + 1) % n];
       const aNew = newVerts[k];
-      faceLists.push(faceList([a, b, bNew, aNew], src.uvs ? [U(k), U(k + 1), U(k + 1), U(k)] : null, src.smooth));
+      faceLists.push(faceList([a, b, bNew, aNew], src.uvs ? [U(k), U(k + 1), U(k + 1), U(k)] : null, src.smooth,
+        src.cols ? [C(k), C(k + 1), C(k + 1), C(k)] : null));
     }
 
     this._buildTopology(faceLists);
@@ -723,15 +815,20 @@ export class EditMesh {
     const uvC = avgUV(outerUV);
     const innerUV = outerUV.map(u => lerpUV(u, uvC, amount));
     const has = !!src.uvs;
+    const outerC = faceVerts.map((_, k) => this._fcol(src, k));
+    const colC = avgCol(outerC);
+    const innerC = outerC.map(c => lerpCol(c, colC, amount));
+    const hasC = !!src.cols;
 
     // Replace original face with inner face
-    faceLists[fi] = faceList(innerVerts, has ? innerUV : null, src.smooth);
+    faceLists[fi] = faceList(innerVerts, has ? innerUV : null, src.smooth, hasC ? innerC : null);
 
     // Add border quads
     for (let k = 0; k < n; k++) {
       const k1 = (k + 1) % n;
       faceLists.push(faceList([faceVerts[k], faceVerts[k1], innerVerts[k1], innerVerts[k]],
-        has ? [outerUV[k], outerUV[k1], innerUV[k1], innerUV[k]] : null, src.smooth));
+        has ? [outerUV[k], outerUV[k1], innerUV[k1], innerUV[k]] : null, src.smooth,
+        hasC ? [outerC[k], outerC[k1], innerC[k1], innerC[k]] : null));
     }
   }
 
@@ -761,11 +858,15 @@ export class EditMesh {
     const remap = new Int32Array(this.vertices.length);
     for (let i = 0; i < remap.length; i++) { const r = i === v2 ? v1 : i; remap[i] = r > v2 ? r - 1 : r; }
 
-    // Replace all v2 references with v1 (in place — each face keeps its corner UVs, corner for corner)
+    // Replace all v2 references with v1 (in place — each face keeps its corner UVs / colours, corner for corner); a
+    // face around the moved v1 loses its custom normals (its shape changed — _buildTopology clears their fans)
     for (const f of faceLists) {
+      let touched = false;
       for (let k = 0; k < f.length; k++) {
         if (f[k] === v2) f[k] = v1;
+        if (f[k] === v1) touched = true;
       }
+      if (touched) f.nrms = undefined;
     }
 
     // Remove vertex v2 and remap indices above v2
@@ -884,24 +985,28 @@ export class EditMesh {
       const hasCut13 = M1 !== undefined && M3 !== undefined;
 
       // Corner UV of a cut point on this face's edge i → j (the cut sits at t from the edge key's vA).
-      const has = !!f.uvs;
+      const has = !!f.uvs, hasC = !!f.cols;
       const U = (k: number): UV | undefined => this._fuv(f, k);
-      const cutUV = (i: number, j: number): UV | undefined => {
-        if (!has) return undefined;
+      const C = (k: number): RGBA => this._fcol(f, k);
+      const tAt = (i: number, j: number): number => {
         const e = cutEdges.get(f[i] < f[j] ? `${f[i]},${f[j]}` : `${f[j]},${f[i]}`)!;
-        return lerpUV(U(i), U(j), e.vA === f[i] ? t : 1 - t);
+        return e.vA === f[i] ? t : 1 - t;
       };
+      const cutUV = (i: number, j: number): UV | undefined => (has ? lerpUV(U(i), U(j), tAt(i, j)) : undefined);
+      const cutC = (i: number, j: number): RGBA => lerpCol(C(i), C(j), tAt(i, j));
 
       if (hasCut02 && !hasCut13) {
         // Cut through edges 0 and 2: split into [a,M0,M2,d] and [M0,b,c,M2]
         const m0 = cutUV(0, 1), m2 = cutUV(2, 3);
-        newFaceLists.push(faceList([a, M0!, M2!, d], has ? [U(0), m0, m2, U(3)] : null, f.smooth));
-        newFaceLists.push(faceList([M0!, b, c, M2!], has ? [m0, U(1), U(2), m2] : null, f.smooth));
+        const c0 = hasC ? cutC(0, 1) : C(0), c2 = hasC ? cutC(2, 3) : C(0);
+        newFaceLists.push(faceList([a, M0!, M2!, d], has ? [U(0), m0, m2, U(3)] : null, f.smooth, hasC ? [C(0), c0, c2, C(3)] : null));
+        newFaceLists.push(faceList([M0!, b, c, M2!], has ? [m0, U(1), U(2), m2] : null, f.smooth, hasC ? [c0, C(1), C(2), c2] : null));
       } else if (hasCut13 && !hasCut02) {
         // Cut through edges 1 and 3: split into [a,b,M1,M3] and [M3,M1,c,d]
         const m1 = cutUV(1, 2), m3 = cutUV(3, 0);
-        newFaceLists.push(faceList([a, b, M1!, M3!], has ? [U(0), U(1), m1, m3] : null, f.smooth));
-        newFaceLists.push(faceList([M3!, M1!, c, d], has ? [m3, m1, U(2), U(3)] : null, f.smooth));
+        const c1 = hasC ? cutC(1, 2) : C(0), c3 = hasC ? cutC(3, 0) : C(0);
+        newFaceLists.push(faceList([a, b, M1!, M3!], has ? [U(0), U(1), m1, m3] : null, f.smooth, hasC ? [C(0), C(1), c1, c3] : null));
+        newFaceLists.push(faceList([M3!, M1!, c, d], has ? [m3, m1, U(2), U(3)] : null, f.smooth, hasC ? [c3, c1, C(2), C(3)] : null));
       } else {
         // Non-matching or boundary face: keep as-is
         newFaceLists.push(f);
@@ -924,17 +1029,20 @@ export class EditMesh {
     let changed = false;
     const verts: number[] = [];
     const uvs: Array<UV | undefined> = [];
+    const cols: RGBA[] = [];
     for (let k = 0; k < n; k++) {
       const a = f[k], b = f[(k + 1) % n];
-      verts.push(a); uvs.push(this._fuv(f, k));
+      verts.push(a); uvs.push(this._fuv(f, k)); cols.push(this._fcol(f, k));
       const p = points.get(a < b ? `${a},${b}` : `${b},${a}`);
       if (p && p.idx !== a && p.idx !== b) {
+        const tt = p.vA === a ? p.t : 1 - p.t;
         verts.push(p.idx);
-        uvs.push(lerpUV(this._fuv(f, k), this._fuv(f, (k + 1) % n), p.vA === a ? p.t : 1 - p.t));
+        uvs.push(lerpUV(this._fuv(f, k), this._fuv(f, (k + 1) % n), tt));
+        cols.push(lerpCol(this._fcol(f, k), this._fcol(f, (k + 1) % n), tt));
         changed = true;
       }
     }
-    return changed ? faceList(verts, f.uvs ? uvs : null, f.smooth) : f;
+    return changed ? faceList(verts, f.uvs ? uvs : null, f.smooth, f.cols ? cols : null) : f;
   }
 
   /**
@@ -974,15 +1082,16 @@ export class EditMesh {
     //   F2 part: starting at (k2+2)%n2, run n2-2 iterations → F2 excluding v_to and v_from
     const mergedVerts: number[] = [];
     const mergedUVs: Array<UV | undefined> = [];
+    const mergedCols: RGBA[] = [];
     for (let i = 0; i < n1; i++) {
       const k = (k1 + 1 + i) % n1;
-      mergedVerts.push(F1[k]); mergedUVs.push(this._fuv(L1, k));
+      mergedVerts.push(F1[k]); mergedUVs.push(this._fuv(L1, k)); mergedCols.push(this._fcol(L1, k));
     }
     for (let i = 0; i < n2 - 2; i++) {
       const k = (k2 + 2 + i) % n2;
-      mergedVerts.push(F2[k]); mergedUVs.push(this._fuv(L2, k));
+      mergedVerts.push(F2[k]); mergedUVs.push(this._fuv(L2, k)); mergedCols.push(this._fcol(L2, k));
     }
-    const merged = faceList(mergedVerts, L1.uvs || L2.uvs ? mergedUVs : null, L1.smooth);
+    const merged = faceList(mergedVerts, L1.uvs || L2.uvs ? mergedUVs : null, L1.smooth, L1.cols || L2.cols ? mergedCols : null);
 
     // Remove F1 and F2 (higher index first to preserve indices)
     const loIdx = Math.min(fIdx1, fIdx2);
@@ -995,159 +1104,81 @@ export class EditMesh {
   }
 
   /**
-   * Bevel the edge identified by `halfEdgeIdx`, replacing it with a quad face strip.
-   * `amount` is a [0–1] lerp fraction along each adjacent edge: 0 = no-op, 0.5 = midpoint.
-   * Only works on interior edges (twin ≥ 0). Both neighbouring faces are updated in place.
+   * BEVEL / CHAMFER (edit-mesh-bevel.ts): vertex chamfer (`spec.vertices`) or edge bevel (`spec.edges`, undirected
+   * vertex pairs) by `spec.amount` — a distance along the edges, clamped so no cut passes a neighbour or overlaps
+   * another ({@link bevelLimit}) — with `spec.segments` (1 = flat, > 1 = rounded). Edge ends are re-cut Blender-style
+   * (meet points, the old vertex kept or removed, holes capped): the result is closed wherever the mesh was. Corner UVs /
+   * colours / shading of the faces around are kept and interpolated onto the new faces; custom normals stay on the
+   * untouched corners. Returns the new (strip + cap) face indices and the amount used, or null when nothing changed.
    */
-  bevelEdge(halfEdgeIdx: number, amount: number): void {
-    const { halfEdges, vertices } = this;
-    if (halfEdgeIdx < 0 || halfEdgeIdx >= halfEdges.length) return;
-
-    const he = halfEdges[halfEdgeIdx];
-    if (he.twin < 0) return;
-
-    const fIdx1 = he.face;
-    const fIdx2 = halfEdges[he.twin].face;
-    if (fIdx1 < 0 || fIdx2 < 0) return;
-
-    const v_from = halfEdges[he.prev].vertex;
-    const v_to = he.vertex;
-
-    const F1 = this._getFaceVerts(fIdx1);
-    const F2 = this._getFaceVerts(fIdx2);
-    const n1 = F1.length, n2 = F2.length;
-    if (n1 < 3 || n2 < 3) return;
-
-    // v_from is at k in F1, v_to is at (k+1)%n1
-    // v_to   is at j in F2, v_from is at (j+1)%n2
-    const k = F1.indexOf(v_from);
-    const j = F2.indexOf(v_to);
-    if (k < 0 || j < 0) return;
-
-    const t = Math.max(0, Math.min(0.999, amount));
-
-    const lerpV = (vIdxA: number, vIdxB: number): EditVertex => {
-      const a = vertices[vIdxA], b = vertices[vIdxB];
-      return {
-        x: a.x + (b.x - a.x) * t,
-        y: a.y + (b.y - a.y) * t,
-        z: a.z + (b.z - a.z) * t,
-        color: [
-          a.color[0] + (b.color[0] - a.color[0]) * t,
-          a.color[1] + (b.color[1] - a.color[1]) * t,
-          a.color[2] + (b.color[2] - a.color[2]) * t,
-          a.color[3] + (b.color[3] - a.color[3]) * t,
-        ] as [number, number, number, number],
-        halfEdge: -1,
-        uv: a.uv && b.uv ? lerpUV(a.uv, b.uv, t) : undefined,
-      };
-    };
-
-    // Four new bevel vertices — two near each endpoint, one per adjacent face
-    const A_prev_F1 = F1[(k + n1 - 1) % n1];  // neighbour of v_from in F1 (not v_to)
-    const B_next_F1 = F1[(k + 2) % n1];         // neighbour of v_to  in F1 (not v_from)
-    const B_prev_F2 = F2[(j + n2 - 1) % n2];    // neighbour of v_to  in F2 (not v_from)
-    const A_next_F2 = F2[(j + 2) % n2];          // neighbour of v_from in F2 (not v_to)
-
-    const A1_idx = vertices.length; vertices.push(lerpV(v_from, A_prev_F1));
-    const B1_idx = vertices.length; vertices.push(lerpV(v_to,   B_next_F1));
-    const B2_idx = vertices.length; vertices.push(lerpV(v_to,   B_prev_F2));
-    const A2_idx = vertices.length; vertices.push(lerpV(v_from, A_next_F2));
-
-    const faceLists = this._getAllFaceLists();
-    const f1 = faceLists[fIdx1], f2 = faceLists[fIdx2];
-    // Each face's corner UV slides with its corner (computed before the rewrite).
-    const at = (f: FaceList, v: number): UV | undefined => this._fuv(f, f.indexOf(v));
-    const uvA1 = lerpUV(at(f1, v_from), at(f1, A_prev_F1), t), uvB1 = lerpUV(at(f1, v_to), at(f1, B_next_F1), t);
-    const uvB2 = lerpUV(at(f2, v_to), at(f2, B_prev_F2), t),   uvA2 = lerpUV(at(f2, v_from), at(f2, A_next_F2), t);
-
-    // Rewrite F1: v_from → A1, v_to → B1
-    for (let i = 0; i < f1.length; i++) {
-      if (f1[i] === v_from) { f1[i] = A1_idx; if (f1.uvs) f1.uvs[i] = uvA1; }
-      else if (f1[i] === v_to) { f1[i] = B1_idx; if (f1.uvs) f1.uvs[i] = uvB1; }
+  bevel(spec: BevelSpec): { newFaces: number[]; amount: number } | null {
+    const b = buildBevel(this.vertices, this._getAllFaceLists(), spec);
+    if (!b) return null;
+    const key = (a: number, c: number): string => (a < c ? `${a},${c}` : `${c},${a}`);
+    const seam = new Set(this._flagPairs('isSeam').map(([a, c]) => key(a, c)));
+    const sharp = new Set(this._flagPairs('isSharp').map(([a, c]) => key(a, c)));
+    // the kept vertices are the same EditVertex objects; the new points become EditVertices
+    this.vertices = b.vertices.map(v => ('halfEdge' in v ? v as EditVertex
+      : { x: v.x, y: v.y, z: v.z, color: [v.color[0], v.color[1], v.color[2], v.color[3]] as RGBA, halfEdge: -1, uv: v.uv ? [v.uv[0], v.uv[1]] as UV : undefined }));
+    this._buildTopology(b.faces, { remap: b.remap });   // flags of the untouched edges follow their (renumbered) vertices
+    // a split edge hands its seam / sharp flag to every piece
+    const addSeam: Array<[number, number]> = [], addSharp: Array<[number, number]> = [];
+    for (const [a, c, chain] of b.splitChains) {
+      const k = key(a, c);
+      for (let i = 0; i + 1 < chain.length; i++) {
+        if (seam.has(k)) addSeam.push([chain[i], chain[i + 1]]);
+        if (sharp.has(k)) addSharp.push([chain[i], chain[i + 1]]);
+      }
     }
+    this._markPairs(addSeam, 'isSeam');
+    this._markPairs(addSharp, 'isSharp');
+    this._normalizeCustomNormals();
+    return { newFaces: b.newFaces, amount: b.amount };
+  }
 
-    // Rewrite F2: v_to → B2, v_from → A2
-    for (let i = 0; i < f2.length; i++) {
-      if (f2[i] === v_to) { f2[i] = B2_idx; if (f2.uvs) f2.uvs[i] = uvB2; }
-      else if (f2[i] === v_from) { f2[i] = A2_idx; if (f2.uvs) f2.uvs[i] = uvA2; }
-    }
+  /** The largest amount {@link bevel} accepts for `spec` (clamp overlap); 0 = nothing to bevel. */
+  bevelLimit(spec: Omit<BevelSpec, 'amount'>): number {
+    return bevelLimit(this.vertices, this._getAllFaceLists(), { ...spec, amount: 0 });
+  }
 
-    // Bevel strip quad — winding produces outward normal along the chamfer
-    faceLists.push(faceList([A1_idx, A2_idx, B2_idx, B1_idx], f1.uvs || f2.uvs ? [uvA1, uvA2, uvB2, uvB1] : null, f1.smooth));
-
-    this._buildTopology(faceLists);
+  /** The inward guide of every bevel target (origin + direction, object space) — the tool draws it and maps the drag
+   *  onto it. */
+  bevelGuides(spec: Omit<BevelSpec, 'amount'>): BevelGuide[] {
+    return bevelGuides(this.vertices, this._getAllFaceLists(), { ...spec, amount: 0 });
   }
 
   /**
-   * Bevel (chamfer) the vertex `vIdx` — cut the corner off, replacing the single vertex with a small cap face.
-   * One new vertex is created per incident edge (at `amount` [0–1] along the edge toward each neighbour); each
-   * face using the vertex swaps it for its two cut-points, and a cap face closes the exposed corner. Works on a
-   * closed corner (≥3 incident faces).
+   * Bevel the edge identified by `halfEdgeIdx` into a chamfer strip (a full bevel: the end corners are closed —
+   * {@link bevel}). `amount` is the legacy [0–1] fraction: the cut runs `amount` × the shortest edge it slides along.
+   */
+  bevelEdge(halfEdgeIdx: number, amount: number): void {
+    const ends = this.getHalfEdgeVertices(halfEdgeIdx);
+    if (!ends || this.halfEdges[halfEdgeIdx].twin < 0) return;
+    const spec = { edges: [ends] as Array<[number, number]> };
+    this.bevel({ ...spec, amount: Math.max(0, Math.min(1, amount)) * this._shortestCutEdge(ends) });
+  }
+
+  /**
+   * Bevel (chamfer) the vertex `vIdx` — cut the corner off, replacing the vertex with a cap face (a cube corner → a
+   * triangle; n incident edges → an n-gon). `amount` is the legacy [0–1] fraction of the shortest incident edge.
    */
   bevelVertex(vIdx: number, amount: number): void {
-    const { vertices } = this;
-    if (vIdx < 0 || vIdx >= vertices.length) return;
-    const t = Math.max(0.001, Math.min(0.999, amount));
-    const faceLists = this._getAllFaceLists();
+    if (vIdx < 0 || vIdx >= this.vertices.length) return;
+    this.bevel({ vertices: [vIdx], amount: Math.max(0, Math.min(1, amount)) * this._shortestCutEdge([vIdx]) });
+  }
 
-    // Incident faces + the two neighbours flanking the vertex in each (prev before it, next after it).
-    const incident: { fi: number; prev: number; next: number }[] = [];
-    for (let fi = 0; fi < faceLists.length; fi++) {
-      const f = faceLists[fi];
-      const at = f.indexOf(vIdx);
-      if (at < 0) continue;
-      const n = f.length;
-      incident.push({ fi, prev: f[(at + n - 1) % n], next: f[(at + 1) % n] });
+  /** The shortest edge at any of `verts` (the legacy fraction → distance scale). */
+  private _shortestCutEdge(verts: number[]): number {
+    let best = Infinity;
+    const set = new Set(verts);
+    for (const he of this.halfEdges) {
+      const a = this.halfEdges[he.prev]?.vertex;
+      if (a === undefined || !(set.has(a) || set.has(he.vertex))) continue;
+      const p = this.vertices[a], q = this.vertices[he.vertex];
+      const l = Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z);
+      if (l > 0 && l < best) best = l;
     }
-    if (incident.length < 3) return;   // not a proper closed corner
-
-    // One new cut-vertex per neighbour edge (shared between the two faces on that edge).
-    const V = vertices[vIdx];
-    const cutForNeighbour = new Map<number, number>();
-    const cutOf = (nIdx: number): number => {
-      const existing = cutForNeighbour.get(nIdx);
-      if (existing !== undefined) return existing;
-      const b = vertices[nIdx];
-      const idx = vertices.length;
-      vertices.push({ x: V.x + (b.x - V.x) * t, y: V.y + (b.y - V.y) * t, z: V.z + (b.z - V.z) * t, color: [...V.color] as [number, number, number, number], halfEdge: -1,
-        uv: V.uv && b.uv ? lerpUV(V.uv, b.uv, t) : undefined });
-      cutForNeighbour.set(nIdx, idx);
-      return idx;
-    };
-    for (const inc of incident) { cutOf(inc.prev); cutOf(inc.next); }
-
-    // Replace the vertex in each face with its two cut-points (prev-side then next-side); the face's corner UV
-    // splits the same way (slid toward each neighbour's corner UV).
-    const cutUV = new Map<number, UV | undefined>();   // cut vertex → a corner UV for the cap
-    let anyUV = false;
-    for (const inc of incident) {
-      const f = faceLists[inc.fi];
-      const at = f.indexOf(vIdx);
-      if (at < 0) continue;
-      const n = f.length;
-      const uP = lerpUV(this._fuv(f, at), this._fuv(f, (at + n - 1) % n), t);
-      const uN = lerpUV(this._fuv(f, at), this._fuv(f, (at + 1) % n), t);
-      f.splice(at, 1, cutOf(inc.prev), cutOf(inc.next));
-      if (f.uvs) { f.uvs.splice(at, 1, uP, uN); anyUV = true; }
-      if (!cutUV.has(cutOf(inc.prev))) cutUV.set(cutOf(inc.prev), uP);
-      if (!cutUV.has(cutOf(inc.next))) cutUV.set(cutOf(inc.next), uN);
-    }
-
-    // Cap: chain prev→next around the neighbour fan into one ring, then reverse so it winds opposite to the
-    // faces on the shared cut edges (front-facing outward).
-    const nextOf = new Map<number, number>();
-    for (const inc of incident) nextOf.set(inc.prev, inc.next);
-    const ring: number[] = [];
-    const seen = new Set<number>();
-    let cur: number | undefined = incident[0].prev;
-    while (cur !== undefined && !seen.has(cur)) { seen.add(cur); ring.push(cutOf(cur)); cur = nextOf.get(cur); }
-    if (ring.length >= 3) {
-      ring.reverse();
-      faceLists.push(faceList(ring, anyUV ? ring.map(c => cutUV.get(c)) : null, faceLists[incident[0].fi].smooth));
-    }
-
-    this._buildTopology(faceLists);
+    return Number.isFinite(best) ? best : 0;
   }
 
   // ── Knife cut ─────────────────────────────────────────────────────────────
@@ -1228,12 +1259,18 @@ export class EditMesh {
         lerpUV(cu[fv.indexOf(c.vA)], cu[fv.indexOf(c.vB)], c.t);
       const u1 = uvAt(sorted[0]), u2 = uvAt(sorted[1]);
       const has = !!fv.uvs;
+      const cc = [...fv].map((_, k) => this._fcol(fv, k));
+      const colAt = (c: { vA: number; vB: number; t: number }): RGBA => lerpCol(cc[fv.indexOf(c.vA)], cc[fv.indexOf(c.vB)], c.t);
+      const c1 = colAt(sorted[0]), c2 = colAt(sorted[1]);
+      const hasC = !!fv.cols;
 
       // Face A: [v0..vi, M1, M2, v(j+1)..vN-1]
       const faceA = faceList([...fv.slice(0, i + 1), M1, M2, ...fv.slice(j + 1)],
-        has ? [...cu.slice(0, i + 1), u1, u2, ...cu.slice(j + 1)] : null, fv.smooth);
+        has ? [...cu.slice(0, i + 1), u1, u2, ...cu.slice(j + 1)] : null, fv.smooth,
+        hasC ? [...cc.slice(0, i + 1), c1, c2, ...cc.slice(j + 1)] : null);
       // Face B: [M1, v(i+1)..vj, M2]
-      const faceB = faceList([M1, ...fv.slice(i + 1, j + 1), M2], has ? [u1, ...cu.slice(i + 1, j + 1), u2] : null, fv.smooth);
+      const faceB = faceList([M1, ...fv.slice(i + 1, j + 1), M2], has ? [u1, ...cu.slice(i + 1, j + 1), u2] : null, fv.smooth,
+        hasC ? [c1, ...cc.slice(i + 1, j + 1), c2] : null);
 
       if (faceA.length >= 3) newFaceLists.push(faceA);
       if (faceB.length >= 3) newFaceLists.push(faceB);
@@ -1507,12 +1544,20 @@ export class EditMesh {
 
   // ── Shading ───────────────────────────────────────────────────────────────
 
-  /** Shade the given faces smooth (corner normals averaged across non-sharp edges) or flat. */
+  /** Shade the given faces smooth (corner normals averaged across non-sharp edges) or flat. Their custom normals are
+   *  cleared (with every smooth fan they were part of, before and after the change). */
   setFacesSmooth(fIdxSet: Iterable<number>, smooth: boolean): void {
-    for (const fi of fIdxSet) { const f = this.faces[fi]; if (f) f.smooth = smooth || undefined; }
+    const faces = [...fIdxSet].filter(fi => !!this.faces[fi]);
+    const corners = (): number[] => faces.flatMap(fi => this._faceCorners(fi));
+    this._clearFans(corners());
+    for (const fi of faces) this.faces[fi].smooth = smooth || undefined;
+    this._clearFans(corners());
+    this._normalizeCustomNormals();
+    this.attrVersion++;
   }
 
-  /** Mark / clear half-edges (and their twins) as sharp (hard) edges. */
+  /** Mark / clear half-edges (and their twins) as sharp (hard) edges. A smooth fan that now mixes custom and computed
+   *  normals is recomputed. */
   setSharpEdges(halfEdgeIndices: number[], sharp: boolean): void {
     for (const hi of halfEdgeIndices) {
       const he = this.halfEdges[hi];
@@ -1520,19 +1565,164 @@ export class EditMesh {
       he.isSharp = sharp || undefined;
       if (he.twin >= 0) this.halfEdges[he.twin].isSharp = sharp || undefined;
     }
+    this._normalizeCustomNormals();
+    this.attrVersion++;
+  }
+
+  // ── Custom split normals ──────────────────────────────────────────────────
+  //
+  // Rules: a corner's custom normal (EditHalfEdge.normal) is drawn as is. Every smooth FAN (the corners of one vertex
+  // joined across non-sharp edges between smooth faces; a flat face's corner is its own fan) is either all custom or
+  // all computed — a fan that would mix (an op built new corners into it, a sharp edge was cleared) is recomputed
+  // whole. Editing clears: moving a vertex clears every corner of its faces (+ their fans); an op's new / rebuilt faces
+  // carry none, so the fans they join are recomputed; Shade Smooth / Flat clears the faces'. Untouched regions keep
+  // the authored normals exactly.
+
+  /** True when some corner has a custom split normal. */
+  hasCustomNormals(): boolean {
+    if (this._cn === null) { this._cn = false; for (const h of this.halfEdges) if (h.normal) { this._cn = true; break; } }
+    return this._cn;
+  }
+  /** hasCustomNormals cache (null = unknown; reset by every topology rebuild). */
+  private _cn: boolean | null = null;
+
+  /** Drop every custom normal (the whole mesh shades from its topology again). */
+  clearCustomNormals(): void {
+    for (const h of this.halfEdges) h.normal = undefined;
+    this._cn = false;
+    this.attrVersion++;
+  }
+
+  /** Clear the custom normals of every face around the given vertices (all their corners, with their smooth fans) —
+   *  what a vertex move does. Returns whether anything was cleared (an in-place drag patch applies the change). */
+  clearCustomNormalsAround(vertices: Iterable<number>): boolean {
+    if (!this.hasCustomNormals()) return false;
+    const seenFace = new Set<number>();
+    const corners: number[] = [];
+    for (const v of vertices) {
+      for (const c of this._cornersAt(v)) {
+        const f = this.halfEdges[c].face;
+        if (f < 0 || seenFace.has(f)) continue;
+        seenFace.add(f);
+        corners.push(...this._faceCorners(f));
+      }
+    }
+    const before = this._cnCleared.length;
+    this._clearFans(corners, this._cnCleared);
+    return this._cnCleared.length > before;
+  }
+
+  /** The corners (half-edges ending at the face's vertices) of face f, in face order. */
+  private _faceCorners(f: number): number[] {
+    const face = this.faces[f];
+    if (!face) return [];
+    const out: number[] = [];
+    let h = face.halfEdge, guard = 0;
+    do { out.push(h); h = this.halfEdges[h].next; } while (h !== face.halfEdge && ++guard < 4096);
+    return out;
+  }
+
+  /** The face corners at vertex v (half-edges ending at v), rotating around it (both ways from a boundary). */
+  private _cornersAt(v: number): number[] {
+    const H = this.halfEdges, start = this.vertices[v]?.halfEdge ?? -1;
+    if (start < 0 || !H[start]) return [];
+    const out: number[] = [];
+    const seen = new Set<number>();
+    let h = start, open = false;
+    for (let g = 0; g < 4096; g++) {         // outgoing h → its face's corner at v is prev(h); next outgoing = twin(prev(h))
+      const c = H[h].prev;
+      if (seen.has(c)) break;
+      seen.add(c); out.push(c);
+      const t = H[c].twin;
+      if (t < 0) { open = true; break; }
+      h = t;
+      if (h === start) break;
+    }
+    if (open) {
+      let b = H[start].twin;                 // backward: twin(outgoing) ends at v in the neighbour face
+      for (let g = 0; b >= 0 && g < 4096 && !seen.has(b); g++) { seen.add(b); out.push(b); b = H[H[b].next].twin; }
+    }
+    return out;
+  }
+
+  /** The smooth fan of corner c (c itself for a flat face): the corners of the same vertex reachable across non-sharp
+   *  edges between smooth faces — the corners compile() averages one normal over. */
+  private _fanOf(c: number): number[] {
+    const H = this.halfEdges, F = this.faces;
+    const smooth = (h: number): boolean => !!F[H[h].face]?.smooth;
+    if (!H[c] || !smooth(c)) return [c];
+    const out = [c];
+    let cur = c;
+    for (let g = 0; g < 4096; g++) {         // across the edge leaving the vertex: twin(next(cur)) is the next face's corner
+      const e = H[cur].next;
+      if (H[e].isSharp) break;
+      const t = H[e].twin;
+      if (t < 0 || !smooth(t)) break;
+      if (t === c) return out;               // closed fan
+      out.push(t); cur = t;
+    }
+    cur = c;
+    for (let g = 0; g < 4096; g++) {         // across the edge entering the vertex: prev(twin(cur))
+      if (H[cur].isSharp) break;
+      const t = H[cur].twin;
+      if (t < 0) break;
+      const k = H[t].prev;
+      if (!smooth(k) || k === c) break;
+      out.push(k); cur = k;
+    }
+    return out;
+  }
+
+  /** Clear the custom normals of the given corners and of every corner in their smooth fans (the cleared half-edges
+   *  are appended to `out`). */
+  private _clearFans(corners: Iterable<number>, out?: number[]): boolean {
+    if (!this.hasCustomNormals()) return false;
+    let cleared = false;
+    for (const c of corners) {
+      for (const k of this._fanOf(c)) if (this.halfEdges[k].normal) { this.halfEdges[k].normal = undefined; cleared = true; out?.push(k); }
+    }
+    return cleared;
+  }
+
+  /** Enforce "a fan is all custom or all computed": a fan mixing both is recomputed whole. */
+  _normalizeCustomNormals(): void {
+    this._cn = null;
+    if (!this.hasCustomNormals()) return;
+    const H = this.halfEdges;
+    const seen = new Uint8Array(H.length);
+    for (let c = 0; c < H.length; c++) {
+      if (seen[c] || !H[c].normal || H[c].face < 0) continue;
+      const fan = this._fanOf(c);
+      let mixed = false;
+      for (const k of fan) { seen[k] = 1; if (!H[k].normal) mixed = true; }
+      if (mixed) for (const k of fan) H[k].normal = undefined;
+    }
+    this._cn = null;
   }
 
   // ── Vertex colors ─────────────────────────────────────────────────────────
 
+  /** Paint a vertex: its colour, at every corner (a corner colour painted there before is replaced). */
   paintVertexColor(vIdx: number, r: number, g: number, b: number, a: number): void {
     const v = this.vertices[vIdx];
-    if (v) v.color = [r, g, b, a];
+    if (!v) return;
+    v.color = [r, g, b, a];
+    for (const h of this.halfEdges) if (h.vertex === vIdx) h.color = undefined;
+    this.attrVersion++;
   }
 
+  /** Paint a face: the colour of its own CORNERS only — the neighbours sharing its vertices keep theirs (a welded mesh
+   *  no longer bleeds the paint into the faces around). */
   paintFaceColor(fIdx: number, r: number, g: number, b: number, a: number): void {
-    for (const vi of this._getFaceVerts(fIdx)) {
-      this.vertices[vi].color = [r, g, b, a];
-    }
+    for (const h of this._faceCorners(fIdx)) this.halfEdges[h].color = [r, g, b, a];
+    this.attrVersion++;
+  }
+
+  /** The colour a face corner shows (half-edge `hi`): its own, else its vertex's. */
+  cornerColor(hi: number): [number, number, number, number] | undefined {
+    const he = this.halfEdges[hi];
+    if (!he) return undefined;
+    return he.color ?? this.vertices[he.vertex]?.color;
   }
 
   /**
@@ -1603,7 +1793,7 @@ export class EditMesh {
       const newVerts = fv.map((_, k) => newBase + k);
       faceNewVerts.set(fi, newVerts);
       const src = origFace.get(fi)!;
-      faceLists[fi] = faceList(newVerts, src.uvs, src.smooth);
+      faceLists[fi] = faceList(newVerts, src.uvs, src.smooth, src.cols);
     }
 
     for (const [fi, fv] of origFaceVerts) {
@@ -1615,7 +1805,9 @@ export class EditMesh {
         const key = a < b ? `${a},${b}` : `${b},${a}`;
         if (interiorEdges.has(key)) continue;
         const ua = this._fuv(src, k), ub = this._fuv(src, (k + 1) % n);
-        faceLists.push(faceList([a, b, newVerts[(k + 1) % n], newVerts[k]], src.uvs ? [ua, ub, ub, ua] : null, src.smooth));
+        const ca = this._fcol(src, k), cb = this._fcol(src, (k + 1) % n);
+        faceLists.push(faceList([a, b, newVerts[(k + 1) % n], newVerts[k]], src.uvs ? [ua, ub, ub, ua] : null, src.smooth,
+          src.cols ? [ca, cb, cb, ca] : null));
       }
     }
     this._buildTopology(faceLists);
@@ -1643,7 +1835,7 @@ export class EditMesh {
     for (const fi of fIdxSet) {
       if (fi < 0 || fi >= faceLists.length) continue;
       const f = faceLists[fi];
-      faceLists[fi] = faceList([...f].reverse(), f.uvs ? [...f.uvs].reverse() : null, f.smooth);
+      faceLists[fi] = faceList([...f].reverse(), f.uvs ? [...f.uvs].reverse() : null, f.smooth, f.cols ? [...f.cols].reverse() : null);
     }
     this._buildTopology(faceLists);
   }
@@ -1764,6 +1956,9 @@ export class EditMesh {
     const cu = fv.map((_, k) => this._fuv(fv, k));
     const cC = avgUV(cu);
     const has = !!fv.uvs;
+    const cc = fv.map((_, k) => this._fcol(fv, k));
+    const ccC = avgCol(cc);
+    const hasC = !!fv.cols;
     faceLists.splice(fIdx, 1);
     // The neighbours across each split edge take its midpoint (they become n-gons) — no T-junction crack.
     const points = new Map<string, { idx: number; vA: number; t: number }>();
@@ -1772,7 +1967,8 @@ export class EditMesh {
     for (let k = 0; k < n; k++) {
       const kp = (k - 1 + n) % n;
       faceLists.push(faceList([fv[k], edgeMids[k], centerIdx, edgeMids[kp]],
-        has ? [cu[k], lerpUV(cu[k], cu[(k + 1) % n], 0.5), cC, lerpUV(cu[kp], cu[k], 0.5)] : null, fv.smooth));
+        has ? [cu[k], lerpUV(cu[k], cu[(k + 1) % n], 0.5), cC, lerpUV(cu[kp], cu[k], 0.5)] : null, fv.smooth,
+        hasC ? [cc[k], lerpCol(cc[k], cc[(k + 1) % n], 0.5), ccC, lerpCol(cc[kp], cc[k], 0.5)] : null));
     }
     this._buildTopology(faceLists);
   }
@@ -2043,11 +2239,17 @@ export class EditMesh {
    * round trip); `cornerUVs[f]` = that face's corner UVs flattened [u0, v0, u1, v1, …] (null pairs = the vertex's
    * UV; the whole entry null = per-vertex UVs), present only when some corner has its own UV; `smoothFaces` = the
    * smooth-shaded face indices; `seamEdges` / `sharpEdges` = vertex pairs. Vertex `color` is omitted when default.
-   * Older snapshots (no cornerUVs / smoothFaces / sharpEdges) load as per-vertex UVs, flat — exactly as before.
+   * `cornerColors[f]` (rgba per corner) / `cornerNormals[f]` (xyz per corner) follow the cornerUVs layout, present only
+   * when some corner has its own colour / custom normal.
+   * Older snapshots (no cornerUVs / smoothFaces / sharpEdges / cornerColors / cornerNormals) load as per-vertex UVs and
+   * colours, computed normals, flat — exactly as before.
    */
   toJSON(): object {
     const lists = this._getAllFaceLists();
     const anyCorner = lists.some(f => !!f.uvs);
+    const anyCol = lists.some(f => !!f.cols), anyN = lists.some(f => !!f.nrms);
+    const flat = <T extends ArrayLike<number>>(list: Array<T | undefined> | undefined, w: number): Array<number | null> | null =>
+      list ? list.flatMap(c => (c ? Array.from({ length: w }, (_, i) => c[i]) : new Array<null>(w).fill(null))) : null;
     const smoothFaces: number[] = [];
     lists.forEach((f, fi) => { if (f.smooth) smoothFaces.push(fi); });
     const sharpEdges = this._flagPairs('isSharp');
@@ -2059,6 +2261,8 @@ export class EditMesh {
       }),
       faces: lists.map(f => [...f]),
       ...(anyCorner ? { cornerUVs: lists.map(f => f.uvs ? f.uvs.flatMap(u => (u ? [u[0], u[1]] : [null, null])) : null) } : {}),
+      ...(anyCol ? { cornerColors: lists.map(f => flat(f.cols, 4)) } : {}),
+      ...(anyN ? { cornerNormals: lists.map(f => flat(f.nrms, 3)) } : {}),
       ...(smoothFaces.length ? { smoothFaces } : {}),
       seamEdges: this._flagPairs('isSeam'),
       ...(sharpEdges.length ? { sharpEdges } : {}),
@@ -2079,17 +2283,28 @@ export class EditMesh {
     }));
     const rawFaces: number[][] = data.faces ?? [];
     const cornerUVs: Array<Array<number | null> | null> | undefined = data.cornerUVs;
+    const cornerCols: Array<Array<number | null> | null> | undefined = data.cornerColors;
+    const cornerNs: Array<Array<number | null> | null> | undefined = data.cornerNormals;
     const smooth = new Set<number>(data.smoothFaces ?? []);
+    const unflat = <T extends number[]>(flat: Array<number | null> | null | undefined, n: number, w: number): Array<T | undefined> | null => {
+      if (!flat) return null;
+      return Array.from({ length: n }, (_, k) => {
+        const c: number[] = [];
+        for (let i = 0; i < w; i++) { const x = flat[k * w + i]; if (x == null) return undefined; c.push(x); }
+        return c as T;
+      });
+    };
     const faceLists = rawFaces.map((f, fi) => {
       const flat = cornerUVs?.[fi];
       const uvs = flat ? f.map((_, k) => (flat[k * 2] == null || flat[k * 2 + 1] == null ? undefined : [flat[k * 2]!, flat[k * 2 + 1]!] as UV)) : null;
-      return faceList([...f], uvs, smooth.has(fi));
+      return faceList([...f], uvs, smooth.has(fi), unflat<RGBA>(cornerCols?.[fi], f.length, 4), unflat<N3>(cornerNs?.[fi], f.length, 3));
     });
     mesh._buildTopology(faceLists, { keepFlags: false });
 
     // Restore seam / sharp edges by vertex pair.
     mesh._markPairs(data.seamEdges ?? [], 'isSeam');
     mesh._markPairs(data.sharpEdges ?? [], 'isSharp');
+    mesh._normalizeCustomNormals();
 
     mesh.proportionalEditEnabled = data.proportionalEditEnabled ?? false;
     mesh.proportionalEditRadius = data.proportionalEditRadius ?? 1.0;
@@ -2157,6 +2372,7 @@ export class EditMesh {
         const to = verts[(k + 1) % n];
         const heIdx = this.halfEdges.length;
         const uv = uvs?.[(k + 1) % n];   // this half-edge ends at corner k+1
+        const col = verts.cols?.[(k + 1) % n], nrm = verts.nrms?.[(k + 1) % n];
 
         this.halfEdges.push({
           vertex: to,
@@ -2166,6 +2382,8 @@ export class EditMesh {
           face: fi,
           isSeam: false,
           ...(uv ? { uv: [uv[0], uv[1]] as UV } : {}),
+          ...(col ? { color: [col[0], col[1], col[2], col[3]] as RGBA } : {}),
+          ...(nrm ? { normal: [nrm[0], nrm[1], nrm[2]] as N3 } : {}),
         });
 
         // Store any outgoing half-edge for this vertex
@@ -2198,6 +2416,11 @@ export class EditMesh {
         if (f & 2) he.isSharp = true;
       }
     }
+    // New / rebuilt faces carry no custom normals: the fans they joined are recomputed. (A caller replacing the mesh
+    // wholesale marks its sharp edges first, then normalises itself.)
+    this._cn = null;
+    this._cnCleared = [];
+    if (opts.keepFlags !== false) this._normalizeCustomNormals();
   }
 
   private _getFaceVerts(fIdx: number): number[] {
@@ -2214,10 +2437,13 @@ export class EditMesh {
     return verts;
   }
 
-  /** Face fIdx as a FaceList: its vertex loop + its own corner UVs (when any corner has one) + its shading. */
+  /** Face fIdx as a FaceList: its vertex loop + its own corner UVs / colours / custom normals (each when any corner
+   *  has one) + its shading. */
   private _getFaceList(fIdx: number): FaceList {
     const verts: number[] = [];
     const uvs: Array<UV | undefined> = [];
+    const cols: Array<RGBA | undefined> = [];
+    const nrms: Array<N3 | undefined> = [];
     let any = false;
     const face = this.faces[fIdx];
     if (!face) return verts as FaceList;
@@ -2228,11 +2454,13 @@ export class EditMesh {
       const h = this.halfEdges[he];
       verts.push(h.vertex);
       uvs.push(h.uv);
+      cols.push(h.color);
+      nrms.push(h.normal);
       if (h.uv) any = true;
       he = h.next;
       if (++guard > 1000) break;
     } while (he !== start);
-    return faceList(verts, any ? uvs : null, face.smooth);
+    return faceList(verts, any ? uvs : null, face.smooth, cols, nrms);
   }
 
   private _getAllFaceLists(): FaceList[] {
@@ -2242,6 +2470,11 @@ export class EditMesh {
   /** Corner k of face list f: its own UV, else its vertex's. */
   private _fuv(f: FaceList | number[], k: number): UV | undefined {
     return (f as FaceList).uvs?.[k] ?? this.vertices[f[k]]?.uv;
+  }
+
+  /** Corner k of face list f: its own colour, else its vertex's (default grey for a missing vertex). */
+  private _fcol(f: FaceList | number[], k: number): RGBA {
+    return (f as FaceList).cols?.[k] ?? this.vertices[f[k]]?.color ?? [0.8, 0.8, 0.8, 1];
   }
 
   /** Set `flag` on both halves of every edge between the given vertex pairs (undirected). */
@@ -2285,7 +2518,7 @@ export class EditMesh {
   private _toEditMeshData(): EditMeshData {
     return {
       vertices: this.vertices.map(v => ({ x: v.x, y: v.y, z: v.z, color: [...v.color] as [number, number, number, number] })),
-      faces: this._getAllFaceLists().map(f => ({ verts: [...f], uvs: f.uvs, smooth: f.smooth })),
+      faces: this._getAllFaceLists().map(f => ({ verts: [...f], uvs: f.uvs, smooth: f.smooth, cols: f.cols, nrms: f.nrms })),
       uvs: this.vertices.map(v => v.uv ? [v.uv[0], v.uv[1]] as [number, number] : [0, 0]),
       sharpEdges: this._flagPairs('isSharp'),
     };
@@ -2300,8 +2533,9 @@ export class EditMesh {
         ? [data.uvs[i][0], data.uvs[i][1]] as [number, number]
         : undefined,
     }));
-    this._buildTopology(data.faces.map(f => faceList([...f.verts], f.uvs, f.smooth)), { keepFlags: false });
+    this._buildTopology(data.faces.map(f => faceList([...f.verts], f.uvs, f.smooth, f.cols, f.nrms)), { keepFlags: false });
     this._markPairs(data.sharpEdges ?? [], 'isSharp');
+    this._normalizeCustomNormals();
   }
 }
 
@@ -2318,6 +2552,9 @@ interface IncrementalCompile {
   verts: EditVertex[]; faces: EditFace[]; halfEdges: EditHalfEdge[];
   nv: number; nf: number; nh: number;
   state: RenderState;
+  attrVersion: number;
+  /** Half-edge → build corner index. */
+  heCorner: Int32Array;
 }
 
 // ── Modifier helpers ──────────────────────────────────────────────────────────
@@ -2517,6 +2754,10 @@ function _catmullClark(mesh: EditMeshData): EditMeshData {
     const n = fVerts.length;
     const cu = face.uvs ? fVerts.map((vi, k) => face.uvs![k] ?? uvOf(vi)) : null;
     const cC = cu ? avgUV(cu) : undefined;
+    // corner colours interpolate inside the face like the UVs (a painted face stays its own colour); custom normals
+    // do not survive smoothing (computed)
+    const cc = face.cols ? fVerts.map((vi, k) => face.cols![k] ?? mesh.vertices[vi].color) : null;
+    const ccC = cc ? avgCol(cc) : undefined;
     for (let k = 0; k < n; k++) {
       const v0 = fVerts[k];
       const v1 = fVerts[(k + 1) % n];
@@ -2528,6 +2769,7 @@ function _catmullClark(mesh: EditMeshData): EditMeshData {
       newFaces.push({
         verts: [v0, ep01, fpIdx, ep0prev],
         uvs: cu ? [cu[k], lerpUV(cu[k], cu[(k + 1) % n], 0.5), cC, lerpUV(cu[(k + n - 1) % n], cu[k], 0.5)] : undefined,
+        cols: cc ? [cc[k], lerpCol(cc[k], cc[(k + 1) % n], 0.5), ccC!, lerpCol(cc[(k + n - 1) % n], cc[k], 0.5)] : undefined,
         smooth: face.smooth,
       });
     }

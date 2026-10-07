@@ -28,6 +28,7 @@ import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { isPointerEventClaimed } from '../../renderer/util/pointer-claims';
 import { EditFacePicker, pickFaceFullScene } from './mesh-edit-face-pick';
+import { MeshBevelTool } from './mesh-bevel-tool';
 
 export type MeshEditSelectionMode = 'vertex' | 'face' | 'edge';
 
@@ -72,6 +73,8 @@ export class MeshEditPointerController {
   private _dragStartCanvasY = 0;
   private _dragStartObjPos: { x: number; y: number; z: number } | null = null;
   private _dragSnapshot: object | null = null;
+  /** The mesh had custom split normals at the drag start (a move clears them around it; a cancel restores the snapshot). */
+  private _dragHadCustomNormals = false;
   /** All vertex positions at drag start — lets the drag re-apply as an absolute move from the
    *  start each frame (no float drift) while routing through moveVertex for proportional falloff. */
   private _dragStartVerts: { x: number; y: number; z: number }[] | null = null;
@@ -86,7 +89,7 @@ export class MeshEditPointerController {
   /** 7.3d perf counters: full recompiles (syncFromEditMesh) vs in-place patches during vertex drags, and what the
    *  patches re-sent (vertex spans / vertices / bytes at the 48-byte pool stride; gpuDirty = a patch the renderer
    *  could not take, so the pool re-uploads the mesh). */
-  readonly dragStats = { fullSyncs: 0, patches: 0, spans: 0, uploadVerts: 0, uploadBytes: 0, gpuDirty: 0 };
+  readonly dragStats = { fullSyncs: 0, patches: 0, spans: 0, indexSpans: 0, uploadVerts: 0, uploadBytes: 0, gpuDirty: 0 };
   /** 7.3d: face picks against the edit mesh only (own BVH + face-centre grid). */
   private readonly _facePicker = new EditFacePicker();
   /** The face picker's counters (tests / perf report). */
@@ -123,7 +126,18 @@ export class MeshEditPointerController {
     this._pushCmd = pushCmd;
     this._scheduleRenderFn = scheduleRender;
     this._opts = opts;
+    this.bevel = new MeshBevelTool({
+      getMesh: (id) => this._scene3d.getMesh(id),
+      meshEdit,
+      pushCmd,
+      scheduleRender,
+      onChange: () => { this._syncBevelWheel(); this._onSelectionChange?.(); },
+    });
   }
+
+  /** The interactive Chamfer / Bevel (mesh-bevel-tool.ts). While it is active this controller routes the canvas
+   *  pointer to it: the pick phase picks a vertex / edge, the adjust phase turns a drag into the amount. */
+  readonly bevel: MeshBevelTool;
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -142,6 +156,7 @@ export class MeshEditPointerController {
 
   detach(): void {
     if (!this._canvas) return;
+    if (this.bevel.active) this.bevel.cancel();
     this._finishPatchedDrag();
     removeZonelessListener(this._canvas, 'pointerdown', this._onDown);
     removeZonelessListener(this._canvas, 'pointermove', this._onMove);
@@ -167,6 +182,7 @@ export class MeshEditPointerController {
   }
 
   setMode(mode: MeshEditSelectionMode): void {
+    if (this.bevel.active && mode !== this._mode) this.bevel.cancel();
     this._mode = mode;
     this._dragging = false;
     this._dragVertexIdx = -1;
@@ -177,7 +193,7 @@ export class MeshEditPointerController {
   get mode(): MeshEditSelectionMode { return this._mode; }
   get isAttached(): boolean { return this._canvas !== null; }
   /** True while a vertex drag (or a finger press that may become one) owns a pointer. */
-  get isBusy(): boolean { return this._dragging || this._pending !== null; }
+  get isBusy(): boolean { return this._dragging || this._pending !== null || this._bevelPointer !== null; }
 
   // ── Pointer handlers ────────────────────────────────────────────────────────
 
@@ -185,6 +201,7 @@ export class MeshEditPointerController {
     if (!this._canvas || !this._meshId) return;
     // Only handle primary button
     if (e.button !== 0) return;
+    if (this.bevel.active) { this._bevelDown(e); return; }
     const additive = !!e.shiftKey || this._isAdditive();
     if (e.pointerType === 'touch') {
       const id = e.pointerId ?? 0;
@@ -220,6 +237,7 @@ export class MeshEditPointerController {
 
   private _handleMove(e: PointerEvent): void {
     if (!this._canvas || !this._meshId) return;
+    if (this.bevel.active) { this._bevelMove(e); return; }
     const touch = e.pointerType === 'touch';
     // A finger press that moved past the slop: in vertex mode a drag from a vertex picks it up (from the PRESS point,
     // so it follows the finger exactly); otherwise it isn't a tap any more and does nothing.
@@ -263,6 +281,7 @@ export class MeshEditPointerController {
   }
 
   private _handleUp(e: PointerEvent): void {
+    if (this.bevel.active || this._bevelPointer !== null || this._bevelPending) { this._bevelUp(e); return; }
     const touch = e.pointerType === 'touch';
     if (touch) this._touchIds.delete(e.pointerId ?? 0);
     const p = this._pending;
@@ -315,6 +334,12 @@ export class MeshEditPointerController {
   }
 
   private _handleCancel(e: PointerEvent): void {
+    if (this.bevel.active || this._bevelPointer !== null || this._bevelPending) {
+      if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+      if (this._bevelPending && (e.pointerId ?? 0) === this._bevelPending.id) this._bevelPending = null;
+      if (this._bevelPointer !== null && (e.pointerId === undefined || e.pointerId === this._bevelPointer)) { this._bevelPointer = null; this.bevel.dragAbort(); }
+      return;
+    }
     if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
     if (this._pending && (e.pointerId ?? 0) === this._pending.id) { this._pending = null; return; }
     if (this._dragPointerId === null || e.pointerId === undefined || e.pointerId === this._dragPointerId) this._cancelDrag();
@@ -325,6 +350,130 @@ export class MeshEditPointerController {
   private _handleLostCapture(e: PointerEvent): void {
     if (!this._dragging || this._dragPointerId === null || e.pointerId !== this._dragPointerId) return;
     this._handleUp(e);
+  }
+
+  // ── Chamfer / Bevel tool routing ────────────────────────────────────────────
+
+  /** The pointer whose drag sets the bevel amount (null = none). */
+  private _bevelPointer: number | null = null;
+  /** A finger press in the bevel tool waiting to become a tap (pick) or a drag (amount). */
+  private _bevelPending: { id: number; clientX: number; clientY: number } | null = null;
+  private _bevelAt: { x: number; y: number; ctrl: boolean } | null = null;
+  private _bevelFrame = 0;
+
+  private _bevelDown(e: PointerEvent): void {
+    if (!this._canvas) return;
+    if (e.pointerType === 'touch') {
+      const id = e.pointerId ?? 0;
+      if (e.isPrimary && this._bevelPointer === null && !this._bevelPending) this._touchIds.clear();
+      this._touchIds.add(id);
+      // a 2nd finger is a camera gesture: drop the press, put the amount back where the drag started
+      if (this._touchIds.size > 1) { this._bevelPending = null; if (this._bevelPointer !== null) { this._bevelPointer = null; this.bevel.dragAbort(); } return; }
+      if (isPointerEventClaimed(e) || e.isPrimary === false) return;
+      this._bevelPending = { id, clientX: e.clientX, clientY: e.clientY };
+      this._rect = this._canvas.getBoundingClientRect();
+      return;
+    }
+    // mouse / pen: a press picks (pick phase) and drags the amount at once
+    this._pickScale = 1;
+    this._rect = this._canvas.getBoundingClientRect();
+    const at = this._toCanvasPx(e.clientX, e.clientY);
+    if (this.bevel.phase === 'pick' && !this._bevelPick(at.x, at.y)) return;
+    this._bevelStartDrag(at.x, at.y, e.pointerId);
+  }
+
+  private _bevelMove(e: PointerEvent): void {
+    const p = this._bevelPending;
+    if (p && e.pointerType === 'touch' && (e.pointerId ?? 0) === p.id) {
+      if (Math.hypot(e.clientX - p.clientX, e.clientY - p.clientY) <= MeshEditPointerController.TAP_SLOP_PX) return;
+      this._bevelPending = null;
+      // a finger drag sets the amount (adjust phase; not while the host latched one-finger navigation)
+      if (this.bevel.phase !== 'adjust' || this._touchIds.size > 1 || this._scene3d.getTouchNavigate3D?.()) return;
+      this._pickScale = TOUCH_PICK_SCALE;
+      const at = this._toCanvasPx(p.clientX, p.clientY);
+      if (!this._bevelStartDrag(at.x, at.y, p.id)) return;
+      // fall through: apply the current position
+    }
+    if (this._bevelPointer === null || (e.pointerId !== undefined && e.pointerId !== this._bevelPointer)) return;
+    const c = this._toCanvasPx(e.clientX, e.clientY);
+    this._bevelAt = { x: c.x, y: c.y, ctrl: !!(e.ctrlKey || e.metaKey) };
+    if (this._bevelFrame) return;
+    let ran = false;
+    const id = this._frame(() => { ran = true; this._bevelFrame = 0; this._applyBevelDrag(); });
+    if (!ran) this._bevelFrame = id;
+  }
+
+  private _bevelUp(e: PointerEvent): void {
+    const touch = e.pointerType === 'touch';
+    if (touch) this._touchIds.delete(e.pointerId ?? 0);
+    const p = this._bevelPending;
+    if (p && touch && (e.pointerId ?? 0) === p.id) {
+      // a TAP: in the pick phase it picks the corner / edge under the finger
+      this._bevelPending = null;
+      if (this._canvas && this.bevel.phase === 'pick') {
+        this._pickScale = TOUCH_PICK_SCALE;
+        const at = this._toCanvasPx(e.clientX, e.clientY);
+        this._bevelPick(at.x, at.y);
+      }
+      this._rect = null;
+      return;
+    }
+    if (this._bevelPointer === null || (e.pointerId !== undefined && e.pointerId !== this._bevelPointer)) return;
+    if (this._bevelFrame) { this._cancelFrame(this._bevelFrame); this._bevelFrame = 0; }
+    this._applyBevelDrag();
+    if (this._canvas) { try { this._canvas.releasePointerCapture(this._bevelPointer); } catch { /* gone */ } }
+    this._bevelPointer = null;
+    this.bevel.dragEnd();
+    this._rect = null;
+  }
+
+  /** Pick phase: the vertex under (x, y), else the edge — start the bevel on it. */
+  private _bevelPick(px: number, py: number): boolean {
+    const mesh = this._getMesh();
+    if (!mesh?.editMesh) return false;
+    const vi = this._pickVertex(px, py);
+    if (vi >= 0 && this.bevel.pick({ vertex: vi })) return true;
+    const hi = this._pickEdge(px, py);
+    const ends = hi >= 0 ? mesh.editMesh.getHalfEdgeVertices(hi) : null;
+    return !!ends && this.bevel.pick({ edge: ends });
+  }
+
+  private _bevelStartDrag(px: number, py: number, pointerId: number): boolean {
+    const mesh = this._getMesh();
+    if (!this._canvas || !mesh) return false;
+    if (!this.bevel.dragStart(px, py, this._projector(mesh, this._canvas.width, this._canvas.height))) return false;
+    try { this._canvas.setPointerCapture(pointerId); } catch { /* pointer already gone */ }
+    this._bevelPointer = pointerId ?? 0;
+    return true;
+  }
+
+  private _applyBevelDrag(): void {
+    const at = this._bevelAt;
+    this._bevelAt = null;
+    if (!at || this._bevelPointer === null) return;
+    this.bevel.dragMove(at.x, at.y, at.ctrl);
+    this._scheduleRender();
+  }
+
+  /** Mouse wheel while the tool is active: segments ± 1 (instead of the Edit Mesh zoom). Window capture phase, so it
+   *  runs before the canvas zoom interceptor. */
+  private _bevelWheelOn = false;
+  private readonly _onBevelWheel = (e: WheelEvent): void => {
+    if (!this.bevel.active || e.target !== this._canvas || Math.abs(e.deltaY) < 0.5) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    const s = this.bevel.state();
+    if (s) this.bevel.setSegments(s.segments + (e.deltaY < 0 ? 1 : -1));
+    this._scheduleRender();
+  };
+  private _syncBevelWheel(): void {
+    const w = typeof window !== 'undefined' ? window : null;
+    if (!w) return;
+    const want = this.bevel.active && !!this._canvas;
+    if (want === this._bevelWheelOn) return;
+    this._bevelWheelOn = want;
+    if (want) w.addEventListener('wheel', this._onBevelWheel, { capture: true, passive: false });
+    else w.removeEventListener('wheel', this._onBevelWheel, { capture: true });
   }
 
   // ── Selection + drag ────────────────────────────────────────────────────────
@@ -377,6 +526,7 @@ export class MeshEditPointerController {
     this._dragStartCanvasY = py;
     this._dragDepth = s?.depth ?? 0.5;
     this._dragSnapshot = mesh.editMesh.toJSON();
+    this._dragHadCustomNormals = typeof mesh.editMesh.hasCustomNormals === 'function' && mesh.editMesh.hasCustomNormals();
     this._dragStartObjPos = { x: v.x, y: v.y, z: v.z };
     this._dragStartVerts = mesh.editMesh.vertices.map(vt => ({ x: vt.x, y: vt.y, z: vt.z }));
     try { this._canvas.setPointerCapture(pointerId); } catch { /* pointer already gone */ }
@@ -434,6 +584,13 @@ export class MeshEditPointerController {
       this.dragStats.uploadVerts += spans[i + 1];
       this.dragStats.uploadBytes += spans[i + 1] * 48;
     }
+    // A quad whose diagonal flipped this frame (concave drag) rewrote its index range in place: re-send it too.
+    const idx = mesh.editMesh?.lastPatchIndexSpans ?? [];
+    for (let i = 0; ok && i < idx.length; i += 2) {
+      if (typeof this._scene3d.patchMeshIndices3D !== 'function' || !this._scene3d.patchMeshIndices3D(mesh, idx[i], idx[i + 1])) { ok = false; break; }
+      this.dragStats.indexSpans++;
+      this.dragStats.uploadBytes += idx[i + 1] * 4;
+    }
     if (ok) this._scene3d.noteMeshVerticesMoved3D?.(mesh);
     else { mesh.gpuDirty = true; this.dragStats.gpuDirty++; }
   }
@@ -457,8 +614,13 @@ export class MeshEditPointerController {
     if (this._dragging && this._dragStartVerts) {
       const mesh = this._getMesh();
       if (mesh?.editMesh) {
-        const verts = mesh.editMesh.vertices, start = this._dragStartVerts;
-        for (let i = 0; i < verts.length && i < start.length; i++) { verts[i].x = start[i].x; verts[i].y = start[i].y; verts[i].z = start[i].z; }
+        if (this._dragHadCustomNormals && this._dragSnapshot) {
+          // the drag recomputed (cleared) custom normals around the moved vertices: the snapshot puts them back exactly
+          mesh.editMesh = EditMesh.fromJSON(this._dragSnapshot);
+        } else {
+          const verts = mesh.editMesh.vertices, start = this._dragStartVerts;
+          for (let i = 0; i < verts.length && i < start.length; i++) { verts[i].x = start[i].x; verts[i].y = start[i].y; verts[i].z = start[i].z; }
+        }
         mesh.syncFromEditMesh();
         this.dragStats.fullSyncs++;
       }
@@ -510,6 +672,10 @@ export class MeshEditPointerController {
 
   private _cancelFrames(): void {
     if (this._dragFrame) { this._cancelFrame(this._dragFrame); this._dragFrame = 0; }
+    if (this._bevelFrame) { this._cancelFrame(this._bevelFrame); this._bevelFrame = 0; }
+    this._bevelAt = null;
+    this._bevelPointer = null;
+    this._bevelPending = null;
     if (this._hoverFrame) { this._cancelFrame(this._hoverFrame); this._hoverFrame = 0; }
     this._dragAt = null;
     this._hoverAt = null;

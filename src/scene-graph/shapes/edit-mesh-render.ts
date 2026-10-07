@@ -8,15 +8,18 @@
  *  - render vertices: a FLAT face's corners each get their own render vertex (the corner's position, the face
  *    normal, the corner UV) — exactly what a generator emits for a hard-edged primitive (a cube = 24 render
  *    vertices); a SMOOTH face's corners share a render vertex with every other smooth corner of the same vertex in
- *    the same normal FAN (corners joined across non-sharp edges between smooth faces) that has the same UV. The
- *    sharing is decided from the topology + UVs only (never from computed float values), so moving vertices never
- *    changes which corners share — the in-place drag patch below stays exact.
- *  - normals: flat = the face's Newell normal (the polygon normal, so a non-planar quad stays one flat face);
- *    smooth = the angle-weighted sum of the face normals over the corner's fan.
+ *    the same normal FAN (corners joined across non-sharp edges between smooth faces) that has the same UV, colour
+ *    and custom normal. The sharing is decided from the topology + corner attributes only (never from computed float
+ *    values), so moving vertices never changes which corners share — the in-place drag patch below stays exact.
+ *  - normals: a corner's CUSTOM split normal when it has one (an import's authored normal, written bit for bit);
+ *    else flat = the face's Newell normal (the polygon normal, so a non-planar quad stays one flat face), smooth =
+ *    the angle-weighted sum of the face normals over the corner's fan.
+ *  - colours: the corner's own colour (Paint Face Colour), else its vertex's.
  *  - tangents: from the UV gradients of the face (summed over its triangles), Gram-Schmidt'd against the normal;
  *    handedness in w. Faces without usable UVs fall back to an axis-derived tangent (the old compile's rule).
- *  - triangulation: triangle as is; quad = (0,1,2)(0,2,3); 5+ corners = ear clipping in the face plane (concave
- *    n-gons stay correct), fan fallback when no ear exists.
+ *  - triangulation: triangle as is; quad = (0,1,2)(0,2,3), or (0,1,3)(1,2,3) when the 0–2 split folds (a concave
+ *    quad — Blender's diagonal flip); 5+ corners = ear clipping in the face plane (concave n-gons stay correct), fan
+ *    fallback when no ear exists.
  *
  * The output is INDEXED (render vertices are shared between the triangles of a face, and between faces in a smooth
  * fan). `sourceVerts[r]` is the topology vertex of render vertex r (skinned weight remap, drag patch).
@@ -32,7 +35,13 @@ import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 /** The flat mesh format the build reads (EditMeshData in edit-mesh.ts — structurally typed here to avoid a cycle). */
 export interface RenderSourceData {
   vertices: ArrayLike<{ x: number; y: number; z: number; color: ArrayLike<number> }>;
-  faces: ArrayLike<{ verts: number[]; uvs?: ReadonlyArray<readonly [number, number] | undefined>; smooth?: boolean }>;
+  faces: ArrayLike<{
+    verts: number[]; uvs?: ReadonlyArray<readonly [number, number] | undefined>; smooth?: boolean;
+    /** Corner colours (absent = the vertex colour). */
+    cols?: ReadonlyArray<ArrayLike<number> | undefined>;
+    /** Corner custom normals (absent = computed). */
+    nrms?: ReadonlyArray<ArrayLike<number> | undefined>;
+  }>;
   /** Per-vertex fallback UV (a corner without its own UV uses its vertex's). */
   uvs: ArrayLike<readonly [number, number] | undefined>;
   /** Undirected vertex pairs marked sharp (smooth fans never cross them). */
@@ -53,6 +62,11 @@ export interface RenderState {
   cornerFace: Int32Array;
   /** Resolved corner UV (doubles, u v). */
   cornerUV: Float64Array;
+  /** Resolved corner colour (rgba). */
+  cornerCol: Float64Array;
+  /** Corner custom normal (xyz) where cornerHasN[c]. */
+  cornerN: Float64Array;
+  cornerHasN: Uint8Array;
   /** Corner → render vertex. */
   cornerRV: Int32Array;
   faceSmooth: Uint8Array;
@@ -80,6 +94,9 @@ export interface RenderState {
   /** Scratch: per-face / per-render-vertex marks (all zero between patches). */
   faceMark: Uint8Array;
   rvMark: Uint8Array;
+  /** The INDEX ranges the last patch rewrote (a quad whose diagonal flipped / an n-gon re-clipped), flattened
+   *  [start, count, ...] in index units ([] = none). The caller re-sends them with the vertex spans. */
+  idxSpans: number[];
 }
 
 /** Output-vertex gap (≈1.5 KB) below which two dirty spans are sent as one write. */
@@ -98,6 +115,7 @@ export function buildRenderMesh(data: RenderSourceData): { geom: RenderGeometry;
   for (let f = 0; f < nf; f++) faceStart[f + 1] = faceStart[f] + F[f].verts.length;
   const nc = faceStart[nf];
   const cornerVert = new Int32Array(nc), cornerFace = new Int32Array(nc), cornerUV = new Float64Array(nc * 2);
+  const cornerCol = new Float64Array(nc * 4), cornerN = new Float64Array(nc * 3), cornerHasN = new Uint8Array(nc);
   const faceSmooth = new Uint8Array(nf);
   for (let f = 0; f < nf; f++) {
     const face = F[f], vs = face.verts, s = faceStart[f];
@@ -107,6 +125,10 @@ export function buildRenderMesh(data: RenderSourceData): { geom: RenderGeometry;
       cornerVert[c] = v; cornerFace[c] = f;
       const uv = face.uvs?.[k] ?? data.uvs[v];
       cornerUV[c * 2] = uv ? uv[0] : 0; cornerUV[c * 2 + 1] = uv ? uv[1] : 0;
+      const col = face.cols?.[k] ?? V[v]?.color;
+      if (col) { cornerCol[c * 4] = col[0]; cornerCol[c * 4 + 1] = col[1]; cornerCol[c * 4 + 2] = col[2]; cornerCol[c * 4 + 3] = col[3]; }
+      const n = face.nrms?.[k];
+      if (n) { cornerHasN[c] = 1; cornerN[c * 3] = n[0]; cornerN[c * 3 + 1] = n[1]; cornerN[c * 3 + 2] = n[2]; }
     }
   }
 
@@ -166,16 +188,20 @@ export function buildRenderMesh(data: RenderSourceData): { geom: RenderGeometry;
   }
   const { start: fanStart, items: fanCorners } = csr(nFan, nc, (c) => cornerFan[c]);
 
-  // 4. Render vertices in face / corner order: a flat corner → its own; a smooth corner → (fan, UV) shared.
+  // 4. Render vertices in face / corner order: a flat corner → its own; a smooth corner → (fan, UV, colour, custom
+  //    normal) shared.
   const cornerRV = new Int32Array(nc);
   const smoothKey = new Map<string, number>();
   let nRV = 0;
-  const f32 = new Float32Array(2), u32 = new Uint32Array(f32.buffer);
+  const f32 = new Float32Array(9), u32 = new Uint32Array(f32.buffer);
   for (let c = 0; c < nc; c++) {
     const fan = cornerFan[c];
     if (fan < 0) { cornerRV[c] = nRV++; continue; }
     f32[0] = cornerUV[c * 2]; f32[1] = cornerUV[c * 2 + 1];
-    const key = `${fan}:${u32[0]}:${u32[1]}`;
+    for (let i = 0; i < 4; i++) f32[2 + i] = cornerCol[c * 4 + i];
+    for (let i = 0; i < 3; i++) f32[6 + i] = cornerN[c * 3 + i];
+    const key = `${fan}:${u32[0]}:${u32[1]}:${u32[2]}:${u32[3]}:${u32[4]}:${u32[5]}`
+      + (cornerHasN[c] ? `:${u32[6]}:${u32[7]}:${u32[8]}` : '');
     let rv = smoothKey.get(key);
     if (rv === undefined) { rv = nRV++; smoothKey.set(key, rv); }
     cornerRV[c] = rv;
@@ -197,11 +223,11 @@ export function buildRenderMesh(data: RenderSourceData): { geom: RenderGeometry;
   for (let v = 0; v < nv; v++) { const p = V[v]; pos[v * 3] = p.x; pos[v * 3 + 1] = p.y; pos[v * 3 + 2] = p.z; }
 
   const state: RenderState = {
-    nv, nf, faceStart, cornerVert, cornerFace, cornerUV, cornerRV, faceSmooth, faceTriStart, faceTris,
+    nv, nf, faceStart, cornerVert, cornerFace, cornerUV, cornerCol, cornerN, cornerHasN, cornerRV, faceSmooth, faceTriStart, faceTris,
     faceN: new Float64Array(nf * 3), faceT: new Float64Array(nf * 3), faceB: new Float64Array(nf * 3),
     cornerAngle: new Float64Array(nc),
     cornerFan, fanStart, fanCorners, rvStart, rvCorners, vfStart, vfFaces, pos,
-    faceMark: new Uint8Array(nf), rvMark: new Uint8Array(nRV),
+    faceMark: new Uint8Array(nf), rvMark: new Uint8Array(nRV), idxSpans: [],
   };
 
   // 6. Face frames, then every render vertex.
@@ -212,8 +238,7 @@ export function buildRenderMesh(data: RenderSourceData): { geom: RenderGeometry;
   for (let rv = 0; rv < nRV; rv++) {
     const c0 = rvCorners[rvStart[rv]], v = cornerVert[c0];
     writeRenderVertex(state, V, rv, vertBuf);
-    const col = V[v].color;
-    colorBuf[rv * 4] = col[0]; colorBuf[rv * 4 + 1] = col[1]; colorBuf[rv * 4 + 2] = col[2]; colorBuf[rv * 4 + 3] = col[3];
+    for (let i = 0; i < 4; i++) colorBuf[rv * 4 + i] = cornerCol[c0 * 4 + i];
     sourceVerts[rv] = v;
   }
   const idxBuf = new Uint32Array(nTri * 3);
@@ -234,12 +259,25 @@ export function buildRenderMesh(data: RenderSourceData): { geom: RenderGeometry;
  * Rewrite `out` (the vertex buffer the build produced) for the vertex positions in `verts`. Only faces touching a
  * moved vertex are re-framed, and only the render vertices of those faces — plus every render vertex of a smooth fan
  * such a face feeds — are rewritten. Returns the rewritten render-vertex spans flattened as [start, count, ...] in
- * ascending order ([] = nothing moved), or null when the patch cannot reproduce a fresh build (an n-gon whose
- * triangulation changed) — the caller recompiles. On null nothing was written.
+ * ascending order ([] = nothing moved), or null when the patch cannot reproduce a fresh build — the caller recompiles.
+ * On null nothing was written.
+ *
+ * A quad whose diagonal flipped (a concave drag) or an n-gon whose ear clipping changed keeps its triangle COUNT, so
+ * its fixed range of `outIdx` (the build's index buffer) is rewritten in place and listed in `state.idxSpans`; without
+ * `outIdx` such a frame returns null.
+ *
+ * `clearedN` = build corners whose CUSTOM normal was cleared since (a vertex move recomputes its region — whole smooth
+ * fans at a time): they switch to computed normals in place, as long as that keeps every render vertex's corners the
+ * same (corners of one fan with equal UV / colour must already share one) — else null.
  */
-export function patchRenderMesh(state: RenderState, verts: ArrayLike<P3>, out: Float32Array): number[] | null {
+export function patchRenderMesh(
+  state: RenderState, verts: ArrayLike<P3>, out: Float32Array, outIdx?: Uint32Array, clearedN?: ArrayLike<number>,
+): number[] | null {
   const { nv, pos, vfStart, vfFaces, faceMark } = state;
+  state.idxSpans = [];
   if (verts.length !== nv) return null;
+  const nCleared = clearedN ? clearedN.length : 0;
+  if (nCleared && !clearedNormalsKeepSharing(state, clearedN!)) return null;
 
   // 1. Moved vertices → dirty faces (not committed until the n-gon check passes).
   const moved: number[] = [];
@@ -247,27 +285,48 @@ export function patchRenderMesh(state: RenderState, verts: ArrayLike<P3>, out: F
     const p = verts[v];
     if (p.x !== pos[o] || p.y !== pos[o + 1] || p.z !== pos[o + 2]) moved.push(v);
   }
-  if (moved.length === 0) return [];
+  if (moved.length === 0 && nCleared === 0) return [];
   const dirtyFaces: number[] = [];
   for (const v of moved) {
     for (let k = vfStart[v]; k < vfStart[v + 1]; k++) { const f = vfFaces[k]; if (!faceMark[f]) { faceMark[f] = 1; dirtyFaces.push(f); } }
   }
+  // a corner whose custom normal was cleared rewrites its face (and so its fan's render vertices)
+  for (let i = 0; i < nCleared; i++) { const f = state.cornerFace[clearedN![i]]; if (f >= 0 && !faceMark[f]) { faceMark[f] = 1; dirtyFaces.push(f); } }
   const clearMarks = (): void => { for (const f of dirtyFaces) faceMark[f] = 0; };
 
-  // 2. An n-gon's ear clipping depends on the positions: a different triangulation = a different index buffer.
+  // 2. A quad's diagonal / an n-gon's ear clipping depends on the positions: a different triangulation rewrites the
+  //    face's (fixed-size) index range — collected here, committed in 3 (nothing is written before every check passed).
+  let retri: Array<{ f: number; tri: number[] }> | null = null;
   for (const f of dirtyFaces) {
     const s = state.faceStart[f], n = state.faceStart[f + 1] - s;
-    if (n < 5) continue;
+    if (n < 4) continue;
     const vs: number[] = new Array(n);
     for (let k = 0; k < n; k++) vs[k] = state.cornerVert[s + k];
     const tri = triangulateFace(verts, vs);
     const t0 = state.faceTriStart[f] * 3, t1 = state.faceTriStart[f + 1] * 3;
-    let same = tri.length === t1 - t0;
-    for (let i = 0; same && i < tri.length; i++) if (tri[i] !== state.faceTris[t0 + i]) same = false;
-    if (!same) { clearMarks(); return null; }
+    if (tri.length !== t1 - t0) { clearMarks(); return null; }
+    if (!sameTris(tri, state.faceTris, t0)) (retri ??= []).push({ f, tri });
   }
+  if (retri && (!outIdx || outIdx.length !== state.faceTriStart[state.nf] * 3)) { clearMarks(); return null; }
 
-  // 3. Commit positions, re-frame the dirty faces, collect the render vertices they feed.
+  // 3. Commit positions (+ new triangulations, cleared custom normals), re-frame the dirty faces, collect the render
+  //    vertices they feed.
+  for (let i = 0; i < nCleared; i++) {
+    const c = clearedN![i], fan = state.cornerFan[c];
+    state.cornerHasN[c] = 0;
+    if (fan >= 0) for (let k = state.fanStart[fan]; k < state.fanStart[fan + 1]; k++) state.cornerHasN[state.fanCorners[k]] = 0;
+  }
+  if (retri) {
+    for (const { f, tri } of retri) {
+      const s = state.faceStart[f], t0 = state.faceTriStart[f] * 3;
+      for (let i = 0; i < tri.length; i++) { state.faceTris[t0 + i] = tri[i]; outIdx![t0 + i] = state.cornerRV[s + tri[i]]; }
+    }
+    retri.sort((a, b) => a.f - b.f);
+    for (const { f } of retri) {
+      const t0 = state.faceTriStart[f] * 3, cnt = state.faceTriStart[f + 1] * 3 - t0, sp = state.idxSpans, L = sp.length;
+      if (L && sp[L - 2] + sp[L - 1] === t0) sp[L - 1] += cnt; else sp.push(t0, cnt);
+    }
+  }
   for (const v of moved) { const p = verts[v], o = v * 3; pos[o] = p.x; pos[o + 1] = p.y; pos[o + 2] = p.z; }
   const { rvMark, cornerRV, cornerFan, fanStart, fanCorners } = state;
   const dirtyRV: number[] = [];
@@ -364,6 +423,37 @@ function orthoTangent(nx: number, ny: number, nz: number, tx: number, ty: number
   out[o] = x / l; out[o + 1] = y / l; out[o + 2] = z / l;
 }
 
+/** True when clearing the custom normals of `cleared` (whole smooth fans) leaves every render vertex's corner set as
+ *  built: within each touched fan, corners with equal UV + colour bits already share one render vertex. */
+function clearedNormalsKeepSharing(st: RenderState, cleared: ArrayLike<number>): boolean {
+  const nc = st.cornerVert.length;
+  const f32 = new Float32Array(6), u32 = new Uint32Array(f32.buffer);
+  const doneFan = new Set<number>();
+  for (let i = 0; i < cleared.length; i++) {
+    const c = cleared[i];
+    if (!(c >= 0 && c < nc)) return false;
+    const fan = st.cornerFan[c];
+    if (fan < 0 || doneFan.has(fan)) continue;
+    doneFan.add(fan);
+    const rvOf = new Map<string, number>();
+    for (let k = st.fanStart[fan]; k < st.fanStart[fan + 1]; k++) {
+      const q = st.fanCorners[k];
+      f32[0] = st.cornerUV[q * 2]; f32[1] = st.cornerUV[q * 2 + 1];
+      for (let j = 0; j < 4; j++) f32[2 + j] = st.cornerCol[q * 4 + j];
+      const key = `${u32[0]}:${u32[1]}:${u32[2]}:${u32[3]}:${u32[4]}:${u32[5]}`;
+      const rv = rvOf.get(key);
+      if (rv === undefined) rvOf.set(key, st.cornerRV[q]);
+      else if (rv !== st.cornerRV[q]) return false;
+    }
+  }
+  return true;
+}
+
+function sameTris(tri: number[], faceTris: Int32Array, t0: number): boolean {
+  for (let i = 0; i < tri.length; i++) if (tri[i] !== faceTris[t0 + i]) return false;
+  return true;
+}
+
 const _N = new Float64Array(3), _T = new Float64Array(3);
 
 /** Write render vertex rv (position, normal, UV, tangent) into `buf`. */
@@ -372,6 +462,29 @@ function writeRenderVertex(st: RenderState, V: ArrayLike<P3>, rv: number, buf: F
   const p = V[st.cornerVert[c0]];
   const fan = st.cornerFan[c0];
   let nx: number, ny: number, nz: number, tx: number, ty: number, tz: number, bx: number, by: number, bz: number;
+  if (st.cornerHasN[c0]) {
+    // Custom split normal (every corner of this render vertex has the same one): written exactly (its float32 value;
+    // only a −0 component is written +0, as everywhere in the build); the tangent is the
+    // UV tangent of its corners' faces, orthogonalised against it.
+    nx = st.cornerN[c0 * 3]; ny = st.cornerN[c0 * 3 + 1]; nz = st.cornerN[c0 * 3 + 2];
+    tx = 0; ty = 0; tz = 0; bx = 0; by = 0; bz = 0;
+    for (let k = k0; k < k1; k++) {
+      const o = st.cornerFace[st.rvCorners[k]] * 3;
+      tx += st.faceT[o]; ty += st.faceT[o + 1]; tz += st.faceT[o + 2];
+      bx += st.faceB[o]; by += st.faceB[o + 1]; bz += st.faceB[o + 2];
+    }
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    orthoTangent(nx / nl, ny / nl, nz / nl, tx, ty, tz, _T, 0);
+    const qx = _T[0], qy = _T[1], qz = _T[2];
+    const cx = ny * qz - nz * qy, cy = nz * qx - nx * qz, cz = nx * qy - ny * qx;
+    const w = cx * bx + cy * by + cz * bz < 0 ? -1 : 1;
+    const o = rv * FLOATS_PER_VERT;
+    buf[o] = p.x; buf[o + 1] = p.y; buf[o + 2] = p.z;
+    buf[o + 3] = nx + 0; buf[o + 4] = ny + 0; buf[o + 5] = nz + 0;   // (−0 → +0: a JSON save cannot keep −0)
+    buf[o + 6] = st.cornerUV[c0 * 2]; buf[o + 7] = st.cornerUV[c0 * 2 + 1];
+    buf[o + 8] = qx + 0; buf[o + 9] = qy + 0; buf[o + 10] = qz + 0; buf[o + 11] = w;
+    return;
+  }
   if (fan < 0) {
     // Flat: the face frame.
     const o = f0 * 3;
@@ -413,15 +526,16 @@ function writeRenderVertex(st: RenderState, V: ArrayLike<P3>, rv: number, buf: F
 // ── Triangulation ─────────────────────────────────────────────────────────────
 
 /**
- * Corner-local triangle list of a polygon: a triangle as is, a quad as (0,1,2)(0,2,3) (the generators' split, so a
- * primitive's diagonals are kept), 5+ corners by ear clipping in the plane of the Newell normal (handles concave
- * n-gons), falling back to a fan when no ear is found (degenerate / self-intersecting).
+ * Corner-local triangle list of a polygon: a triangle as is, a quad by {@link quadSplit} ((0,1,2)(0,2,3) — the
+ * generators' split, so a primitive's diagonals are kept — unless that folds), 5+ corners by ear clipping in the plane
+ * of the Newell normal (handles concave n-gons), falling back to a fan when no ear is found (degenerate /
+ * self-intersecting).
  */
 export function triangulateFace(V: ArrayLike<P3>, vs: ArrayLike<number>): number[] {
   const n = vs.length;
   if (n < 3) return [];
   if (n === 3) return [0, 1, 2];
-  if (n === 4) return [0, 1, 2, 0, 2, 3];
+  if (n === 4) return quadSplit(V[vs[0]], V[vs[1]], V[vs[2]], V[vs[3]]) ? [0, 1, 3, 1, 2, 3] : [0, 1, 2, 0, 2, 3];
   // Project onto the face plane (drop the dominant normal axis, keep the orientation CCW).
   let nx = 0, ny = 0, nz = 0;
   for (let k = 0; k < n; k++) {
@@ -464,6 +578,27 @@ export function triangulateFace(V: ArrayLike<P3>, vs: ArrayLike<number>): number
   // No ear (degenerate): fan the rest.
   for (let k = 1; k < ring.length - 1; k++) out.push(ring[0], ring[k], ring[k + 1]);
   return out;
+}
+
+/**
+ * Blender's quad diagonal choice: true = split along 1–3. The default 0–2 split is kept unless its two triangles face
+ * opposite ways (dot of their normals < 0 — the quad is concave at corner 1 or 3, or dragged past folding), and then
+ * only when the 1–3 split is better. Deterministic, position-only; a convex (or planar-convex) quad always keeps 0–2,
+ * so unedited meshes triangulate exactly as before.
+ */
+export function quadSplit(p0: P3, p1: P3, p2: P3, p3: P3): boolean {
+  const d02 = crossDot(p0, p1, p2, p0, p2, p3);
+  if (!(d02 < 0)) return false;
+  return crossDot(p0, p1, p3, p1, p2, p3) > d02;
+}
+
+/** dot(normal(a, b, c), normal(d, e, f)) with unnormalised triangle normals. */
+function crossDot(a: P3, b: P3, c: P3, d: P3, e: P3, f: P3): number {
+  const ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z, vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+  const n1x = uy * vz - uz * vy, n1y = uz * vx - ux * vz, n1z = ux * vy - uy * vx;
+  const sx = e.x - d.x, sy = e.y - d.y, sz = e.z - d.z, tx = f.x - d.x, ty = f.y - d.y, tz = f.z - d.z;
+  const n2x = sy * tz - sz * ty, n2y = sz * tx - sx * tz, n2z = sx * ty - sy * tx;
+  return n1x * n2x + n1y * n2y + n1z * n2z;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

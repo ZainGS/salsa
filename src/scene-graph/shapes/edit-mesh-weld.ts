@@ -21,6 +21,10 @@
  *
  * With `weld: false` (skinned bodies: their rest weights / weight paint index the GEOMETRY's vertices) the vertex
  * array stays 1:1 with the geometry and only the triangles are read (no welding, no quads, UVs stay per vertex).
+ *
+ * Every face corner also reports the geometry's normal there (`nrms`): EditMesh.fromGeometry keeps them as custom
+ * split normals, so an import's authored normals survive entering Edit Mesh bit for bit (a missing / zero normal →
+ * undefined = computed).
  */
 
 import type { MeshGeometry } from '../../renderer/3d/mesh-generators';
@@ -41,7 +45,7 @@ export interface WeldOptions {
 
 export interface WeldResult {
   vertices: Array<{ x: number; y: number; z: number; color: [number, number, number, number]; uv?: UV2 }>;
-  faces: Array<{ verts: number[]; uvs?: UV2[]; smooth: boolean }>;
+  faces: Array<{ verts: number[]; uvs?: UV2[]; smooth: boolean; nrms?: Array<[number, number, number] | undefined> }>;
   sharpEdges: Array<[number, number]>;
   /** Stats (tests / the report). */
   stats: { sourceVerts: number; sourceTris: number; degenerate: number; quads: number };
@@ -126,11 +130,16 @@ export function weldGeometry(geom: MeshGeometry, opts: WeldOptions = {}): WeldRe
 
   const uvOf = (s: number): UV2 => [src[s * S + 6] ?? 0, src[s * S + 7] ?? 0];
   const nrmOf = (s: number): [number, number, number] => [src[s * S + 3] ?? 0, src[s * S + 4] ?? 0, src[s * S + 5] ?? 0];
+  /** The source normal as a custom split normal (bit-exact float32 values), or undefined when missing / degenerate. */
+  const customOf = (s: number): [number, number, number] | undefined => {
+    const n = nrmOf(s);
+    return Number.isFinite(n[0] + n[1] + n[2]) && Math.hypot(n[0], n[1], n[2]) > 0.5 ? n : undefined;
+  };
 
   if (!weld) {
     // 1:1 (skinned): UVs per vertex, as the legacy edit mesh; smooth where the source normals say so.
     for (let i = 0; i < nSrc; i++) vertices[i].uv = uvOf(i);
-    const faces = tris.map((t) => ({ verts: [...t.v], smooth: isSmooth(vertices, t.v, t.s.map(nrmOf)) }));
+    const faces = tris.map((t) => ({ verts: [...t.v], smooth: isSmooth(vertices, t.v, t.s.map(nrmOf)), nrms: t.s.map(customOf) }));
     return { vertices, faces, sharpEdges: [], stats: { sourceVerts: nSrc, sourceTris: nTri, degenerate, quads: 0 } };
   }
 
@@ -179,6 +188,7 @@ export function weldGeometry(geom: MeshGeometry, opts: WeldOptions = {}): WeldRe
     verts: p.v,
     uvs: p.s.map(uvOf),
     smooth: isSmooth(vertices, p.v, p.s.map(nrmOf)),
+    nrms: p.s.map(customOf),
   }));
   if (vertexUVs) {
     faces.forEach((f) => f.verts.forEach((v, k) => { if (!vertices[v].uv) vertices[v].uv = [f.uvs![k][0], f.uvs![k][1]]; }));

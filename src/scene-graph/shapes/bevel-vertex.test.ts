@@ -9,11 +9,13 @@ describe('EditMesh.bevelVertex', () => {
 
         m.bevelVertex(0, 0.3);
 
-        // A cube corner has 3 incident faces → 3 new cut-vertices + 1 cap face.
-        expect(m.vertices.length).toBe(vertsBefore + 3);
+        // A cube corner has 3 incident faces → 3 new cut-vertices + 1 cap face; the corner vertex itself is gone
+        // (the full bevel removes it — the old chamfer left it in the array, unused).
+        expect(m.vertices.length).toBe(vertsBefore - 1 + 3);
         expect(m.faces.length).toBe(facesBefore + 1);
         // The 3 new vertices sit between the old corner and its neighbours (pulled inward), not at the old corner.
-        const newVerts = m.vertices.slice(vertsBefore);
+        const newVerts = m.vertices.slice(vertsBefore - 1);
+        expect(newVerts.length).toBe(3);
         for (const nv of newVerts) {
             const moved = Math.abs(nv.x - v0.x) > 1e-6 || Math.abs(nv.y - v0.y) > 1e-6 || Math.abs(nv.z - v0.z) > 1e-6;
             expect(moved).toBe(true);

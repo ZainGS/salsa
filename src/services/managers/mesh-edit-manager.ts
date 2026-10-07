@@ -20,7 +20,7 @@ import type { ManagerContext } from './manager-context';
 import type { Command3D } from './undo-manager-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
-import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier, faceList, type FaceList } from '../../scene-graph/shapes/edit-mesh';
+import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier, remapFace, type FaceList, type BevelSpec } from '../../scene-graph/shapes/edit-mesh';
 import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
 export interface EditSelection {
@@ -392,6 +392,28 @@ export class MeshEditManager {
   }
 
   /**
+   * Bevel / chamfer (EditMesh.bevel — docs/specs/edit-mesh-topology.md §8): vertices (`spec.vertices`) or edges
+   * (`spec.edges`, vertex pairs) by `spec.amount` (distance along the edges, clamped) with `spec.segments`. One undo
+   * step; the selection is dropped (the indices change). Returns the amount used, or null when nothing was beveled.
+   */
+  bevel(meshId: string, spec: BevelSpec): number | null {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return null;
+    const before = mesh.editMesh.toJSON();
+    const r = mesh.editMesh.bevel(spec);
+    if (!r) return null;
+    mesh.syncFromEditMesh();
+    const after = mesh.editMesh.toJSON();
+    this._clearSelectionGeometry(meshId);
+    this.pushCommand({
+      description: spec.vertices?.length ? 'Chamfer vertex' : 'Bevel edge',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh = EditMesh.fromJSON(after); mesh.syncFromEditMesh(); },
+    });
+    return r.amount;
+  }
+
+  /**
    * Apply a pre-computed knife cut to the EditMesh.
    * The `faceCuts` array is produced by ShapeManager.knifeCut3D after screen-space
    * projection. Snapshot undo/redo; redo restores the post-cut snapshot so face
@@ -731,12 +753,12 @@ export class MeshEditManager {
       newVerts.push({ ...em.vertices[vi] });
     }
 
-    // Build remapped face lists (corner UVs + shading travel with their faces)
+    // Build remapped face lists (corner UVs / colours / custom normals + shading travel with their faces)
     const newFaceLists: FaceList[] = [];
     for (const fi of set) {
       if (fi >= 0 && fi < allFaceLists.length) {
         const f = allFaceLists[fi];
-        newFaceLists.push(faceList(f.map(vi => oldToNew.get(vi)!), f.uvs, f.smooth));
+        newFaceLists.push(remapFace(f, vi => oldToNew.get(vi)!));
       }
     }
 
@@ -744,6 +766,7 @@ export class MeshEditManager {
     const newEm = new EditMesh();
     newEm.vertices = newVerts;
     newEm._buildTopology(newFaceLists, { keepFlags: false });
+    newEm._normalizeCustomNormals();
 
     // Create new Mesh3D at source's position
     const newMesh = new Mesh3D(this.ctx.interactionService, mesh.x, mesh.y, mesh.z, { primitive: 'custom', geometry: newEm.compile() });

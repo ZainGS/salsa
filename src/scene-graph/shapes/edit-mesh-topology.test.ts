@@ -227,7 +227,8 @@ describe('Edit Mesh topology — primitives enter welded, Blender-style', () => 
     expect(split.length).toBeGreaterThan(0);
     for (const [a, b] of split) {
       if (Math.abs(V[a * S + 4]) > 0.99) continue;   // (poles split per triangle UV)
-      expect([V[a * S + 3], V[a * S + 4], V[a * S + 5]]).toEqual([V[b * S + 3], V[b * S + 4], V[b * S + 5]]);
+      // (the generator's own normals are kept as custom normals — its u = 0 / u = 1 copies differ in the last bits)
+      for (let k = 3; k < 6; k++) expect(V[a * S + k]).toBeCloseTo(V[b * S + k], 6);
     }
   });
 });
@@ -407,10 +408,9 @@ describe('Edit Mesh topology — tools keep a valid closed mesh', () => {
     em.flipFaces(new Set([2]));
     em.subdivideFace(1);
     expect(topologyErrors(em, true)).toEqual([]);
-    // (bevelEdge chamfers only the edge's two faces — the end corners stay open, as before this change: the half-edge
-    //  structure is valid, the cracks are boundaries. A full edge bevel is listed in edit-mesh-topology.md §7.)
+    // (bevelEdge is a full bevel now — edit-mesh-bevel.ts: the end corners are re-cut and capped, the mesh stays closed)
     em.bevelEdge(em.faces[0].halfEdge, 0.2);
-    expect(topologyErrors(em, false)).toEqual([]);
+    expect(topologyErrors(em, true)).toEqual([]);
     em.deleteFaces(new Set([0]));
     expect(topologyErrors(em, false)).toEqual([]);
     expect(em.mergeByDistance(1e-9)).toBe(0);

@@ -74,6 +74,8 @@ function setup(opts: { em?: EditMesh; patchOk?: boolean } = {}) {
     projectWorldToScreen3D: project,
     unprojectScreenToWorld3D: (sx: number, sy: number) => ({ x: sx / 100, y: -sy / 100, z: 0 }),
     patchMeshVertices3D: (_m: Mesh3D, start: number, count: number) => { uploads.push({ start, count }); return opts.patchOk ?? true; },
+    // a quad whose diagonal flips mid-drag (a big drag folds a cage quad) re-sends its index range
+    patchMeshIndices3D: () => opts.patchOk ?? true,
     noteMeshVerticesMoved3D: () => { moved++; },
   } as unknown as Scene3DManager;
   const meshEdit = new MeshEditManager({ sceneGraph: { findNodeById: () => null } } as unknown as ManagerContext, () => {});

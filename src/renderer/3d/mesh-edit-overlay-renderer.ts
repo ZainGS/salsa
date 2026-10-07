@@ -25,6 +25,7 @@ import { RD } from './render-debug';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import type { EditSelection } from '../../services/managers/mesh-edit-manager';
 import type { MeshEditSelectionMode } from '../../services/managers/mesh-edit-pointer-controller';
+import { triangulateFace } from '../../scene-graph/shapes/edit-mesh-render';
 
 // Fragment shader for rear (occluded) edges: 4-pixel diagonal stipple pattern.
 // Uses (x+y) % 8 so horizontal, vertical, and diagonal lines all look dashed.
@@ -44,9 +45,13 @@ struct In {
 const C_UNSEL_EDGE:  readonly [number, number, number, number] = [0.65, 0.65, 0.65, 0.5];
 const C_SEL_EDGE:    readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
 const C_SEAM_EDGE:   readonly [number, number, number, number] = [0.9, 0.15, 0.15, 1.0];
+/** Sharp (hard) edge — cyan, as Blender draws Mark Sharp (EditMesh.setSharpEdges / sm.setSharpEdges3D). */
+const C_SHARP_EDGE:  readonly [number, number, number, number] = [0.2, 0.85, 1.0, 1.0];
 const C_UNSEL_VERT:  readonly [number, number, number, number] = [1.0, 0.72, 0.4, 0.85];
 const C_SEL_VERT:    readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
 const C_SEL_FACE:    readonly [number, number, number, number] = [1.0, 0.55, 0.0,  0.25];
+/** Chamfer / Bevel guide (dashed bisector through each target) — the knife preview's yellow. */
+const C_GUIDE:       readonly [number, number, number, number] = [1.0, 0.9, 0.3, 1.0];
 /** UV cross-highlight tint (cyan): shown when hovering in the UV canvas pane. */
 const C_HOVER_FACE:  readonly [number, number, number, number] = [0.3, 0.85, 1.0,  0.20];
 
@@ -68,6 +73,9 @@ export interface MeshEditDrawData {
    *  caged in white edges while painting. Selected-edge highlights ride this pass too, but in
    *  UV/paint mode selection is null, so nothing useful is lost when it's off. */
   showWireframe?: boolean;
+  /** Chamfer / Bevel tool guides: world-space segment endpoints (xyz pairs, a line list — the tool already dashed
+   *  them), drawn on top in {@link C_GUIDE}. */
+  guides?: Float32Array | null;
 }
 
 // ── Renderer ─────────────────────────────────────────────────────────────────
@@ -228,20 +236,19 @@ export class MeshEditOverlayRenderer {
         for (const fi of faces) {
           const face = em.faces[fi];
           if (!face) continue;
-          const wv: [number, number, number][] = [];
+          const vs: number[] = [];
           let hi = face.halfEdge;
           for (let guard = 0; guard < 64; guard++) {
-            const v = em.vertices[em.halfEdges[hi].vertex];
-            wv.push(toW(v.x, v.y, v.z));
+            vs.push(em.halfEdges[hi].vertex);
             hi = em.halfEdges[hi].next;
             if (hi === face.halfEdge) break;
           }
-          if (wv.length < 3) continue;
-          const w0 = wv[0];
-          for (let i = 1; i < wv.length - 1; i++) {
-            pushV(fill, w0,        col);
-            pushV(fill, wv[i],     col);
-            pushV(fill, wv[i + 1], col);
+          if (vs.length < 3) continue;
+          // The compile's own triangulation (a concave quad / n-gon fills inside its outline, not as a fan)
+          const tri = triangulateFace(em.vertices, vs);
+          for (const k of tri) {
+            const v = em.vertices[vs[k]];
+            pushV(fill, toW(v.x, v.y, v.z), col);
           }
         }
       };
@@ -307,7 +314,7 @@ export class MeshEditOverlayRenderer {
       const wTo   = toW(vTo.x, vTo.y, vTo.z);
       const wFrom = toW(vFrom.x, vFrom.y, vFrom.z);
       const isSel  = mode === 'edge' && !!selection?.edges.has(hi);
-      const col    = isSel ? C_SEL_EDGE : he.isSeam ? C_SEAM_EDGE : C_UNSEL_EDGE;
+      const col    = isSel ? C_SEL_EDGE : he.isSeam ? C_SEAM_EDGE : he.isSharp ? C_SHARP_EDGE : C_UNSEL_EDGE;
       lineV.push(wFrom[0], wFrom[1], wFrom[2], col[0], col[1], col[2], col[3]);
       lineV.push(wTo[0],   wTo[1],   wTo[2],   col[0], col[1], col[2], col[3]);
     }
@@ -353,7 +360,30 @@ export class MeshEditOverlayRenderer {
       pass.draw(this._lineFloats / 7);
       }
     }
+
+    // ── 4. Chamfer / Bevel guides (tiny; rebuilt every frame while the tool shows them) ──
+    const gl = data.guides;
+    if (gl && gl.length >= 6) {
+      const nv = Math.floor(gl.length / 3), floats = nv * 7, bytes = floats * 4;
+      if (!this._guideBuf || this._guideCap < bytes) {
+        this._guideBuf?.destroy();
+        this._guideCap = Math.max((Math.ceil(bytes * 1.5) + 3) & ~3, 64 * GIZMO_VERTEX_STRIDE);
+        this._guideBuf = this.device.createBuffer({ size: this._guideCap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      }
+      if (!this._guideScratch || this._guideScratch.length < floats) this._guideScratch = new Float32Array(this._guideCap / 4);
+      let o = 0;
+      for (let i = 0; i < nv; i++) o = putV(this._guideScratch, o, gl[i * 3], gl[i * 3 + 1], gl[i * 3 + 2], C_GUIDE);
+      this.device.queue.writeBuffer(this._guideBuf, 0, this._guideScratch, 0, floats);
+      pass.setPipeline(this._linePipe.get()!);
+      pass.setBindGroup(0, this._uniBG);
+      pass.setVertexBuffer(0, this._guideBuf);
+      pass.draw(nv);
+    }
   }
+
+  private _guideBuf: GPUBuffer | null = null;
+  private _guideCap = 0;
+  private _guideScratch: Float32Array | null = null;
 
   // ── Tri cache (fills + vertex dots) ───────────────────────────────────────
   /** Floats in the cached tri VB (0 = nothing to draw). */
@@ -432,7 +462,7 @@ export class MeshEditOverlayRenderer {
           const E = this._wfHe;
           for (let i = 0; i < H.length; i++) {
             const he = H[i], o = i * 4;
-            if (E[o] !== he.twin || E[o + 1] !== he.prev || E[o + 2] !== he.vertex || E[o + 3] !== (he.isSeam ? 1 : 0)) { same = false; break; }
+            if (E[o] !== he.twin || E[o + 1] !== he.prev || E[o + 2] !== he.vertex || E[o + 3] !== edgeFlags(he)) { same = false; break; }
           }
         }
         if (same && edgeSel) {
@@ -457,7 +487,7 @@ export class MeshEditOverlayRenderer {
       if (this._wfHe.length !== H.length * 4) this._wfHe = new Int32Array(H.length * 4);
       for (let i = 0; i < H.length; i++) {
         const he = H[i], o = i * 4;
-        this._wfHe[o] = he.twin; this._wfHe[o + 1] = he.prev; this._wfHe[o + 2] = he.vertex; this._wfHe[o + 3] = he.isSeam ? 1 : 0;
+        this._wfHe[o] = he.twin; this._wfHe[o + 1] = he.prev; this._wfHe[o + 2] = he.vertex; this._wfHe[o + 3] = edgeFlags(he);
       }
       this._wfSel = edgeSel ? [...selection!.edges] : [];
     } else {
@@ -473,10 +503,16 @@ export class MeshEditOverlayRenderer {
     this._uniBuf.destroy();
     this._triBuf?.destroy();
     this._lineBuf?.destroy();
+    this._guideBuf?.destroy();
   }
 }
 
 // ── Module-private helper ─────────────────────────────────────────────────────
+
+/** The edge flags the wireframe colours by (seam = 1, sharp = 2) — part of the wireframe cache snapshot. */
+function edgeFlags(he: { isSeam: boolean; isSharp?: boolean }): number {
+  return (he.isSeam ? 1 : 0) | (he.isSharp ? 2 : 0);
+}
 
 /** Write one vertex (position + colour, 7 floats) at `o`; returns the next offset. */
 function putV(out: Float32Array, o: number, x: number, y: number, z: number, col: readonly [number, number, number, number]): number {

@@ -185,6 +185,8 @@ import { debugLog } from './debug-log';
 import { MeshPaintManager } from './managers/mesh-paint-manager';
 import { MeshEditManager } from './managers/mesh-edit-manager';
 import type { UVIsland } from '../scene-graph/shapes/edit-mesh';
+import type { BevelSpec } from '../scene-graph/shapes/edit-mesh';
+import type { BevelToolState } from './managers/mesh-bevel-tool';
 import { UVEditorSession, UVCanvasRenderer } from './managers/uv-canvas-renderer';
 import type { UVSelectionMode } from './managers/uv-canvas-renderer';
 import { UVEditManager } from './managers/uv-edit-manager';
@@ -931,6 +933,8 @@ class ShapeManager {
                     // Honour the toggle if a UV editor is open alongside, else always show
                     // edges (you need them to select verts/edges while mesh-editing).
                     showWireframe: uvSession?.showWireframe ?? true,
+                    // the Chamfer / Bevel tool's dashed guide lines (null when it shows none)
+                    guides: this._meshEditPointerController.bevel.guideLines(),
                 };
             }
 
@@ -7824,6 +7828,7 @@ class ShapeManager {
 
     /** Exit mesh edit mode, clearing selection. */
     public exitMeshEditMode3D(): void {
+        this._meshEditPointerController.bevel.cancel();   // a Chamfer in progress puts the mesh back
         this.meshEdit.exitEditMode();
         this.scene3d.disableMeshEditOrbit();
     }
@@ -7978,6 +7983,54 @@ class ShapeManager {
     public bevelVertex3D(meshId: string, vertexIndex: number, amount: number): boolean {
         return this.meshEdit.bevelVertex(meshId, vertexIndex, amount);
     }
+
+    // ── Chamfer / Bevel (docs/specs/edit-mesh-topology.md §8; the touch pill: docs/ui/touch-controls.md) ──
+
+    /**
+     * Bevel / chamfer in one call (no tool): `spec.vertices` (vertex chamfer) or `spec.edges` (edge bevel, vertex
+     * pairs), `spec.amount` = distance along the edges (object units, clamped — clamp overlap), `spec.segments`
+     * (1 = flat, > 1 = rounded). The end corners of an edge bevel are re-cut and capped (closed mesh). One undo step.
+     * Returns the amount used, or null when nothing was beveled.
+     */
+    public bevel3D(meshId: string, spec: BevelSpec): number | null {
+        return this.meshEdit.bevel(meshId, spec);
+    }
+
+    /**
+     * Start the interactive Chamfer on the mesh in Edit Mesh: on the selected vertices (vertex mode) / edges (edge
+     * mode), else it waits for a tap / click on a vertex or edge (`getBevelState3D().phase === 'pick'`). A drag on the
+     * canvas then sets the amount (relative to the press — it need not follow the dashed guide), the mouse wheel sets
+     * the segments, Ctrl snaps. Finish with {@link commitBevel3D} (one undo step) or {@link cancelBevel3D} (exact
+     * restore). Returns false when no mesh is in Edit Mesh.
+     */
+    public beginBevel3D(opts?: { segments?: number; kind?: 'vertex' | 'edge'; snap?: boolean }): boolean {
+        const id = this.meshEdit.activeMeshId;
+        if (!id) return false;
+        const ok = this._meshEditPointerController.bevel.begin(id, opts);
+        this.scheduleRender();
+        return ok;
+    }
+
+    /** The Chamfer tool's state (phase, amount, limit, segments, snap, hint), or null when it is not running. */
+    public getBevelState3D(): BevelToolState | null { return this._meshEditPointerController.bevel.state(); }
+
+    /** True while the Chamfer tool runs (Enter / Esc belong to it). */
+    get isBevelActive3D(): boolean { return this._meshEditPointerController.bevel.active; }
+
+    /** Set the Chamfer amount (object units; clamped to the limit; snapped when Snap is on) — the pill's field. */
+    public setBevelAmount3D(amount: number): void { this._meshEditPointerController.bevel.setAmount(amount); this.scheduleRender(); }
+
+    /** Set the Chamfer segments (1 = flat, > 1 = rounded; at most 32). */
+    public setBevelSegments3D(segments: number): void { this._meshEditPointerController.bevel.setSegments(segments); this.scheduleRender(); }
+
+    /** The Chamfer Snap toggle (round the amount to `step`, default 0.05 object units; Ctrl inverts it while dragging). */
+    public setBevelSnap3D(on: boolean, step?: number): void { this._meshEditPointerController.bevel.setSnap(on, step); this.scheduleRender(); }
+
+    /** Apply the Chamfer (one undo step; an amount of 0 cancels). Returns whether the mesh changed. */
+    public commitBevel3D(): boolean { const ok = this._meshEditPointerController.bevel.commit(); this.scheduleRender(); return ok; }
+
+    /** Cancel the Chamfer: the mesh and the selection exactly as before. */
+    public cancelBevel3D(): void { this._meshEditPointerController.bevel.cancel(); this.scheduleRender(); }
 
     /**
      * Run a smart-project (box/triplanar) UV unwrap on the mesh.
@@ -11078,8 +11131,8 @@ class ShapeManager {
     get undoDescription3D(): string | null { return this.scene3d.undoDescription3D; }
     get redoDescription3D(): string | null { return this.scene3d.redoDescription3D; }
 
-    public undo3D(): boolean { return this.scene3d.undo3D(); }
-    public redo3D(): boolean { return this.scene3d.redo3D(); }
+    public undo3D(): boolean { this._meshEditPointerController?.bevel.cancel(); return this.scene3d.undo3D(); }   // (a Chamfer preview first goes back)
+    public redo3D(): boolean { this._meshEditPointerController?.bevel.cancel(); return this.scene3d.redo3D(); }
     public clearUndo3D(): void { this.scene3d.clearUndo3D(); }
 
     // ── 2D vector OBJECT undo (P1, editing-loop-polish.md) ──────────
