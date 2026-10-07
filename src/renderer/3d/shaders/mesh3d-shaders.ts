@@ -29,8 +29,9 @@ import { STYLE_WGSL_FUNCTIONS } from './style-shaders';
 import { CROWD_PALETTE_WGSL } from '../crowd-palette';
 
 // ── Shared PBR + IBL WGSL (included in both fragment shader variants) ──────
+// (Exported for the shader split: shaders/mesh3d-fs-template.ts splices it into the merged template.)
 
-const PBR_IBL_WGSL = /* wgsl */`
+export const PBR_IBL_WGSL = /* wgsl */`
 
 struct IBLUniforms {
   shCoeffs:    array<vec4<f32>, 9>,  // L0+L1+L2 SH irradiance coefficients (rgb, w unused)
@@ -4437,7 +4438,8 @@ fn fs_main(
 // in-fragment from worldPos (no VS change). shadowParams.w = PCF penumbra width multiplier (soft shadows).
 // The emissive part is restored un-shadowed (neon must not dim inside a building's shadow).
 
-const SHADOW_SAMPLE_WGSL = (group: number): string => /* wgsl */ `
+/** Shadow-receive bindings + PCF / cascade helpers at bind group `group` (exported for shaders/mesh3d-fs-template.ts). */
+export const SHADOW_SAMPLE_WGSL = (group: number): string => /* wgsl */ `
 @group(${group}) @binding(0) var shadowMap:     texture_depth_2d;
 @group(${group}) @binding(1) var shadowSampler: sampler_comparison;
 @group(${group}) @binding(2) var shadowCascades: texture_depth_2d_array;

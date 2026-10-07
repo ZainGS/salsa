@@ -1185,6 +1185,70 @@ describe('P15 sub-bundles: omitted draws are zero draws, the replay set = the fu
   });
 });
 
+describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
+  it('slot key = material key, state codes carry split ids, GPU = CPU sequence, covered meshes never touch the uber pipelines', async () => {
+    const { r, dev, cam, meshes, Renderer3D } = await scene();
+    const R3 = Renderer3D as unknown as { gpuDriven: boolean; gpuDrivenLean: boolean; rangeCulling: boolean; splitKeyOfMesh: (m: unknown) => number; SPLIT_ID_FLAG: number };
+    const prev = { g: R3.gpuDriven, l: R3.gpuDrivenLean, rc: R3.rangeCulling };
+    R3.gpuDriven = true; R3.gpuDrivenLean = false; R3.rangeCulling = false;
+    try {
+      // covered: plain, Cel + rim, painted metal; NOT covered (today's pipelines): procedural ground, stripes
+      meshes.forEach((m, i) => {
+        if (!/^m\d+$/.test(m.name)) return;
+        if (i % 5 === 1) m.material.metalShade = true;
+        else if (i % 5 === 2) { m.material.renderStyle = 'cel'; m.material.rimEnabled = true; }
+        else if (i % 5 === 3) m.material.groundShade = true;
+        else if (i % 5 === 4) m.material.patternMode = 'stripes';
+        m.materialDirty = true;
+      });
+      expect(r.setShaderSplit({ enabled: true }).active).toBe(true);
+      const em = emulator(r, dev.mem);
+      dev.onEncode.push(em.run);
+      cam.setPosition(0, 40, 90); cam.setTarget(0, 0, 0);
+      let compared = 0;
+      for (let f = 0; f < 12; f++) {
+        await Promise.resolve();
+        const rp = recordingPass(em.args);
+        r.drawMeshes(rp.pass, meshes, 1300, 850);
+        if (!r._gdDrew) continue;
+        expect(rp.draws).toEqual(cpuSequence(r));
+        compared++;
+      }
+      expect(compared).toBeGreaterThan(5);
+      // the slot read-back key = the material key; covered iff no heavy feature
+      let covered = 0;
+      for (const m of meshes) if (m.submeshes.length === 0 && m._r3Slot >= 0) {
+        expect(m._r3FK, m.name).toBe(R3.splitKeyOfMesh(m));
+        expect(m._r3FK >= 0, m.name).toBe(!m.material.groundShade && (m.material.patternMode ?? 'none') === 'none');
+        if (m._r3FK >= 0) covered++;
+      }
+      expect(covered).toBeGreaterThan(20);
+      // GPU state codes: covered records carry SPLIT_ID_FLAG | id, the rest no split id
+      const gd = r._gd;
+      for (let p = 0; p < gd._nOrder; p++) {
+        const rr = gd._order[p], m = gd._isGroup[rr] ? gd._srcRef[rr] : gd._obj[rr];
+        const id = (gd._code[rr] >> 5) & 0x7fff;
+        expect((id & R3.SPLIT_ID_FLAG) !== 0, m.name).toBe(R3.splitKeyOfMesh(m) >= 0);
+      }
+      // the generated pipelines exist; the PLAIN uber pipelines (only covered meshes would draw with them) never compiled
+      // (a draw's get() compiles synchronously outside a live frame; the document pre-warm may still QUEUE one for the
+      // uncovered vertex-coloured mesh, as today)
+      const st = r.setShaderSplit({});
+      expect(st.pipelines).toBeGreaterThanOrEqual(3);
+      expect(st.list.every((e: { key: string }) => e.key.startsWith('U|') || e.key.startsWith('T|'))).toBe(true);
+      for (const n of ['opaqueUntexturedPlainPipeline', 'opaqueUntexturedNoCullPlainPipeline', 'transparentUntexturedPipeline']) {
+        expect(r.pipeline.handleOf(n).ready, n).toBe(false);
+      }
+      // switching the split off keeps the draw order and drops the split ids
+      const order0 = (r._drawOrder.orderedMeshes() as typeof meshes).map((m) => m.id).join(',');
+      r.setShaderSplit({ mode: 'auto' });
+      for (let f = 0; f < 6; f++) { await Promise.resolve(); r.drawMeshes(recordingPass(em.args).pass, meshes, 1300, 850); }
+      expect((r._drawOrder.orderedMeshes() as typeof meshes).map((m) => m.id).join(',')).toBe(order0);
+      for (let p = 0; p < gd._nOrder; p++) expect(((gd._code[gd._order[p]] >> 5) & R3.SPLIT_ID_FLAG) !== 0).toBe(false);
+    } finally { r.setShaderSplit({ mode: 'auto' }); R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; }
+  });
+});
+
 describe('P15 GPU culling mode', () => {
   it('auto: switching paths (the GPU scene warm on CPU frames) draws the CPU sequence every frame, with no rebuild', async () => {
     const { r, dev, cam, meshes, Renderer3D } = await scene();

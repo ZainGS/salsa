@@ -190,6 +190,9 @@ export class Mesh3D extends Shape {
   /** Step 8 (renderer/3d/shader-variants.ts): RENDERER-PRIVATE — the shader-variant key read back from this mesh's
    *  instance slot at its last write (the exact material flags, or -1 = the uber-shader). */
   public _r3VF = -1;
+  /** Shader split (renderer/3d/mesh-fs-pipelines.ts): RENDERER-PRIVATE — the packed phase-1 fragment-shader key read
+   *  back from this mesh's instance slot at its last write (shaders/mesh-fs-key.ts meshFsPhase1Num; -1 = not covered). */
+  public _r3FK = -1;
   /** Ray-pickable? Set false for pure DECORATION that is never individually selected (the whole procedural
    *  city — buildings/props/movers). The picker skips these BEFORE the expensive per-mesh BVH build, so hover/
    *  click over a ~700-mesh city costs nothing (previously each pick rebuilt every mesh's BVH after a regen —

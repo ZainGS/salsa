@@ -7484,6 +7484,13 @@ class ShapeManager {
      *  pixels), `{ max }` caps the variant keys; returns the keys in use, compiled / pending pipelines and compile ms. */
     public setShaderVariants3D(o: Parameters<Renderer3D['setShaderVariants']>[0] = {}): ReturnType<Renderer3D['setShaderVariants']> { const r = this.renderer3D.setShaderVariants(o); this.scheduleRender(); return r; }
     public getShaderVariants3D(): ReturnType<Renderer3D['setShaderVariants']> { return this.renderer3D.setShaderVariants({}); }
+    /** SHADER SPLIT phase 1 (docs/specs/shader-split.md; docs/ui/gpu-diagnostics.md): `{ enabled }` / `{ mode: 'on' |
+     *  'off' | 'auto' }` switches it per machine (localStorage salsa.shaderSplit; reload for the full effect), `bisect`
+     *  ('none' | 'noTexSample' | 'minimal') picks the RENDER-1 bisect keys, and the test knobs `forceFallback` /
+     *  `noFallback` / `slowCompileMs` exercise the fallback and hold paths. Returns the state + keys, compiled / pending
+     *  pipelines, sizes, compile ms and the exact / fallback / held selection counters. */
+    public setShaderSplit3D(o: Parameters<Renderer3D['setShaderSplit']>[0] = {}): ReturnType<Renderer3D['setShaderSplit']> { const r = this.renderer3D.setShaderSplit(o); this.scheduleRender(); return r; }
+    public getShaderSplit3D(): ReturnType<Renderer3D['setShaderSplit']> { return this.renderer3D.setShaderSplit({}); }
     /** P15 diagnostics: records / draw order / buckets, the GPU-reported counters (one frame late, `age`), rebuilds,
      *  bundle re-records, uploads, the draw mode and CPU ms. */
     public getGpuDrivenStats3D(): ReturnType<Renderer3D['getGpuDrivenStats']> { return this.renderer3D.getGpuDrivenStats(); }
