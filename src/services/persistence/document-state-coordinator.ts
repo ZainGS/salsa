@@ -121,6 +121,8 @@ export interface DocumentStatePrivate {
     restoreClothingTextures(blobs: Map<string, ArrayBuffer>): Promise<void>;
     restoreProceduralMeshTextures(map: Map<string, ArrayBuffer>): Promise<void>;
     backfillUnassignedVectorLayers(): void;
+    /** Give orphaned vector shapes / placements (their layer was removed without them) a layer back. Optional. */
+    recoverOrphanedVectorContent?(): void;
     /** Called with each successful GPU read-back (the device-lost shadow). Optional. */
     onGpuOnlyGathered?(data: GpuOnlyDocumentData): void;
     /** Suppresses intermediate scene-graph-changed events during restore. */
@@ -1003,6 +1005,13 @@ export class DocumentStateCoordinator {
             }
         } else {
             this.priv.ephemera?.deserialize?.(EMPTY_EPHEMERA_JSON);
+        }
+
+        // UI review 2026-10-07 #2: the vector-layer ✕ used to drop the layer but keep its shapes (drawn, saved, but no
+        // layer could select or delete them). Shapes + placements are both back by now: give each missing layer id a
+        // "Recovered shapes" vector layer so that content is reachable again.
+        if (this.rlm) {
+            try { this.priv.recoverOrphanedVectorContent?.(); } catch (e) { fail('orphaned vector shapes', e); }
         }
 
         // Restore GARP pools + skin sources BEFORE procedural regen (below) so the city's fascia resolver picks

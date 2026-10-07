@@ -102,6 +102,7 @@ import { GizmoMode, GizmoAxis } from '../../renderer/3d/gizmo-renderer';
 import { type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { type SnapMode, type SnapVizData } from './transform-controller-3d';
+import type { ElementTransformRouter } from './mesh-element-transform';
 import { rebase3DNodeToParent } from './transform-rebase-3d';
 import { TextureLibrary } from '../texture-library';
 import {
@@ -9677,7 +9678,11 @@ export class Scene3DManager {
         return this._arrayTool?.getRadialArc() ?? 360;
     }
 
-    setGizmoMode(mode: GizmoMode): void { return this._armature.setGizmoMode(mode); }
+    setGizmoMode(mode: GizmoMode): void {
+        // In Edit Mesh the selection gizmo follows the scene's gizmo mode too (the object gizmo is hidden there).
+        if (this._elementXf?.handles()) this._elementXf.setGizmoMode(mode);
+        return this._armature.setGizmoMode(mode);
+    }
 
     getGizmoMode(): GizmoMode { return this._armature.getGizmoMode(); }
 
@@ -9761,7 +9766,7 @@ export class Scene3DManager {
         axis: GizmoAxis;
         angleDeg: number | null;
         gizmoCenterWorld: [number, number, number] | null;
-    } { return this._armature.getDragInfo(); }
+    } { return this._elementXf?.dragInfo() ?? this._armature.getDragInfo(); }
 
     // ── Viewport snapping ────────────────────────────────────────────
 
@@ -9804,28 +9809,72 @@ export class Scene3DManager {
 
     // ── Viewport transform shortcuts ────────────────────────────────
 
-    get isShortcutActive(): boolean { return this._armature.getTransformController()?.isShortcutActive ?? false; }
-    get shortcutMode(): 'grab' | 'rotate' | 'scale' | null { return this._armature.getTransformController()?.shortcutMode ?? null; }
-    get shortcutAxis(): 'x' | 'y' | 'z' | null { return this._armature.getTransformController()?.shortcutAxis ?? null; }
-    get shortcutNumericDisplay(): string { return this._armature.getTransformController()?.shortcutNumericDisplay ?? ''; }
+    /** Edit Mesh element transforms (docs/specs/edit-mesh-topology.md §11): while a mesh is in Edit Mesh the G / R / S
+     *  family below drives the SELECTED ELEMENTS (the MeshEditPointerController's router), not the object. */
+    private _elementXf: ElementTransformRouter | null = null;
+    setElementTransformRouter(router: ElementTransformRouter | null): void { this._elementXf = router; }
+    /** The element transform owns the G / R / S family right now: one runs, or a mesh is in Edit Mesh. */
+    private _xfRouted(): ElementTransformRouter | null {
+        const r = this._elementXf;
+        return r && (r.isActive() || r.handles()) ? r : null;
+    }
+
+    get isShortcutActive(): boolean {
+        const r = this._xfRouted();
+        if (r) return r.isModal();
+        return this._armature.getTransformController()?.isShortcutActive ?? false;
+    }
+    get shortcutMode(): 'grab' | 'rotate' | 'scale' | null {
+        const r = this._xfRouted();
+        if (r) return r.isModal() ? r.mode() : null;
+        return this._armature.getTransformController()?.shortcutMode ?? null;
+    }
+    get shortcutAxis(): 'x' | 'y' | 'z' | null {
+        const r = this._xfRouted();
+        if (r) return r.isModal() ? r.axis() : null;
+        return this._armature.getTransformController()?.shortcutAxis ?? null;
+    }
+    get shortcutNumericDisplay(): string {
+        const r = this._xfRouted();
+        if (r) return r.isModal() ? r.numeric() : '';
+        return this._armature.getTransformController()?.shortcutNumericDisplay ?? '';
+    }
 
     // Round 8: the G/R/S modal-transform family is an EDITOR hotkey path (the host's keydown calls it) — inert while
     // playing (Play's WASD reaches the host's document listener too; S would start a scale). Cancel still works.
-    beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void { if (this._playing) return; return this._armature.beginTransform3D(mode); }
+    beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void {
+        if (this._playing) return;
+        const r = this._xfRouted();
+        if (r) { r.begin(mode); return; }   // Edit Mesh: the selected elements (nothing selected → nothing)
+        return this._armature.beginTransform3D(mode);
+    }
 
     constrainAxis3D(axis: 'x' | 'y' | 'z'): void {
         if (this._playing) return;
+        const r = this._xfRouted();
+        if (r) { if (r.isModal()) r.constrainAxis(axis); return; }
         this._armature.getTransformController()?.constrainAxis3D(axis);
     }
 
     appendNumericInput(char: string): void {
         if (this._playing) return;
+        const r = this._xfRouted();
+        if (r) { if (r.isModal()) r.appendNumeric(char); return; }
         this._armature.getTransformController()?.appendNumericInput(char);
     }
 
-    commitTransform3D(): void { if (this._playing) return; return this._armature.commitTransform3D(); }
+    commitTransform3D(): void {
+        if (this._playing) return;
+        const r = this._xfRouted();
+        if (r) { r.commit(); return; }
+        return this._armature.commitTransform3D();
+    }
 
-    cancelTransform3D(): void { return this._armature.cancelTransform3D(); }
+    cancelTransform3D(): void {
+        const r = this._xfRouted();
+        if (r) { r.cancel(); return; }
+        return this._armature.cancelTransform3D();
+    }
 
     // ── Keyframe animation ───────────────────────────────────────────
 

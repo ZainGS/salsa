@@ -74,6 +74,10 @@ export class VectorObjectUndo {
     redo(): boolean { return this._mgr.redo(); }
     clear(): void { this._mgr.clear(); }
 
+    /** Push a ready-made command (already applied) as ONE step — for compound ops whose state is more than node
+     *  transforms / parenting, e.g. removing a vector layer with its shapes + ephemera (vector-layer-removal.ts). */
+    pushCommand(cmd: { description: string; undo(): void; redo(): void }): void { this._mgr.push(cmd); }
+
     /** Snapshot the watch set for a gesture that is ABOUT to mutate `seeds` (and possibly their
      *  ancestors/descendants). Call at pointer-down / before a structural op. */
     begin(root: Node, seeds: Iterable<Node>): UndoCaptureToken {

@@ -76,6 +76,19 @@ export interface MeshEditDrawData {
   /** Chamfer / Bevel tool guides: world-space segment endpoints (xyz pairs, a line list — the tool already dashed
    *  them), drawn on top in {@link C_GUIDE}. */
   guides?: Float32Array | null;
+  /** The transform gizmo on the selection (Edit Mesh element transforms, docs/specs/edit-mesh-topology.md §11): drawn
+   *  by the renderer's gizmo at `center` (world), oriented by `rotation` (null = world axes), on top of the overlay.
+   *  Absent / null = no gizmo (nothing selected, no gizmo mode, a modal G / R / S running). */
+  gizmo?: MeshEditGizmoDraw | null;
+}
+
+/** The Edit Mesh selection gizmo as the renderer draws it. */
+export interface MeshEditGizmoDraw {
+  center: [number, number, number];
+  rotation: Float32Array | null;
+  mode: 'move' | 'rotate' | 'scale';
+  hovered: 'x' | 'y' | 'z' | 'xy' | 'xz' | 'yz' | null;
+  dragging: 'x' | 'y' | 'z' | 'xy' | 'xz' | 'yz' | null;
 }
 
 // ── Renderer ─────────────────────────────────────────────────────────────────

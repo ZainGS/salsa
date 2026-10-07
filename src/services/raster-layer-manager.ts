@@ -577,11 +577,24 @@ export class RasterLayerManager {
   }
 
   public removeVectorLayer(id: string): boolean {
+    return this.takeVectorLayer(id) !== null;
+  }
+
+  /** Remove a vector layer and RETURN its entry + stack index, so an undo can put it back exactly
+   *  ({@link reinsertVectorLayer}). Vector entries own no GPU texture, so holding one is free. */
+  public takeVectorLayer(id: string): { index: number; entry: RasterLayer } | null {
     const idx = this.layers.findIndex(l => l.id === id && (l.type === 'vector' || l.type === 'ephemera'));
-    if (idx < 0) return false;
-    this.layers.splice(idx, 1);
+    if (idx < 0) return null;
+    const [entry] = this.layers.splice(idx, 1);
     this.notifyCompositionChanged();
-    return true;
+    return { index: idx, entry };
+  }
+
+  /** Put an entry taken by {@link takeVectorLayer} back at its old stack index (no-op if the id exists again). */
+  public reinsertVectorLayer(snap: { index: number; entry: RasterLayer }): void {
+    if (this.layers.some(l => l.id === snap.entry.id)) return;
+    this.layers.splice(Math.min(Math.max(0, snap.index), this.layers.length), 0, snap.entry);
+    this.notifyCompositionChanged();
   }
 
   public getVectorLayers(): Array<{ id: string; name: string; visible: boolean; systemOwner?: string; packageOwnerId?: string }> {

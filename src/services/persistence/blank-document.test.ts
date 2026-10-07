@@ -93,6 +93,7 @@ function documentAOpen() {
   const vectorUndoClear = vi.fn();
   const clearUndo3D = vi.fn();
   const emit = vi.fn();
+  const recoverOrphanedVectorContent = vi.fn();
   const sm = new Proxy({
     scene3d: undefined,
     sceneGraph,
@@ -120,11 +121,12 @@ function documentAOpen() {
     ephemera,
     pendingProcTextures: new Map(),
     uvPaintTextures: new Map(),
+    recoverOrphanedVectorContent,
   } as Record<string, unknown>, {
     get: (t, k) => (k in t ? t[k as string] : (k === 'then' ? undefined : () => undefined)),
   });
   const coordinator = new DocumentStateCoordinator(sm as never, priv as never);
-  return { rlm, sceneGraph, coordinator, calls, grid, ephemera, setDitherConfig, vectorUndoClear, clearUndo3D, emit, docALayerIds };
+  return { rlm, sceneGraph, coordinator, calls, grid, ephemera, setDitherConfig, vectorUndoClear, clearUndo3D, emit, docALayerIds, recoverOrphanedVectorContent };
 }
 
 describe('the blank document payload', () => {
@@ -187,6 +189,8 @@ describe('restoring the blank payload over an open document leaves nothing of it
     expect(a.vectorUndoClear).toHaveBeenCalled();
     expect(a.clearUndo3D).toHaveBeenCalled();
     expect(a.emit).toHaveBeenCalledTimes(1);
+    // Orphaned vector shapes / placements get a layer back once both are restored (UI review 2026-10-07 #2).
+    expect(a.recoverOrphanedVectorContent).toHaveBeenCalledTimes(1);
   });
 
   it('a bounded blank document sets its artboard size instead of clearing it', async () => {

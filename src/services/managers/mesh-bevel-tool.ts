@@ -55,6 +55,8 @@ export interface BevelToolHost {
   scheduleRender(): void;
   /** The state changed (the host's panel / HUD / pill re-read it). */
   onChange?(): void;
+  /** The tool is about to start (the host ends an element transform first). */
+  onBegin?(): void;
 }
 
 /** Object-space point → canvas px (null = behind the camera). */
@@ -107,6 +109,7 @@ export class MeshBevelTool {
    */
   begin(meshId: string, opts: { segments?: number; kind?: BevelKind; snap?: boolean } = {}): boolean {
     if (this.active) this.cancel();
+    try { this.host.onBegin?.(); } catch { /* host callback */ }
     const mesh = this.host.getMesh(meshId);
     if (!mesh?.editMesh) return false;
     this._meshId = meshId;

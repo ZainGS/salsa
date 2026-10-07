@@ -157,30 +157,7 @@ export class MeshEditManager {
     const mesh = this._getMesh(meshId);
     const em = mesh?.editMesh;
     if (!mesh || !em || em.vertices.length === 0) return null;
-    const idx = new Set<number>();
-    const sel = wholeMesh ? null : this.getSelection(meshId);
-    if (sel) {
-      for (const v of sel.vertices) idx.add(v);
-      for (const h of sel.edges) {
-        const he = em.halfEdges[h];
-        if (!he) continue;
-        idx.add(he.vertex);
-        const prev = em.halfEdges[he.prev];
-        if (prev) idx.add(prev.vertex);
-      }
-      for (const f of sel.faces) {
-        const face = em.faces[f];
-        if (!face) continue;
-        let hi = face.halfEdge;
-        for (let guard = 0; guard < 256; guard++) {
-          const he = em.halfEdges[hi];
-          if (!he) break;
-          idx.add(he.vertex);
-          hi = he.next;
-          if (hi === face.halfEdge) break;
-        }
-      }
-    }
+    const idx = new Set<number>(wholeMesh ? [] : this.selectedVertexIndices(meshId));
     const m = mesh.localMatrix as unknown as Float32Array;
     let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
     const add = (v: { x: number; y: number; z: number } | undefined) => {
@@ -195,6 +172,37 @@ export class MeshEditManager {
     else for (const v of em.vertices) add(v);
     if (!Number.isFinite(minX)) return null;
     return { minX, minY, minZ, maxX, maxY, maxZ };
+  }
+
+  /** The VERTEX SET of the selection: the selected vertices, both ends of every selected edge and every vertex of
+   *  every selected face (welded topology: a face's neighbours share these vertices). Ascending, no duplicates; [] when
+   *  `meshId` isn't being edited or nothing is selected. What the element transforms (G / R / S, the gizmo) move. */
+  selectedVertexIndices(meshId: string): number[] {
+    const em = this._getMesh(meshId)?.editMesh;
+    const sel = this.getSelection(meshId);
+    if (!em || !sel) return [];
+    const idx = new Set<number>();
+    for (const v of sel.vertices) if (v >= 0 && v < em.vertices.length) idx.add(v);
+    for (const h of sel.edges) {
+      const he = em.halfEdges[h];
+      if (!he) continue;
+      idx.add(he.vertex);
+      const prev = em.halfEdges[he.prev];
+      if (prev) idx.add(prev.vertex);
+    }
+    for (const f of sel.faces) {
+      const face = em.faces[f];
+      if (!face) continue;
+      let hi = face.halfEdge;
+      for (let guard = 0; guard < 256; guard++) {
+        const he = em.halfEdges[hi];
+        if (!he) break;
+        idx.add(he.vertex);
+        hi = he.next;
+        if (hi === face.halfEdge) break;
+      }
+    }
+    return [...idx].sort((a, b) => a - b);
   }
 
   /** A copy of the selection (TOUCH-5: a finger press that turns into a pinch puts it back with restoreSelection). */

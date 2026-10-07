@@ -741,8 +741,10 @@ export function hitTestProjectGrid(model: ShellRenderModel, px: number, py: numb
  * else null. The button geometry MUST match the one drawn in GRID_SHADER's fragment shader (shell-renderer):
  * a `bs`-square button inset at the top-right of the `titleH` (projectCardTitleH) title bar. Card-local px are mapped into the same
  * curved/scaled screen space the card is drawn + hit-tested in (`projX - hw + xLocal*sc`, `cy - hh + yLocal*sc`).
+ * `minHitPx` (device px, default 0): the hit box grows around the button's centre to at least this size in each
+ * direction — the Shell passes a finger-sized box on a coarse pointer (the drawn button stays the same).
  */
-export function hitTestProjectGridClose(model: ShellRenderModel, px: number, py: number, viewportW: number): string | null {
+export function hitTestProjectGridClose(model: ShellRenderModel, px: number, py: number, viewportW: number, minHitPx = 0): string | null {
   const grid = model.projectGrid;
   if (!grid) return null;
   for (let i = grid.length - 1; i >= 0; i--) {
@@ -756,8 +758,10 @@ export function hitTestProjectGridClose(model: ShellRenderModel, px: number, py:
     const bx1 = w - 2 * b - b * 1.5, bx0 = bx1 - bs;   // card-local button box (matches the shader)
     const by0 = 2 * b + (titleH - bs) * 0.5, by1 = by0 + bs;
     const pad = 2 * sc;                                 // a touch of slop so the small button is easy to hit
-    const l = projX - hw + bx0 * sc - pad, r = projX - hw + bx1 * sc + pad;
-    const t = cy - hh + by0 * sc - pad, bm = cy - hh + by1 * sc + pad;
+    let l = projX - hw + bx0 * sc - pad, r = projX - hw + bx1 * sc + pad;
+    let t = cy - hh + by0 * sc - pad, bm = cy - hh + by1 * sc + pad;
+    if (minHitPx > r - l) { const mx = (l + r) / 2; l = mx - minHitPx / 2; r = mx + minHitPx / 2; }
+    if (minHitPx > bm - t) { const my = (t + bm) / 2; t = my - minHitPx / 2; bm = my + minHitPx / 2; }
     if (px >= l && px <= r && py >= t && py <= bm) return grid[i].id;
   }
   return null;

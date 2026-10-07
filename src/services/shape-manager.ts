@@ -69,6 +69,7 @@ import { RasterSelectionService } from "./raster-selection-service";
 import { RasterMoveService } from "./raster-move-service";
 import { RasterTextService, RasterTextState } from './raster-text-service';
 import { RasterLayerManager } from './raster-layer-manager';
+import { removeVectorLayerWithContent, recoverOrphanedVectorContent, type VectorLayerRemovalDeps } from './vector-layer-removal';
 import { OnionSkinConfig } from '../animation';
 import { ConnectorService, SnapResult } from './connector-service';
 import { LayerBlendMode, RasterCompositor, type CompositorLayerInfo } from '../renderer/raster/core/raster-compositor';
@@ -187,6 +188,7 @@ import { MeshEditManager } from './managers/mesh-edit-manager';
 import type { UVIsland } from '../scene-graph/shapes/edit-mesh';
 import type { BevelSpec } from '../scene-graph/shapes/edit-mesh';
 import type { BevelToolState } from './managers/mesh-bevel-tool';
+import type { ElementTransformState } from './managers/mesh-element-transform';
 import { UVEditorSession, UVCanvasRenderer } from './managers/uv-canvas-renderer';
 import type { UVSelectionMode } from './managers/uv-canvas-renderer';
 import { UVEditManager } from './managers/uv-edit-manager';
@@ -225,6 +227,7 @@ import { runStrokePredictionSelfTest as _runStrokePredictionSelfTest, type Strok
 import { markRasterCompositeDirty as _markRasterCompositeDirty } from '../renderer/raster/core/raster-composite-dirty';
 import { rasterContentSeq as _rasterContentSeq } from '../renderer/raster/raster-content-version';
 import { vectorSceneObject as _vectorSceneObject } from './persistence/vector-scene-json';
+import { computeArtboardFit, type ArtboardFitInsets } from './artboard-fit';
 import {
     setRenderDebug as _setRenderDebug, getRenderDebug as _getRenderDebug, encodeRealFramePNG as _encodeRealFramePNG,
     RENDER_DEBUG_FLAGS, type RenderDebugFlags, type RealScreenshot,
@@ -900,8 +903,14 @@ class ShapeManager {
             this.meshEdit,
             (cmd) => this.scene3d.pushCommand3D(cmd),
             () => ctx.scheduleRender(),
-            { isAdditive: () => this.interactionService.additiveSelect3D === true },   // TOUCH-10 additive latch
+            {
+                isAdditive: () => this.interactionService.additiveSelect3D === true,   // TOUCH-10 additive latch
+                isSnapLatched: () => this.interactionService.snapLatch3D === true,     // element transforms snap like Ctrl
+            },
         );
+        // Edit Mesh element transforms: G / R / S (sm.beginTransform3D …) drive the selected elements while a mesh is in
+        // Edit Mesh (docs/specs/edit-mesh-topology.md §11).
+        this.scene3d.setElementTransformRouter(this._meshEditPointerController.elementTransformRouter());
         // Suppress the transform gizmo's object-selection click while mesh edit
         // OR UV edit is active, so pointer controllers can handle picks uncontested.
         this.scene3d.setMeshEditModeChecker(
@@ -935,6 +944,8 @@ class ShapeManager {
                     showWireframe: uvSession?.showWireframe ?? true,
                     // the Chamfer / Bevel tool's dashed guide lines (null when it shows none)
                     guides: this._meshEditPointerController.bevel.guideLines(),
+                    // the transform gizmo on the selection's centroid (null when hidden)
+                    gizmo: this._meshEditPointerController.gizmoDrawData(),
                 };
             }
 
@@ -7829,6 +7840,7 @@ class ShapeManager {
     /** Exit mesh edit mode, clearing selection. */
     public exitMeshEditMode3D(): void {
         this._meshEditPointerController.bevel.cancel();   // a Chamfer in progress puts the mesh back
+        this._meshEditPointerController.elementTransformRouter().cancel();   // so does a G / R / S / gizmo drag
         this.meshEdit.exitEditMode();
         this.scene3d.disableMeshEditOrbit();
     }
@@ -8031,6 +8043,32 @@ class ShapeManager {
 
     /** Cancel the Chamfer: the mesh and the selection exactly as before. */
     public cancelBevel3D(): void { this._meshEditPointerController.bevel.cancel(); this.scheduleRender(); }
+
+    // ── Element transforms (docs/specs/edit-mesh-topology.md §11) ─────────────
+    // In Edit Mesh the G / R / S family (beginTransform3D, constrainAxis3D, appendNumericInput, commitTransform3D,
+    // cancelTransform3D and the isShortcutActive3D / shortcut* getters) drives the SELECTED vertices / edges / faces:
+    // mouse-follow, finger / pen drags, axis + typed amounts, Apply = one undo step, Cancel = exact restore. The
+    // transform gizmo sits on the selection's centroid.
+
+    /** The running element transform (Edit Mesh G / R / S or a selection-gizmo drag): mode, source ('modal' |
+     *  'gizmo'), axis, typed amount, pivot, move / angle / factor, vertex counts — or null when none runs. */
+    public getElementTransformState3D(): ElementTransformState | null { return this._meshEditPointerController.transform.state(); }
+
+    /** The Edit Mesh selection gizmo's mode (null = hidden). It also follows setGizmoMode3D while in Edit Mesh. */
+    public setMeshEditGizmoMode3D(mode: 'move' | 'rotate' | 'scale' | null): void {
+        this._meshEditPointerController.elementTransformRouter().setGizmoMode(mode);
+        this.scheduleRender();
+    }
+    public getMeshEditGizmoMode3D(): 'move' | 'rotate' | 'scale' | null { return this._meshEditPointerController.gizmoMode; }
+
+    /** Snap steps of the element transforms while Ctrl / the snap latch is on: move (world units per axis), angle
+     *  (degrees), scale (factor). Omitted values are kept. */
+    public setElementTransformSnap3D(steps: { move?: number; angleDeg?: number; scale?: number }): void {
+        const t = this._meshEditPointerController.transform;
+        if (steps.move !== undefined && steps.move > 0) t.snapMove = steps.move;
+        if (steps.angleDeg !== undefined && steps.angleDeg > 0) t.snapAngle = steps.angleDeg * Math.PI / 180;
+        if (steps.scale !== undefined && steps.scale > 0) t.snapScale = steps.scale;
+    }
 
     /**
      * Run a smart-project (box/triplanar) UV unwrap on the mesh.
@@ -11131,8 +11169,12 @@ class ShapeManager {
     get undoDescription3D(): string | null { return this.scene3d.undoDescription3D; }
     get redoDescription3D(): string | null { return this.scene3d.redoDescription3D; }
 
-    public undo3D(): boolean { this._meshEditPointerController?.bevel.cancel(); return this.scene3d.undo3D(); }   // (a Chamfer preview first goes back)
-    public redo3D(): boolean { this._meshEditPointerController?.bevel.cancel(); return this.scene3d.redo3D(); }
+    public undo3D(): boolean { this._cancelMeshEditTools(); return this.scene3d.undo3D(); }   // (a Chamfer preview / element transform first goes back)
+    public redo3D(): boolean { this._cancelMeshEditTools(); return this.scene3d.redo3D(); }
+    private _cancelMeshEditTools(): void {
+        this._meshEditPointerController?.bevel.cancel();
+        if (this._meshEditPointerController?.transform.active) this._meshEditPointerController.elementTransformRouter().cancel();
+    }
     public clearUndo3D(): void { this.scene3d.clearUndo3D(); }
 
     // ── 2D vector OBJECT undo (P1, editing-loop-polish.md) ──────────
@@ -13320,19 +13362,27 @@ class ShapeManager {
     }
 
     /**
-     * Fit the viewport so the artboard is centered and fills ~85% of the canvas.
+     * Fit the viewport so the whole artboard is centred and fills ~85% of the canvas (of its width or height,
+     * whichever runs out first).
      *
      * Call this after setDocumentSize() on every create and load to ensure the
      * artboard is always visible with a dark margin around it.
      *
-     * Internally: because worldH=2 always maps the artboard height to the canvas
-     * height at zoom=1, setting zoom=0.85 gives an 85% fill with equal margins.
-     * Pan is reset to (0,0) to centre the artboard.
+     * `insets` (optional, CSS px of the canvas covered by host UI on each side: tool rail, open panels, timeline,
+     * top bar) fits and centres the artboard in the VISIBLE part of the canvas instead of the whole canvas. Math in
+     * artboard-fit.ts (worldH=2 maps the artboard height to the canvas height at zoom=1).
      */
-    public fitArtboard(): void {
+    public fitArtboard(insets?: ArtboardFitInsets | null): void {
         if (!this.interactionService || !this._documentSizePx) return;
-        this.interactionService.setPanOffset(0, 0);
-        this.interactionService.setZoom(0.85);
+        const canvas = this.webgpuRenderer?.getCanvas() as HTMLCanvasElement | null | undefined;
+        const fit = computeArtboardFit({
+            cssWidth: canvas?.clientWidth ?? 0, cssHeight: canvas?.clientHeight ?? 0,
+            pxWidth: canvas?.width ?? 0, pxHeight: canvas?.height ?? 0,
+            docWidth: this._documentSizePx.w, docHeight: this._documentSizePx.h,
+            insets,
+        });
+        this.interactionService.setPanOffset(fit.panX, fit.panY);
+        this.interactionService.setZoom(fit.zoom);
         this.scheduleRender();
     }
 
@@ -14760,6 +14810,7 @@ class ShapeManager {
             restoreClothingTextures: (b) => this._restoreClothingTextures(b),
             restoreProceduralMeshTextures: (m) => this._restoreProceduralMeshTextures(m),
             backfillUnassignedVectorLayers: () => this._backfillUnassignedVectorLayers(),
+            recoverOrphanedVectorContent: () => { if (this.rasterLayerManager) recoverOrphanedVectorContent(this._vectorLayerRemovalDeps()); },
             setRestoring: (v) => { this._isRestoring = v; },
             getDocumentSizePx: () => this._documentSizePx,
             getDocIdentity: () => ({ id: this.currentDocId, name: this.currentDocName }),
@@ -14942,11 +14993,50 @@ class ShapeManager {
         return this.rasterLayerManager.addVectorLayer(name);
     }
 
-    /** Remove a vector layer and all its ephemera placements. */
+    /** Remove a vector layer together with its shapes and ephemera placements, as ONE step on the 2D object undo stack
+     *  (Ctrl+Z puts back the layer at its stack index, its shapes in their draw order and its placements). An active
+     *  layer is deactivated. UI review 2026-10-07 #2: the shapes used to stay behind, orphaned. */
     public removeVectorLayer(layerId: string): boolean {
-        this._ephemera.deleteAllPlacementsForLayer(layerId);
-        this._ephemeraOverlay.invalidateCache();
-        return this.rasterLayerManager?.removeVectorLayer(layerId) ?? false;
+        if (!this.rasterLayerManager) return false;
+        return removeVectorLayerWithContent(this._vectorLayerRemovalDeps(), layerId);
+    }
+
+    /** Wiring for vector-layer-removal.ts (removal + load-time orphan recovery). Requires rasterLayerManager. */
+    private _vectorLayerRemovalDeps(): VectorLayerRemovalDeps {
+        const eraserTypes = ['Scribble', 'Highlight'];
+        const typeOf = (n: Node): string | undefined => (n as Shape).getType?.();
+        return {
+            root: this.sceneGraph.root,
+            layers: this.rasterLayerManager!,
+            placements: this._ephemera,
+            isVectorNode: (n) => this._isVectorLayerNode(n),
+            onDetached: (n) => {
+                n.forEachDeep((d: Node) => { if (this.interactionService.selectedNodes.has(d)) this.interactionService.deselectNode(d); });
+                const type = typeOf(n);
+                if (type && eraserTypes.includes(type)) {
+                    for (const arr of [this.eraserService.scribbles, this.eraserService.scribblesInView] as Node[][]) {
+                        const i = arr.indexOf(n);
+                        if (i !== -1) arr.splice(i, 1);
+                    }
+                }
+                this.deallocateCacheEntries(n as Shape, type);   // as deleteSelected; caches re-allocate on re-attach
+            },
+            onAttached: (n) => {
+                const type = typeOf(n);
+                if (type && eraserTypes.includes(type) && !(this.eraserService.scribbles as Node[]).includes(n)) {
+                    (this.eraserService.scribbles as Node[]).push(n);
+                }
+            },
+            getActiveVectorLayerId: () => this._activeVectorLayerId,
+            setActiveVectorLayer: (id) => this.setActiveVectorLayer(id),
+            changed: (layerId) => {
+                if (this.getSelectedPlacement()?.layerId === layerId) this.clearPlacementSelection();
+                this._ephemeraOverlay.invalidateCache();
+                this.emitSceneGraphChanged();
+                this.scheduleRender();
+            },
+            undo: this.interactionService.vectorUndo,
+        };
     }
 
     /** Get all vector layers in the stack. `systemOwner`/`packageOwnerId` let the host FILTER
@@ -15041,15 +15131,18 @@ class ShapeManager {
         let changed = false;
         for (const n of this.sceneGraph.root.children) {
             if (!(n instanceof Shape) || n.layerId !== undefined) continue;
-            // 2D vector shapes only — 3D nodes are Shapes too but live outside the vector-layer
-            // system; stamping them made a LOAD change the next save (caught by the P6 round-trip
-            // drive, 2026-09-15).
-            if (n instanceof Mesh3D || n instanceof MeshGroup3D || n instanceof ArrayGroup3D
-                || n instanceof ParticleEmitter3D
-                || ['Skeleton3D', 'SkinnedMesh3D', 'GpObject3D'].includes(n.getType?.() ?? '')) continue;
+            if (!this._isVectorLayerNode(n)) continue;
             n.layerId = defaultId; changed = true;
         }
         if (changed) this.emitSceneGraphChanged();
+    }
+    /** A node of the vector-layer system: a 2D Shape. 3D nodes are Shapes too but live outside it — stamping them
+     *  made a LOAD change the next save (caught by the P6 round-trip drive, 2026-09-15). */
+    private _isVectorLayerNode(n: Node): boolean {
+        if (!(n instanceof Shape)) return false;
+        return !(n instanceof Mesh3D || n instanceof MeshGroup3D || n instanceof ArrayGroup3D
+            || n instanceof ParticleEmitter3D
+            || ['Skeleton3D', 'SkinnedMesh3D', 'GpObject3D'].includes(n.getType?.() ?? ''));
     }
 
     public setActiveVectorLayer(id: string | null): void {

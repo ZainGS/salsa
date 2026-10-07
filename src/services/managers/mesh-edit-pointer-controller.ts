@@ -29,6 +29,9 @@ import { addZonelessListener, removeZonelessListener } from '../../renderer/util
 import { isPointerEventClaimed } from '../../renderer/util/pointer-claims';
 import { EditFacePicker, pickFaceFullScene } from './mesh-edit-face-pick';
 import { MeshBevelTool } from './mesh-bevel-tool';
+import { MeshElementTransform, gizmoModeToTransform, type ElementTransformMode, type ElementTransformRouter } from './mesh-element-transform';
+import { GizmoRenderer, hitTestGizmoAt, type GizmoAxis, type GizmoMode } from '../../renderer/3d/gizmo-renderer';
+import type { MeshEditGizmoDraw } from '../../renderer/3d/mesh-edit-overlay-renderer';
 
 export type MeshEditSelectionMode = 'vertex' | 'face' | 'edge';
 
@@ -42,6 +45,8 @@ const TOUCH_PICK_SCALE = 2;
 export interface MeshEditPointerOptions {
   /** The additive-select latch (sm.setAdditiveSelect3D): a press adds to the selection like Shift. */
   isAdditive?: () => boolean;
+  /** The snap latch (sm.setSnapToggle3D): element transforms snap like Ctrl is held. */
+  isSnapLatched?: () => boolean;
   /** Frame scheduling for the coalesced drag / hover work (tests inject; default requestAnimationFrame, or run
    *  synchronously where there is none). */
   requestFrame?: (cb: () => void) => number;
@@ -132,12 +137,40 @@ export class MeshEditPointerController {
       pushCmd,
       scheduleRender,
       onChange: () => { this._syncBevelWheel(); this._onSelectionChange?.(); },
+      onBegin: () => { if (this.transform?.active) this._endElementTransform(false); },
+    });
+    this.transform = new MeshElementTransform({
+      getMesh: (id) => this._scene3d.getMesh(id),
+      getCamera: () => this._scene3d.getCamera?.() ?? null,
+      meshEdit,
+      pushCmd,
+      scheduleRender,
+      getOrientation: () => this._scene3d.getGizmoOrientation?.() ?? 'world',
+      isSnapLatched: () => { try { return !!this._opts.isSnapLatched?.(); } catch { return false; } },
+      syncGeometry: (mesh) => this._syncDragGeometry(mesh),
+      finishGeometry: (mesh) => {
+        if (!this._dragPatched) return;
+        this._dragPatched = false;
+        mesh.syncFromEditMesh();
+        this.dragStats.fullSyncs++;
+      },
+      recompile: (mesh) => { this._dragPatched = false; mesh.syncFromEditMesh(); this.dragStats.fullSyncs++; },
+      onChange: () => this._onSelectionChange?.(),
     });
   }
 
   /** The interactive Chamfer / Bevel (mesh-bevel-tool.ts). While it is active this controller routes the canvas
    *  pointer to it: the pick phase picks a vertex / edge, the adjust phase turns a drag into the amount. */
   readonly bevel: MeshBevelTool;
+
+  /** Edit Mesh element transforms (mesh-element-transform.ts, docs/specs/edit-mesh-topology.md §11): G / R / S on the
+   *  selected vertices / edges / faces (mouse-follow; finger / pen drags) and the gizmo on the selection's centroid.
+   *  While a session runs this controller routes the canvas pointer to it. */
+  readonly transform: MeshElementTransform;
+
+  /** The selection gizmo's mode in Edit Mesh (null = no gizmo). Follows the scene's gizmo mode while in Edit Mesh
+   *  (ElementTransformRouter.setGizmoMode); 'move' by default so the gizmo is there on entering. */
+  gizmoMode: GizmoMode = 'move';
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -146,6 +179,10 @@ export class MeshEditPointerController {
     this._canvas = canvas;
     this._meshId = meshId;
     this._onSelectionChange = onSelectionChange ?? null;
+    // (registered first: in the browser a target's capture listeners run first anyway; a plain EventTarget keeps order)
+    addZonelessListener(canvas, 'pointerdown', this._onDownCapture, { capture: true });
+    addZonelessListener(canvas, 'contextmenu', this._onContextMenu);
+    addZonelessListener(canvas, 'pointerleave', this._onLeave);
     addZonelessListener(canvas, 'pointerdown', this._onDown);
     addZonelessListener(canvas, 'pointermove', this._onMove);
     addZonelessListener(canvas, 'pointerup',   this._onUp);
@@ -157,7 +194,11 @@ export class MeshEditPointerController {
   detach(): void {
     if (!this._canvas) return;
     if (this.bevel.active) this.bevel.cancel();
+    if (this.transform.active) this._endElementTransform(false);
     this._finishPatchedDrag();
+    removeZonelessListener(this._canvas, 'pointerdown', this._onDownCapture, { capture: true });
+    removeZonelessListener(this._canvas, 'contextmenu', this._onContextMenu);
+    removeZonelessListener(this._canvas, 'pointerleave', this._onLeave);
     removeZonelessListener(this._canvas, 'pointerdown', this._onDown);
     removeZonelessListener(this._canvas, 'pointermove', this._onMove);
     removeZonelessListener(this._canvas, 'pointerup',   this._onUp);
@@ -179,10 +220,14 @@ export class MeshEditPointerController {
     this._dragPatched = false;
     this._rect = null;
     this._facePicker.clear();
+    this._xfPointer = null;
+    this._lastMouse = null;
+    this._gizmoHover = null;
   }
 
   setMode(mode: MeshEditSelectionMode): void {
     if (this.bevel.active && mode !== this._mode) this.bevel.cancel();
+    if (this.transform.active && mode !== this._mode) this._endElementTransform(false);
     this._mode = mode;
     this._dragging = false;
     this._dragVertexIdx = -1;
@@ -193,7 +238,7 @@ export class MeshEditPointerController {
   get mode(): MeshEditSelectionMode { return this._mode; }
   get isAttached(): boolean { return this._canvas !== null; }
   /** True while a vertex drag (or a finger press that may become one) owns a pointer. */
-  get isBusy(): boolean { return this._dragging || this._pending !== null || this._bevelPointer !== null; }
+  get isBusy(): boolean { return this._dragging || this._pending !== null || this._bevelPointer !== null || this._xfPointer !== null; }
 
   // ── Pointer handlers ────────────────────────────────────────────────────────
 
@@ -201,6 +246,7 @@ export class MeshEditPointerController {
     if (!this._canvas || !this._meshId) return;
     // Only handle primary button
     if (e.button !== 0) return;
+    if (this.transform.active) { this._xfDown(e); return; }
     if (this.bevel.active) { this._bevelDown(e); return; }
     const additive = !!e.shiftKey || this._isAdditive();
     if (e.pointerType === 'touch') {
@@ -213,6 +259,8 @@ export class MeshEditPointerController {
       // 7.3b P1: a finger UV paint took (not stopped, so the orbit controller can pinch) is a brush stroke — no pick.
       if (isPointerEventClaimed(e)) return;
       if (e.isPrimary === false) return;
+      // A finger on a handle of the selection gizmo drags it at once (fatter hit, as the object gizmo).
+      if (!this._scene3d.getTouchNavigate3D?.() && this._gizmoDown(e, TOUCH_PICK_SCALE)) return;
       // TOUCH-6: nothing on the press — a tap selects on release, a drag from a vertex moves it.
       this._pending = { id, clientX: e.clientX, clientY: e.clientY, additive };
       this._rect = this._canvas.getBoundingClientRect();
@@ -220,6 +268,8 @@ export class MeshEditPointerController {
     }
     this._pickScale = 1;
     this._rect = this._canvas.getBoundingClientRect();
+    // The selection gizmo's handles win over the vertex / edge / face under them.
+    if (this._gizmoDown(e, 1)) return;
     const { x: px, y: py } = this._toCanvasPx(e.clientX, e.clientY);
 
     if (this._mode === 'vertex') {
@@ -237,6 +287,8 @@ export class MeshEditPointerController {
 
   private _handleMove(e: PointerEvent): void {
     if (!this._canvas || !this._meshId) return;
+    if (e.pointerType === 'mouse') this._lastMouse = { clientX: e.clientX, clientY: e.clientY };
+    if (this.transform.active) { this._xfMove(e); return; }
     if (this.bevel.active) { this._bevelMove(e); return; }
     const touch = e.pointerType === 'touch';
     // A finger press that moved past the slop: in vertex mode a drag from a vertex picks it up (from the PRESS point,
@@ -264,23 +316,34 @@ export class MeshEditPointerController {
       this._scheduleDragFrame();
       return;
     }
-    if (touch || this._mode !== 'vertex') return;   // a finger has no hover
-    // Mouse hover in vertex mode: the cursor shows "grab" over a vertex — resolved once per frame (a pick is O(V)).
+    if (touch || (this._mode !== 'vertex' && this.gizmoMode === null)) return;   // a finger has no hover
+    // Mouse hover: the selection gizmo's handle under the pointer lights up; in vertex mode the cursor shows "grab"
+    // over a vertex — resolved once per frame (a pick is O(V)).
     this._hoverAt = { x: e.clientX, y: e.clientY };
     if (this._hoverFrame) return;
-    this._hoverFrame = this._frame(() => {
+    let ran = false;
+    const id = this._frame(() => {
+      ran = true;
       this._hoverFrame = 0;
       const at = this._hoverAt;
       this._hoverAt = null;
-      if (!at || !this._canvas || this._dragging || this._mode !== 'vertex') return;
+      if (!at || !this._canvas || this._dragging || this.transform.active || this.bevel.active) return;
       this._pickScale = 1;
       this._rect = null;   // a hover reads the rect fresh (the canvas may have moved since the last press)
       const c = this._toCanvasPx(at.x, at.y);
+      const g = this._gizmoTarget();
+      const cam = this._scene3d.getCamera?.();
+      const axis = g && cam ? this._gizmoHit(c.x, c.y, g, cam, 1) : null;
+      if (axis !== this._gizmoHover) { this._gizmoHover = axis; this._scheduleRender(); }
+      if (axis) { this._canvas.style.cursor = 'grab'; return; }
+      if (this._mode !== 'vertex') { this._canvas.style.cursor = 'crosshair'; return; }
       this._canvas.style.cursor = this._pickVertex(c.x, c.y) >= 0 ? 'grab' : 'crosshair';
     });
+    if (!ran) this._hoverFrame = id;
   }
 
   private _handleUp(e: PointerEvent): void {
+    if (this.transform.active || this._xfPointer !== null) { this._xfUp(e); return; }
     if (this.bevel.active || this._bevelPointer !== null || this._bevelPending) { this._bevelUp(e); return; }
     const touch = e.pointerType === 'touch';
     if (touch) this._touchIds.delete(e.pointerId ?? 0);
@@ -334,6 +397,11 @@ export class MeshEditPointerController {
   }
 
   private _handleCancel(e: PointerEvent): void {
+    if (this.transform.active || this._xfPointer !== null) {
+      if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+      if (this._xfPointer !== null && (e.pointerId === undefined || e.pointerId === this._xfPointer)) this._xfAbortPointer();
+      return;
+    }
     if (this.bevel.active || this._bevelPointer !== null || this._bevelPending) {
       if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
       if (this._bevelPending && (e.pointerId ?? 0) === this._bevelPending.id) this._bevelPending = null;
@@ -348,8 +416,238 @@ export class MeshEditPointerController {
   /** The drag's pointer lost capture without an up (the browser / another handler took it): end the drag normally
    *  (after a normal up it is already over — no-op). */
   private _handleLostCapture(e: PointerEvent): void {
+    if (this._xfPointer !== null && e.pointerId === this._xfPointer) { this._xfUp(e); return; }
     if (!this._dragging || this._dragPointerId === null || e.pointerId !== this._dragPointerId) return;
     this._handleUp(e);
+  }
+
+  // ── Element transforms (G / R / S + the selection gizmo) ────────────────────
+
+  /** The pointer driving the element transform: a finger / pen drag of the modal, or a gizmo-handle drag. */
+  private _xfPointer: number | null = null;
+  /** Latest pointer position for the transform (client px + Ctrl), applied once per frame. */
+  private _xfAt: { clientX: number; clientY: number; ctrl: boolean } | null = null;
+  private _xfFrame = 0;
+  /** Where the mouse last was over the canvas (client px) — the mouse-follow start when G is pressed; null after it
+   *  left the canvas (the next move into it starts the follow, no jump). */
+  private _lastMouse: { clientX: number; clientY: number } | null = null;
+  /** A right-click cancel: swallow the context menu that follows it. */
+  private _suppressMenuUntil = 0;
+  /** The selection-gizmo handle under the mouse (hover highlight). */
+  private _gizmoHover: GizmoAxis = null;
+
+  private readonly _onDownCapture = (e: PointerEvent) => this._handleDownCapture(e);
+  private readonly _onContextMenu = (e: Event) => {
+    if ((this.transform.active && this.transform.source === 'modal') || Date.now() < this._suppressMenuUntil) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  };
+  private readonly _onLeave = (e: PointerEvent) => { if (e.pointerType === 'mouse') this._lastMouse = null; };
+
+  /**
+   * Start G / R / S on the selected elements of the mesh in Edit Mesh (the router's begin). With the mouse over the
+   * canvas the transform follows it from where it is now; otherwise from the next move / finger drag. False when nothing
+   * is selected, the Chamfer runs, a vertex / gizmo drag is in progress, or the mesh can't be sculpted (skinned).
+   */
+  beginElementTransform(mode: ElementTransformMode): boolean {
+    const id = this._meshEdit.activeMeshId ?? this._meshId;
+    if (!id || this.bevel.active || this._dragging) return false;
+    if (this.transform.active && this.transform.source === 'gizmo') return false;
+    if (this.transform.active) this._endElementTransform(false);
+    if (!this.transform.begin(id, mode, { source: 'modal' })) return false;
+    this._gizmoHover = null;
+    if (this._canvas && this._meshId === id && this._lastMouse) {
+      this._rect = this._canvas.getBoundingClientRect();
+      const at = this._toCanvasPx(this._lastMouse.clientX, this._lastMouse.clientY);
+      this.transform.pointerStart(at.x, at.y, this._canvas.width, this._canvas.height);
+    }
+    return true;
+  }
+
+  /** Apply (true) or cancel the running element transform; the pointer it held is released. */
+  private _endElementTransform(apply: boolean): void {
+    if (apply) this._flushXfFrame();
+    else this._dropXfFrame();
+    this._xfReleasePointer();
+    if (apply) this.transform.commit(); else this.transform.cancel();
+    this._rect = null;
+    if (this._canvas) this._canvas.style.cursor = 'crosshair';
+  }
+
+  /** Capture-phase press while a MODAL transform runs (mouse): left = Apply, right = Cancel — before the orbit
+   *  controller (a right-drag pans) or a selection pick sees it. Fingers / pen fall through to {@link _xfDown}. */
+  private _handleDownCapture(e: PointerEvent): void {
+    if (!this._canvas || !this.transform.active || this.transform.source !== 'modal') return;
+    if (e.pointerType !== 'mouse' || (e.button !== 0 && e.button !== 2)) return;   // middle: the camera
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (e.button === 2) this._suppressMenuUntil = Date.now() + 1500;
+    else if (this._lastMouse === null) this._lastMouse = { clientX: e.clientX, clientY: e.clientY };
+    if (e.button === 0) this._xfAt = this._xfAt ?? { clientX: e.clientX, clientY: e.clientY, ctrl: !!(e.ctrlKey || e.metaKey) };
+    this._endElementTransform(e.button === 0);
+  }
+
+  /** A press (bubble phase) while a transform runs: a finger / pen starts a drag of the modal (each drag continues the
+   *  last); a 2nd finger is a camera gesture — it drops the current drag (a gizmo drag is cancelled). */
+  private _xfDown(e: PointerEvent): void {
+    if (!this._canvas) return;
+    if (e.pointerType === 'touch') {
+      const id = e.pointerId ?? 0;
+      if (e.isPrimary && this._xfPointer === null) this._touchIds.clear();
+      this._touchIds.add(id);
+      if (this._touchIds.size > 1) { this._xfAbortPointer(); return; }
+    }
+    if (this.transform.source !== 'modal' || e.pointerType === 'mouse') return;
+    if (isPointerEventClaimed(e) || e.isPrimary === false || this._scene3d.getTouchNavigate3D?.()) return;
+    if (this.transform.dragging) this.transform.pointerEnd();
+    this._rect = this._canvas.getBoundingClientRect();
+    const at = this._toCanvasPx(e.clientX, e.clientY);
+    try { this._canvas.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+    this._xfPointer = e.pointerId ?? 0;
+    this.transform.pointerStart(at.x, at.y, this._canvas.width, this._canvas.height);
+  }
+
+  private _xfMove(e: PointerEvent): void {
+    if (this._xfPointer !== null) {
+      if ((e.pointerId ?? 0) !== this._xfPointer) return;
+    } else if (!(e.pointerType === 'mouse' && this.transform.source === 'modal')) {
+      return;   // the modal follows the mouse; a finger / pen needs a press first
+    }
+    this._xfAt = { clientX: e.clientX, clientY: e.clientY, ctrl: !!(e.ctrlKey || e.metaKey) };
+    if (this._xfFrame) return;
+    let ran = false;
+    const id = this._frame(() => { ran = true; this._xfFrame = 0; this._applyXfMove(); });
+    if (!ran) this._xfFrame = id;
+  }
+
+  private _applyXfMove(): void {
+    const at = this._xfAt;
+    this._xfAt = null;
+    if (!at || !this._canvas || !this.transform.active) return;
+    if (!this._rect) this._rect = this._canvas.getBoundingClientRect();
+    const c = this._toCanvasPx(at.clientX, at.clientY);
+    this.transform.pointerMove(c.x, c.y, this._canvas.width, this._canvas.height, at.ctrl);
+  }
+
+  private _flushXfFrame(): void {
+    if (this._xfFrame) { this._cancelFrame(this._xfFrame); this._xfFrame = 0; }
+    if (this._xfAt) this._applyXfMove();
+  }
+
+  private _dropXfFrame(): void {
+    if (this._xfFrame) { this._cancelFrame(this._xfFrame); this._xfFrame = 0; }
+    this._xfAt = null;
+  }
+
+  private _xfUp(e: PointerEvent): void {
+    if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+    if (this._xfPointer === null || (e.pointerId ?? 0) !== this._xfPointer) return;
+    if (this.transform.source === 'gizmo') { this._endElementTransform(true); return; }   // a gizmo drag applies on release
+    this._flushXfFrame();
+    this._xfReleasePointer();
+    this.transform.pointerEnd();
+  }
+
+  /** A 2nd finger / pointercancel: a modal drag's movement is dropped (the earlier drags stay); a gizmo drag is cancelled. */
+  private _xfAbortPointer(): void {
+    if (this.transform.active && this.transform.source === 'gizmo') { this._endElementTransform(false); return; }
+    this._dropXfFrame();
+    this._xfReleasePointer();
+    this.transform.pointerAbort();
+  }
+
+  private _xfReleasePointer(): void {
+    if (this._xfPointer !== null && this._canvas) { try { this._canvas.releasePointerCapture(this._xfPointer); } catch { /* gone */ } }
+    this._xfPointer = null;
+  }
+
+  /** The selection gizmo, when it shows: a gizmo mode, something selected, no Chamfer / modal transform, a sculptable
+   *  mesh. `center` = the selection's centroid now (it moves with a grab), `rotation` = the local orientation's. */
+  private _gizmoTarget(): { center: [number, number, number]; rotation: Float32Array | null; mode: 'move' | 'rotate' | 'scale' } | null {
+    const mode = this.gizmoMode;
+    if (!this._canvas || !this._meshId || mode === null || this.bevel.active) return null;
+    if (this.transform.active && this.transform.source === 'modal') return null;
+    const mesh = this._getMesh();
+    const em = mesh?.editMesh;
+    if (!mesh || !em || mesh instanceof SkinnedMesh3D) return null;
+    const sel = this._meshEdit.selectedVertexIndices(this._meshId);
+    if (sel.length === 0) return null;
+    let x = 0, y = 0, z = 0;
+    for (const i of sel) { const v = em.vertices[i]; x += v.x; y += v.y; z += v.z; }
+    const w = this._objToWorld(x / sel.length, y / sel.length, z / sel.length, mesh);
+    const local = (this._scene3d.getGizmoOrientation?.() ?? 'world') === 'local';
+    return {
+      center: [w.x, w.y, w.z],
+      rotation: local ? GizmoRenderer.rotationOf(mesh.localMatrix as unknown as ArrayLike<number>) as unknown as Float32Array : null,
+      mode,
+    };
+  }
+
+  /** The gizmo handle under canvas px (x, y), or null. */
+  private _gizmoHit(x: number, y: number, g: NonNullable<ReturnType<MeshEditPointerController['_gizmoTarget']>>,
+    cam: NonNullable<ReturnType<Scene3DManager['getCamera']>>, hitScale: number): GizmoAxis {
+    if (!this._canvas) return null;
+    const ray = screenRay(cam.getViewProjectionMatrix() as unknown as mat4, x, y, this._canvas.width, this._canvas.height);
+    if (!ray) return null;
+    return hitTestGizmoAt(ray.origin, ray.dir, g.center, g.rotation as unknown as mat4 | null, cam, g.mode, hitScale);
+  }
+
+  /** A press on a selection-gizmo handle starts a gizmo drag of the selected elements (released = applied). */
+  private _gizmoDown(e: PointerEvent, hitScale: number): boolean {
+    if (!this._canvas || !this._meshId) return false;
+    const g = this._gizmoTarget();
+    const cam = this._scene3d.getCamera?.();
+    if (!g || !cam) return false;
+    this._rect = this._canvas.getBoundingClientRect();
+    const at = this._toCanvasPx(e.clientX, e.clientY);
+    const axis = this._gizmoHit(at.x, at.y, g, cam, hitScale);
+    const mode = gizmoModeToTransform(g.mode);
+    if (!axis || !mode) return false;
+    if (!this.transform.begin(this._meshId, mode, { source: 'gizmo', axis })) return false;
+    try { this._canvas.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+    this._xfPointer = e.pointerId ?? 0;
+    this._gizmoHover = null;
+    this.transform.pointerStart(at.x, at.y, this._canvas.width, this._canvas.height);
+    e.stopPropagation();
+    this._canvas.style.cursor = 'grabbing';
+    this._scheduleRender();
+    return true;
+  }
+
+  /** The selection gizmo for the edit overlay (MeshEditDrawData.gizmo), or null when it is hidden. */
+  gizmoDrawData(): MeshEditGizmoDraw | null {
+    const g = this._gizmoTarget();
+    if (!g) return null;
+    const dragging = this.transform.active && this.transform.source === 'gizmo' ? this.transform.axis : null;
+    return { center: g.center, rotation: g.rotation, mode: g.mode, hovered: dragging ? null : this._gizmoHover, dragging };
+  }
+
+  /** scene3d's G / R / S family, routed here while a mesh is in Edit Mesh (Scene3DManager.setElementTransformRouter). */
+  elementTransformRouter(): ElementTransformRouter {
+    return {
+      handles: () => this._meshEdit.isEditing && !!this._meshEdit.activeMeshId,
+      isActive: () => this.transform.active,
+      isModal: () => this.transform.active && this.transform.source === 'modal',
+      mode: () => this.transform.mode,
+      axis: () => this.transform.shortcutAxis,
+      numeric: () => this.transform.numeric,
+      begin: (mode) => { this.beginElementTransform(mode); },
+      constrainAxis: (axis) => this.transform.setAxis(axis),
+      appendNumeric: (ch) => this.transform.appendNumeric(ch),
+      commit: () => { if (this.transform.active) this._endElementTransform(true); },
+      cancel: () => { if (this.transform.active) this._endElementTransform(false); },
+      setGizmoMode: (mode) => { this.gizmoMode = mode; this._gizmoHover = null; this._scheduleRender(); },
+      dragInfo: () => {
+        const s = this.transform.state();
+        if (!s || s.source !== 'gizmo') return null;
+        const axis = s.axis;
+        return {
+          isDragging: true, mode: s.mode === 'grab' ? 'move' : s.mode, axis,
+          angleDeg: s.mode === 'rotate' ? s.angleDeg : null, gizmoCenterWorld: s.pivot,
+        };
+      },
+    };
   }
 
   // ── Chamfer / Bevel tool routing ────────────────────────────────────────────
@@ -677,6 +975,7 @@ export class MeshEditPointerController {
     this._bevelPointer = null;
     this._bevelPending = null;
     if (this._hoverFrame) { this._cancelFrame(this._hoverFrame); this._hoverFrame = 0; }
+    this._dropXfFrame();
     this._dragAt = null;
     this._hoverAt = null;
   }
@@ -802,4 +1101,20 @@ export class MeshEditPointerController {
   private _scheduleRender(): void {
     this._scheduleRenderFn();
   }
+}
+
+/** The world ray through canvas px (x, y) of a w × h canvas (near-plane origin, unit direction), or null. */
+function screenRay(vp: mat4, x: number, y: number, w: number, h: number): { origin: [number, number, number]; dir: [number, number, number] } | null {
+  const inv = mat4.invert(mat4.create(), vp);
+  if (!inv) return null;
+  const nx = (2 * x) / w - 1, ny = 1 - (2 * y) / h;
+  const at = (z: number): [number, number, number] | null => {
+    const p = vec4.transformMat4(vec4.create(), vec4.fromValues(nx, ny, z, 1), inv);
+    return Math.abs(p[3]) < 1e-12 ? null : [p[0] / p[3], p[1] / p[3], p[2] / p[3]];
+  };
+  const o = at(0), f = at(1);
+  if (!o || !f) return null;
+  const dx = f[0] - o[0], dy = f[1] - o[1], dz = f[2] - o[2], len = Math.hypot(dx, dy, dz);
+  if (!(len > 0)) return null;
+  return { origin: o, dir: [dx / len, dy / len, dz / len] };
 }

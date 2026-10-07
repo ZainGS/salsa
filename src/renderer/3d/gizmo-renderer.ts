@@ -1293,6 +1293,65 @@ function hitPlane(
   return null;
 }
 
+/** The transform gizmo's model matrix at world `center`: translate, [rotate — local orientation], uniform screen-size
+ *  scale ({@link GizmoRenderer.computeGizmoScale}). Shared by drawing and hit-testing, so they always agree. */
+export function gizmoModelAt(center: ArrayLike<number>, rotation: mat4 | null, camera: Camera3D): mat4 {
+  const c = vec3.fromValues(center[0], center[1], center[2]);
+  const scale = GizmoRenderer.computeGizmoScale(camera, c);
+  const model = mat4.create();
+  mat4.translate(model, model, c);
+  if (rotation) mat4.multiply(model, model, rotation);
+  mat4.scale(model, model, [scale, scale, scale]);
+  return model;
+}
+
+/**
+ * Test a world-space ray against the transform gizmo at world `center` (oriented by `rotation`, null = world axes):
+ * the nearest axis / plane / ring hit, or null. Pure (no GPU) — GizmoRenderer.hitTest (object mode) and the Edit Mesh
+ * selection gizmo both use it. `hitScale` = the TOUCH-8 multiplier (2 under a finger).
+ */
+export function hitTestGizmoAt(
+  rayOrigin: ArrayLike<number>,
+  rayDir: ArrayLike<number>,
+  center: ArrayLike<number>,
+  rotation: mat4 | null,
+  camera: Camera3D,
+  mode: GizmoMode,
+  hitScale = 1,
+): GizmoAxis {
+  if (mode === null) return null;
+  const model = gizmoModelAt(center, rotation, camera);
+  const invModel = mat4.invert(mat4.create(), model);
+  if (!invModel) return null;
+
+  const { lO, lD } = toGizmoLocal(rayOrigin as vec3, rayDir as vec3, invModel);
+
+  let bestT = Infinity;
+  let bestAxis: GizmoAxis = null;
+  const tryHit = (axis: GizmoAxis, t: number | null): void => {
+    if (t !== null && t > 0 && t < bestT) { bestT = t; bestAxis = axis; }
+  };
+
+  const hs = hitScale;
+  if (mode === 'move' || mode === 'scale') {
+    tryHit('x', hitAxisCylinder(lO, lD, 'x', HIT_RADIUS_AXIS * hs));
+    tryHit('y', hitAxisCylinder(lO, lD, 'y', HIT_RADIUS_AXIS * hs));
+    tryHit('z', hitAxisCylinder(lO, lD, 'z', HIT_RADIUS_AXIS * hs));
+    if (mode === 'move') {
+      tryHit('xy', hitPlane(lO, lD, 'xy', hs));
+      tryHit('xz', hitPlane(lO, lD, 'xz', hs));
+      tryHit('yz', hitPlane(lO, lD, 'yz', hs));
+    }
+  } else {
+    // rotate — near halves only (the far halves are drawn thin + dim and aren't grabbable)
+    const view = GizmoRenderer.viewLocal(camera, model, invModel);
+    tryHit('x', hitRotateRing(lO, lD, 'x', hs, view));
+    tryHit('y', hitRotateRing(lO, lD, 'y', hs, view));
+    tryHit('z', hitRotateRing(lO, lD, 'z', hs, view));
+  }
+  return bestAxis;
+}
+
 // ── GizmoRenderer class ────────────────────────────────────────────
 
 export class GizmoRenderer {
@@ -2076,17 +2135,27 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     dragging: GizmoAxis = null,
   ): void {
     if (selectedMeshes.length === 0 || mode === null) return;
-
     const center = this.computeCenter(selectedMeshes);
-    const scale  = GizmoRenderer.computeGizmoScale(camera, center);
+    const rotation = this.orientationMode === 'local' ? this.extractRotationMatrix(selectedMeshes[0]) : null;
+    this.drawGizmoAt(pass, center, rotation, camera, mode, hovered, dragging);
+  }
 
-    // Build model matrix: translate to center, [rotate if local mode], uniform scale
-    const model = mat4.create();
-    mat4.translate(model, model, center);
-    if (this.orientationMode === 'local' && selectedMeshes.length > 0) {
-      mat4.multiply(model, model, this.extractRotationMatrix(selectedMeshes[0]));
-    }
-    mat4.scale(model, model, [scale, scale, scale]);
+  /**
+   * Draw the transform gizmo at a world-space `center` (Edit Mesh: the selection's centroid), oriented by `rotation`
+   * (a pure rotation, e.g. {@link GizmoRenderer.rotationOf} of the object's matrix for the local orientation; null =
+   * world axes). The same geometry as {@link drawGizmo} (rings split near / far).
+   */
+  drawGizmoAt(
+    pass: GPURenderPassEncoder,
+    center: vec3 | [number, number, number],
+    rotation: mat4 | null,
+    camera: Camera3D,
+    mode: GizmoMode,
+    hovered: GizmoAxis,
+    dragging: GizmoAxis = null,
+  ): void {
+    if (mode === null) return;
+    const model = gizmoModelAt(center, rotation, camera);
 
     // Upload uniforms
     const vp = camera.getViewProjectionMatrix();
@@ -2380,51 +2449,9 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     mode: GizmoMode,
   ): GizmoAxis {
     if (selectedMeshes.length === 0 || mode === null) return null;
-
     const center = this.computeCenter(selectedMeshes);
-    const scale  = GizmoRenderer.computeGizmoScale(camera, center);
-
-    // Gizmo model matrix and its inverse (matches drawGizmo exactly)
-    const model = mat4.create();
-    mat4.translate(model, model, center);
-    if (this.orientationMode === 'local' && selectedMeshes.length > 0) {
-      mat4.multiply(model, model, this.extractRotationMatrix(selectedMeshes[0]));
-    }
-    mat4.scale(model, model, [scale, scale, scale]);
-    const invModel = mat4.invert(mat4.create(), model);
-    if (!invModel) return null;
-
-    const { lO, lD } = toGizmoLocal(rayOrigin, rayDir, invModel);
-
-    let bestT = Infinity;
-    let bestAxis: GizmoAxis = null;
-
-    function tryHit(axis: GizmoAxis, t: number | null): void {
-      if (t !== null && t > 0 && t < bestT) {
-        bestT = t;
-        bestAxis = axis;
-      }
-    }
-
-    const hs = this.hitScale;
-    if (mode === 'move' || mode === 'scale') {
-      tryHit('x', hitAxisCylinder(lO, lD, 'x', HIT_RADIUS_AXIS * hs));
-      tryHit('y', hitAxisCylinder(lO, lD, 'y', HIT_RADIUS_AXIS * hs));
-      tryHit('z', hitAxisCylinder(lO, lD, 'z', HIT_RADIUS_AXIS * hs));
-      if (mode === 'move') {
-        tryHit('xy', hitPlane(lO, lD, 'xy', hs));
-        tryHit('xz', hitPlane(lO, lD, 'xz', hs));
-        tryHit('yz', hitPlane(lO, lD, 'yz', hs));
-      }
-    } else {
-      // rotate — near halves only (the far halves are drawn thin + dim and aren't grabbable)
-      const view = GizmoRenderer.viewLocal(camera, model, invModel);
-      tryHit('x', hitRotateRing(lO, lD, 'x', hs, view));
-      tryHit('y', hitRotateRing(lO, lD, 'y', hs, view));
-      tryHit('z', hitRotateRing(lO, lD, 'z', hs, view));
-    }
-
-    return bestAxis;
+    const rotation = this.orientationMode === 'local' ? this.extractRotationMatrix(selectedMeshes[0]) : null;
+    return hitTestGizmoAt(rayOrigin, rayDir, center, rotation, camera, mode, this.hitScale);
   }
 
   // ── Bone overlay ────────────────────────────────────────────────
@@ -2577,7 +2604,11 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
   /** Extract pure rotation matrix from a mesh's localMatrix (strips scale and translation). */
   private extractRotationMatrix(mesh: Mesh3D): mat4 {
-    const mm = mesh.localMatrix as unknown as Float32Array;
+    return GizmoRenderer.rotationOf(mesh.localMatrix as unknown as ArrayLike<number>);
+  }
+
+  /** The pure rotation of a column-major 4x4 transform (scale and translation stripped) — a local-orientation gizmo. */
+  static rotationOf(mm: ArrayLike<number>): mat4 {
     const c0l = Math.hypot(mm[0], mm[1], mm[2]) || 1;
     const c1l = Math.hypot(mm[4], mm[5], mm[6]) || 1;
     const c2l = Math.hypot(mm[8], mm[9], mm[10]) || 1;

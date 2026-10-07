@@ -132,6 +132,16 @@ export function faceList(
   return f;
 }
 
+/** The proportional-editing falloff: the weight at `t` = distance / radius (0 = at the moved vertex, < 1 inside the
+ *  radius) — the vertex drag's curve (EditMesh.moveVertex) and the element transforms' (proportionalWeights). */
+export function proportionalFalloff(t: number, falloff: 'smooth' | 'linear' | 'sharp'): number {
+  switch (falloff) {
+    case 'linear': return 1 - t;
+    case 'sharp':  return t < 0.1 ? 1 : 0;
+    default:       return (1 - t) * (1 - t);
+  }
+}
+
 /** `f` with its vertex indices mapped (every attribute kept, corner for corner — incl. custom normals). */
 export function remapFace(f: FaceList, fn: (vi: number) => number): FaceList {
   return faceList(f.map(fn), f.uvs, f.smooth, f.cols, f.nrms);
@@ -713,17 +723,38 @@ export class EditMesh {
       const vi = this.vertices[i];
       const dist = Math.sqrt((vi.x - ox) ** 2 + (vi.y - oy) ** 2 + (vi.z - oz) ** 2);
       if (dist >= r) continue;
-      const t = dist / r;
-      let weight: number;
-      switch (this.proportionalEditFalloff) {
-        case 'linear': weight = 1 - t; break;
-        case 'sharp':  weight = t < 0.1 ? 1 : 0; break;
-        default:       weight = (1 - t) * (1 - t); break;
-      }
+      const weight = proportionalFalloff(dist / r, this.proportionalEditFalloff);
       vi.x += dx * weight; vi.y += dy * weight; vi.z += dz * weight;
       if (weight && (dx || dy || dz)) moved.push(i);
     }
     this.clearCustomNormalsAround(moved);
+  }
+
+  /**
+   * Proportional-editing weights for transforming the vertex set `selected` (Edit Mesh element transforms): 1 for a
+   * selected vertex; with proportional editing on, every other vertex closer than `proportionalEditRadius` (object
+   * space) to its NEAREST selected vertex gets the falloff of that distance (the same curve as the vertex drag,
+   * {@link proportionalFalloff}); 0 otherwise. Distances are measured at the current positions.
+   */
+  proportionalWeights(selected: Iterable<number>): Float32Array {
+    const V = this.vertices;
+    const w = new Float32Array(V.length);
+    const sel: number[] = [];
+    for (const s of selected) if (s >= 0 && s < V.length && w[s] !== 1) { w[s] = 1; sel.push(s); }
+    if (!this.proportionalEditEnabled || sel.length === 0) return w;
+    const r = this.proportionalEditRadius, r2 = r * r;
+    for (let i = 0; i < V.length; i++) {
+      if (w[i] === 1) continue;
+      const p = V[i];
+      let best = r2;
+      for (const s of sel) {
+        const q = V[s];
+        const d2 = (p.x - q.x) ** 2 + (p.y - q.y) ** 2 + (p.z - q.z) ** 2;
+        if (d2 < best) best = d2;
+      }
+      if (best < r2) w[i] = proportionalFalloff(Math.sqrt(best) / r, this.proportionalEditFalloff);
+    }
+    return w;
   }
 
   /**

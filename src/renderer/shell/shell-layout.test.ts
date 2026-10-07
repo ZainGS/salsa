@@ -115,6 +115,25 @@ describe('computeProjectGrid — fixed-size cards (UI-14)', () => {
       expect(hitTestProjectGridClose(model, x + w / 2, y + it.rect[3] / 2, 1280 * dpr)).toBeNull();
     }
   });
+
+  it('the ✕ hit box grows to minHitPx around the button centre (coarse pointer), and only then', () => {
+    const g = computeProjectGrid(1280, 800, ids(1), 0, 1);
+    const it = g.items[0];
+    const model = { projectGrid: g.items } as unknown as ShellRenderModel;
+    const [x, y, w] = it.rect;
+    const titleH = projectCardTitleH(it);
+    const b = Math.min(Math.max(Math.min(w, it.rect[3]) * 0.012, 1.5), 2.5);
+    const bx1 = w - 2 * b - b * 1.5, bx0 = bx1 - titleH * 0.7;
+    const by0 = 2 * b + (titleH - titleH * 0.7) * 0.5;
+    const cx = x + (bx0 + bx1) / 2, cy = y + by0 + titleH * 0.35;
+    // 20 px left of the centre: outside the drawn button (+ its 2 px slop), inside a 44 px finger box.
+    expect(hitTestProjectGridClose(model, cx - 20, cy, 1280)).toBeNull();
+    expect(hitTestProjectGridClose(model, cx - 20, cy, 1280, 44)).toBe('p0');
+    expect(hitTestProjectGridClose(model, cx, cy + 20, 1280, 44)).toBe('p0');
+    expect(hitTestProjectGridClose(model, cx - 23, cy, 1280, 44)).toBeNull();
+    // A min smaller than the button changes nothing.
+    expect(hitTestProjectGridClose(model, cx - 20, cy, 1280, 4)).toBeNull();
+  });
 });
 
 describe('shell chip buttons — sized from measured labels', () => {

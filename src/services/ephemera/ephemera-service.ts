@@ -324,6 +324,20 @@ export class EphemeraService {
     this._placements.delete(layerId);
   }
 
+  /** Remove and RETURN a layer's placement list (the very objects, so an undo can put them back unchanged). */
+  takePlacementsForLayer(layerId: string): EphemeraPlacement[] {
+    const list = this._placements.get(layerId) ?? [];
+    this._placements.delete(layerId);
+    return list;
+  }
+
+  /** Put a list taken by {@link takePlacementsForLayer} back (ahead of anything placed on that id since). */
+  restorePlacementsForLayer(layerId: string, list: EphemeraPlacement[]): void {
+    if (!list.length) return;
+    const now = this._placements.get(layerId) ?? [];
+    this._placements.set(layerId, [...list, ...now.filter(p => !list.includes(p))]);
+  }
+
   // ── 3D Texture Export ─────────────────────────────────────────────────────
 
   async exportAs3DTexture(typeId: string, params: Record<string, unknown>, size: number): Promise<Blob> {

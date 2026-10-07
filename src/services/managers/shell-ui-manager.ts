@@ -62,6 +62,10 @@ import {
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { syncShellCanvasBacking, shellBackingRatio } from '../../renderer/shell/shell-backing';
 import { DESKTOP_CAPS } from '../../renderer/core/gpu-capabilities';
+import { isHostModalOpen, shellShouldIgnoreEscape } from './shell-escape-guard';
+
+/** Minimum hit box (CSS px) of a project card's ✕ on a coarse (finger) pointer — the drawn button is ~14 px. */
+const SHELL_CLOSE_MIN_HIT_COARSE_CSS = 44;
 
 /** Synthetic tile id for the trailing "＋ Install cart" slot in shell mode. */
 export const SHELL_ADD_CART_ID = '__add_cart__';
@@ -1012,6 +1016,7 @@ export class ShellUIManager {
     if (!this.sceneCanvas) return;
     if (!this.clusterEl) {
       this.clusterEl = this.buildChromeCluster();
+      this.clusterEl.classList.add('salsa-shell-cluster');   // a host can find it (e.g. make it inert under its own modal)
       this.clusterEl.style.position = 'fixed';
       this.clusterEl.style.zIndex = '50';
       document.body.appendChild(this.clusterEl);
@@ -1732,7 +1737,7 @@ export class ShellUIManager {
       }
       // Project-card ✕ (delete intent) takes priority over opening the card. The host shows the modal + deletes.
       if (this.view.mode === 'illustrations') {
-        const delId = hitTestProjectGridClose(this.currentModel, px, py, this.sceneCanvas?.width ?? 0);
+        const delId = hitTestProjectGridClose(this.currentModel, px, py, this.sceneCanvas?.width ?? 0, this.closeMinHitPx(canvas));
         if (delId) { this.onProjectDelete.emit({ id: delId, dashboardKind: this.dashboardKind }); return; }
       }
       const id = this.hitTest(px, py);
@@ -1741,12 +1746,14 @@ export class ShellUIManager {
     this.boundDblClick = (e) => {
       const [px, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
       // Don't open the illustration when the double-click lands on its ✕ (the first click already fired delete).
-      if (this.view.mode === 'illustrations' && hitTestProjectGridClose(this.currentModel, px, py, this.sceneCanvas?.width ?? 0)) return;
+      if (this.view.mode === 'illustrations' && hitTestProjectGridClose(this.currentModel, px, py, this.sceneCanvas?.width ?? 0, this.closeMinHitPx(canvas))) return;
       const id = this.hitTest(px, py);
       if (id) this.handleActivate(id);
     };
     this.boundKeyDown = (e) => {
-      if (e.key === 'Escape' && this.view.mode === 'illustrations') {
+      // Not an Escape a host dialog consumed / meant for itself (it used to close the dialog AND flip the grid home).
+      if (e.key === 'Escape' && this.view.mode === 'illustrations'
+        && !shellShouldIgnoreEscape(e, isHostModalOpen(typeof document !== 'undefined' ? document : null))) {
         this.closeIllustratorDashboard();
       }
     };
@@ -1804,6 +1811,13 @@ export class ShellUIManager {
     this.suppressNextClick = false;
     this.boundKeyDown = undefined;
     this.boundWheel = undefined;
+  }
+
+  /** The project-card ✕ hit box (device px): finger-sized on a coarse pointer, else the drawn button (0). */
+  private closeMinHitPx(canvas: HTMLCanvasElement): number {
+    let coarse = false;
+    try { coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches; } catch { /* no matchMedia */ }
+    return coarse ? SHELL_CLOSE_MIN_HIT_COARSE_CSS * shellBackingRatio(canvas) : 0;
   }
 
   /** Convert a client (CSS px) pointer position to canvas device pixels. */

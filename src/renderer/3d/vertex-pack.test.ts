@@ -249,6 +249,22 @@ describe('P22 packed vertices: the geometry pool', () => {
         const pi = new Uint16Array(ib.slice(a.firstIndex * 2, a.firstIndex * 2 + ix.length * 2).buffer);
         for (let i = 0; i < ix.length; i++) expect(pi[i]).toBe(ix[i]);
     });
+    it('a vertex-coloured (Edit Mesh) mesh: the patch also reaches the standalone VB override it draws from', async () => {
+        const { r, dev, mk } = await setup();
+        for (const packable of [true, false]) {
+            const m = mk(300, packable);
+            m.vertexColors = new Float32Array(300 * 4).fill(1);
+            r._ensureGeomPool([m]);
+            r._uploadVCBuffers(m);                                                   // (what the frame does for a VC mesh)
+            const ov = r._vertexBufferOverrides.get(m.id);
+            expect(ov).toBeDefined();
+            const v = m.geometry.vertices as Float32Array;
+            for (let i = 40 * 12; i < 52 * 12; i++) if (i % 12 < 3) v[i] += 2.25;   // move vertices 40..51
+            expect(r.patchMeshVertices(m, 40, 12)).toBe(true);
+            const bytes = dev.mem.get(ov)!;
+            expect(Buffer.from(bytes.subarray(0, v.byteLength)).equals(Buffer.from(v.buffer, v.byteOffset, v.byteLength))).toBe(true);
+        }
+    });
 });
 
 describe('P22 packed vertices: draws', () => {

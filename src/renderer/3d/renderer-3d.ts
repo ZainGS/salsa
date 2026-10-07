@@ -3606,6 +3606,11 @@ export class Renderer3D {
     this._meshEditDataPass = null; this._meshEditDataMemo = null;   // the overlay is the frame's last reader
     if (!this._meshEditOverlay || !editData) return;
     this._meshEditOverlay.draw(pass, editData, this.camera);
+    // The element-transform gizmo on the selection's centroid (on top of the wireframe; hidden by the no-gizmo debug flag)
+    const g = editData.gizmo;
+    if (g && this._gizmoRenderer && !(RD.on && RD.f.noGizmo)) {
+      this._gizmoRenderer.drawGizmoAt(pass, g.center, g.rotation as unknown as mat4 | null, this.camera, g.mode, g.hovered, g.dragging);
+    }
   }
 
   /** The mesh-edit data provider's result for THIS frame. mobile-parity 7.3b P4: the selection gizmo and the overlay
@@ -8569,6 +8574,12 @@ export class Renderer3D {
     const v = g.vertices as Float32Array, fpv = MESH3D_VERTEX_STRIDE / 4, st = strideOf(alloc.pk);
     // (P22: the span is padded in pack mode — it must hold the whole vertex array at the allocation's stride)
     if (alloc.vtxBytes < (v.length / fpv) * st || alloc.vtxBytes >= (v.length / fpv) * st + 96 || (start + count) * fpv > v.length || this._geomPartial.has(mesh.geometryKey)) return false;
+    // A vertex-coloured mesh (every Edit Mesh: its compile emits vertexColors) DRAWS from its standalone VB override
+    // (_uploadVCBuffers, re-sent only on gpuDirty) — patch that too, or an in-place drag patch never reaches the screen.
+    const ov = mesh.vertexColors ? this._vertexBufferOverrides.get(mesh.id) : undefined;
+    if (ov && ov.size >= v.byteLength) {
+      this.device.queue.writeBuffer(ov, start * MESH3D_VERTEX_STRIDE, v.buffer, v.byteOffset + start * MESH3D_VERTEX_STRIDE, count * MESH3D_VERTEX_STRIDE);
+    }
     if (alloc.pk) {   // P22: re-pack the range (position, normal, uv) into the 32-byte layout
       const pv = packVertices(v.subarray(start * fpv, (start + count) * fpv));
       if (!pv) return false;
