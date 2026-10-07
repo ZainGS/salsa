@@ -23,6 +23,7 @@ import type { Camera3D } from '../../renderer/3d/camera-3d';
 import type { SpringCollider } from '../../types/armature-3d';
 import type { RenderStyle } from '../../renderer/3d/material-3d';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
+import { noteRasterContentWrite } from '../../renderer/raster/raster-content-version';
 import { EyeParams, renderEyes, defaultEyeParams, blinkParamsFor } from './eye-generator';
 import {
     type FaceFeatureParams, type FaceLayout, type ExpressionShape, type ExpressionWeights, type FaceExpressionName,
@@ -278,6 +279,7 @@ export class Scene3DCharacter {
             const enc = device.createCommandEncoder();
             enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), clearValue: { r:0,g:0,b:0,a:0 }, loadOp:'clear', storeOp:'store' }] }).end();
             device.queue.submit([enc.finish()]);
+            noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
         }
         return mgr;
     }
@@ -405,6 +407,7 @@ export class Scene3DCharacter {
             renderEyes(bctx, params, W, H, aspect);
         }
         device.queue.copyExternalImageToTexture({ source: big, flipY: false }, { texture: tex }, [W, H]);
+        noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
     }
 
     getDefaultEyeParams(): EyeParams { return defaultEyeParams(); }
@@ -818,6 +821,7 @@ export class Scene3DCharacter {
                 renderFaceLayer(bctx, layer, p, L, shape, colors, W, H);
             }
             device.queue.copyExternalImageToTexture({ source: big, flipY: false }, { texture: tex, premultipliedAlpha: true }, [W, H]);
+            noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
             mesh.diffuseTexture = tex;
             mesh.material.hasTexture = true;
             mesh.visible = p.enabled;
@@ -1012,6 +1016,7 @@ export class Scene3DCharacter {
                         const bmp = await createImageBitmap(new Blob([buf], { type: 'image/png' }));
                         const tex = mgr.ensureTexture(bmp.width, bmp.height);
                         device.queue.copyExternalImageToTexture({ source: bmp, flipY: false }, { texture: tex }, [bmp.width, bmp.height]);
+                        noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
                     } catch (err) { console.warn('[Face] restore texture failed', e.id, err); }
                 } else if (e.eyeParams) {
                     this._renderEyeParamsToTexture(mgr, e.eyeParams, rig.faceAspect);
@@ -1363,6 +1368,7 @@ export class Scene3DCharacter {
             ctx2d.putImageData(img, 0, 0);
         }
         device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
+        noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
         return tex;
     }
 
@@ -1750,6 +1756,7 @@ export class Scene3DCharacter {
         if (c2d) {
             this._drawGarmentColorCanvas(c2d, W, H, params);
             device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
+            noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
             mesh.diffuseTexture = tex; mesh.material.hasTexture = true;
             mesh.setDiffuseColor(1, 1, 1, 1);
         }
@@ -1790,6 +1797,7 @@ export class Scene3DCharacter {
         if (!c2d) return false;
         this._drawGarmentColorCanvas(c2d, W, H, params);
         device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
+        noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
         return true;
     }
 
@@ -1826,6 +1834,7 @@ export class Scene3DCharacter {
         if (!changed) return false;
         curC.putImageData(cur, 0, 0);
         device.queue.copyExternalImageToTexture({ source: curC.canvas, flipY: false }, { texture: tex }, [W, H]);
+        noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
         this.ctx.scheduleRender();
         return true;
     }

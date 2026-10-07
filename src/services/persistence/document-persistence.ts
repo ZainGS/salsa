@@ -22,8 +22,15 @@
  *         {celId}.bin         — legacy: raw RGBA (v2 saves)
  *
  * Auto-save fires on a configurable timer (default: 30s) and also after
- * every stroke ends (debounced). The entire save is atomic — a new temp
- * directory is written, then the old one is replaced.
+ * every stroke ends (debounced). The manifest is written LAST (the commit record).
+ *
+ * INCREMENTAL (2026-10-06): each instance remembers what it last wrote (or loaded) file by file — JSON text, binary
+ * bytes, and an opaque CONTENT KEY per layer / cel PNG (payload.pixelContentKeys) — and an automatic save writes only
+ * the files that differ. When nothing differs it writes nothing at all (an idle timed save costs the gather only, no
+ * GPU read-back: DocumentStateCoordinator serves unchanged pixels from its cache). The record is trusted only while
+ * the on-disk manifest still carries the savedAt it was taken with (another tab or instance writing the document →
+ * full write), is committed only after a write completes, and is dropped on any failure. Explicit saves (saveNow)
+ * ignore it and write everything.
  *
  * This module has ZERO coupling to UI frameworks. Frogmarks wires it
  * through ShapeManager.
@@ -188,7 +195,13 @@ export class DocumentPersistence {
   private encodePoolTried = false;
 
   // Callbacks (set by ShapeManager)
-  private getDocumentState: (() => Promise<DocumentSavePayload>) | null = null;
+  private getDocumentState: ((opts?: { explicit?: boolean }) => Promise<DocumentSavePayload>) | null = null;
+  /** What this instance last wrote / loaded, file by file (see the header: INCREMENTAL). Null = unknown → write all. */
+  private written: WriteRecord | null = null;
+  /** Diagnostics / tests: saves that wrote, saves that found nothing to write, and files written / left as they were. */
+  public readonly writeStats = { writes: 0, unchanged: 0, filesWritten: 0, filesSkipped: 0 };
+  /** The files the last write wrote (paths relative to the document folder). */
+  public lastWrittenFiles: string[] = [];
   private onSaveStart: (() => void) | null = null;
   private onSaveComplete: ((success: boolean) => void) | null = null;
   /** When set and it returns true, all AUTOMATIC saves skip — e.g. Play mode is active, where the scene is
@@ -237,10 +250,17 @@ export class DocumentPersistence {
 
   /**
    * Set the callback that gathers the full document state.
-   * ShapeManager provides this.
+   * ShapeManager provides this. `opts.explicit` = a saveNow() (the provider may then read every pixel fresh); an
+   * automatic save passes false (the provider may serve unchanged pixels from a cache, with content keys).
    */
-  public setStateProvider(fn: () => Promise<DocumentSavePayload>): void {
+  public setStateProvider(fn: (opts?: { explicit?: boolean }) => Promise<DocumentSavePayload>): void {
     this.getDocumentState = fn;
+  }
+
+  /** Take over another instance's write record (a host re-enabling autosave builds a new instance — the record is
+   *  re-validated against the disk on every save, so carrying it over is always safe). */
+  public inheritWriteRecord(from: DocumentPersistence | null | undefined): void {
+    if (!this.written && from?.written) this.written = from.written;
   }
 
   /** Set callbacks for save lifecycle (for UI indicators). */
@@ -359,18 +379,18 @@ export class DocumentPersistence {
   public async saveNow(): Promise<boolean> {
     if (this.busyPredicate?.()) {
       if (!this.deferred) { try { this.onDeferred?.(); } catch { /* host callback */ } }
-      return this.deferUntilIdle();
+      return this.deferUntilIdle(true);
     }
-    return this.executeSave();
+    return this.executeSave(true);
   }
 
   /** Poll interval for a deferred explicit save (see saveNow). */
   private static readonly DEFER_POLL_MS = 250;
-  private deferred: { promise: Promise<boolean>; resolve: (ok: boolean) => void; timer: ReturnType<typeof setInterval> } | null = null;
+  private deferred: { promise: Promise<boolean>; resolve: (ok: boolean) => void; timer: ReturnType<typeof setInterval>; explicit: boolean } | null = null;
 
-  /** One shared save that runs as soon as the busy predicate clears (D-P2). */
-  private deferUntilIdle(): Promise<boolean> {
-    if (this.deferred) return this.deferred.promise;
+  /** One shared save that runs as soon as the busy predicate clears (D-P2). Explicit if any request sharing it was. */
+  private deferUntilIdle(explicit = false): Promise<boolean> {
+    if (this.deferred) { this.deferred.explicit ||= explicit; return this.deferred.promise; }
     let resolve!: (ok: boolean) => void;
     const promise = new Promise<boolean>((r) => { resolve = r; });
     const timer = setInterval(() => {
@@ -379,9 +399,9 @@ export class DocumentPersistence {
       if (!d) return;
       clearInterval(d.timer);
       this.deferred = null;   // BEFORE the save — a new busy period during it gets its own deferral
-      this.executeSave().then(d.resolve, () => d.resolve(false));
+      this.executeSave(d.explicit).then(d.resolve, () => d.resolve(false));
     }, DocumentPersistence.DEFER_POLL_MS);
-    this.deferred = { promise, resolve, timer };
+    this.deferred = { promise, resolve, timer, explicit };
     return promise;
   }
 
@@ -420,7 +440,7 @@ export class DocumentPersistence {
   public setSaveBlocked(reason: string | null): void { this.saveBlockedReason = reason; }
   public get saveBlocked(): string | null { return this.saveBlockedReason; }
 
-  private async executeSave(): Promise<boolean> {
+  private async executeSave(explicit = false): Promise<boolean> {
     // Serialize: an explicit saveNow() used to bypass isSaving and write the same files CONCURRENTLY with a running
     // autosave (audit P9). Wait for the one in flight, then save (re-checking the gates below after the wait).
     while (this.inFlight) { try { await this.inFlight; } catch { /* it reported its own failure */ } }
@@ -430,25 +450,29 @@ export class DocumentPersistence {
       return false;
     }
     let busyAfterGather = false;
-    const run = this.runSave(() => { busyAfterGather = true; });
+    const run = this.runSave(() => { busyAfterGather = true; }, explicit);
     this.inFlight = run;
     let ok: boolean;
     try { ok = await run; }
     finally { if (this.inFlight === run) this.inFlight = null; }
     // Play (etc.) started while the state was being gathered (the gather awaits pixel export before reading the 3D
     // scene) → nothing was written; save again once it ends (D-P2). Outside inFlight, so no self-wait.
-    return busyAfterGather ? this.deferUntilIdle() : ok;
+    return busyAfterGather ? this.deferUntilIdle(explicit) : ok;
   }
 
-  private async runSave(onBusy: () => void): Promise<boolean> {
+  private async runSave(onBusy: () => void, explicit = false): Promise<boolean> {
     if (!this.getDocumentState || !isOPFSAvailable()) return false;
 
     this.isSaving = true;
-    this.onSaveStart?.();
+    // "Saving…" is reported when the first file is about to be written (an automatic save that finds nothing changed
+    // writes nothing and reports nothing). An explicit save reports it up front, as before.
+    let started = false;
+    const start = (): void => { if (!started) { started = true; this.onSaveStart?.(); } };
+    if (explicit) start();
 
     try {
       const epoch0 = this.busyEpoch?.();
-      const payload = await this.getDocumentState();
+      const payload = await this.getDocumentState({ explicit });
       if (this.busyPredicate?.()) { onBusy(); return false; }   // in-game frame — never write it (D-P2)
       if (this.busyEpoch && this.busyEpoch() !== epoch0) { onBusy(); return false; }   // a busy period came and went mid-gather
       // No document id = no document open yet (ShapeManager.startBlankDocument without an id): nowhere to write. It
@@ -458,12 +482,13 @@ export class DocumentPersistence {
         this.onSaveComplete?.(false);
         return false;
       }
-      await withDocLock(payload.manifest.docId, () => this.writeToOPFS(payload));
-      payload._onWriteComplete?.();
-      this.onSaveComplete?.(true);
+      const result = await withDocLock(payload.manifest.docId, () => this.writeToOPFS(payload, { explicit, onFirstWrite: start }));
+      payload._onWriteComplete?.();   // also when nothing needed writing: the disk already holds this state
+      if (started || result === 'written') this.onSaveComplete?.(true);
       return true;
     } catch (e) {
       console.error('[DocumentPersistence] Save failed:', e);
+      this.written = null;   // what is on disk is unknown now: the next save writes everything
       this.onSaveComplete?.(false);
       return false;
     } finally {
@@ -491,12 +516,12 @@ export class DocumentPersistence {
     return root.getDirectoryHandle(docId, { create });
   }
 
-  private async writeToOPFS(payload: DocumentSavePayload): Promise<void> {
+  private async writeToOPFS(payload: DocumentSavePayload, opts: { explicit?: boolean; onFirstWrite?: () => void } = {}): Promise<'written' | 'unchanged'> {
     const dir = await this.getDocDir(payload.manifest.docId, true);
 
     // Refuse to overwrite a document a NEWER build wrote (audit P10) — e.g. another tab on an updated build saved it
     // after this tab opened it. This build doesn't know the newer fields, so writing would silently drop them.
-    const onDisk = await this.readJSON<{ schemaVersion?: number }>(dir, 'manifest.json');
+    const onDisk = await this.readJSON<{ schemaVersion?: number; savedAt?: string }>(dir, 'manifest.json');
     if (isNewerThanThisBuild(onDisk)) {
       const reason = `this document was saved by a newer version of Salsa (schema v${schemaVersionOf(onDisk)}; this build ` +
         `is v${DOCUMENT_SCHEMA_VERSION}) — saving is disabled so its newer data isn't overwritten`;
@@ -504,118 +529,194 @@ export class DocumentPersistence {
       throw new Error(reason);
     }
 
-    // (The manifest is written LAST — see the end of this method.)
+    // ── Plan: which files differ from what this instance last wrote / loaded (INCREMENTAL — see the header) ──
+    // The record is trusted only for the same document, an automatic save, and an on-disk manifest that still has
+    // the savedAt it was taken with. Anything else → `prev` null → every file is written, as before.
+    const docId = payload.manifest.docId;
+    const r = this.written;
+    const prev = (!opts.explicit && r && r.docId === docId && !!onDisk && onDisk.savedAt === r.savedAt) ? r : null;
+    const next = prev ? cloneWriteRecord(prev) : emptyWriteRecord(docId);
+    next.savedAt = payload.manifest.savedAt;
 
-    // Write scene graph
-    if (payload.sceneGraphJSON) {
-      await this.writeText(dir, 'scene.json', payload.sceneGraphJSON);
-    }
-
-    // Write brush presets
-    if (payload.brushPresetsJSON) {
-      await this.writeText(dir, 'brushes.json', payload.brushPresetsJSON);
-    }
-
-    // Write layer pixel data. The PNG encode runs in the worker pool (off the main thread — audit §2.1);
-    // layers+cels encode concurrently across the pool, then the OPFS writes stay sequential as before.
     const fmt = this.config.pixelFormat;
     const ext = pixelFormatExtension(fmt);
     const w = payload.manifest.canvasWidth;
     const h = payload.manifest.canvasHeight;
+
+    // JSON files (gzipped by writeText; textures3d.json raw via writeJSON). null = delete (garp / ui only).
+    const textFiles: Array<{ name: string; text: string | null; raw?: boolean }> = [];
+    if (payload.sceneGraphJSON) textFiles.push({ name: 'scene.json', text: payload.sceneGraphJSON });
+    if (payload.brushPresetsJSON) textFiles.push({ name: 'brushes.json', text: payload.brushPresetsJSON });
+    if (payload.scene3dJSON) textFiles.push({ name: 'scene3d.json', text: payload.scene3dJSON });
+    if (payload.textureLibrary) textFiles.push({ name: 'textures3d.json', text: JSON.stringify(payload.textureLibrary), raw: true });
+    // GARP pools + UI state machines (audit 2026-09-28 P3): both were gathered into the payload but never written,
+    // so authored skin pools and UI layers vanished on reload. The gather sends null when there are NONE — so null
+    // must DELETE the file, or a doc whose last UI layer / pool was removed would resurrect it on the next load.
+    textFiles.push({ name: 'garp.json', text: payload.garpJSON ? JSON.stringify(payload.garpJSON) : null });
+    textFiles.push({ name: 'ui.json', text: payload.uiLayersJSON || null });
+    if (payload.ephemeraJSON) textFiles.push({ name: 'ephemera.json', text: payload.ephemeraJSON });
+    const textNeeds = (f: { name: string; text: string | null }): boolean =>
+      f.text === null ? (!prev || !prev.absent.has(f.name)) : (!prev || prev.texts.get(f.name) !== f.text);
+
+    // Layer / cel pixels: written unless the content key matches the one this file was written (or loaded) with.
+    const keys = payload.pixelContentKeys;
+    const pixelNeeds = (path: string, key: string | undefined): boolean => !key || !prev || prev.keys.get(path) !== key;
+    const layerJobs = payload.layers.filter((l) => pixelNeeds(`layers/${l.id}.${ext}`, keys?.layers?.[l.id]));
+    const celJobs = (payload.cels ?? []).filter((c) => pixelNeeds(`cels/${c.celId}.${ext}`, keys?.cels?.[c.celId]));
+    // A raster layer the manifest lists with no pixels is BLANK now: its old file must go, or a reload before the next
+    // prune resurrects what was cleared. Removed AFTER the manifest (an interrupted save keeps the previous state).
+    const withPixels = new Set(payload.layers.map((l) => l.id));
+    const blankRemovals = payload.manifest.layers
+      .filter((l) => (l.type ?? 'layer') === 'layer' && !withPixels.has(l.id))
+      .map((l) => `${l.id}.${ext}`)
+      .filter((name) => !prev || prev.pixelFiles.has(`layers/${name}`));
+
+    // Binary sidecars: written unless byte-identical to what this file holds.
+    const binFiles: Array<{ dir: string; name: string; buf: ArrayBuffer }> = [];
+    for (const [k, buf] of Object.entries(payload.models3d ?? {})) binFiles.push({ dir: 'models3d', name: `${k}.glb`, buf });
+    for (const [k, buf] of Object.entries(payload.meshTextures ?? {})) binFiles.push({ dir: 'meshTextures', name: `${k}.png`, buf });
+    for (const [k, buf] of Object.entries(payload.bakedParts ?? {})) binFiles.push({ dir: 'bakedParts', name: `${k}.glb`, buf });
+    const binNeeds = (b: { dir: string; name: string; buf: ArrayBuffer }): boolean => !prev || !sameBuffer(prev.bins.get(`${b.dir}/${b.name}`), b.buf);
+
+    const manifestNorm = normalizedManifest(payload.manifest);
+    const anyChange = !prev
+      || prev.manifest !== manifestNorm
+      || textFiles.some(textNeeds)
+      || layerJobs.length > 0 || celJobs.length > 0 || blankRemovals.length > 0
+      || binFiles.some(binNeeds);
+    const total = textFiles.length + payload.layers.length + (payload.cels?.length ?? 0) + binFiles.length + 1;
+    if (!anyChange) {
+      this.writeStats.unchanged++;
+      this.writeStats.filesSkipped += total;
+      this.lastWrittenFiles = [];
+      return 'unchanged';   // the disk already holds exactly this document: write nothing (and don't prune)
+    }
+
+    // ── Write ──
+    opts.onFirstWrite?.();
+    this.written = null;   // mid-write the disk matches neither record; committed again only once the manifest lands
+    const wrote: string[] = [];
+    const writeTextFile = async (f: { name: string; text: string | null; raw?: boolean }): Promise<void> => {
+      if (!textNeeds(f)) return;
+      if (f.text === null) {
+        await this.removeFile(dir, f.name);
+        next.texts.delete(f.name); next.absent.add(f.name);
+      } else {
+        if (f.raw) await this.writeRawText(dir, f.name, f.text);
+        else await this.writeText(dir, f.name, f.text);
+        next.texts.set(f.name, f.text); next.absent.delete(f.name);
+      }
+      wrote.push(f.name);
+    };
+    const textByName = (n: string) => textFiles.find((f) => f.name === n);
+
+    // (The manifest is written LAST — see the end of this method.)
+    for (const n of ['scene.json', 'brushes.json']) { const f = textByName(n); if (f) await writeTextFile(f); }
+
+    // Write layer pixel data. The PNG encode runs in the worker pool (off the main thread — audit §2.1);
+    // layers+cels encode concurrently across the pool, then the OPFS writes stay sequential as before.
     const layersDir = await dir.getDirectoryHandle('layers', { create: true });
-    const encodedLayers = await Promise.all(payload.layers.map(async (layer) => ({
+    const encodedLayers = await Promise.all(layerJobs.map(async (layer) => ({
       id: layer.id, encoded: await this.encodeForSave(layer.pixelData, w, h, fmt),
     })));
     for (const { id, encoded } of encodedLayers) {
       await this.writeBinary(layersDir, `${id}.${ext}`, encoded);
+      const path = `layers/${id}.${ext}`;
+      const key = keys?.layers?.[id];
+      if (key) next.keys.set(path, key); else next.keys.delete(path);
+      next.pixelFiles.add(path);
+      wrote.push(path);
     }
 
     // Write animation cel pixel data
     if (payload.cels && payload.cels.length > 0) {
       const celsDir = await dir.getDirectoryHandle('cels', { create: true });
-      const encodedCels = await Promise.all(payload.cels.map(async (cel) => ({
+      const encodedCels = await Promise.all(celJobs.map(async (cel) => ({
         celId: cel.celId, encoded: await this.encodeForSave(cel.pixelData, w, h, fmt),
       })));
       for (const { celId, encoded } of encodedCels) {
         await this.writeBinary(celsDir, `${celId}.${ext}`, encoded);
+        const path = `cels/${celId}.${ext}`;
+        const key = keys?.cels?.[celId];
+        if (key) next.keys.set(path, key); else next.keys.delete(path);
+        next.pixelFiles.add(path);
+        wrote.push(path);
       }
     }
 
     // Write 3D scene state
-    if (payload.scene3dJSON) {
-      await this.writeText(dir, 'scene3d.json', payload.scene3dJSON);
-    }
+    { const f = textByName('scene3d.json'); if (f) await writeTextFile(f); }
 
-    // Write 3D model buffers (GLB bytes per imported mesh)
-    if (payload.models3d && Object.keys(payload.models3d).length > 0) {
-      const models3dDir = await dir.getDirectoryHandle('models3d', { create: true });
-      for (const [meshId, buffer] of Object.entries(payload.models3d)) {
-        await this.writeBinary(models3dDir, `${meshId}.glb`, buffer);
-      }
-    }
-
-    // Write UV-painted mesh textures (PNG) keyed by mesh ID.
-    if (payload.meshTextures && Object.keys(payload.meshTextures).length > 0) {
-      const meshTexDir = await dir.getDirectoryHandle('meshTextures', { create: true });
-      for (const [meshId, buffer] of Object.entries(payload.meshTextures)) {
-        await this.writeBinary(meshTexDir, `${meshId}.png`, buffer);
-      }
-    }
-
-    // Write baked kitbash parts (generated garments/hair) as GLB keyed by part id.
-    if (payload.bakedParts && Object.keys(payload.bakedParts).length > 0) {
-      const bakedDir = await dir.getDirectoryHandle('bakedParts', { create: true });
-      for (const [partId, buffer] of Object.entries(payload.bakedParts)) {
-        await this.writeBinary(bakedDir, `${partId}.glb`, buffer);
+    // Write 3D model buffers (GLB bytes per imported mesh), UV-painted mesh textures (PNG, keyed by mesh ID) and
+    // baked kitbash parts (generated garments/hair, GLB keyed by part id) — each only when its bytes changed.
+    for (const sub of ['models3d', 'meshTextures', 'bakedParts']) {
+      const files = binFiles.filter((b) => b.dir === sub);
+      if (!files.length) continue;
+      const subDir = await dir.getDirectoryHandle(sub, { create: true });
+      for (const b of files) {
+        if (!binNeeds(b)) continue;
+        await this.writeBinary(subDir, b.name, b.buf);
+        next.bins.set(`${sub}/${b.name}`, b.buf);
+        wrote.push(`${sub}/${b.name}`);
       }
     }
 
     // Write texture library snapshot (base64 data URLs for material textures)
-    if (payload.textureLibrary) {
-      await this.writeJSON(dir, 'textures3d.json', payload.textureLibrary);
-    }
+    { const f = textByName('textures3d.json'); if (f) await writeTextFile(f); }
 
-    // GARP pools + UI state machines (audit 2026-09-28 P3): both were gathered into the payload but never written,
-    // so authored skin pools and UI layers vanished on reload. The gather sends null when there are NONE — so null
-    // must DELETE the file, or a doc whose last UI layer / pool was removed would resurrect it on the next load.
-    if (payload.garpJSON) await this.writeText(dir, 'garp.json', JSON.stringify(payload.garpJSON));
-    else await this.removeFile(dir, 'garp.json');
-    if (payload.uiLayersJSON) await this.writeText(dir, 'ui.json', payload.uiLayersJSON);
-    else await this.removeFile(dir, 'ui.json');
+    // GARP pools + UI state machines (see above: null deletes the file).
+    for (const n of ['garp.json', 'ui.json']) { const f = textByName(n); if (f) await writeTextFile(f); }
 
     // Write ephemera placements + sheets
-    if (payload.ephemeraJSON) {
-      await this.writeText(dir, 'ephemera.json', payload.ephemeraJSON);
-    }
+    { const f = textByName('ephemera.json'); if (f) await writeTextFile(f); }
 
     // ★ Manifest LAST = the commit record (audit 2026-09-28 P9). It used to be written FIRST, so a save interrupted
     // mid-way (tab killed, crash) left a manifest describing layers/files that were never written. Now everything
     // it references is on disk before it is. (Not a full atomic swap — OPFS can't rename directories — but an
     // interrupted save leaves the PREVIOUS manifest in charge, whose layer files still exist because pruning runs
     // after this.) A brand-new doc interrupted before this line simply has no manifest → treated as unsaved.
+    // Always written when anything else was: its savedAt is what validates this instance's write record.
     await this.writeJSON(dir, 'manifest.json', payload.manifest);
+    next.manifest = manifestNorm;
+    wrote.push('manifest.json');
+
+    // Blank layers' old files (see above).
+    for (const name of blankRemovals) {
+      await this.removeFile(layersDir, name);
+      next.pixelFiles.delete(`layers/${name}`); next.keys.delete(`layers/${name}`);
+    }
 
     // Prune ORPHANED files — deleted layers/cels/textures leave their files on disk (writes never remove them),
     // so a doc directory balloons over an editing session (draw on N layers, delete them → N stale PNGs remain).
-    // Delete anything in each managed subdir that isn't referenced by the CURRENT payload. (A now-blank layer is
-    // also skipped by exportLayerPixels, so its stale file is pruned here too — recreated blank on load.)
+    // Delete anything in each managed subdir that isn't referenced by the CURRENT payload. (The payload always holds
+    // EVERY non-blank layer and every cel — unchanged ones included, with their cached pixels — so an unchanged file
+    // is never pruned. A now-blank layer's file was removed just above.)
     // Throttled: a full OPFS listing × 5 dirs on EVERY save is wasted work when nothing was deleted, and the
     // deletion paths live in managers this module can't see — so prune on the first save and then every Nth.
     // Orphans are only ever cleaned up *late*, never missed (worst case: stale files linger a few saves).
     if (this.saveCount % DocumentPersistence.PRUNE_EVERY_N_SAVES === 0) {
-      await this.pruneDir(dir, 'layers',       new Set(payload.layers.map(l => `${l.id}.${ext}`)));
-      await this.pruneDir(dir, 'cels',         new Set((payload.cels ?? []).map(c => `${c.celId}.${ext}`)));
+      const forget = (sub: string, names: string[]): void => {
+        for (const n of names) { const p = `${sub}/${n}`; next.keys.delete(p); next.pixelFiles.delete(p); next.bins.delete(p); }
+      };
+      forget('layers', await this.pruneDir(dir, 'layers',       new Set(payload.layers.map(l => `${l.id}.${ext}`))));
+      forget('cels',   await this.pruneDir(dir, 'cels',         new Set((payload.cels ?? []).map(c => `${c.celId}.${ext}`))));
       // Only prune models3d when this save gathered the whole store — otherwise the (empty) map would read as
       // "keep nothing" and wipe every GLB on the first save after a load that made no 3D edit.
       if (payload.models3dComplete) {
-        await this.pruneDir(dir, 'models3d',     new Set(Object.keys(payload.models3d ?? {}).map(k => `${k}.glb`)));
+        forget('models3d', await this.pruneDir(dir, 'models3d',     new Set(Object.keys(payload.models3d ?? {}).map(k => `${k}.glb`))));
       }
       if (payload.meshTexturesComplete !== false) {
-        await this.pruneDir(dir, 'meshTextures', new Set(Object.keys(payload.meshTextures ?? {}).map(k => `${k}.png`)));
+        forget('meshTextures', await this.pruneDir(dir, 'meshTextures', new Set(Object.keys(payload.meshTextures ?? {}).map(k => `${k}.png`))));
       }
-      await this.pruneDir(dir, 'bakedParts',   new Set(Object.keys(payload.bakedParts ?? {}).map(k => `${k}.glb`)));
+      forget('bakedParts', await this.pruneDir(dir, 'bakedParts',   new Set(Object.keys(payload.bakedParts ?? {}).map(k => `${k}.glb`))));
     }
     this.saveCount++;
+    this.written = next;
+    this.writeStats.writes++;
+    this.writeStats.filesWritten += wrote.length;
+    this.writeStats.filesSkipped += Math.max(0, total - wrote.length);
+    this.lastWrittenFiles = wrote;
+    return 'written';
   }
 
   /**
@@ -652,6 +753,9 @@ export class DocumentPersistence {
         : 'raw';
       const ext = pixelFormatExtension(fmt);
 
+      // Layer / cel files read under their own name (not the legacy .bin fallback) — seeds the write record below.
+      const loadedPixelFiles: Array<{ kind: 'layer' | 'cel'; id: string; file: string }> = [];
+
       // Read all layer pixel files in parallel — same pattern as Frogmarks' Azure download fix.
       // Sequential awaits here were the dominant cost in loadDocument() (e.g. ~341ms for 9 layers).
       const layers: LayerPixelData[] = [];
@@ -660,17 +764,17 @@ export class DocumentPersistence {
           manifest.layers.map(async (entry) => {
             try {
               // Try format-specific extension first, fall back to .bin for legacy v2 saves.
-              const raw = await this.readBinary(layersDir, `${entry.id}.${ext}`)
-                ?? await this.readBinary(layersDir, `${entry.id}.bin`);
+              const own = await this.readBinary(layersDir, `${entry.id}.${ext}`);
+              const raw = own ?? await this.readBinary(layersDir, `${entry.id}.bin`);
               if (!raw) return null;
               const { rgba } = await decodePixels(raw, fmt);
-              return { id: entry.id, pixelData: rgba };
+              return { id: entry.id, pixelData: rgba, file: own ? `layers/${entry.id}.${ext}` : null };
             } catch {
               return null; // Layer file missing — will be a blank layer
             }
           }),
         );
-        for (const r of results) { if (r) layers.push(r); }
+        for (const r of results) { if (r) { layers.push({ id: r.id, pixelData: r.pixelData }); if (r.file) loadedPixelFiles.push({ kind: 'layer', id: r.id, file: r.file }); } }
       }
 
       // Read animation cels
@@ -689,17 +793,17 @@ export class DocumentPersistence {
           const celResults = await Promise.all(
             allCelMetas.map(async (celMeta) => {
               try {
-                const raw = await this.readBinary(celsDir, `${celMeta.celId}.${ext}`)
-                  ?? await this.readBinary(celsDir, `${celMeta.celId}.bin`);
+                const own = await this.readBinary(celsDir, `${celMeta.celId}.${ext}`);
+                const raw = own ?? await this.readBinary(celsDir, `${celMeta.celId}.bin`);
                 if (!raw) return null;
                 const { rgba } = await decodePixels(raw, fmt);
-                return { celId: celMeta.celId, pixelData: rgba };
+                return { celId: celMeta.celId, pixelData: rgba, file: own ? `cels/${celMeta.celId}.${ext}` : null };
               } catch {
                 return null; // Cel file missing
               }
             }),
           );
-          for (const r of celResults) { if (r) cels.push(r); }
+          for (const r of celResults) { if (r) { cels.push({ celId: r.celId, pixelData: r.pixelData }); if (r.file) loadedPixelFiles.push({ kind: 'cel', id: r.celId, file: r.file }); } }
         }
       }
 
@@ -730,7 +834,31 @@ export class DocumentPersistence {
       }
       const uiLayersJSON = await this.readText(dir, 'ui.json');
 
-      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, meshTextures, bakedParts, textureLibrary, ephemeraJSON, garpJSON, uiLayersJSON };
+      // Incremental autosave: what was just read IS what this document's files hold. Seed the write record with it,
+      // and give each layer / cel read from its own file a content key (the restore caches the uploaded pixels under
+      // that key), so the first automatic save after a load writes nothing that didn't change.
+      const rec = emptyWriteRecord(docId);
+      rec.savedAt = manifest.savedAt;
+      rec.manifest = normalizedManifest(manifest);
+      const texts: Array<[string, string | null]> = [
+        ['scene.json', sceneGraphJSON], ['brushes.json', brushPresetsJSON], ['scene3d.json', scene3dJSON],
+        ['ephemera.json', ephemeraJSON], ['garp.json', garpText], ['ui.json', uiLayersJSON],
+        ['textures3d.json', textureLibrary ? JSON.stringify(textureLibrary) : null],
+      ];
+      for (const [name, text] of texts) { if (text !== null) rec.texts.set(name, text); else rec.absent.add(name); }
+      const pixelContentKeys: NonNullable<DocumentSavePayload['pixelContentKeys']> = { layers: {}, cels: {} };
+      for (const { kind, id, file } of loadedPixelFiles) {
+        const key = `disk:${manifest.savedAt}:${file}`;
+        (kind === 'layer' ? pixelContentKeys.layers : pixelContentKeys.cels)[id] = key;
+        rec.keys.set(file, key);
+        rec.pixelFiles.add(file);
+      }
+      for (const [sub, map, ext2] of [['models3d', models3d, '.glb'], ['meshTextures', meshTextures, '.png'], ['bakedParts', bakedParts, '.glb']] as const) {
+        for (const [k, buf] of Object.entries(map)) rec.bins.set(`${sub}/${k}${ext2}`, buf);
+      }
+      this.written = rec;
+
+      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, meshTextures, bakedParts, textureLibrary, ephemeraJSON, garpJSON, uiLayersJSON, pixelContentKeys };
     } catch (e) {
       // A brand-new document that was never saved has no OPFS directory yet —
       // getDocDir() throws NotFoundError. That's an expected "nothing to load",
@@ -780,6 +908,7 @@ export class DocumentPersistence {
   public async deleteDocument(docId: string): Promise<boolean> {
     if (!isOPFSAvailable()) return false;
     try {
+      if (this.written?.docId === docId) this.written = null;
       const root = await this.getRoot();
       await root.removeEntry(docId, { recursive: true });
       return true;
@@ -799,6 +928,7 @@ export class DocumentPersistence {
       const manifest = await this.readJSON<DocumentManifest>(dir, 'manifest.json');
       if (!manifest) return false;
       manifest.name = name;
+      if (this.written?.docId === docId) this.written = null;   // the manifest on disk no longer matches the record
       await this.writeJSON(dir, 'manifest.json', manifest);
       return true;
     } catch {
@@ -839,9 +969,14 @@ export class DocumentPersistence {
   // ── File helpers ──────────────────────────────────────────────────
 
   private async writeJSON(dir: FileSystemDirectoryHandle, name: string, data: any): Promise<void> {
+    await this.writeRawText(dir, name, JSON.stringify(data));
+  }
+
+  /** Write text as-is (not gzipped) — what writeJSON writes for already-serialized JSON. */
+  private async writeRawText(dir: FileSystemDirectoryHandle, name: string, text: string): Promise<void> {
     const file = await dir.getFileHandle(name, { create: true });
     const writable = await file.createWritable();
-    await writable.write(JSON.stringify(data));
+    await writable.write(text);
     await writable.close();
   }
 
@@ -944,13 +1079,15 @@ export class DocumentPersistence {
 
   /** Delete files in `parent/dirName` whose name isn't in `keep` — prunes ORPHANS left by deleted layers /
    *  textures / cels (writes never remove old files, so the doc directory grows over an editing session). No-op
-   *  if the subdir is absent. */
-  private async pruneDir(parent: FileSystemDirectoryHandle, dirName: string, keep: Set<string>): Promise<void> {
+   *  if the subdir is absent. Returns the names it deleted. */
+  private async pruneDir(parent: FileSystemDirectoryHandle, dirName: string, keep: Set<string>): Promise<string[]> {
     let dir: FileSystemDirectoryHandle;
-    try { dir = await parent.getDirectoryHandle(dirName); } catch { return; }   // subdir doesn't exist yet
+    try { dir = await parent.getDirectoryHandle(dirName); } catch { return []; }   // subdir doesn't exist yet
     const stale: string[] = [];
-    try { for await (const name of (dir as any).keys()) if (!keep.has(name)) stale.push(name); } catch { return; }
-    for (const name of stale) { try { await dir.removeEntry(name); } catch { /* best-effort */ } }
+    try { for await (const name of (dir as any).keys()) if (!keep.has(name)) stale.push(name); } catch { return []; }
+    const removed: string[] = [];
+    for (const name of stale) { try { await dir.removeEntry(name); removed.push(name); } catch { /* best-effort */ } }
+    return removed;
   }
 }
 
@@ -987,6 +1124,14 @@ export interface DocumentSavePayload {
   /** UI System layers (docs/specs/ui-system.md) — the state machine + shape interactions per ui-layer. */
   uiLayersJSON?: string | null;
   /**
+   * Incremental autosave (not persisted): an opaque CONTENT key per layer / cel in `layers` / `cels`. Equal keys mean
+   * identical pixels, so the writer skips re-encoding a file it already wrote (or loaded) with that key. Set by
+   * DocumentStateCoordinator for a read-back it made (cached pixels keep their key) and by loadDocument for pixels it
+   * read from disk. Absent = always write. Anything that changes `layers` / `cels` pixel buffers in a payload (e.g. a
+   * future schema migration) must drop it.
+   */
+  pixelContentKeys?: { layers: Record<string, string>; cels: Record<string, string> };
+  /**
    * Called by DocumentPersistence after writeToOPFS succeeds.
    * ShapeManager sets this to clearDirtyMeshState3D() when 3D state is included,
    * so dirty flags are cleared only after the data is confirmed on disk.
@@ -1002,4 +1147,48 @@ export interface LayerPixelData {
 export interface CelPixelData {
   celId: string;
   pixelData: ArrayBuffer;
+}
+
+// ── Incremental write record (see the DocumentPersistence header: INCREMENTAL) ──
+
+/** What one DocumentPersistence instance last wrote (or loaded) for a document, file by file. */
+interface WriteRecord {
+  docId: string;
+  /** The savedAt of the manifest that record matches — the disk's manifest must still carry it. */
+  savedAt: string;
+  /** The manifest without savedAt / createdAt (null = unknown). */
+  manifest: string | null;
+  /** JSON files ('scene.json' …) → their exact text. */
+  texts: Map<string, string>;
+  /** JSON files known NOT to exist (garp.json / ui.json after a delete, or absent at load). */
+  absent: Set<string>;
+  /** Layer / cel files ('layers/<id>.png') → the content key they were written with. */
+  keys: Map<string, string>;
+  /** Layer / cel files known to exist (with or without a key). */
+  pixelFiles: Set<string>;
+  /** Binary sidecars ('models3d/<id>.glb' …) → the bytes written. */
+  bins: Map<string, ArrayBuffer>;
+}
+
+function emptyWriteRecord(docId: string): WriteRecord {
+  return { docId, savedAt: '', manifest: null, texts: new Map(), absent: new Set(), keys: new Map(), pixelFiles: new Set(), bins: new Map() };
+}
+
+function cloneWriteRecord(r: WriteRecord): WriteRecord {
+  return { docId: r.docId, savedAt: r.savedAt, manifest: r.manifest, texts: new Map(r.texts), absent: new Set(r.absent),
+    keys: new Map(r.keys), pixelFiles: new Set(r.pixelFiles), bins: new Map(r.bins) };
+}
+
+/** The manifest as compared between saves: savedAt / createdAt are stamped fresh by every gather. */
+function normalizedManifest(m: DocumentManifest): string {
+  return JSON.stringify({ ...m, savedAt: '', createdAt: '' });
+}
+
+/** Same bytes (identity first; a re-gathered copy of the same file compares by content). */
+function sameBuffer(a: ArrayBuffer | undefined, b: ArrayBuffer): boolean {
+  if (a === b) return true;
+  if (!a || a.byteLength !== b.byteLength) return false;
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  return true;
 }

@@ -5,6 +5,7 @@ import { RGBA } from "../types/rgba";
 import { EventEmitter } from "../renderer/util/event-emitter";
 import { RasterPaintEngine } from "../renderer/raster/core/raster-paint-engine";
 import { PointerInput } from "../renderer/raster/brushes/brush-engine";
+import type { RasterLayerManager } from './raster-layer-manager';
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 import { isPointerEventClaimed } from '../renderer/util/pointer-claims';
 import { getStrokePrediction, predictionAppliesTo } from '../renderer/raster/brushes/brush-input-settings';
@@ -116,6 +117,14 @@ export class RasterDrawingService {
     this.getPaintEngine()?.setLockTransparency(locked);
   }
   private lockTransparency = false;
+  /** The selected layer's own "Lock transparency" (the layers panel sets it on the LAYER via
+   *  setRasterLayerLockTransparency; nothing forwarded it here, so a locked layer painted unlocked — mobile-parity 7.2). */
+  private selectedLayerLocksAlpha(): boolean {
+    const lm = (this.renderer as unknown as { rasterLayerManager?: Partial<Pick<RasterLayerManager, 'getSelectedLayerId' | 'getLayerById'>> })
+      .rasterLayerManager;
+    const id = lm?.getSelectedLayerId?.() ?? null;
+    return !!(id && lm?.getLayerById?.(id)?.lockTransparency);
+  }
 
   // ── Preset passthrough API (for ShapeManager / Frogmarks) ─────────
 
@@ -350,7 +359,7 @@ export class RasterDrawingService {
     if (engine) {
       // Sync color, erase mode, lock-transparency
       engine.setBrushColor(this.brushColor.r, this.brushColor.g, this.brushColor.b, this.brushColor.a ?? 1);
-      engine.setLockTransparency(this.lockTransparency);
+      engine.setLockTransparency(this.lockTransparency || this.selectedLayerLocksAlpha());
       // The tool mode is the source of truth for erase: re-apply it every stroke, so an engine that missed a
       // setEraserMode (created / re-created after it, e.g. renderer reinit) can't keep a stale erase override.
       engine.setEraseMode(this.getEraseMode());

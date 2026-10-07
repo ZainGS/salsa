@@ -110,11 +110,15 @@ export function stampKernel(
   }
 }
 
-/** CPU port of the wet-stroke composite over [x0,x0+w)×[y0,y0+h). */
-export function compositeKernel(base: CpuTexture, accum: CpuTexture, out: CpuTexture, x0: number, y0: number, w: number, h: number): void {
+/** CPU port of the wet-stroke composite over [x0,x0+w)×[y0,y0+h). `lockAlpha` = the lock-transparency branch. */
+export function compositeKernel(base: CpuTexture, accum: CpuTexture, out: CpuTexture, x0: number, y0: number, w: number, h: number, lockAlpha = false): void {
   for (let y = y0; y < y0 + h && y < out.height; y++) {
     for (let x = x0; x < x0 + w && x < out.width; x++) {
       const b = load(base, x, y), s = load(accum, x, y);
+      if (lockAlpha) {
+        store(out, x, y, s[3] <= 0.001 || b[3] <= 0 ? b : [0, 1, 2].map(i => b[i] + (s[i] - b[i]) * s[3]).concat(b[3]));
+        continue;
+      }
       if (s[3] <= 0.001) { store(out, x, y, b); continue; }
       const outA = s[3] + b[3] * (1 - s[3]);
       const rgb = outA > 0.001 ? [0, 1, 2].map(i => (s[i] * s[3] + b[i] * b[3] * (1 - s[3])) / outA) : [0, 0, 0];
@@ -376,7 +380,7 @@ export function createCpuDevice() {
     } else if (code.includes('var accumTex')) {
       const out = tex(2);
       const r = res(3) ? u32(buf(3)) : null;
-      if (r) compositeKernel(tex(0), tex(1), out, r[0], r[1], Math.min(r[2], tx), Math.min(r[3], ty));
+      if (r) compositeKernel(tex(0), tex(1), out, r[0], r[1], Math.min(r[2], tx), Math.min(r[3], ty), r.length > 4 && (r[4] & 1) !== 0);
       else compositeKernel(tex(0), tex(1), out, 0, 0, Math.min(out.width, tx), Math.min(out.height, ty));
     } else {
       throw new Error('cpu-gpu-mirror: unknown compute shader');

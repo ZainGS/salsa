@@ -175,7 +175,7 @@ export class RasterTransformEngine {
     pass.dispatchWorkgroups(Math.ceil(copyW / 8), Math.ceil(copyH / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
+    markRasterCompositeDirty(null, dst);   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit; autosave: dst)
     paramBuf.destroy();
     tempTex.destroy();
   }
@@ -261,7 +261,7 @@ export class RasterTransformEngine {
     pass.dispatchWorkgroups(Math.ceil(dispW / 8), Math.ceil(dispH / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
+    markRasterCompositeDirty(null, dst);   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit; autosave: dst)
     paramBuf.destroy();
     tempTex.destroy();
   }

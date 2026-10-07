@@ -491,7 +491,7 @@ export class RasterSelectionEngine {
     pass.dispatchWorkgroups(Math.ceil(clearW / 8), Math.ceil(clearH / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
+    markRasterCompositeDirty(null, texture);   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit; autosave: this texture)
     paramBuf.destroy();
   }
 

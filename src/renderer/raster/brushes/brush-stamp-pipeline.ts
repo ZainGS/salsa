@@ -202,6 +202,12 @@ export class BrushStampPipeline {
   /** BRUSH-5: texels of a NON-accum texture (a layer) written by the commands recorded since the last submit.
    *  Reported to the incremental layer composite (markRasterCompositeDirty) right after flush() submits them. */
   private recordedDirty: TexelRect | null = null;
+  /** The textures those recorded writes landed in — reported with them, so the incremental autosave re-reads only
+   *  these (raster-content-version.ts). Collected at the same three sites as `recordedDirty`. */
+  private recordedTargets: GPUTexture[] = [];
+  private noteRecordedTarget(tex: GPUTexture): void {
+    if (!this.recordedTargets.includes(tex)) this.recordedTargets.push(tex);
+  }
   /** Direct-path (erase / blend-mode) dab writes to the stroke's output since the last composite. The old
    *  full-canvas composite overwrote them; the bounded composite re-covers them so the result stays identical. */
   private strokeOutputDirty: TexelRect | null = null;
@@ -354,7 +360,7 @@ export class BrushStampPipeline {
       usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
     this.compositeRectBuf = device.createBuffer({
-      size: 16,
+      size: 32,   // rect (vec4<u32>) + flags (vec4<u32>: x bit 0 = lock transparency)
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
   }
@@ -389,9 +395,11 @@ export class BrushStampPipeline {
     this.batchEnc = null;
     this.stagingCursor = 0;
     const dirty = this.recordedDirty;
+    const targets = this.recordedTargets;
+    this.recordedTargets = [];
     if (dirty) {
       this.recordedDirty = null;
-      markRasterCompositeDirty(dirty);
+      markRasterCompositeDirty(dirty, targets);   // (no target recorded → [] → every texture counts as changed)
     }
   }
 
@@ -518,11 +526,12 @@ export class BrushStampPipeline {
    * and creates a transparent strokeAccumTex. All subsequent stampWithPingPong
    * calls will use indirect painting until endStroke().
    */
-  public beginStroke(texture: GPUTexture): void {
+  public beginStroke(texture: GPUTexture, opts: { lockAlpha?: boolean } = {}): void {
     const w = texture.width;
     const h = texture.height;
     this.settleProvisional();
     this.flush();   // anything still recorded belongs to the previous stroke
+    this.strokeLockAlpha = !!opts.lockAlpha;
 
     // Ensure stroke textures match dimensions
     if (!this.strokeBaseTex || this.strokeTexW !== w || this.strokeTexH !== h) {
@@ -845,7 +854,7 @@ export class BrushStampPipeline {
     pass.setBindGroup(0, entry.bg);
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
-    if (dst !== this.strokeAccumTex) this.recordedDirty = unionRect(this.recordedDirty, rect);   // BRUSH-5
+    if (dst !== this.strokeAccumTex) { this.recordedDirty = unionRect(this.recordedDirty, rect); this.noteRecordedTarget(dst); }   // BRUSH-5
   }
 
   /** True while a provisional tail is on the texture. */
@@ -997,6 +1006,7 @@ export class BrushStampPipeline {
     // the layer through compositeRecord; the ping texture is never a layer.
     if (dstTexture !== this.strokeAccumTex && dstTexture !== this.pingTex) {
       this.recordedDirty = unionRect(this.recordedDirty, b.footprint);
+      this.noteRecordedTarget(dstTexture);
     }
     return true;
   }
@@ -1065,7 +1075,10 @@ export class BrushStampPipeline {
         this.stats.copiedTexels += fw * fh;
         // Stamp dab: read from ping (current accum), write to strokeAccumTex
         // The shader uses max-alpha blending for paint mode when strokeActive
-        this.stampRecord(enc, ping, accum, { ...params, wetStroke: true });
+        // No lock clamp INTO the accum (its alpha is 0 ahead of the stroke, so the clamp painted nothing): the lock
+        // is applied against the layer's alpha in the accum → layer composite (strokeLockAlpha).
+        if (params.lockTransparency) this.strokeLockAlpha = true;
+        this.stampRecord(enc, ping, accum, { ...params, wetStroke: true, lockTransparency: false });
         this.pendingComposite = unionRect(this.pendingComposite, fp);
         this.strokeAccumDirty = unionRect(this.strokeAccumDirty, fp);
       }
@@ -1201,6 +1214,7 @@ export class BrushStampPipeline {
 
     this.compositeRectData[0] = rect.x0; this.compositeRectData[1] = rect.y0;
     this.compositeRectData[2] = w; this.compositeRectData[3] = h;
+    this.compositeRectData[4] = this.strokeLockAlpha ? 1 : 0;
     this.stageUniform(enc, this.compositeRectBuf, this.compositeRectData);
 
     const pass = enc.beginComputePass();
@@ -1210,8 +1224,14 @@ export class BrushStampPipeline {
     pass.end();
     this.stats.compositedTexels += w * h;
     this.recordedDirty = unionRect(this.recordedDirty, rect);   // BRUSH-5: the layer changed here
+    this.noteRecordedTarget(outputTex);
   }
-  private compositeRectData = new Uint32Array(4);
+  private compositeRectData = new Uint32Array(8);
+  /** Lock transparency for the stroke in progress (beginStroke). On the wet path it is applied HERE, in the accum →
+   *  layer composite, against the layer's real alpha (the stroke base): the stamp shader's clamp only sees the accum,
+   *  whose alpha is 0 ahead of the stroke, so a locked layer painted nothing at all (mobile-parity 7.2). Covers the
+   *  wet dabs, per-dab + end bleed, wet edges, smudge and the stroke-texture strip — all reach the layer through here. */
+  private strokeLockAlpha = false;
 
   /** Record a clear of `tex` to transparent black (0,0,0,0) — a loadOp:'clear' render pass (BRUSH-1b; was a
    *  CPU zero-filled w×h×4 buffer upload every stroke). */
@@ -1235,10 +1255,13 @@ export class BrushStampPipeline {
       @group(0) @binding(1) var accumTex: texture_2d<f32>;   // stroke accumulation layer
       @group(0) @binding(2) var output: texture_storage_2d<rgba8unorm, write>;
       // rect: originX, originY, width, height (BRUSH-1: only the changed region is composited)
-      @group(0) @binding(3) var<uniform> rect: vec4<u32>;
+      // flags.x bit 0: lock transparency (the layer's alpha never changes)
+      struct CompositeParams { rect: vec4<u32>, flags: vec4<u32> }
+      @group(0) @binding(3) var<uniform> cp: CompositeParams;
 
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let rect = cp.rect;
         if (gid.x >= rect.z || gid.y >= rect.w) { return; }
         let dim = textureDimensions(output);
         let px = gid.x + rect.x;
@@ -1251,6 +1274,16 @@ export class BrushStampPipeline {
 
         // Standard alpha-over: stroke layer on top of base
         let srcA = stroke.a;
+        // Lock transparency (source-atop): the stroke recolours what is there and the alpha stays the base's,
+        // byte for byte; fully transparent texels are left exactly as they were.
+        if ((cp.flags.x & 1u) != 0u) {
+          if (srcA <= 0.001 || base.a <= 0.0) {
+            textureStore(output, coords, base);
+            return;
+          }
+          textureStore(output, coords, vec4<f32>(mix(base.rgb, stroke.rgb, srcA), base.a));
+          return;
+        }
         if (srcA <= 0.001) {
           textureStore(output, coords, base);
           return;

@@ -7,6 +7,7 @@ import type ShapeManager from '../shape-manager';
 import { UVPaintController, UVBrushSettings } from './uv-paint-controller';
 import { UVEditorSession, UVCanvasRenderer } from './uv-canvas-renderer';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
+import { noteRasterContentWrite } from '../../renderer/raster/raster-content-version';
 
 export class UVPaintSessionController {
     constructor(private readonly sm: ShapeManager) {}
@@ -111,6 +112,7 @@ export class UVPaintSessionController {
                     colorAttachments: [{ view: tex.createView(), clearValue: { r: 1, g: 1, b: 1, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
                 }).end();
                 device.queue.submit([enc.finish()]);
+                noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
             }
         }
         mesh.diffuseTexture = tex;

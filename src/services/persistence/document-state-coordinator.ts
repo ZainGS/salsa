@@ -29,6 +29,7 @@ import type { PackagingManager } from '../../packaging/packaging-manager';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
 import { gpuPixelEpoch } from '../../renderer/raster/gpu-pixel-epoch';
+import { rasterContentSeq, rasterTextureWrittenAt } from '../../renderer/raster/raster-content-version';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D } from '../../scene-graph/shapes/array-group-3d';
 import { defaultDitherConfig } from '../../renderer/raster/effects/dither-engine';
@@ -53,6 +54,47 @@ export interface GpuOnlyDocumentData {
     /** gpuPixelEpoch() when the capture STARTED (an edit during the read-back moves the count past it). Absent = unknown
      *  (treated as stale). */
     editEpoch?: number;
+    /** Incremental autosave: an opaque CONTENT key per layer / cel in `layers` / `cels` — equal keys = identical
+     *  pixels (the same cached read-back). The writer skips re-encoding a file whose key it already wrote. */
+    layerKeys?: Record<string, string>;
+    celKeys?: Record<string, string>;
+}
+
+/** One cached read-back of a raster texture (incremental autosave). `pixels` null = fully transparent. */
+interface PixelCacheEntry { at: number; w: number; h: number; pixels: ArrayBuffer | null; key: string }
+
+/** Read-back counters (tests / `sm.getAutoSaveStats()`). */
+export interface PixelReadStats {
+    /** Raster layer / cel textures read back from the GPU. */
+    readbacks: number;
+    /** Raster layer / cel textures served from the cache (unchanged since their last read-back). */
+    reused: number;
+    /** Painted mesh / face textures exported (GPU read-back + PNG encode). */
+    meshExports: number;
+    /** Painted mesh / face textures served from the cache. */
+    meshReused: number;
+    /** A texture whose cache said "unchanged" read back DIFFERENT (a writer that reported no content write). Saved
+     *  anyway by that read; a non-zero count means a writer is missing its note (see raster-content-version.ts). */
+    unnotedChanges: number;
+}
+
+/** True when every pixel's alpha is 0. */
+function isTransparent(rgba: ArrayBuffer): boolean {
+    const a = new Uint8Array(rgba);
+    for (let i = 3; i < a.length; i += 4) if (a[i] !== 0) return false;
+    return true;
+}
+
+/** Byte-exact equality (null = transparent / absent). */
+function sameBytes(a: ArrayBuffer | null, b: ArrayBuffer | null): boolean {
+    if (a === b) return true;
+    if (!a || !b || a.byteLength !== b.byteLength) return false;
+    const n4 = a.byteLength >>> 2;
+    const x = new Uint32Array(a, 0, n4), y = new Uint32Array(b, 0, n4);
+    for (let i = 0; i < n4; i++) if (x[i] !== y[i]) return false;
+    const u = new Uint8Array(a), v = new Uint8Array(b);
+    for (let i = n4 << 2; i < u.length; i++) if (u[i] !== v[i]) return false;
+    return true;
 }
 
 /** The facade-PRIVATE state the orchestration needs — wired by ShapeManager with closures/refs. */
@@ -98,7 +140,14 @@ export class DocumentStateCoordinator {
     /** Shorthand — the original methods read `this.rasterLayerManager` (optional) pervasively. */
     private get rlm(): RasterLayerManager | undefined { return this.priv.getRasterLayerManager(); }
 
-    async gather(forceAll3D = false, opts: { gpuOnly?: GpuOnlyDocumentData | null } = {}): Promise<DocumentSavePayload> {
+    /**
+     * Gather the whole document. `opts.gpuOnly` replaces every GPU read-back (device-lost recovery). `opts.reusePixels`
+     * (the incremental AUTOSAVE only): raster layers / cels / painted textures unchanged since their last read-back
+     * come from the cache instead of the GPU, and the payload carries their content keys so the writer can skip
+     * files it already wrote. Every other caller (export, package, explicit save) reads everything fresh, as before.
+     * Either way the payload is COMPLETE — every non-blank layer and every cel has its pixels.
+     */
+    async gather(forceAll3D = false, opts: { gpuOnly?: GpuOnlyDocumentData | null; reusePixels?: boolean } = {}): Promise<DocumentSavePayload> {
         const canvasSize = this.rlm?.getCanvasSize() ?? { w: 1920, h: 1080 };
         const layerMeta = this.rlm?.getLayerMetadata() ?? [];
 
@@ -180,8 +229,12 @@ export class DocumentStateCoordinator {
 
         // Everything read back from the GPU (raster layers, cels, painted textures). A device-lost recovery passes the
         // last read-back instead (the dead device can't be read); a normal save reads it now and refreshes that shadow.
-        const gpuOnly = opts.gpuOnly ?? await this.gatherGpuOnly();
+        const gpuOnly = opts.gpuOnly ?? await this.gatherGpuOnly({ reuse: !!opts.reusePixels });
         const { layers, cels, meshTextures, meshTexturesComplete } = gpuOnly;
+        // Content keys only for a read-back made now (a recovery's shadow is restored, never written).
+        const pixelContentKeys = !opts.gpuOnly && (gpuOnly.layerKeys || gpuOnly.celKeys)
+            ? { layers: { ...(gpuOnly.layerKeys ?? {}) }, cels: { ...(gpuOnly.celKeys ?? {}) } }
+            : undefined;
 
         // Gather 3D mesh states — gated on dirty to avoid serializing geometry on every stroke save.
         // packProject() passes forceAll3D=true to always include the full snapshot.
@@ -268,6 +321,7 @@ export class DocumentStateCoordinator {
             garpJSON: this.priv.garp.hasContent() ? this.priv.garp.serialize() : null,
             // UI System layers (state machine + shape interactions). Null when the doc has none.
             uiLayersJSON: this.sm.ui.listUILayers().length ? JSON.stringify(this.sm.ui.serialize()) : null,
+            pixelContentKeys,
             _onWriteComplete,
         };
     }
@@ -275,27 +329,101 @@ export class DocumentStateCoordinator {
     /** Serializes GPU read-backs: a save and the shadow refresh share RasterLayerManager's one read-back buffer. */
     private _gpuReadChain: Promise<unknown> = Promise.resolve();
 
-    /** Read back everything that lives only on the GPU (see GpuOnlyDocumentData). Also feeds the device-lost shadow. */
-    async gatherGpuOnly(): Promise<GpuOnlyDocumentData> {
-        const run = this._gpuReadChain.then(() => this._gatherGpuOnlyNow(), () => this._gatherGpuOnlyNow());
+    /**
+     * Read back everything that lives only on the GPU (see GpuOnlyDocumentData). Also feeds the device-lost shadow.
+     *
+     * `reuse` (incremental autosave, the shadow refresh): a texture with no content write reported since its last
+     * read-back (raster-content-version.ts) is served from the cache instead of the GPU — so a save after a stroke on
+     * one layer reads back ONE layer, and an idle save reads back nothing. The result is still COMPLETE (every
+     * non-blank layer, every cel, every painted texture), so the shadow and the payload never lose a layer. Without
+     * `reuse` (exports, explicit saves) everything is read fresh. Every `pixelVerifyIntervalMs` a reuse request reads
+     * everything anyway and compares it with the cache — the safety net for a writer that forgot to report.
+     */
+    async gatherGpuOnly(opts: { reuse?: boolean } = {}): Promise<GpuOnlyDocumentData> {
+        const reuse = opts.reuse ?? true;
+        const run = this._gpuReadChain.then(() => this._gatherGpuOnlyNow(reuse), () => this._gatherGpuOnlyNow(reuse));
         this._gpuReadChain = run.catch(() => undefined);
         return run;
     }
 
-    private async _gatherGpuOnlyNow(): Promise<GpuOnlyDocumentData> {
-        const at = Date.now();
-        const editEpoch = gpuPixelEpoch();
-        const layerIds = (this.rlm?.getLayerMetadata() ?? []).map((l) => l.id);
-        const celIds: string[] = [];
-        for (const l of this.rlm?.getLayerMetadata() ?? []) if (l.animationType === 'animated') for (const c of this.rlm!.getCels(l.id)) celIds.push(c.id);
-        // Read pixel data
-        const layers = await this.rlm?.exportLayerPixels() ?? [];
-        const cels = await this.rlm?.exportCelPixels() ?? [];
+    // ── Incremental autosave: read-back caches ──
+    /** The newest read-back of each raster layer / cel texture (WeakMap: a destroyed layer's entry goes with it). The
+     *  buffers are the same ones the device-lost shadow holds, so the cache costs no extra memory while it is on. */
+    private readonly _pixelCache = new WeakMap<object, PixelCacheEntry>();
+    /** The newest PNG export of each painted mesh / face texture, by its save key. */
+    private _meshTexCache = new Map<string, { tex: object; at: number; bytes: ArrayBuffer | null }>();
+    private _keySeq = 0;
+    private _lastFullReadAt = Date.now();
+    /** One shared all-zero buffer per size, for blank cels (cels are always saved, blank or not). */
+    private _zeros = new Map<string, ArrayBuffer>();
+    /** A reuse request reads EVERYTHING (comparing with the cache) when the last full read is older than this.
+     *  0 = never. Default 10 minutes. */
+    public pixelVerifyIntervalMs = 10 * 60_000;
+    public readonly pixelReadStats: PixelReadStats = { readbacks: 0, reused: 0, meshExports: 0, meshReused: 0, unnotedChanges: 0 };
+
+    private _newKey(): string { return `px${++this._keySeq}`; }
+
+    private _zeroBuffer(w: number, h: number): ArrayBuffer {
+        const k = `${w}x${h}`;
+        let z = this._zeros.get(k);
+        if (!z) { z = new ArrayBuffer(w * h * 4); this._zeros.set(k, z); }
+        return z;
+    }
+
+    /** One texture's pixels: the cached read-back when it is still current (and `useCache`), else read now. */
+    private async _pixelsOf(rlm: RasterLayerManager, tex: GPUTexture, useCache: boolean): Promise<PixelCacheEntry> {
+        const w = tex.width, h = tex.height;
+        const prev = this._pixelCache.get(tex);
+        const prevValid = !!prev && prev.w === w && prev.h === h && rasterTextureWrittenAt(tex) <= prev.at;
+        if (useCache && prevValid) { this.pixelReadStats.reused++; return prev!; }
+        const at = rasterContentSeq();   // BEFORE the read-back is submitted: it reflects every write noted so far
+        const raw = await rlm.readTexturePixels(tex);
+        this.pixelReadStats.readbacks++;
+        const pixels = isTransparent(raw) ? null : raw;
+        if (prev && prev.w === w && prev.h === h && sameBytes(prev.pixels, pixels)) {
+            // Same pixels as the cached read-back (a write that changed nothing, or a verification read): keep its
+            // key, so the file it already wrote is not re-encoded.
+            const kept: PixelCacheEntry = { ...prev, at };
+            this._pixelCache.set(tex, kept);
+            return kept;
+        }
+        if (prevValid) {
+            this.pixelReadStats.unnotedChanges++;
+            console.warn('[Salsa][autosave] a raster texture changed without reporting a content write — saved by the full read-back; its writer must call markRasterCompositeDirty / bumpGpuPixelEpoch (raster-content-version.ts)');
+        }
+        const entry: PixelCacheEntry = { at, w, h, pixels, key: this._newKey() };
+        this._pixelCache.set(tex, entry);
+        return entry;
+    }
+
+    /** One painted texture's PNG: the cached export when its texture is unchanged (and `useCache`), else export now. */
+    private async _meshTexBytes(key: string, mgr: RasterTextureManager, useCache: boolean,
+        next: Map<string, { tex: object; at: number; bytes: ArrayBuffer | null }>): Promise<ArrayBuffer | null> {
+        const tex = mgr.getTexture();
+        if (!tex) return null;
+        const prev = this._meshTexCache.get(key);
+        const prevValid = !!prev && prev.tex === tex && rasterTextureWrittenAt(tex) <= prev.at;
+        if (useCache && prevValid) { this.pixelReadStats.meshReused++; next.set(key, prev!); return prev!.bytes; }
+        const at = rasterContentSeq();
+        const blob = await mgr.exportToBlob('image/png');
+        this.pixelReadStats.meshExports++;
+        const bytes = blob.size > 0 ? await blob.arrayBuffer() : null;
+        if (prev && prev.tex === tex && sameBytes(prev.bytes, bytes)) {
+            next.set(key, { tex, at, bytes: prev.bytes });   // same PNG: keep the buffer the writer already wrote
+            return prev.bytes;
+        }
+        if (prevValid) {
+            this.pixelReadStats.unnotedChanges++;
+            console.warn('[Salsa][autosave] a painted texture changed without reporting a content write:', key);
+        }
+        next.set(key, { tex, at, bytes });
+        return bytes;
+    }
+
+    /** Every painted texture a save exports, with its save key (shared by the gather and the post-restore seeding). */
+    private _meshTextureSources(): Array<{ key: string; mgr: RasterTextureManager; label: string; kind: 'uv' | 'face' }> {
+        const out: Array<{ key: string; mgr: RasterTextureManager; label: string; kind: 'uv' | 'face' }> = [];
         // UV-painted mesh textures → PNG bytes keyed by mesh ID (from the UV paint tool).
-        const meshTextures: Record<string, ArrayBuffer> = {};
-        // False if ANY texture failed to export this save: the map is then incomplete, and pruning meshTextures/
-        // against it would delete that texture's existing file on disk (same bug class as the models3d prune wipe).
-        let meshTexturesComplete = true;
         for (const [meshId, mgr] of this.priv.uvPaintTextures) {
             if (this.sm.scene3d?.getMesh(meshId)?.isFaceDecal) continue;   // decal texture persists via the face path
             if (!mgr.getTexture()) continue;
@@ -306,10 +434,7 @@ export class DocumentStateCoordinator {
             const clothKey = this.sm.scene3d?.clothingRigKeyForMesh(meshId) ?? null;
             const procKey = clothKey ? null : this.priv.procMeshKey(meshId);
             const key = clothKey ? `__cloth__:${clothKey}` : procKey ? `__proc__:${procKey}` : meshId;
-            try {
-                const blob = await mgr.exportToBlob('image/png');
-                if (blob.size > 0) meshTextures[key] = await blob.arrayBuffer();
-            } catch (e) { meshTexturesComplete = false; console.warn('[UVPaint] export texture failed for', meshId, e); }
+            out.push({ key, mgr, label: meshId, kind: 'uv' });
         }
         // Anime face expression textures → PNG, keyed `__face__:${bodyMeshId}:${exprId}` (rides in meshTextures).
         // PROCEDURAL expressions (eye params) regenerate from params on load (restoreFaceRigs), so skip their PNG —
@@ -317,15 +442,86 @@ export class DocumentStateCoordinator {
         for (const { key, mgr, procedural } of this.sm.scene3d?.getFaceTextureExports() ?? []) {
             if (procedural) continue;
             if (!mgr.getTexture()) continue;
-            try {
-                const blob = await mgr.exportToBlob('image/png');
-                if (blob.size > 0) meshTextures[`__face__:${key}`] = await blob.arrayBuffer();
-            } catch (e) { meshTexturesComplete = false; console.warn('[Face] export texture failed for', key, e); }
+            out.push({ key: `__face__:${key}`, mgr, label: key, kind: 'face' });
         }
+        return out;
+    }
 
-        const data: GpuOnlyDocumentData = { layers, cels, meshTextures, meshTexturesComplete, layerIds, celIds, meshTextureKeys: Object.keys(meshTextures), at, editEpoch };
+    private async _gatherGpuOnlyNow(reuse: boolean): Promise<GpuOnlyDocumentData> {
+        const at = Date.now();
+        const editEpoch = gpuPixelEpoch();
+        const layerIds = (this.rlm?.getLayerMetadata() ?? []).map((l) => l.id);
+        const celIds: string[] = [];
+        for (const l of this.rlm?.getLayerMetadata() ?? []) if (l.animationType === 'animated') for (const c of this.rlm!.getCels(l.id)) celIds.push(c.id);
+        // A reuse request past the verification interval reads everything (and compares it with the cache).
+        const verify = reuse && this.pixelVerifyIntervalMs > 0 && at - this._lastFullReadAt >= this.pixelVerifyIntervalMs;
+        const useCache = reuse && !verify;
+        if (!useCache) this._lastFullReadAt = at;
+        // Read pixel data — the same layers / cels, in the same order and under the same rules as exportLayerPixels /
+        // exportCelPixels (blank layers are skipped: recreated blank on load; cels are always saved).
+        const layers: Array<{ id: string; pixelData: ArrayBuffer }> = [];
+        const cels: Array<{ celId: string; pixelData: ArrayBuffer }> = [];
+        const layerKeys: Record<string, string> = {};
+        const celKeys: Record<string, string> = {};
+        const rlm = this.rlm;
+        if (rlm) {
+            const src = rlm.getPixelSources();
+            for (const { id } of src.layers) {
+                const tex = rlm.getLayerTexture(id);   // re-read: a layer deleted / re-pointed while an earlier one was read
+                if (!tex) continue;
+                const e = await this._pixelsOf(rlm, tex, useCache);
+                if (!e.pixels) continue;
+                layers.push({ id, pixelData: e.pixels });
+                layerKeys[id] = e.key;
+            }
+            for (const { celId, texture } of src.cels) {
+                const e = await this._pixelsOf(rlm, texture, useCache);
+                cels.push({ celId, pixelData: e.pixels ?? this._zeroBuffer(e.w, e.h) });
+                celKeys[celId] = e.key;
+            }
+        }
+        const meshTextures: Record<string, ArrayBuffer> = {};
+        // False if ANY texture failed to export this save: the map is then incomplete, and pruning meshTextures/
+        // against it would delete that texture's existing file on disk (same bug class as the models3d prune wipe).
+        let meshTexturesComplete = true;
+        const nextMeshCache = new Map<string, { tex: object; at: number; bytes: ArrayBuffer | null }>();
+        for (const { key, mgr, label, kind } of this._meshTextureSources()) {
+            try {
+                const bytes = await this._meshTexBytes(key, mgr, useCache, nextMeshCache);
+                if (bytes && bytes.byteLength > 0) meshTextures[key] = bytes;
+            } catch (e) { meshTexturesComplete = false; console.warn(kind === 'face' ? '[Face] export texture failed for' : '[UVPaint] export texture failed for', label, e); }
+        }
+        this._meshTexCache = nextMeshCache;
+
+        const data: GpuOnlyDocumentData = { layers, cels, meshTextures, meshTexturesComplete, layerIds, celIds, meshTextureKeys: Object.keys(meshTextures), at, editEpoch, layerKeys, celKeys };
         try { this.priv.onGpuOnlyGathered?.(data); } catch { /* shadow hook */ }
         return data;
+    }
+
+    /**
+     * After a restore uploaded `pixels` into `tex`, that texture holds exactly those bytes: cache them (with the
+     * payload's content key when it came from disk), so the first save after a load neither reads the layer back nor
+     * rewrites its file.
+     */
+    private _seedPixelCache(tex: GPUTexture | null | undefined, pixels: ArrayBuffer | null, key: string | undefined): void {
+        if (!tex) return;
+        const w = tex.width, h = tex.height;
+        if (pixels && pixels.byteLength !== w * h * 4) return;   // stored at another size: not what the texture holds
+        this._pixelCache.set(tex, { at: rasterContentSeq(), w, h, pixels: pixels && isTransparent(pixels) ? null : pixels, key: key ?? this._newKey() });
+    }
+
+    /** End of a restore: every painted texture restored from the payload holds exactly its PNG — cache it (a pure
+     *  optimisation; a texture written after this reports the write and is exported again). */
+    private _seedMeshTextureCache(payload: DocumentSavePayload): void {
+        const next = new Map<string, { tex: object; at: number; bytes: ArrayBuffer | null }>();
+        const saved = payload.meshTextures ?? {};
+        for (const { key, mgr } of this._meshTextureSources()) {
+            const tex = mgr.getTexture();
+            const bytes = saved[key];
+            if (tex && bytes && bytes.byteLength > 0) next.set(key, { tex, at: rasterContentSeq(), bytes });
+        }
+        this._meshTexCache = next;
+        this._lastFullReadAt = Date.now();
     }
 
     async restore(incoming: DocumentSavePayload): Promise<RestoreReport> {
@@ -476,6 +672,13 @@ export class DocumentStateCoordinator {
             for (const layerData of payload.layers) {
                 const ok = this.rlm.uploadPixelsToLayer(layerData.id, layerData.pixelData);
                 console.log('[Salsa restore] Upload pixels for', layerData.id, '→', ok ? 'OK' : 'FAILED (layer not found)');
+                // Incremental autosave: the texture now holds exactly these bytes (and, from disk, that file).
+                if (ok) this._seedPixelCache(this.rlm.getLayerTexture(layerData.id), layerData.pixelData, payload.pixelContentKeys?.layers?.[layerData.id]);
+            }
+            // …and a raster layer with no stored pixels is a freshly created (blank) texture.
+            const uploaded = new Set(payload.layers.map((l) => l.id));
+            for (const entry of payload.manifest.layers) {
+                if ((entry.type ?? 'layer') === 'layer' && !uploaded.has(entry.id)) this._seedPixelCache(this.rlm.getLayerTexture(entry.id), null, undefined);
             }
 
             // After uploading at savedW×savedH, normalize layer textures back to documentSize
@@ -542,6 +745,10 @@ export class DocumentStateCoordinator {
                         if (celArr.some(c => c.celId === celData.celId)) {
                             const ok = this.rlm.uploadPixelsToCel(layerId, celData.celId, celData.pixelData);
                             console.log('[Salsa restore] Upload cel pixels', celData.celId, '→', ok ? 'OK' : 'FAILED');
+                            if (ok) {
+                                const celTex = this.rlm.getPixelSources().cels.find((c) => c.celId === celData.celId)?.texture;
+                                this._seedPixelCache(celTex, celData.pixelData, payload.pixelContentKeys?.cels?.[celData.celId]);
+                            }
                             break;
                         }
                     }
@@ -878,6 +1085,9 @@ export class DocumentStateCoordinator {
                     (rank.get(idOf(b) ?? '') ?? Number.MAX_SAFE_INTEGER));
             }
         } catch { /* ordering is cosmetic — never fail a load over it */ }
+
+        // Incremental autosave: the painted textures now hold exactly the payload's PNGs.
+        try { this._seedMeshTextureCache(payload); } catch { /* an optimisation only */ }
 
         // Sync the renderer's animation frame counter so procedural effects
         // (frame link animations) render correctly on the first frame.

@@ -226,7 +226,7 @@ export class LegacyBrushStamp {
     pass.end();
     device.queue.submit([enc.finish()]);
     // BRUSH-5: the texels this dab could write
-    markRasterCompositeDirty({ x0: minX, y0: minY, x1: minX + workX * wgSize, y1: minY + workY * wgSize });
+    markRasterCompositeDirty({ x0: minX, y0: minY, x1: minX + workX * wgSize, y1: minY + workY * wgSize }, tex);
 
     paramBuf.destroy();
     colorBuf.destroy();

@@ -22,6 +22,7 @@ const NOT_PERSISTED = new Set<keyof DocumentSavePayload>([
   '_onWriteComplete',      // post-write callback
   'models3dComplete',      // prune-safety flag for this save
   'meshTexturesComplete',  // prune-safety flag for this save
+  'pixelContentKeys',      // incremental-autosave content keys (which files this save may leave as they are)
 ]);
 
 const buf = (...b: number[]): ArrayBuffer => new Uint8Array(b).buffer;
@@ -56,6 +57,7 @@ function fullPayload(): Required<DocumentSavePayload> {
     ephemeraJSON: JSON.stringify({ placements: [{ id: 'e1' }] }),
     garpJSON: { pools: [{ id: 'salsa/vending', version: 3 }], textures: { k: { kind: 'image' } } },
     uiLayersJSON: JSON.stringify([{ id: 'ui1', name: 'Menu' }]),
+    pixelContentKeys: { layers: { L1: 'k1' }, cels: {} },
     _onWriteComplete: () => {},
   };
 }

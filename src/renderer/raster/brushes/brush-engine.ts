@@ -288,7 +288,8 @@ export class BrushEngine {
     this._maxDabRadius = 0;
 
     // Begin wet-stroke: snapshot the canvas and prepare the stroke accumulation layer
-    this.stampPipeline.beginStroke(texture);
+    // (lock transparency on the wet path is applied in the accum → layer composite, against the layer's alpha)
+    this.stampPipeline.beginStroke(texture, { lockAlpha: this.lockTransparency });
 
     const smoothed = this.stabilizer.push({
       x: firstPoint.x,

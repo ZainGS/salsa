@@ -781,9 +781,11 @@ class ShapeManager {
             seekAnimation: (targetId, frame) => this._uiSeekAnimation(targetId, frame),
         });
         // Delete/Backspace deletes the selected 2D shapes (the renderer owns the key listener; this owns teardown).
-        ctx.webgpuRenderer.setDeleteSelectedHandler(() => this.deleteSelectedShapes());
-        // Ctrl+D duplicates them (serializer round-trip + undo recording live here).
-        ctx.webgpuRenderer.setDuplicateSelectedHandler(() => { this.duplicateSelectedShapes(); });
+        // A host with its own Edit › Delete routing takes the key over via setDeleteKeyHandler (same guards apply).
+        ctx.webgpuRenderer.setDeleteSelectedHandler(() => this._runDeleteKey());
+        // Ctrl+D duplicates them (serializer round-trip + undo recording live here). A host with its own Edit › Duplicate
+        // (3D meshes through the 3D duplicate) takes the key over via setDuplicateKeyHandler (same guards apply).
+        ctx.webgpuRenderer.setDuplicateSelectedHandler(() => this._runDuplicateKey());
         // Canvas swap (Frogmarks route change): re-bind the manager-owned canvas listeners — the polygon pen
         // tool and the path node editor attach to the OLD canvas otherwise and silently go dead.
         ctx.webgpuRenderer.onCanvasReinitialized = () => {
@@ -4063,6 +4065,7 @@ class ShapeManager {
             if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(meshId, mgr); }
             const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
             device.queue.copyExternalImageToTexture({ source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height]);
+            bumpGpuPixelEpoch('none', tex);   // GPU-only pixels changed (device-lost shadow; incremental autosave: this texture)
             mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
             this.scheduleRender();
             return true;
@@ -5678,7 +5681,7 @@ class ShapeManager {
         });
         pass.end();
         device.queue.submit([enc.finish()]);
-        _markRasterCompositeDirty();   // BRUSH-5: layer pixels changed
+        _markRasterCompositeDirty(null, layer.texture);   // BRUSH-5: layer pixels changed (autosave: this layer)
         this.scheduleRender();
     }
 
@@ -7126,6 +7129,11 @@ class ShapeManager {
         // FIRST: leave City mode + drop the previous doc's world (graph, traffic, streaming, in-flight builds). Its
         // exitCityMode lighting hand-back is then overwritten by the settings reset below (bug-hunt 2026-10-01).
         try { this.world?.clearForDocumentLoad(); } catch (e) { console.warn('[load] world reset failed', e); }
+        // The previous doc's UV editor / UV paint (sessions keyed by its mesh ids): a host that left the document
+        // without closing it kept the mesh-edit orbit + wavy focus background up in the next one (mobile-parity 7.2).
+        if (this._uvSessions.size > 0 || this.uvPaint.isActive()) {
+            try { this.closeAllUVEditors3D(); } catch (e) { console.warn('[load] UV editor reset failed', e); }
+        }
         this.scene3d?.clearForDocumentLoad3D();          // Play stop, character rigs, kitbash catalog + baked parts, GLB store
         this.scene3d?.resetGlobalScene3DSettingsForLoad(); // fog/PS1/SSAO/… back to defaults before the doc's own
         this.world?.resetStyleForLoad();                   // the previous doc's city look (restoreFromSave sets the new one)
@@ -7136,6 +7144,9 @@ class ShapeManager {
         this._uiStopAllClipPlayers();
         this._uiSound?.stopAll();                        // previous doc's (looping) UI sounds kept playing
         this.interactionService?.clearSelectedNodes();   // the 2D selection held the previous doc's (detached) nodes
+        // Brush presets are per-document (brushes.json): the load only merged into the library, so the previous doc's
+        // custom brushes appeared in this one and were saved into it (mobile-parity 7.2). Built-ins only from here.
+        this.getRasterPaintEngine()?.resetPresetsForDocumentLoad();
     }
 
     /** Regenerate ALL procedural objects (City + buildings + foliage) from a loaded save's params-only markers.
@@ -8003,6 +8014,7 @@ class ShapeManager {
                 if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(meshId, mgr); }
                 const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
                 device.queue.copyExternalImageToTexture({ source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height]);
+                bumpGpuPixelEpoch('none', tex);   // GPU-only pixels changed (device-lost shadow; incremental autosave: this texture)
                 mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
                 if (mesh.isClothing) mesh.material.alphaCutout = true;   // re-enable cutout holes (harmless on opaque paint)
             } catch (e) { console.warn('[ClothPaint] restore texture failed for', key, e); }
@@ -8295,6 +8307,7 @@ class ShapeManager {
         const w = Math.max(1, (source as any).width ?? 1024), h = Math.max(1, (source as any).height ?? 1024);
         const tex = mgr.ensureTexture(w, h);
         device.queue.copyExternalImageToTexture({ source, flipY: false }, { texture: tex }, [w, h]);
+        bumpGpuPixelEpoch('none', tex);   // GPU-only pixels changed (device-lost shadow; incremental autosave: this texture)
         mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
         this.scheduleRender();
     }
@@ -8592,6 +8605,19 @@ class ShapeManager {
         if (!this.meshEdit.isEditing && this._uvSessions.size === 0) {
             this.scene3d.disableMeshEditOrbit();
         }
+        this.scheduleRender();
+    }
+
+    /**
+     * Leave UV editing / UV paint completely, whatever mesh it was opened on: exits paint (surface input, the idle
+     * pause, double-sided restore) and closes EVERY open UV editor session, so the mesh-edit orbit + focus background
+     * come down (unless full mesh-edit mode is active). The host's one "close the UV editor" call: closing by the
+     * CURRENT selection's id missed the session when the selection had moved while the editor was open, leaving the
+     * wavy background and the orbit up (mobile-parity 7.2). Idempotent.
+     */
+    public closeAllUVEditors3D(): void {
+        this.exitUVPaintMode3D();
+        for (const id of [...this._uvSessions.keys()]) this.closeUVEditor3D(id);
         this.scheduleRender();
     }
 
@@ -11471,7 +11497,7 @@ class ShapeManager {
             { width: srcW, height: srcH },
         );
         device.queue.submit([enc.finish()]);
-        _markRasterCompositeDirty();   // BRUSH-5: layer pixels changed
+        _markRasterCompositeDirty(null, activeLayer.texture);   // BRUSH-5: layer pixels changed (autosave: this layer)
         await device.queue.onSubmittedWorkDone();
 
         result.texture.destroy();
@@ -12575,6 +12601,37 @@ class ShapeManager {
         return changed;
     }
 
+    /** Host override for the Delete / Backspace shortcut (null = the default {@link deleteSelectedShapes}). */
+    private _deleteKeyHandler: (() => void) | null = null;
+    /**
+     * Route the engine's Delete / Backspace shortcut through the host's own Edit › Delete, so the key and the menu do
+     * exactly the same thing (mobile-parity 7.2: the key unlinked a selected 3D mesh raw — no 3D undo, no character /
+     * UV-texture teardown, a stale outliner — while the menu ran the full teardown). The engine's guards still apply
+     * (typing, a selected text shape, Play, a creator mode owning input). Pass null to restore the default.
+     */
+    public setDeleteKeyHandler(fn: (() => void) | null): void { this._deleteKeyHandler = fn; }
+    /** The engine's Delete / Backspace hook: the host's route when it set one, else the 2D shape delete. */
+    private _runDeleteKey(): void {
+        if (this._deleteKeyHandler) this._deleteKeyHandler();
+        else this.deleteSelectedShapes();
+    }
+
+    /** Host override for the Ctrl+D shortcut (null = the default {@link duplicateSelectedShapes}). */
+    private _duplicateKeyHandler: (() => void) | null = null;
+    /**
+     * Route the engine's Ctrl+D shortcut through the host's own Edit › Duplicate, so the key and the menu do exactly the
+     * same thing (mobile-parity 7.2, the Delete fix's twin): 3D nodes sit in the 2D selection too, and the engine's
+     * default only duplicates 2D shapes — a selected mesh has to go through the host's 3D duplicate (duplicateMesh3D:
+     * 3D undo, characters, instance groups, the outliner). The engine's guards still apply (typing, Play, a creator
+     * mode owning input) and a held Ctrl+D runs once. Pass null to restore the default.
+     */
+    public setDuplicateKeyHandler(fn: (() => void) | null): void { this._duplicateKeyHandler = fn; }
+    /** The engine's Ctrl+D hook: the host's route when it set one, else the 2D shape duplicate. */
+    private _runDuplicateKey(): void {
+        if (this._duplicateKeyHandler) this._duplicateKeyHandler();
+        else this.duplicateSelectedShapes();
+    }
+
     public deleteSelectedShapes(): void {
         this.beginInteractive();
 
@@ -13523,7 +13580,10 @@ class ShapeManager {
      *  the five creation sites used to skip the predicate, so a stroke-debounced save could still fire mid-Play). */
     private _createPersistence(config?: Partial<AutoSaveConfig>): DocumentPersistence {
         const p = new DocumentPersistence(config);
-        p.setStateProvider(() => this.gatherDocumentState());
+        // Incremental autosave (docs/ui/document-persistence.md): an AUTOMATIC save serves raster layers / cels /
+        // painted textures unchanged since their last read-back from the cache (content keys let the writer skip
+        // their files); an explicit save (saveNow) reads everything fresh and writes every file.
+        p.setStateProvider((o) => this.docState.gather(false, { reusePixels: !o?.explicit }));
         // Don't AUTO-save a transient frame: Play mode (walked-to positions, mid-stride pose) — and, since audit
         // 2026-09-28 P11, UI preview / Player mode too, where playAnimation / seekAnimation pose skeletons and a
         // save would persist the scrubbed pose over the authored one. Autosave resumes (and saves) once they end.
@@ -13547,8 +13607,12 @@ class ShapeManager {
         this.currentDocName = docName;
         // Destroy the previous instance first — otherwise its interval keeps firing forever, saving from a stale
         // provider and (being a different object) dodging the load guard in restoreDocumentState. (audit P1/P9)
-        this.persistence?.destroy();
+        const prev = this.persistence;
+        prev?.destroy();
         this.persistence = this._createPersistence(config);
+        // Keep what the previous instance knows is on disk (e.g. the document loadDocument just read): the first
+        // automatic save then writes only what changed. Re-validated against the disk on every save.
+        this.persistence.inheritWriteRecord(prev);
         this.persistence.startAutoSave();
     }
 
@@ -13836,8 +13900,34 @@ class ShapeManager {
      * brush engine's stroke-end callback.
      */
     public notifyStrokeEnd(): void {
-        bumpGpuPixelEpoch();   // a host-reported stroke may have changed GPU-only pixels (device-lost shadow; over-counting is safe)
+        // A host-reported stroke may have changed GPU-only pixels (device-lost shadow; over-counting is safe). It was
+        // painted on the selected layer (its current texture — the displayed cel when animated): the incremental
+        // autosave re-reads that one (the brush pipeline already reported the exact texture it wrote; this is the
+        // backstop). No selected layer → every texture counts as changed.
+        bumpGpuPixelEpoch('full', this.rasterLayerManager?.getSelectedLayerTexture() ?? null);
         this.persistence?.notifyStrokeEnd();
+    }
+
+    /** Incremental autosave counters (docs/ui/document-persistence.md): GPU read-backs vs cache hits for raster
+     *  layers / cels / painted textures, saves that wrote vs found nothing to write, the files the last write wrote,
+     *  and `unnotedChanges` (non-zero = some pixel writer did not report its write; caught by the verification read). */
+    public getAutoSaveStats(): {
+        pixels: { readbacks: number; reused: number; meshExports: number; meshReused: number; unnotedChanges: number };
+        writes: { writes: number; unchanged: number; filesWritten: number; filesSkipped: number } | null;
+        lastWrittenFiles: string[];
+    } {
+        return {
+            pixels: { ...this.docState.pixelReadStats },
+            writes: this.persistence ? { ...this.persistence.writeStats } : null,
+            lastWrittenFiles: this.persistence?.lastWrittenFiles.slice() ?? [],
+        };
+    }
+
+    /** How long an automatic save may go on serving unchanged pixels from its cache before it reads every layer / cel
+     *  / painted texture again and compares (the safety net for a pixel writer that forgot to report). 0 = never.
+     *  Default 10 minutes. */
+    public setAutoSavePixelVerifyInterval(ms: number): void {
+        this.docState.pixelVerifyIntervalMs = Math.max(0, ms | 0);
     }
 
     /**
@@ -14440,6 +14530,7 @@ class ShapeManager {
                 if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(mesh.id, mgr); }
                 const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
                 device.queue.copyExternalImageToTexture({ source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height]);
+                bumpGpuPixelEpoch('none', tex);   // GPU-only pixels changed (device-lost shadow; incremental autosave: this texture)
                 mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
             } catch (e) { console.warn('[UVPaint] restore procedural texture failed for', key, e); }
         }

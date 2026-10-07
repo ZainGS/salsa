@@ -294,7 +294,7 @@ export class RasterTextStamp {
     pass.dispatchWorkgroups(Math.ceil(srcW / 8), Math.ceil(srcH / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
+    markRasterCompositeDirty(null, target);   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit; autosave: target)
 
     readCopy.destroy();
     paramBuf.destroy();

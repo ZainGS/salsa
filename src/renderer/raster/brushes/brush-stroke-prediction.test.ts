@@ -121,9 +121,9 @@ async function customPresets() {
 
 describe('stroke prediction never reaches the committed layer', () => {
   // visible = the tail changes bytes while shown (false: watercolor's dabs are a few /255 of alpha and mostly land
-  // under the stroke already painted — only exactness is checked). Lock transparency is tested on the direct path:
-  // on a WET stroke the stamp shader clamps to the stroke accum's alpha (0 ahead of the stroke), so a normal brush
-  // with lock on paints nothing at all — pre-existing, see the BRUSH-4 row in mobile-parity.md.
+  // under the stroke already painted — only exactness is checked). Lock transparency on both paths: the direct path
+  // clamps in the stamp shader, the WET path in the accum → layer composite (mobile-parity 7.2; before that a
+  // normal brush with lock on painted nothing at all).
   const cases: Array<[string, string, () => Promise<Setup>, boolean?]> = [
     ['wet paint (round soft)', 'default_round_soft', async () => ({})],
     ['moving-average stabilizer (hard pen)', 'default_hard_pen', async () => ({})],
@@ -133,6 +133,7 @@ describe('stroke prediction never reaches the committed layer', () => {
     ['erase override on a paint brush', 'default_round_soft', async () => ({ erase: 1 })],
     ['blend mode multiply (direct path)', 'test_multiply', async () => ({ preset: (await customPresets()).multiply })],
     ['lock transparency (multiply, direct path)', 'test_multiply', async () => ({ preset: (await customPresets()).multiply, lock: true })],
+    ['lock transparency (wet, round soft)', 'default_round_soft', async () => ({ lock: true })],
     ['wet edges at stroke end (watercolor)', 'default_watercolor_wash', async () => ({}), false],
     ['stroke-texture strip at stroke end', 'test_strip', async () => ({ preset: (await customPresets()).strip })],
   ];

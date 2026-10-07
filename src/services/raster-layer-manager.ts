@@ -634,7 +634,7 @@ export class RasterLayerManager {
     }
 
     const composited = await createImageBitmap(canvas);
-    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
+    bumpGpuPixelEpoch('full', l.texture);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: this layer)
     this.device.queue.copyExternalImageToTexture(
       { source: composited, flipY: false },
       { texture: l.texture },
@@ -1186,6 +1186,21 @@ export class RasterLayerManager {
   }
 
   /**
+   * The textures exportLayerPixels / exportCelPixels read, in the same order and under the same rules (a layer
+   * entry = its CURRENT texture — for an animated layer the displayed cel), without reading them. The incremental
+   * autosave reads back only the ones that changed (DocumentStateCoordinator).
+   */
+  public getPixelSources(): { layers: Array<{ id: string; texture: GPUTexture }>; cels: Array<{ celId: string; texture: GPUTexture }> } {
+    const layers: Array<{ id: string; texture: GPUTexture }> = [];
+    const cels: Array<{ celId: string; texture: GPUTexture }> = [];
+    for (const l of this.layers) if (l.texture) layers.push({ id: l.id, texture: l.texture });
+    for (const layer of this.layers) {
+      for (const cel of this.timeline.getCels(layer.id)) if (cel.texture) cels.push({ celId: cel.id, texture: cel.texture });
+    }
+    return { layers, cels };
+  }
+
+  /**
    * Get full layer metadata for persistence (everything except pixel data).
    */
   public getLayerMetadata(): Array<{
@@ -1231,7 +1246,7 @@ export class RasterLayerManager {
     if (!cel?.texture) return false;
     const w = cel.texture.width;
     const h = cel.texture.height;
-    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
+    bumpGpuPixelEpoch('full', cel.texture);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: this cel)
     this.device.queue.writeTexture(
       { texture: cel.texture },
       pixels,
@@ -1290,7 +1305,7 @@ export class RasterLayerManager {
     if (pixels.byteLength !== expectedBytes) {
       console.warn(`[RasterLayerManager] uploadPixelsToLayer size mismatch: layer="${layer.name}" texture=${w}x${h} (${expectedBytes}B) but pixels=${pixels.byteLength}B`);
     }
-    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
+    bumpGpuPixelEpoch('full', layer.texture);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: this layer)
     this.device.queue.writeTexture(
       { texture: layer.texture },
       pixels,
@@ -1318,7 +1333,7 @@ export class RasterLayerManager {
 
     if (src.texture) {
       const enc = this.device.createCommandEncoder();
-      bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
+      bumpGpuPixelEpoch('full', newTex);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: the copy)
       enc.copyTextureToTexture(
         { texture: src.texture },
         { texture: newTex },
@@ -1401,7 +1416,7 @@ export class RasterLayerManager {
     lowerBitmap.close();
 
     const mergedBitmap = await createImageBitmap(canvas as OffscreenCanvas);
-    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
+    bumpGpuPixelEpoch('full', lower.texture);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: the lower layer)
     this.device.queue.copyExternalImageToTexture(
       { source: mergedBitmap, flipY: false },
       { texture: lower.texture },
@@ -1464,7 +1479,7 @@ export class RasterLayerManager {
     }
 
     const composited = await createImageBitmap(canvas);
-    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
+    bumpGpuPixelEpoch('full', l.texture);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: this layer)
     this.device.queue.copyExternalImageToTexture(
       { source: composited, flipY: false },
       { texture: l.texture },
@@ -1528,7 +1543,7 @@ export class RasterLayerManager {
       bitmap.close();
 
       const placed = await createImageBitmap(canvas as OffscreenCanvas);
-      bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
+      bumpGpuPixelEpoch('full', snap.layer.texture);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: this layer)
       this.device.queue.copyExternalImageToTexture(
         { source: placed, flipY: false },
         { texture: snap.layer.texture },
@@ -1574,7 +1589,7 @@ export class RasterLayerManager {
     ctx.drawImage(imageBitmap, dx, dy, dw, dh);
 
     const fitted = await createImageBitmap(canvas as OffscreenCanvas);
-    bumpGpuPixelEpoch();   // GPU-only pixels changed (device-lost shadow accuracy)
+    bumpGpuPixelEpoch('full', tex);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: the new layer)
     this.device.queue.copyExternalImageToTexture(
       { source: fitted, flipY: false },
       { texture: tex },

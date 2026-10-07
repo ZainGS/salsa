@@ -148,8 +148,10 @@ describe('Shell frame structure (source guards)', () => {
       expect(shaders.length).toBeGreaterThan(3);
       for (const sh of shaders) expect(sh.slice(sh.indexOf('`') + 1, sh.lastIndexOf('`')).includes('`')).toBe(false);
     }
-    const fs = renderer.slice(renderer.indexOf('let gm = gridMask(in.uv);'));
-    expect(fs.indexOf('if (gm > 0.0 && bg.time.w < 0.5)')).toBeGreaterThan(0);
+    // Home = the terrain band (gridMask); the illustrations grid page = the full-height rise (gridPageMask, time.w 2).
+    const fs = renderer.slice(renderer.indexOf('let gm = select(gridMask(in.uv), gridPageMask(in.uv), bg.time.w > 1.5);'));
+    expect(fs.length).toBeLessThan(renderer.length);
+    expect(fs.indexOf('if (gm > 0.0 && (bg.time.w < 0.5 || bg.time.w > 1.5))')).toBeGreaterThan(0);
     expect(fs.indexOf('specks(in.uv, aspect, t) * gm')).toBeGreaterThan(fs.indexOf('if (gm > 0.0'));
   });
 });

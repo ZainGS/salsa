@@ -166,7 +166,7 @@ export class RasterMoveService {
     );
     pass.end();
     device.queue.submit([enc.finish()]);
-    markRasterCompositeDirty();   // BRUSH-5: the whole layer was rewritten (shifted)
+    markRasterCompositeDirty(null, dst);   // BRUSH-5: the whole layer was rewritten (shifted; autosave: dst)
     paramBuf.destroy();
   }
 

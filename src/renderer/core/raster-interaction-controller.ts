@@ -237,12 +237,14 @@ export class RasterInteractionController {
       }
 
       // P2 duplicate: Ctrl+D duplicates the selected 2D shapes (a modifier combo, not text input, so
-      // this sits BEFORE the text-shape guard — a selected sticky note can be duplicated too).
+      // this sits BEFORE the text-shape guard — a selected sticky note can be duplicated too). A host with its own
+      // Edit › Duplicate takes it over via ShapeManager.setDuplicateKeyHandler (same guards). A HELD Ctrl+D runs
+      // once: the auto-repeats stay claimed (no browser bookmark dialog) but duplicate nothing (mobile-parity 7.2).
       if ((event.key === 'd' || event.key === 'D') && (event.ctrlKey || event.metaKey) && !event.altKey
           && this.r._duplicateSelectedHandler
           && this.r.interactionService.selectedNodes.size >= 1
           && !this.r.interactionService.suppressBoxSelect) {
-          this.r._duplicateSelectedHandler();
+          if (!event.repeat) this.r._duplicateSelectedHandler();
           event.preventDefault();
           return;
       }

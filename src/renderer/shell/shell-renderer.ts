@@ -224,6 +224,14 @@ fn gridMask(uv: vec2<f32>) -> f32 {
   return 1.0 - smoothstep(0.125, 1.0, max(q.x, q.y));   // 1 inside the core, fades out from 12.5% of the radius
 }
 
+// Illustrations grid page (no terrain there): the specks rise the full height instead, fading in just above the
+// bottom edge and out just below the top, and softly at the far left / right edges.
+fn gridPageMask(uv: vec2<f32>) -> f32 {
+  let rise  = smoothstep(0.03, 0.16, uv.y) * (1.0 - smoothstep(0.84, 0.97, uv.y));
+  let sides = 1.0 - smoothstep(0.42, 0.5, abs(uv.x - 0.5));
+  return rise * sides;
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let t = bg.time.x;
@@ -234,9 +242,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   // themes keep the solid confetti printed on the paper, a touch LIGHTER than the cream.
   if (bg.time.z > 0.5) {
     // The mask first: outside the grid footprint it is exactly 0, where specks * 0 added nothing, so the two
-    // speck layers (4 hash-grid taps each) are skipped there. bg.time.w > 0.5 = the debug "no specks" toggle.
-    let gm = gridMask(in.uv);
-    if (gm > 0.0 && bg.time.w < 0.5) {
+    // speck layers (4 hash-grid taps each) are skipped there. bg.time.w: 0 = home (the terrain band), 1 = the debug
+    // "no specks" toggle, 2 = the illustrations grid page (full-height rise, gridPageMask).
+    let gm = select(gridMask(in.uv), gridPageMask(in.uv), bg.time.w > 1.5);
+    if (gm > 0.0 && (bg.time.w < 0.5 || bg.time.w > 1.5)) {
       let s = specks(in.uv, aspect, t) * gm;                // s is vec3 — colour baked in (50/50 rose / cyan)
       col = col + s;                                        // additive — only over the grid
     }
@@ -2280,7 +2289,8 @@ export class ShellRenderer {
       bgd.set(m.bgBottom, topLen);
       const bo = topLen + botLen;
       bgd[bo] = now; bgd[bo + 1] = w / Math.max(1, h); bgd[bo + 2] = m.backdropGrid ? 1 : 0;
-      bgd[bo + 3] = dbg.specks ? 0 : 1;   // debug: skip the specks (0 = draw them, the default)
+      // 0 = specks over the home terrain band, 2 = full-height rise on the illustrations grid page, 1 = debug: none
+      bgd[bo + 3] = dbg.specks ? (m.projectGrid ? 2 : 0) : 1;
       this.device.queue.writeBuffer(this.bgBuf, 0, bgd, 0, bgLen);
     }
 

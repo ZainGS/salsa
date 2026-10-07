@@ -82,7 +82,7 @@ export class RasterSnapshotManager {
     // pushes a snapshot after writing a layer can never leave the screen stale.
     bumpGpuPixelEpoch(dirtyRect
       ? { x0: dirtyRect.x, y0: dirtyRect.y, x1: dirtyRect.x + dirtyRect.w, y1: dirtyRect.y + dirtyRect.h }
-      : 'full');
+      : 'full', texture);   // (incremental autosave: this texture changed)
     return this._push(texture, dirtyRect);
   }
 
@@ -93,7 +93,7 @@ export class RasterSnapshotManager {
    * full push when the stack has no state of this size to sit on.
    */
   public async pushPatch(texture: GPUTexture, patch: RasterRectPatch): Promise<void> {
-    bumpGpuPixelEpoch('none');   // (BRUSH-5: the brush pipeline reported the stroke's texels as it wrote them)
+    bumpGpuPixelEpoch('none', texture);   // (BRUSH-5: the brush pipeline reported the stroke's texels as it wrote them)
     const w = texture.width, h = texture.height;
     const top = this.snapIndex >= 0 ? this.snapshots[this.snapIndex] : undefined;
     const fits = patch.w === w && patch.h === h && patch.rw > 0 && patch.rh > 0
@@ -334,8 +334,8 @@ export class RasterSnapshotManager {
   /** Write one rect entry's BEFORE (undo) or AFTER (redo) pixels back. */
   private writeRect(s: RectSnap, bytes: Uint8Array, texture: GPUTexture, resize?: (w: number, h: number) => GPUTexture): void {
     // undo / redo rewrite the pixels (BRUSH-5: only this rect is re-composited)
-    bumpGpuPixelEpoch({ x0: s.x, y0: s.y, x1: s.x + s.rw, y1: s.y + s.rh });
     const target = resize ? resize(s.w, s.h) : texture;
+    bumpGpuPixelEpoch({ x0: s.x, y0: s.y, x1: s.x + s.rw, y1: s.y + s.rh }, [target, texture]);   // (autosave: these textures)
     this.device.queue.writeTexture(
       { texture: target, mipLevel: 0, origin: { x: s.x, y: s.y, z: 0 } },
       bytes as unknown as ArrayBuffer,
@@ -345,7 +345,7 @@ export class RasterSnapshotManager {
   }
 
   private async restore(texture: GPUTexture, snap: { w: number; h: number; data: Uint8Array }): Promise<void> {
-    bumpGpuPixelEpoch();   // undo / redo rewrite the pixels
+    bumpGpuPixelEpoch('full', texture);   // undo / redo rewrite the pixels (autosave: of this texture)
     const w = snap.w;
     const h = snap.h;
     const bytesPerPixel = 4;

@@ -12,6 +12,7 @@
  * `bumpGpuPixelEpoch()`.
  */
 import { markRasterCompositeDirty, type DirtyTexelRect } from './core/raster-composite-dirty';
+import { noteRasterContentWrite } from './raster-content-version';
 
 let epoch = 0;
 
@@ -25,8 +26,12 @@ export function gpuPixelEpoch(): number { return epoch; }
  * path that already had to call this is covered there too. `dirty`: the texels written (max-exclusive), 'full'
  * (the default — the whole canvas, always safe) or 'none' (the writer reported its own rects, e.g. a brush stroke's
  * undo patch, whose pixels the brush pipeline reported dab by dab).
+ *
+ * `target`: the texture(s) written, when certain — the incremental autosave then re-reads only those
+ * (raster-content-version.ts). Omitted = every texture counts as changed (always safe).
  */
-export function bumpGpuPixelEpoch(dirty: DirtyTexelRect | 'full' | 'none' = 'full'): void {
+export function bumpGpuPixelEpoch(dirty: DirtyTexelRect | 'full' | 'none' = 'full', target?: object | ReadonlyArray<object | null | undefined> | null): void {
   epoch++;
-  if (dirty !== 'none') markRasterCompositeDirty(dirty === 'full' ? null : dirty);
+  if (dirty !== 'none') markRasterCompositeDirty(dirty === 'full' ? null : dirty, target);
+  else noteRasterContentWrite(target);
 }

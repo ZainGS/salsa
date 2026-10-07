@@ -8,6 +8,7 @@ import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
+import { noteRasterContentWrite } from '../../renderer/raster/raster-content-version';
 
 /** Collaborators the decal subsystem needs that don't live on {@link ManagerContext}. */
 export interface DecalManagerHost {
@@ -356,6 +357,7 @@ export class DecalManager {
             const enc = device.createCommandEncoder();
             enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }] }).end();
             device.queue.submit([enc.finish()]);
+            noteRasterContentWrite(tex);   // incremental autosave: this painted texture changed
         }
         // Replacing the base texture with the decal-layer texture — free the old one if it's a DIFFERENT texture
         // that nothing else (a duplicated sibling / the texture library) still holds. Guard `!== tex`: on repeat
@@ -387,7 +389,9 @@ export class DecalManager {
         ctx.rotate(rotation);
         ctx.drawImage(bitmap, -dw / 2, -dh / 2, dw, dh);   // source-over: decal alpha composites over the existing pixels
         ctx.restore();
-        device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: mgr.ensureTexture(W, H) }, [W, H]);
+        const target = mgr.ensureTexture(W, H);
+        device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: target }, [W, H]);
+        noteRasterContentWrite(target);           // incremental autosave (the snapshot below reports it too)
         await mgr.pushSnapshot();                 // undoable
     }
 

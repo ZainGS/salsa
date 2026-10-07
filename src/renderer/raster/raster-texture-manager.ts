@@ -114,7 +114,7 @@ export class RasterTextureManager {
     });
     pass.end();
     this.device.queue.submit([encoder.finish()]);
-    markRasterCompositeDirty();   // BRUSH-5: the texture was cleared
+    markRasterCompositeDirty(null, this.texture);   // BRUSH-5: the texture was cleared (autosave: this texture)
     
     // Seed the blank state as the initial snapshot so the first stroke is undoable.
     await this.ensureSnapshotMgr().initialize(this.texture);
@@ -349,7 +349,7 @@ export class RasterTextureManager {
       { width: rectW, height: rectH, depthOrArrayLayers: 1 }
     );
     this.device.queue.submit([enc.finish()]);
-    markRasterCompositeDirty({ x0: nd.x, y0: nd.y, x1: nd.x + rectW, y1: nd.y + rectH });   // BRUSH-5
+    markRasterCompositeDirty({ x0: nd.x, y0: nd.y, x1: nd.x + rectW, y1: nd.y + rectH }, tex);   // BRUSH-5
 
     return tex;
   }

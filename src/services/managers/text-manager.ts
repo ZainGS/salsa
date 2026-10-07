@@ -202,7 +202,7 @@ export class TextManager {
         const enc = device.createCommandEncoder();
         enc.copyTextureToTexture({ texture: result.texture, origin: [0, 0, 0] }, { texture: activeLayer.texture, origin: [destX, destY, 0] }, { width: srcW, height: srcH });
         device.queue.submit([enc.finish()]);
-        markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
+        markRasterCompositeDirty(null, activeLayer.texture);   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit; autosave: this layer)
         await device.queue.onSubmittedWorkDone();
         result.texture.destroy();
         this.ctx.scheduleRender();
@@ -315,7 +315,7 @@ export class TextManager {
         const enc = device.createCommandEncoder();
         enc.copyTextureToTexture({ texture: tex, origin: [0, 0, 0] }, { texture: activeLayer.texture, origin: [Math.max(0, destX), Math.max(0, destY), 0] }, { width: srcW, height: srcH });
         device.queue.submit([enc.finish()]);
-        markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
+        markRasterCompositeDirty(null, activeLayer.texture);   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit; autosave: this layer)
         await device.queue.onSubmittedWorkDone();
         if (this._editingLiveTextId === nodeId) this.endLiveTextEditing(nodeId);
         const wasAnimated = node.needsAnimation;

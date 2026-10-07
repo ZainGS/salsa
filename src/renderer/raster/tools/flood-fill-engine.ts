@@ -335,7 +335,7 @@ export class FloodFillEngine {
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    markRasterCompositeDirty();   // BRUSH-5: the fill can land anywhere on the layer
+    markRasterCompositeDirty(null, target);   // BRUSH-5: the fill can land anywhere on the layer (autosave: this layer)
   }
 
   private ensureFillApplyPipeline(): void {

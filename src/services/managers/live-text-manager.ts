@@ -275,7 +275,7 @@ export class LiveTextManager {
             { width: srcW, height: srcH },
         );
         device.queue.submit([enc.finish()]);
-        markRasterCompositeDirty();   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit)
+        markRasterCompositeDirty(null, activeLayer.texture);   // BRUSH-5: layer pixels changed (whole canvas: a one-shot edit; autosave: this layer)
         await device.queue.onSubmittedWorkDone();
 
         // End editing if this node was being edited

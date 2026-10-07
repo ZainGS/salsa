@@ -9,7 +9,8 @@ import { RasterDrawingService } from './raster-drawing-service';
 
 type Handler = (e: any) => unknown;
 
-function setup(opts: { layerStack?: boolean; preRender?: boolean } = {}) {
+function setup(opts: { layerStack?: boolean; preRender?: boolean; lockedLayer?: boolean } = {}) {
+  const lockedL1 = !!opts.lockedLayer;
   const listeners = new Map<string, Handler[]>();
   const captured = new Set<number>();
   const canvas = {
@@ -30,10 +31,10 @@ function setup(opts: { layerStack?: boolean; preRender?: boolean } = {}) {
     toWorldCoordsFromCanvas: (x: number, y: number) => ({ x: x / 50 - 1, y: 1 - y / 50 }),
     toWorldCoords: () => { throw new Error('per-event getBoundingClientRect path should not be used'); },
   };
-  const calls = { begin: [] as any[], points: [] as any[][], end: [] as any[], endOpts: [] as any[], erase: [] as Array<number | null>, preset: [] as string[] };
+  const calls = { begin: [] as any[], points: [] as any[][], end: [] as any[], endOpts: [] as any[], erase: [] as Array<number | null>, preset: [] as string[], lock: [] as boolean[] };
   const patch = { texture: {}, w: 100, h: 100, x: 1, y: 1, rw: 2, rh: 2, before: new Uint8Array(16), after: new Uint8Array(16) };
   const engine = {
-    setBrushColor: () => {}, setLockTransparency: () => {}, setAspectCorrection: () => {}, setSelectionMask: () => {},
+    setBrushColor: () => {}, setLockTransparency: (v: boolean) => { calls.lock.push(v); }, setAspectCorrection: () => {}, setSelectionMask: () => {},
     setEraseMode: (m: number | null) => { calls.erase.push(m); },
     setActivePreset: (id: string) => { if (id === 'missing') return false; calls.preset.push(id); return true; },
     beginStroke: (p: any) => { calls.begin.push(p); },
@@ -46,6 +47,7 @@ function setup(opts: { layerStack?: boolean; preRender?: boolean } = {}) {
     getSelectedLayerId: () => 'L1',
     getSelectedLayerManager: () => layerTexMgr,
     pushSnapshotForLayer: vi.fn(() => true),
+    getLayerById: (id: string) => (id === 'L1' ? { lockTransparency: lockedL1 } : undefined),
   };
   const renderer: any = {
     rasterPaintEngine: engine,
@@ -207,5 +209,20 @@ describe('brush switch leaves erase mode', () => {
     await t.fire('pointerdown', { pointerId: 1, clientX: 10, clientY: 10, timeStamp: 3 });
     expect(t.calls.erase).toEqual([2]);                    // eraser stroke: clear re-applied
     await t.fire('pointerup', { pointerId: 1, buttons: 0, timeStamp: 4 });
+  });
+});
+
+// mobile-parity 7.2: the layers panel's "Lock transparency" is set on the LAYER (setRasterLayerLockTransparency);
+// nothing forwarded it to the brush, so a locked layer painted as if unlocked.
+describe('lock transparency follows the selected layer', () => {
+  it('a stroke on a locked layer paints locked; an unlocked layer paints unlocked', async () => {
+    const locked = setup({ lockedLayer: true });
+    await locked.fire('pointerdown', { pointerId: 1, clientX: 10, clientY: 10, timeStamp: 1 });
+    expect(locked.calls.lock).toEqual([true]);
+    await locked.fire('pointerup', { pointerId: 1, buttons: 0, timeStamp: 2 });
+    const open = setup();
+    await open.fire('pointerdown', { pointerId: 1, clientX: 10, clientY: 10, timeStamp: 1 });
+    expect(open.calls.lock).toEqual([false]);
+    await open.fire('pointerup', { pointerId: 1, buttons: 0, timeStamp: 2 });
   });
 });

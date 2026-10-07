@@ -374,6 +374,23 @@ export class RasterPaintEngine {
     return ids;
   }
 
+  /**
+   * Brush presets are DOCUMENT data (saved in the document's brushes.json, re-imported on load), but this registry
+   * outlives every document and the load only MERGED into it — so document A's custom brushes (and A's edits to the
+   * built-ins) showed up in B and were written into B's next save (mobile-parity 7.2). A document load starts the
+   * library over: fresh built-ins only, then the loaded document's own presets are imported. The active brush stays
+   * when it still exists (a built-in), else the first built-in.
+   */
+  public resetPresetsForDocumentLoad(): void {
+    const keep = this.activePresetId;
+    this.presets.clear();
+    const defaults = createDefaultPresets();
+    for (const p of defaults) this.presets.set(p.id, p);
+    const active = (keep ? this.presets.get(keep) : undefined) ?? defaults[0];
+    this.activePresetId = active?.id ?? null;
+    if (active) this.brushEngine.setPreset(active);
+  }
+
   // ── Default presets ───────────────────────────────────────────────
 
   private registerDefaultPresets(): void {

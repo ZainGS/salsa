@@ -18,6 +18,8 @@
  * reported leaves stale pixels on screen until the next full composite.
  */
 
+import { noteRasterContentWrite } from '../raster-content-version';
+
 /** Texels, max-exclusive. */
 export interface DirtyTexelRect { x0: number; y0: number; x1: number; y1: number }
 
@@ -34,8 +36,13 @@ export const rasterDirtyStats = { marks: 0, fullMarks: 0 };
  * Report a write to raster layer pixels. `rect` in texels, max-exclusive (fractional edges are rounded outward when
  * consumed); omitted / null = the whole canvas. An empty rect is ignored. Also asks every listener (the renderer's
  * scheduleRender) for a frame, so a write reported after the frame that would have shown it is never left stale.
+ *
+ * `target`: the texture(s) written, when certain. Every report is also a CONTENT write for the incremental autosave
+ * (raster-content-version.ts): with a target only that texture is read back by the next save; without one every
+ * layer / cel / painted texture is (the safe default — never pass a target you are not sure of).
  */
-export function markRasterCompositeDirty(rect?: DirtyTexelRect | null): void {
+export function markRasterCompositeDirty(rect?: DirtyTexelRect | null, target?: object | ReadonlyArray<object | null | undefined> | null): void {
+  noteRasterContentWrite(target);   // before the empty-rect early-out: over-reporting is always safe
   if (rect) {
     if (!(rect.x1 > rect.x0 && rect.y1 > rect.y0)) {
       // NaN or empty: a NaN rect is "unknown", an empty one is "nothing"
