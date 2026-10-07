@@ -220,16 +220,20 @@ export function solveFabrik(input: IKSolveInput): number {
  * Reads FK world positions from joint.worldMatrix, runs FABRIK,
  * writes joint.ikRotation for each intermediate chain joint (slerped by blendWeight),
  * and updates worldMatrix inline so each joint's children see the correct parent.
+ *
+ * Returns the index of the TOPMOST joint whose ikRotation it wrote (the first intermediate chain joint — every
+ * other written joint is its descendant), or -1 when it wrote nothing. Only that joint's subtree can differ from
+ * the pre-solve FK, so `skeleton.recomputeSubtrees([that])` brings the whole skeleton current (mobile-parity §7.3d).
  */
-export function solveIKChain(skeleton: Skeleton3D, chain: IKChain): void {
-  if (!chain.enabled) return;
+export function solveIKChain(skeleton: Skeleton3D, chain: IKChain): number {
+  if (!chain.enabled) return -1;
   const blend = chain.blendWeight ?? 1;
   // blend = 0 → pure FK; skip solve entirely
-  if (blend <= 0) return;
+  if (blend <= 0) return -1;
   const { joints } = skeleton.data;
   const { endJointIdx, chainLength, target } = chain;
 
-  if (endJointIdx < 0 || endJointIdx >= joints.length) return;
+  if (endJointIdx < 0 || endJointIdx >= joints.length) return -1;
 
   // Walk up chainLength hops from end to find chain joints (root-first order)
   const chainJoints: number[] = [endJointIdx];
@@ -239,7 +243,7 @@ export function solveIKChain(skeleton: Skeleton3D, chain: IKChain): void {
     chainJoints.unshift(parentIdx);
   }
   // chainJoints[0] = anchor (not modified), chainJoints[last] = end effector
-  if (chainJoints.length < 2) return;
+  if (chainJoints.length < 2) return -1;
 
   // Extract FK world positions
   const origPos: [number, number, number][] = chainJoints.map(idx => [
@@ -332,14 +336,19 @@ export function solveIKChain(skeleton: Skeleton3D, chain: IKChain): void {
     // Update this joint's worldMatrix inline so the next iteration sees the correct parent
     recomputeOneJoint(jointIdx, joints);
   }
+  return chainJoints.length > 2 ? chainJoints[1] : -1;
 }
 
-/** Runs solveIKChain for every enabled IKChain on the skeleton. */
-export function solveAllIKChains(skeleton: Skeleton3D): void {
+/** Runs solveIKChain for every enabled IKChain on the skeleton. `touched` (optional) collects each solved chain's
+ *  topmost written joint (see solveIKChain) — pass it to `skeleton.recomputeSubtrees` instead of a full
+ *  computeWorldMatrices() to refresh only the subtrees IK moved. */
+export function solveAllIKChains(skeleton: Skeleton3D, touched?: number[]): void {
   const chains = skeleton.data.ikChains;
   if (!chains || chains.length === 0) return;
   for (const chain of chains) {
-    if (chain.enabled) solveIKChain(skeleton, chain);
+    if (!chain.enabled) continue;
+    const top = solveIKChain(skeleton, chain);
+    if (touched && top >= 0) touched.push(top);
   }
 }
 

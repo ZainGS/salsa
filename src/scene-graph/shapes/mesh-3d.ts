@@ -856,6 +856,22 @@ export class Mesh3D extends Shape {
     this.setGeometry(geom);  // sets gpuDirty = true, signals renderer to re-upload VC buffers
   }
 
+  /**
+   * mobile-parity 7.3d — Mesh Edit vertex-drag FAST PATH: bring the compiled geometry in line with `editMesh`'s vertex
+   * POSITIONS in place (EditMesh.patchCompiledPositions: only the triangles around moved vertices are rewritten, bit-
+   * identical to a recompile) instead of syncFromEditMesh's full compile + new geometry + pool rebuild. Applies only
+   * while the geometry is the editMesh's last compile with the same topology / UVs / colours, and the mesh has no
+   * modifier stack or blend shapes of its own. Returns the rewritten vertex spans as flat [start, count, ...] ([] =
+   * nothing moved), or null → the caller does syncFromEditMesh(). Does NOT set gpuDirty: the caller re-sends the spans
+   * (Renderer3D.patchMeshVertices) or sets gpuDirty itself. Bumps geometryVersion (geometry-derived caches re-key).
+   */
+  patchFromEditMesh(): number[] | null {
+    if (!this.editMesh || this.modifiers.length > 0 || this.baseVertices) return null;
+    const spans = this.editMesh.patchCompiledPositions(this._geometry);
+    if (spans && spans.length > 0) { Mesh3D.geometryEpoch++; this.geometryVersion++; }
+    return spans;
+  }
+
   setPrimitive(primitive: MeshPrimitive, config?: Partial<Mesh3DConfig>): void {
     this._meshPrimitive = primitive;
     if (config) Object.assign(this._meshConfig, config);

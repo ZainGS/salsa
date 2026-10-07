@@ -1407,7 +1407,7 @@ export class Renderer3D {
   // it offset by their normal. When no grab texture is set, a 1×1 texture is bound → sampled but the refraction
   // branch only runs for glassEnhance meshes, so it's a harmless bind for everything else.
   private _sceneColorGrabTex: GPUTexture | null = null;      // the live grab (set by webgpu-renderer); null → default
-  private _sceneColorDefaultTex: GPUTexture | null = null;   // 1×1 bgra8unorm fallback
+  private _sceneColorDefaultTex: GPUTexture | null = null;   // 1×1 opaque-black fallback (swap-chain format, like the grab)
   private _sceneColorSampler: GPUSampler | null = null;
   private _meshBindGroupSceneTex: GPUTexture | null = null;
 
@@ -2020,7 +2020,7 @@ export class Renderer3D {
   /** Ensure the 1×1 scene-color fallback + its sampler exist (bound at group 0 binding 5/6 when no grab is set). */
   private _ensureSceneColorResources(): void {
     if (!this._sceneColorDefaultTex) {
-      this._sceneColorDefaultTex = this.device.createTexture({ size: [1, 1], format: 'bgra8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label: 'SceneColorDefault' });
+      this._sceneColorDefaultTex = this.device.createTexture({ size: [1, 1], format: this._swapChainFormat, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label: 'SceneColorDefault' });
       this.device.queue.writeTexture({ texture: this._sceneColorDefaultTex }, new Uint8Array([0, 0, 0, 255]), { bytesPerRow: 4, rowsPerImage: 1 }, [1, 1, 1]);
     }
     if (!this._sceneColorSampler) {
@@ -8310,6 +8310,17 @@ export class Renderer3D {
     this.device.queue.writeBuffer(this._geomVB, alloc.baseVertex * MESH3D_VERTEX_STRIDE + start * MESH3D_VERTEX_STRIDE,
       v.buffer, v.byteOffset + start * MESH3D_VERTEX_STRIDE, count * MESH3D_VERTEX_STRIDE);
     return true;
+  }
+
+  /** mobile-parity 7.3d (Mesh Edit vertex drag): `mesh`'s vertex POSITIONS were rewritten in place and re-sent with
+   *  patchMeshVertices — drop its cached bounds (the next cull re-scans them; its GPU-driven record re-derives its box)
+   *  and refresh the shadow map, as the gpuDirty pool rebuild would have. */
+  noteMeshVerticesMoved(mesh: Mesh3D): void {
+    const e = this._meshAABBCache.get(mesh.id);
+    if (e) { e.dead = true; this._meshAABBCache.delete(mesh.id); }
+    mesh._r3Aabb = null;
+    mesh._gdKM = -1;
+    this._shadowMapStale = true;
   }
 
   /** Compaction is only worth its ~68 ms full re-upload when the free list holds a LOT of fragmented dead space.

@@ -564,11 +564,32 @@ export class MeshPicker {
 
   // ── Private ──────────────────────────────────────────────────────────────────
 
+  /**
+   * mobile-parity 7.3d (Mesh Edit face pick): ray-cast ONE non-skinned mesh with a BVH the CALLER owns (built with
+   * MeshBVH.build over `mesh.geometry`, and re-keyed by the caller when that geometry changes) — the same ray, BVH walk
+   * and hit math as pickMesh's static-mesh path, so the hit is the one pickMesh would report for this mesh, without
+   * testing the rest of the scene or trusting this picker's id-keyed BVH cache. Visibility / pickable are the caller's.
+   */
+  pickMeshWithBVH(
+    mouseX: number,
+    mouseY: number,
+    canvasWidth: number,
+    canvasHeight: number,
+    camera: Camera3D,
+    mesh: Mesh3D,
+    bvh: MeshBVH,
+  ): PickResult | null {
+    const { origin, dir } = this.castRay(mouseX, mouseY, canvasWidth, canvasHeight, camera);
+    const hit = this.intersectMesh(origin, dir, mesh, Infinity, bvh);
+    return hit ? { mesh, ...hit } : null;
+  }
+
   private intersectMesh(
     rayOrigin: vec3,
     rayDir:    vec3,
     mesh:      Mesh3D,
     maxWorldDist = Infinity,
+    bvhOverride: MeshBVH | null = null,
   ): { distance: number; triangleIndex: number; hitPoint: [number, number, number]; faceNormal: [number, number, number]; baryU: number; baryV: number } | null {
     const geom = mesh.geometry;
     if (!geom || geom.vertices.length === 0) return null;
@@ -577,7 +598,7 @@ export class MeshPicker {
     // against a CPU-skinned copy so painting/selecting a bent-limb creature lands on the visible surface, not
     // the rest silhouette. At rest this equals base × localMatrix, so nothing changes until the rig is posed.
     this._syncBlend(mesh);
-    const skin = this._skinnedDeform(mesh);
+    const skin = bvhOverride ? null : this._skinnedDeform(mesh);
     const modelMat = (skin ? skin.modelMat : mesh.localMatrix) as mat4;
     // P6: world-baked city meshes sit at a pure translation (usually identity) — invert that directly (exact) instead of
     // the general 4x4 inverse on every collision ray x candidate.
@@ -611,9 +632,9 @@ export class MeshPicker {
 
     // A skinned mesh whose pose has held still gets a BVH over that pose's verts (P2); else it keeps the linear scan.
     const skinBvh = skin && !mesh.gpuDirty ? this._skinnedBVH(mesh.id, idxs) : null;
-    if ((!mesh.gpuDirty && !skin) || skinBvh) {
-      // ── BVH path — static geometry (or a settled skinned pose) ──────────────
-      let bvh = skinBvh ?? this._bvhCache.get(mesh.id);
+    if ((!mesh.gpuDirty && !skin) || skinBvh || bvhOverride) {
+      // ── BVH path — static geometry (or a settled skinned pose, or the caller's own BVH) ──────────────
+      let bvh = bvhOverride ?? skinBvh ?? this._bvhCache.get(mesh.id);
       if (!bvh) {
         let t0 = 0;
         if (this._bvhBudgetOn) {

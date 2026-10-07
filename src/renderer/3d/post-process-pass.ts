@@ -11,9 +11,9 @@
  * render per effect. When all effects are disabled, run() returns null and the
  * caller copies lastFrameTex directly (no overhead).
  *
- * Source texture:  bgra8unorm (lastFrameTex, requires TEXTURE_BINDING usage)
+ * Source texture:  the swap-chain format (lastFrameTex, requires TEXTURE_BINDING usage)
  * Bloom textures:  rgba16float (intermediate, for HDR bloom accumulation)
- * Output textures: bgra8unorm (ping-pong pair, caller copies result to swapchain)
+ * Output textures: the swap-chain format (ping-pong pair, caller copies result to swapchain)
  */
 
 import { PP_BLOOM_DOWN_FS, PP_BLOOM_UP_FS } from './shaders/post-process-shaders';
@@ -150,7 +150,7 @@ export class PostProcessPass {
   private device: GPUDevice;
   private swapFormat: GPUTextureFormat;
 
-  // ── Ping-pong output textures (bgra8unorm) ────────────────────────────────
+  // ── Ping-pong output textures (swap-chain format) ────────────────────────────────
   private _pingTex: GPUTexture | null = null;
   private _pongTex: GPUTexture | null = null;
 
@@ -315,7 +315,7 @@ export class PostProcessPass {
   // ── Public API ─────────────────────────────────────────────────────────────
 
   /**
-   * Run all enabled post-process effects into a bgra8unorm output texture.
+   * Run all enabled post-process effects into an output texture in the swap-chain format.
    * Returns the output texture if any effect ran, or null if everything is disabled.
    * The caller should copy the returned texture to the swapchain (instead of lastFrameTex).
    */

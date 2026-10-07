@@ -82,9 +82,10 @@ describe('stroke prediction (service)', () => {
   it('touch: the frame draws the filtered prediction once, and the post-composite hook clears it', async () => {
     const t = setup();
     await t.fire('pointerdown', { clientX: 10, clientY: 50, timeStamp: 1000, pointerType: 'touch' });
-    expect(t.post.length).toBe(1);
+    expect(t.post.length).toBe(0);                                      // TOUCH-5: a finger's first dab waits…
     // speed: 30 px in 24 ms (1.25 px/ms) → allowed at dt 8: 2·1.25·8 + 4 = 24 px
     await t.fire('pointermove', move(1008, [20, 30, 40], 50, [{ x: 48, y: 50, dt: 8 }, { x: 56, y: 50, dt: 16 }]));
+    expect(t.post.length).toBe(1);                                      // …until it moves 8 px (or a frame passes)
     t.frame();
     expect(t.calls.points.length).toBe(1);
     expect(t.calls.drawn.length).toBe(1);
@@ -153,6 +154,7 @@ describe('stroke prediction (service)', () => {
     for (const pt of ['touch', 'pen', 'mouse']) {
       const t = setup();
       await t.fire('pointerdown', { clientX: 10, clientY: 50, timeStamp: 1000, pointerType: pt });
+      t.frame();   // (TOUCH-5: a finger's first dab lands with the next frame)
       expect(t.calls.beginOpts[0]).toEqual({ pointerType: pt });
       await t.fire('pointerup', { buttons: 0, timeStamp: 1100 });
     }

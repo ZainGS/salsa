@@ -5,6 +5,8 @@ import { ShapeFactory } from "../../scene-graph/core/shape-factory";
 import { Scribble } from "../../scene-graph/shapes/scribble";
 import { Highlight } from "../../scene-graph/shapes/highlight";
 import { InteractionService } from "../interaction-service";
+import { TouchGestureTracker } from "../../renderer/util/touch-gesture-tracker";
+import type { Node } from "../../scene-graph/shapes/base/node";
 
 export class EraserService {
     private interactionService: InteractionService;
@@ -20,9 +22,21 @@ export class EraserService {
     public scribbles: (Scribble | Highlight)[] = [];
     public scribblesInView: (Scribble | Highlight)[] = [];
 
+    // TOUCH-5 (docs/ui/touch-controls.md): a finger erase follows one pointer; a second finger (pinch / two-finger
+    // pan) ends it and PUTS BACK every scribble this erase removed; `!isPrimary` fingers never erase. Mouse / pen as before.
+    private readonly touches = new TouchGestureTracker();
+    private erasePointerId: number | null = null;
+    private eraseIsTouch = false;
+    /** What a FINGER erase removed so far (parent + index), so a pinch can put it back. */
+    private erasedThisStroke: Array<{ node: Scribble | Highlight; parent: Node; index: number }> = [];
+
     private startDrawingBound = (event: PointerEvent) => this.startErasure(event);
     private updateDrawingBound = (event: PointerEvent) => this.updateErasure(event);
-    private finishDrawingBound = () => this.finishErasure();
+    private finishDrawingBound = (event?: PointerEvent) => this.finishErasure(event);
+    private cancelDrawingBound = (event: PointerEvent) => {
+        this.touches.up(event);
+        if (this.isErasing && this.eraseIsTouch && event.pointerId === this.erasePointerId) this.cancelTouchErase();
+    };
 
     constructor(
         interactionService: InteractionService,
@@ -67,6 +81,7 @@ export class EraserService {
         canvas.addEventListener("pointerdown", this.startDrawingBound);
         canvas.addEventListener("pointermove", this.updateDrawingBound);
         canvas.addEventListener("pointerup", this.finishDrawingBound);
+        canvas.addEventListener("pointercancel", this.cancelDrawingBound);
 
         this.eventListenersAttached = true;
     }
@@ -78,7 +93,9 @@ export class EraserService {
         canvas.removeEventListener("pointerdown", this.startDrawingBound);
         canvas.removeEventListener("pointermove", this.updateDrawingBound);
         canvas.removeEventListener("pointerup", this.finishDrawingBound);
-    
+        canvas.removeEventListener("pointercancel", this.cancelDrawingBound);
+        this.touches.reset();
+
         // Clear the flag so attachEventListeners can run
         this.eventListenersAttached = false;
     
@@ -87,18 +104,29 @@ export class EraserService {
     }
 
     private startErasure(event: PointerEvent) {
+        const verdict = this.touches.down(event);
+        if (verdict === 'gesture') {
+            if (this.isErasing && this.eraseIsTouch) this.cancelTouchErase();
+            return;
+        }
+        if (verdict === 'ignore') return;
         if (!this.isEnabled || this.isErasing || event.button !== 0) return;
 
         this.interactionService.updateWorldMatrix();
         this.scribblesInView = this.scribbles.filter(s => s.visible);
         //console.log("reference broken");
         this.isErasing = true;
+        this.eraseIsTouch = event.pointerType === 'touch';
+        this.erasePointerId = typeof event.pointerId === 'number' ? event.pointerId : null;
+        this.erasedThisStroke = [];
         this.lastErasePoint = this.transformMouseCoordinatesToWorldSpace(event.offsetX, event.offsetY);
         this.interactionService.beginInteractive();
     }
 
     private updateErasure(event: PointerEvent) {
         if (!this.isErasing) return;
+        // TOUCH-5: only the erasing finger feeds a finger erase (another finger / a palm never erases along its path).
+        if (this.eraseIsTouch && event.pointerId !== this.erasePointerId) return;
 
         const currentPoint = this.transformMouseCoordinatesToWorldSpace(event.offsetX, event.offsetY);
 
@@ -146,7 +174,14 @@ export class EraserService {
             if (this.pendingEraseScribbles.size > 0) {
                 this.scribbles = this.scribbles.filter(s => !this.pendingEraseScribbles.has(s));
                 //console.log("reference broken");
-                this.pendingEraseScribbles.forEach(scribble => this.sceneGraph.root.removeChild(scribble));
+                this.pendingEraseScribbles.forEach(scribble => {
+                    // TOUCH-5: remember where a finger erase took it from (a pinch puts it back)
+                    const parent = scribble.parent;
+                    if (this.isErasing && this.eraseIsTouch && parent) {
+                        this.erasedThisStroke.push({ node: scribble, parent, index: parent.children.indexOf(scribble) });
+                    }
+                    this.sceneGraph.root.removeChild(scribble);
+                });
                 this.pendingEraseScribbles.clear();
                 this.interactionService.onSceneGraphChanged.emit();
                 this.interactionService.requestRender();
@@ -154,11 +189,46 @@ export class EraserService {
         });
     }
 
-    private finishErasure() {
+    private finishErasure(event?: PointerEvent) {
+        if (event) this.touches.up(event);
+        // Another finger lifting doesn't end a finger erase. And only a live erase returns its interactive lease: this
+        // ran on EVERY canvas pointerup (any tool), so it ended a lease someone else held (e.g. a raster stroke's).
+        if (!this.isErasing) return;
+        if (event && this.eraseIsTouch && event.pointerId !== this.erasePointerId) return;
         this.isErasing = false;
+        this.eraseIsTouch = false;
+        this.erasePointerId = null;
+        this.erasedThisStroke = [];
         this.scribblesInView = [];
         this.lastErasePoint = null;
         this.interactionService.endInteractive();
+    }
+
+    /** TOUCH-5: a second finger (or pointercancel) during a FINGER erase — the erase ends and every scribble it removed
+     *  goes back where it was (same parent, same draw order); queued removals are dropped. */
+    private cancelTouchErase(): void {
+        this.pendingEraseScribbles.clear();
+        const restore = this.erasedThisStroke;
+        this.erasedThisStroke = [];
+        for (let i = restore.length - 1; i >= 0; i--) {   // reverse: each index is valid again when it is reinserted
+            const { node, parent, index } = restore[i];
+            if (node.parent) continue;
+            parent.addChild(node);
+            const kids = parent.children;
+            const at = kids.indexOf(node);
+            if (at !== -1 && index >= 0 && index < kids.length - 1) { kids.splice(at, 1); kids.splice(index, 0, node); }
+            if (!this.scribbles.includes(node)) this.scribbles.push(node);
+        }
+        this.isErasing = false;
+        this.eraseIsTouch = false;
+        this.erasePointerId = null;
+        this.scribblesInView = [];
+        this.lastErasePoint = null;
+        this.interactionService.endInteractive();
+        if (restore.length > 0) {
+            this.interactionService.onSceneGraphChanged.emit();
+            this.interactionService.requestRender();
+        }
     }
 
     // private getInterpolatedPoints(start: [number, number], end: [number, number]): [number, number][] {

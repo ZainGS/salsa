@@ -27,6 +27,7 @@ import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { isPointerEventClaimed } from '../../renderer/util/pointer-claims';
+import { EditFacePicker, pickFaceFullScene } from './mesh-edit-face-pick';
 
 export type MeshEditSelectionMode = 'vertex' | 'face' | 'edge';
 
@@ -78,8 +79,18 @@ export class MeshEditPointerController {
   private _dragSelSnap: SelSnap | undefined = undefined;
   /** The canvas rect, read once per press / drag instead of per pointer move. */
   private _rect: Rect | null = null;
-  /** Latest drag position (canvas px), applied once per frame: a drag move recompiles the mesh (syncFromEditMesh). */
+  /** Latest drag position (canvas px), applied once per frame (see _syncDragGeometry). */
   private _dragAt: { x: number; y: number } | null = null;
+  /** 7.3d: this drag patched the compiled geometry in place since its last full recompile (release recompiles). */
+  private _dragPatched = false;
+  /** 7.3d perf counters: full recompiles (syncFromEditMesh) vs in-place patches during vertex drags, and what the
+   *  patches re-sent (vertex spans / vertices / bytes at the 48-byte pool stride; gpuDirty = a patch the renderer
+   *  could not take, so the pool re-uploads the mesh). */
+  readonly dragStats = { fullSyncs: 0, patches: 0, spans: 0, uploadVerts: 0, uploadBytes: 0, gpuDirty: 0 };
+  /** 7.3d: face picks against the edit mesh only (own BVH + face-centre grid). */
+  private readonly _facePicker = new EditFacePicker();
+  /** The face picker's counters (tests / perf report). */
+  get facePickStats(): EditFacePicker['stats'] { return this._facePicker.stats; }
   private _dragFrame = 0;
   /** Latest mouse hover position (vertex-mode cursor), resolved once per frame. */
   private _hoverAt: { x: number; y: number } | null = null;
@@ -131,6 +142,7 @@ export class MeshEditPointerController {
 
   detach(): void {
     if (!this._canvas) return;
+    this._finishPatchedDrag();
     removeZonelessListener(this._canvas, 'pointerdown', this._onDown);
     removeZonelessListener(this._canvas, 'pointermove', this._onMove);
     removeZonelessListener(this._canvas, 'pointerup',   this._onUp);
@@ -149,7 +161,9 @@ export class MeshEditPointerController {
     this._dragStartObjPos = null;
     this._dragStartVerts = null;
     this._dragSelSnap = undefined;
+    this._dragPatched = false;
     this._rect = null;
+    this._facePicker.clear();
   }
 
   setMode(mode: MeshEditSelectionMode): void {
@@ -266,6 +280,7 @@ export class MeshEditPointerController {
     if (this._dragging && this._dragPointerId !== null && e.pointerId !== undefined && e.pointerId !== this._dragPointerId) return;
     this._dragPointerId = null;
     if (this._dragging) this._flushDragFrame();
+    this._finishPatchedDrag();   // 7.3d: one full recompile at the end of an in-place-patched drag
     if (this._dragging && this._dragVertexIdx >= 0 && this._meshId && this._dragSnapshot) {
       const mesh = this._getMesh();
       if (mesh?.editMesh) {
@@ -396,8 +411,42 @@ export class MeshEditPointerController {
       }
     }
     mesh.editMesh.moveVertex(this._dragVertexIdx, delta.x, delta.y, delta.z);
-    mesh.syncFromEditMesh();
+    this._syncDragGeometry(mesh);
     this._scheduleRender();
+  }
+
+  /** mobile-parity 7.3d: bring the GPU mesh in line with a drag frame. Topology is unchanged mid-drag, so the moved
+   *  vertices' triangles are rewritten in place (Mesh3D.patchFromEditMesh: positions + flat normals / tangents, the
+   *  same bits a recompile writes) and only those vertex spans are re-sent (writeBuffer into the mesh's pool range).
+   *  Falls back to the full recompile (syncFromEditMesh) whenever the patch does not apply; a span the renderer cannot
+   *  take (mesh not resident yet / shared pool geometry) marks gpuDirty, which re-uploads from the patched CPU copy. */
+  private _syncDragGeometry(mesh: Mesh3D): void {
+    const spans = typeof mesh.patchFromEditMesh === 'function' ? mesh.patchFromEditMesh() : null;
+    if (!spans) { mesh.syncFromEditMesh(); this.dragStats.fullSyncs++; this._dragPatched = false; return; }
+    this.dragStats.patches++;
+    if (spans.length === 0) return;
+    this._dragPatched = true;
+    // (only a mesh with its OWN pool geometry is patched in the pool — a shared key would rewrite other meshes too)
+    let ok = mesh.geometryKey === `custom:${mesh.id}` && typeof this._scene3d.patchMeshVertices3D === 'function';
+    for (let i = 0; ok && i < spans.length; i += 2) {
+      if (!this._scene3d.patchMeshVertices3D(mesh, spans[i], spans[i + 1])) { ok = false; break; }
+      this.dragStats.spans++;
+      this.dragStats.uploadVerts += spans[i + 1];
+      this.dragStats.uploadBytes += spans[i + 1] * 48;
+    }
+    if (ok) this._scene3d.noteMeshVerticesMoved3D?.(mesh);
+    else { mesh.gpuDirty = true; this.dragStats.gpuDirty++; }
+  }
+
+  /** End of a drag that patched the geometry in place: one full recompile, so everything keyed on a geometry change
+   *  (the scene picker's BVH, bounds, autosave dirtiness, …) sees the final shape exactly as before 7.3d. */
+  private _finishPatchedDrag(): void {
+    if (!this._dragPatched) return;
+    this._dragPatched = false;
+    const mesh = this._getMesh();
+    if (!mesh?.editMesh) return;
+    mesh.syncFromEditMesh();
+    this.dragStats.fullSyncs++;
   }
 
   /** Abort an in-flight vertex drag: every vertex back to its drag-start position, and (for a finger drag) the
@@ -411,7 +460,9 @@ export class MeshEditPointerController {
         const verts = mesh.editMesh.vertices, start = this._dragStartVerts;
         for (let i = 0; i < verts.length && i < start.length; i++) { verts[i].x = start[i].x; verts[i].y = start[i].y; verts[i].z = start[i].z; }
         mesh.syncFromEditMesh();
+        this.dragStats.fullSyncs++;
       }
+      this._dragPatched = false;
       if (this._dragSelSnap !== undefined && this._meshId) {
         this._meshEdit.restoreSelection(this._meshId, this._dragSelSnap);
         this._onSelectionChange?.();
@@ -470,24 +521,17 @@ export class MeshEditPointerController {
 
   // ── Picking ─────────────────────────────────────────────────────────────────
 
+  /** The face under canvas px: the ray is cast at the EDIT MESH only (own BVH), then the face whose world-space centre
+   *  is nearest the hit (a grid, not a scan of every face) — see mesh-edit-face-pick.ts. Without a camera / geometry
+   *  (test doubles) the pre-7.3d full-scene pick + scan runs instead. */
   private _pickFace(px: number, py: number): number {
     if (!this._canvas || !this._meshId) return -1;
-    const hit = this._scene3d.pick3D(px, py, this._canvas.width, this._canvas.height);
-    if (!hit || hit.meshId !== this._meshId) return -1;
-
     const mesh = this._getMesh();
-    if (!mesh?.editMesh) return -1;
-
-    // Find the EditMesh face whose world-space center is closest to the hit point
-    const [hx, hy, hz] = hit.hitPoint;
-    let bestFace = -1, bestDist = Infinity;
-    for (let fi = 0; fi < mesh.editMesh.faces.length; fi++) {
-      const [cx, cy, cz] = mesh.editMesh.getFaceCenter(fi);
-      const w = this._objToWorld(cx, cy, cz, mesh);
-      const d = Math.sqrt((w.x - hx) ** 2 + (w.y - hy) ** 2 + (w.z - hz) ** 2);
-      if (d < bestDist) { bestDist = d; bestFace = fi; }
+    const camera = this._scene3d.getCamera?.();
+    if (mesh?.editMesh && camera && mesh.geometry) {
+      return this._facePicker.pick(mesh, camera, px, py, this._canvas.width, this._canvas.height);
     }
-    return bestFace;
+    return pickFaceFullScene(this._scene3d, this._meshId, mesh, px, py, this._canvas.width, this._canvas.height);
   }
 
   /** Object-space point → canvas px (null = behind the camera), with the model-view-projection composed ONCE per

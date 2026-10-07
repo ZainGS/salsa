@@ -7,6 +7,8 @@
  *   - Frame data as ImageData arrays (for GIF/MP4 encoding by the host app)
  */
 
+import { isBgraFormat } from '../renderer/core/canvas-format';
+
 export interface SpriteSheetOptions {
   /** Max columns in the sprite sheet grid. 0 = auto (sqrt of frame count). */
   columns?: number;
@@ -60,6 +62,10 @@ export class AnimationExporter {
     for (let row = 0; row < h; row++) {
       const src = mapped.subarray(row * bytesPerRow, row * bytesPerRow + w * 4);
       pixels.set(src, row * w * 4);
+    }
+    // Cels are rgba8unorm; a BGRA texture (e.g. a swap-chain-format frame, CRASH-6) is swizzled to RGBA here.
+    if (isBgraFormat(texture.format ?? '')) {
+      for (let i = 0; i < pixels.length; i += 4) { const b = pixels[i]; pixels[i] = pixels[i + 2]; pixels[i + 2] = b; }
     }
 
     buf.unmap();

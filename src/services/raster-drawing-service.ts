@@ -9,6 +9,16 @@ import type { RasterLayerManager } from './raster-layer-manager';
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 import { isPointerEventClaimed } from '../renderer/util/pointer-claims';
 import { getStrokePrediction, predictionAppliesTo } from '../renderer/raster/brushes/brush-input-settings';
+import { TouchGestureTracker } from '../renderer/util/touch-gesture-tracker';
+
+/** A stroke's pointerdown, mapped once (TOUCH-5: a finger stroke keeps it until its first dab). */
+interface StrokeStart {
+  input: PointerInput;
+  pointerType: string;
+  clientX: number;
+  clientY: number;
+  world: { x: number; y: number };
+}
 
 /** Stroke prediction limits (BRUSH-4): a predicted sample more than this far ahead of the last real one (ms) is
  *  dropped — about 1.5 frames at 60 Hz, the input-to-display gap worth hiding; further out the predictor overshoots
@@ -37,9 +47,19 @@ export class RasterDrawingService {
 
   private startBound = (e: PointerEvent) => this.start(e);
   private moveBound = (e: PointerEvent) => this.move(e);
-  private upBound = (e: PointerEvent) => this.end(e);
-  /** Pre-render hook while a stroke is live: stamps the queued coalesced samples (BRUSH-4). */
-  private drainBound = (): boolean => { this.drainPending(true); return false; };
+  private upBound = (e: PointerEvent) => { this.touches.up(e); return this.end(e); };
+  private cancelBound = (e: PointerEvent) => { this.touches.up(e); return this.lostPointer(e); };
+  private lostCaptureBound = (e: PointerEvent) => this.lostPointer(e);
+  /** Pre-render hook while a stroke is live: a waiting finger stroke gets its first dab (TOUCH-5), then the queued
+   *  coalesced samples are stamped (BRUSH-4). */
+  private drainBound = (): boolean => { this.commitTouchStart(); this.drainPending(true); return false; };
+
+  // TOUCH-5 (mobile-parity §3): the fingers on the canvas (a 2nd one = a pinch → the stroke is taken back), the
+  // finger stroke waiting for its first dab (1 frame or TouchGestureTracker.TOUCH_START_PX), and the live stroke's
+  // pointer type (only a FINGER stroke is ever taken back by a pinch — mouse / pen strokes are unchanged).
+  private readonly touches = new TouchGestureTracker();
+  private touchPending: StrokeStart | null = null;
+  private strokePointerType = '';
   /** Post-composite hook while a predicting stroke is live: takes the provisional tail back out of the layer. */
   private clearProvisionalBound = (): void => { this.getPaintEngine()?.clearProvisionalStroke?.(); };
 
@@ -62,6 +82,10 @@ export class RasterDrawingService {
   public onStrokeStart = new EventEmitter<any>();
   public onStrokeUpdate = new EventEmitter<any>();
   public onStrokeEnd = new EventEmitter<any>();
+  /** TOUCH-5: a stroke was ABANDONED (a second finger made it a pinch, a pen took over from a resting finger, or
+   *  cancelActiveStroke()). Its paint is already put back; there is no onStrokeEnd for it, so a host that saves /
+   *  marks the layer dirty on onStrokeEnd does nothing. `{ timestamp, began }` — `began` false = no dab was painted. */
+  public onStrokeCancel = new EventEmitter<any>();
 
   constructor(interactionService: InteractionService, renderer: WebGPURenderer, sceneGraph: SceneGraph) {
     this.interactionService = interactionService;
@@ -168,9 +192,10 @@ export class RasterDrawingService {
     addZonelessListener(canvas, 'pointermove', this.moveBound);
     addZonelessListener(canvas, 'pointerup', this.upBound);
     // BRUSH-3: a cancelled pointer (OS gesture, palm rejection) or lost capture ENDS the stroke — it used to
-    // leave isDrawing stuck (and the interactive lease held) until some later pointerup.
-    addZonelessListener(canvas, 'pointercancel', this.upBound);
-    addZonelessListener(canvas, 'lostpointercapture', this.upBound);
+    // leave isDrawing stuck (and the interactive lease held) until some later pointerup. (TOUCH-5: a finger stroke
+    // still waiting for its first dab paints nothing.)
+    addZonelessListener(canvas, 'pointercancel', this.cancelBound);
+    addZonelessListener(canvas, 'lostpointercapture', this.lostCaptureBound);
     this.eventListenersAttached = true;
   }
 
@@ -185,9 +210,10 @@ export class RasterDrawingService {
     removeZonelessListener(canvas, 'pointerdown', this.startBound);
     removeZonelessListener(canvas, 'pointermove', this.moveBound);
     removeZonelessListener(canvas, 'pointerup', this.upBound);
-    removeZonelessListener(canvas, 'pointercancel', this.upBound);
-    removeZonelessListener(canvas, 'lostpointercapture', this.upBound);
+    removeZonelessListener(canvas, 'pointercancel', this.cancelBound);
+    removeZonelessListener(canvas, 'lostpointercapture', this.lostCaptureBound);
     this.eventListenersAttached = false;
+    this.touches.reset();
     this.attachListeners();
   }
 
@@ -315,14 +341,27 @@ export class RasterDrawingService {
   // ── Stroke lifecycle ──────────────────────────────────────────────
 
   private async start(ev: PointerEvent) {
+    // TOUCH-5: count fingers first (even with the tool off, so the count is right if it turns on mid-gesture). A
+    // second finger makes this a pinch / two-finger pan (RasterInteractionController zooms): the finger stroke is
+    // taken back. Extra fingers, `!isPrimary` ones and fingers of a blocked gesture never start a stroke.
+    const verdict = this.touches.down(ev);
+    if (verdict === 'gesture') {
+      if (this.isDrawing && this.strokePointerType === 'touch') this.cancelActiveStroke();
+      return;
+    }
+    if (verdict === 'ignore') return;
     if (!this.isEnabled || ev.button !== 0) return;
     // 7.3b P1: a finger that 3D surface paint took (it can't stop a touch — the orbit controller needs it) never
     // also starts a 2D stroke on the layer under the mesh.
     if (isPointerEventClaimed(ev)) return;
+    // TOUCH-5: a pen landing while a FINGER stroke is live (a resting palm / knuckle started it) takes that stroke
+    // back and draws — a palm can no longer lock the pen out.
+    if (this.isDrawing && ev.pointerType === 'pen' && this.strokePointerType === 'touch') this.cancelActiveStroke();
     // BRUSH-3: one stroke at a time. A second pointer (resting palm, pinch finger) or a duplicate pointerdown
     // used to restart the stroke mid-way AND take another interactive lease that end() never returned.
     if (this.isDrawing) return;
     this.isDrawing = true;
+    this.strokePointerType = ev.pointerType ?? '';
     this.activePointerId = typeof ev.pointerId === 'number' ? ev.pointerId : null;
     const canvas = this.interactionService.canvas;
     if (this.activePointerId !== null) {
@@ -349,12 +388,42 @@ export class RasterDrawingService {
     this.lastPressure = pressure;
     const timestamp = this.eventTime(ev);
     this.lastCss = { x: ev.clientX - o.left, y: ev.clientY - o.top, t: timestamp };
+    const start: StrokeStart = {
+      input: { x: tex.x, y: tex.y, pressure, timestamp, tiltX: ev.tiltX ?? 0, tiltY: ev.tiltY ?? 0 },
+      pointerType: ev.pointerType, clientX: ev.clientX, clientY: ev.clientY,
+      world: this.interactionService.toWorldCoordsFromCanvas(ev.clientX - o.left, ev.clientY - o.top),
+    };
 
+    // TOUCH-5 (the 7.3b P1 UV-paint rule): a FINGER stroke's first dab waits for the next frame or
+    // TOUCH_START_PX of movement, so a second finger landing in that window makes a pinch with no paint at all.
+    // Mouse and pen begin at once, exactly as before. (No frame hook → no delay: nothing would commit it.)
+    if (ev.pointerType === 'touch' && this.getPaintEngine() && typeof this.renderer.addPreRenderCallback === 'function') {
+      this.touchPending = start;
+      this.renderer.addPreRenderCallback(this.drainBound, 'raster-brush-stroke');
+      this.renderer.scheduleRender?.();
+      return;
+    }
+    this.beginEngineStroke(start);
+  }
+
+  /** TOUCH-5: the waiting finger stroke gets its first dab now (its next frame came, it moved TOUCH_START_PX, or
+   *  it lifted — a tap paints a dot). No-op when nothing is waiting. */
+  private commitTouchStart(): void {
+    const s = this.touchPending;
+    if (!s) return;
+    this.touchPending = null;
+    this.beginEngineStroke(s);
+  }
+
+  /** Sync the engine to the tool and begin the engine stroke at `s` (the first dab). */
+  private beginEngineStroke(s: StrokeStart): void {
     // Safety net: layer textures get reallocated on resize/restore, which can
     // leave the paint engine pointing at a stale texture (invisible strokes).
     // Re-point it at the live selected-layer texture before beginning the stroke.
     this.renderer.syncActiveLayerTexture?.();
 
+    const tex = { x: s.input.x, y: s.input.y };
+    const pressure = s.input.pressure;
     const engine = this.getPaintEngine();
     if (engine) {
       // Sync color, erase mode, lock-transparency
@@ -374,9 +443,8 @@ export class RasterDrawingService {
         engine.setSelectionMask(null);
       }
 
-      const input: PointerInput = { x: tex.x, y: tex.y, pressure, timestamp, tiltX: ev.tiltX ?? 0, tiltY: ev.tiltY ?? 0 };
       // pointerType: a finger stroke gets the touch smoothing cap (brush-input-settings.ts); pen / mouse don't.
-      engine.beginStroke(input, { pointerType: ev.pointerType });
+      engine.beginStroke(s.input, { pointerType: s.pointerType });
       this.renderer.addPreRenderCallback?.(this.drainBound, 'raster-brush-stroke');
       if (this.predictStroke) this.renderer.addPostRasterCompositeCallback?.(this.clearProvisionalBound);
     } else {
@@ -385,7 +453,7 @@ export class RasterDrawingService {
     }
 
     this.onStrokeStart.emit({
-      world: this.interactionService.toWorldCoordsFromCanvas(ev.clientX - o.left, ev.clientY - o.top),
+      world: s.world,
       texel: tex,
       pressure,
       timestamp: Date.now()
@@ -425,11 +493,17 @@ export class RasterDrawingService {
         last = { x: e.clientX - o.left, y: e.clientY - o.top, t: ts };
       }
       this.lastCss = last;
+      // TOUCH-5: a waiting finger stroke that moved TOUCH_START_PX is a stroke — its first dab now (the samples
+      // queued so far follow with the next frame, as usual).
+      const p = this.touchPending;
+      if (p && Math.hypot(ev.clientX - p.clientX, ev.clientY - p.clientY) >= TouchGestureTracker.TOUCH_START_PX) this.commitTouchStart();
       // BRUSH-4: this event's predicted samples replace the previous event's (drawn once by the next frame).
-      if (this.predictStroke && last) this.predicted = this.collectPredicted(ev, last, ref, o, map, pressure, this.lastTs);
+      if (this.predictStroke && last && !this.touchPending) this.predicted = this.collectPredicted(ev, last, ref, o, map, pressure, this.lastTs);
       // No render loop to drain us (no pre-render hook, or rendering stalled) → stamp now rather than grow.
-      if (!this.renderer.addPreRenderCallback || this.pending.length >= RasterDrawingService.MAX_PENDING) this.drainPending();
-      else this.renderer.scheduleRender?.();
+      if (!this.renderer.addPreRenderCallback || this.pending.length >= RasterDrawingService.MAX_PENDING) {
+        this.commitTouchStart();
+        this.drainPending();
+      } else this.renderer.scheduleRender?.();
     } else {
       tex = map(ev.clientX - o.left, ev.clientY - o.top);
       pressure = ev.pressure ?? 1;
@@ -454,6 +528,7 @@ export class RasterDrawingService {
     this.lastTex = tex;
     this.lastPressure = pressure;
 
+    if (this.touchPending) return;   // TOUCH-5: no update before the stroke has started
     this.onStrokeUpdate.emit({
       world: this.interactionService.toWorldCoordsFromCanvas(ev.clientX - o.left, ev.clientY - o.top),
       texel: tex,
@@ -465,6 +540,7 @@ export class RasterDrawingService {
   private async end(ev?: PointerEvent) {
     if (!this.isDrawing) return;
     if (ev && !this.isStrokePointer(ev)) return;   // another pointer lifting doesn't end this stroke
+    this.commitTouchStart();   // TOUCH-5: a quick tap (lifted before its first frame) still paints its dot
     this.isDrawing = false;
     const pointerId = this.activePointerId;
     this.activePointerId = null;
@@ -521,6 +597,54 @@ export class RasterDrawingService {
     }
 
     this.onStrokeEnd.emit({ timestamp: Date.now() });
+  }
+
+  /** pointercancel / lostpointercapture of the stroke's pointer: a live stroke ENDS (BRUSH-3 — it never stays stuck;
+   *  what was drawn is kept, as before); a finger stroke still waiting for its first dab paints nothing (TOUCH-5).
+   *  After a normal pointerup the stroke is already over (the release fires lostpointercapture): no-op. */
+  private lostPointer(ev: PointerEvent): Promise<void> | void {
+    if (!this.isDrawing || !this.isStrokePointer(ev)) return;
+    if (this.touchPending) { this.cancelActiveStroke(); return; }
+    return this.end(ev);
+  }
+
+  /**
+   * TOUCH-5: ABANDON the live stroke — a second finger turned it into a pinch / two-finger pan (or a pen landed on
+   * a finger stroke, or a waiting finger was cancelled). The 7.3b P1 UV-paint take-back, on the 2D layer: queued
+   * samples and a predicted tail are dropped, RasterPaintEngine.cancelStroke() puts every touched texel back to its
+   * stroke-start bytes (GPU only; the restore is reported to the dirty composite + incremental autosave against the
+   * layer texture), and there is NO undo patch, NO snapshot and NO onStrokeEnd — so the host neither schedules an
+   * autosave nor marks the layer dirty for upload. A finger stroke still waiting for its first dab painted nothing:
+   * it is just dropped. Emits onStrokeCancel. True when a stroke was abandoned.
+   */
+  public cancelActiveStroke(): boolean {
+    if (!this.isDrawing) return false;
+    const began = this.touchPending === null;
+    this.touchPending = null;
+    this.isDrawing = false;
+    const pointerId = this.activePointerId;
+    this.activePointerId = null;
+    this.pending = [];
+    this.predicted = [];
+    this.predictStroke = false;
+    this.lastCss = null;
+    this.renderer.removePreRenderCallback?.(this.drainBound);
+    this.renderer.removePostRasterCompositeCallback?.(this.clearProvisionalBound);
+    const canvas = this.interactionService.canvas;
+    if (pointerId !== null) {
+      try { if (canvas.hasPointerCapture?.(pointerId)) canvas.releasePointerCapture(pointerId); } catch { /* gone */ }
+    }
+    if (this.interactiveHeld) {
+      this.interactiveHeld = false;
+      this.interactionService.endInteractive();
+    }
+    if (began) {
+      try { this.getPaintEngine()?.cancelStroke?.(); }   // (the legacy no-engine path can't take its stamps back)
+      catch (e) { console.warn('RasterDrawingService: cancel stroke failed', e); }
+    }
+    this.renderer.scheduleRender?.();
+    this.onStrokeCancel.emit({ timestamp: Date.now(), began });
+    return true;
   }
 
   // ── Legacy fallback (used only when paint engine isn't available) ──

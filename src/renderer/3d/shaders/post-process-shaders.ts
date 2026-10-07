@@ -2,9 +2,9 @@
  * WGSL shaders for the scene post-processing stack.
  *
  * Pipeline:
- *   1. Bloom extract  — scene (bgra8unorm) → bright pixels (rgba16float)
+ *   1. Bloom extract  — scene (swap-chain format) → bright pixels (rgba16float)
  *   2. Blur H / V     — Gaussian blur on rgba16float (reuses BLOOM_BLUR_FS pattern)
- *   3. Bloom composite — scene + blurred bloom → output (bgra8unorm)
+ *   3. Bloom composite — scene + blurred bloom → output (swap-chain format)
  *   4. Grade+vignette  — combined color grading, radial vignette and the FILM look (grain + colour fringing)
  *
  * Passes 1–3 run only when bloom is enabled (the composite also applies film HALATION — a tint on the bloom).
@@ -27,7 +27,7 @@ struct VsOut {
 `;
 
 // ── 1. Bloom extract ──────────────────────────────────────────────────────────
-// Reads the bgra8unorm scene texture, outputs bright pixels to rgba16float.
+// Reads the scene texture (swap-chain format: bgra8unorm or rgba8unorm), outputs bright pixels to rgba16float.
 // Soft knee around threshold so the transition isn't a hard cut.
 // @group(0) binding 0: scene texture_2d<f32>
 // @group(0) binding 1: sampler
@@ -117,7 +117,7 @@ export const PP_BLOOM_UP_FS = /* wgsl */`
 
 // ── 3. Bloom composite ────────────────────────────────────────────────────────
 // Reads scene + blurred bloom; outputs scene with soft-knee bloom added.
-// Writes to bgra8unorm (swapchain format).
+// Writes to the swapchain format (bgra8unorm or rgba8unorm).
 // @group(0) binding 0: scene texture_2d<f32>
 // @group(0) binding 1: bloom (blurred) texture_2d<f32>
 // @group(0) binding 2: sampler
@@ -147,7 +147,7 @@ struct BloomParams {
 // ── 4. Color grade + vignette ─────────────────────────────────────────────────
 // Combined pass: brightness → contrast → saturation → tint → vignette.
 // Any effect can be effectively disabled by using neutral values.
-// Writes to bgra8unorm.
+// Writes to the swapchain format.
 // @group(0) binding 0: source texture_2d<f32>
 // @group(0) binding 1: sampler
 // @group(0) binding 2: GradeVigParams uniform (64 bytes — packGradeVigParams in post-process-pass.ts)

@@ -7,11 +7,13 @@
  *   3. Post-IK world matrices — skel.computeWorldMatrices()
  *   4. Constraints — solveAllConstraints(skel)   ← this module
  *   5. Final world matrices — skel.computeWorldMatrices()
+ * (solveIKAndConstraints below runs this with ONE full pass: 3 and 5 are partial subtree recomputes.)
  */
 
 import { mat4, quat, vec3 } from 'gl-matrix';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import type { Joint3D, JointConstraint } from '../../types/armature-3d';
+import { solveAllIKChains } from './ik-solver';
 
 // ── Math helpers ──────────────────────────────────────────────────────────────
 
@@ -179,13 +181,17 @@ function applyStretchTo(joint: Joint3D, joints: Joint3D[], c: Extract<JointConst
  * Evaluate all joint constraints on the skeleton.
  * Caller must have already run IK and called computeWorldMatrices() once before
  * calling this. After this returns, caller calls computeWorldMatrices() one final
- * time to propagate constraint overrides through the hierarchy.
+ * time to propagate constraint overrides through the hierarchy — or, cheaper and
+ * bit-identical, `skeleton.recomputeSubtrees(touched)` with the joints collected in
+ * `touched` (every joint carrying a constraint: only their subtrees can change).
  */
-export function solveAllConstraints(skeleton: Skeleton3D): void {
+export function solveAllConstraints(skeleton: Skeleton3D, touched?: number[]): void {
     const joints = skeleton.data.joints;
     const nodeMatrix = skeleton.objectTransform;   // character object transform on the root
-    for (const joint of joints) {
+    for (let ji = 0; ji < joints.length; ji++) {
+        const joint = joints[ji];
         if (!joint.constraints?.length) continue;
+        touched?.push(ji);
         for (const c of joint.constraints) {
             switch (c.type) {
                 case 'lookAt':        applyLookAt(joint, joints, c);       break;
@@ -197,6 +203,32 @@ export function solveAllConstraints(skeleton: Skeleton3D): void {
             recomputeWorldMatrix(joint, joints, nodeMatrix);
         }
     }
+}
+
+/**
+ * The per-frame armature solve — FK → IK → constraints → final matrices — with ONE full FK pass (mobile-parity
+ * §7.3d). It used to call computeWorldMatrices() up to 3× a frame (FK, post-IK, final). Each later pass only
+ * re-derived joints whose inputs a solver had just changed — IK writes ikRotation on its chains' intermediate joints,
+ * constraints write constraintRotation/Scale on the constrained joints — so they are now partial recomputes of just
+ * those subtrees (Skeleton3D.recomputeSubtrees), with bit-identical final world + skin matrices. The post-IK pass is
+ * kept (as a partial) only when constraints follow, because they READ world matrices.
+ * `scratch` (optional) is a reusable index list (no per-frame allocation). Returns the joint count recomputed by the
+ * partial passes (for instrumentation / tests).
+ */
+export function solveIKAndConstraints(skeleton: Skeleton3D, hasIK: boolean, hasConstraints: boolean, scratch: number[] = []): number {
+    skeleton.computeWorldMatrices();                     // 1. FK (the one full pass)
+    scratch.length = 0;
+    if (hasIK) solveAllIKChains(skeleton, scratch);      // 2. IK → `scratch` = top joint of each moved chain
+    let partial = 0;
+    if (hasConstraints) {
+        partial += skeleton.recomputeSubtrees(scratch);  // 3. post-IK matrices (only the IK-moved subtrees)
+        scratch.length = 0;
+        solveAllConstraints(skeleton, scratch);          // 4. constraints → `scratch` = constrained joints
+    }
+    partial += skeleton.recomputeSubtrees(scratch);      // 5. final matrices (only what 2/4 changed)
+    scratch.length = 0;
+    skeleton.matricesDirty = true;
+    return partial;
 }
 
 /** Clear ephemeral constraint state (call when constraints change or are removed). */

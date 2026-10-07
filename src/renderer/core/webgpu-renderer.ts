@@ -97,6 +97,7 @@ import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { RenderListIndex, RL_2D, RL_3D, RL_SKELETON, type RenderListNode } from './render-list-index';
 import { RD, rdColorLoad, rdDepthLoad, rdCanvasAlphaMode } from '../3d/render-debug';
+import { pickCanvasFormat, readbackToRgba, FALLBACK_CANVAS_FORMAT } from './canvas-format';
 
 /** WebGPURenderer.captureRealFrame result: the raw pixels the renderer produced (RGBA order, alpha as stored, i.e.
  *  premultiplied) and where they were read: 'swapchain' = the canvas texture itself at the end of the frame;
@@ -250,7 +251,11 @@ export class WebGPURenderer {
   public canvas!: HTMLCanvasElement;
   private device!: GPUDevice;
   private context!: GPUCanvasContext;
-  private swapChainFormat: GPUTextureFormat = 'bgra8unorm';
+  /** The canvas (swap-chain) format: 'bgra8unorm' until initWebGPU picks the device's preferred one (canvas-format.ts,
+   *  CRASH-6). Chosen ONCE per renderer, before any pipeline exists; every canvas / lastFrameTex target reads it. */
+  private swapChainFormat: GPUTextureFormat = FALLBACK_CANVAS_FORMAT;
+  /** True once initWebGPU chose the format (a re-init keeps it: the pipelines were built for it). */
+  private _canvasFormatChosen = false;
 
   // Resolves once initWebGPU() has acquired the device + configured the
   // context. Lets the host (e.g. the Shell UI) await WebGPU readiness without
@@ -1264,7 +1269,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     tier: GpuTier; reasons: string[]; caps: GpuCaps; safeMode: boolean;
     adapter: GpuAdapterFacts | null; gpuName: string | null;
     features: string[]; limits: Record<string, number>; adapterLimits: Record<string, number>;
-    canvas: { cssWidth: number; cssHeight: number; width: number; height: number; windowDpr: number };
+    /** format = the configured swap-chain format; preferredFormat = navigator.gpu.getPreferredCanvasFormat() (they
+     *  differ only under the localStorage 'salsa.gpu.canvasFormat' override, CRASH-6). */
+    canvas: { cssWidth: number; cssHeight: number; width: number; height: number; windowDpr: number; format: GPUTextureFormat; preferredFormat: GPUTextureFormat | null };
     status: GpuDeviceStatusInfo; lastLoss: GpuLossRecord | null;
     breadcrumbs: GpuCrumb[]; openOps: string[]; errors: GpuErrorRecord[];
     previousSession: { at: number; crumbs: GpuCrumb[]; open: string[] } | null;
@@ -1279,12 +1286,15 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     try { features = this.device ? [...(this.device.features as unknown as Iterable<string>)].sort() : []; } catch { features = []; }
     let rect = { width: 0, height: 0 };
     try { rect = this.canvas?.getBoundingClientRect() ?? rect; } catch { /* no layout */ }
+    let preferredFormat: GPUTextureFormat | null = null;
+    try { preferredFormat = typeof navigator !== 'undefined' ? navigator.gpu?.getPreferredCanvasFormat() ?? null : null; } catch { /* no WebGPU */ }
     return {
       tier: this._gpuTier, reasons: this._gpuTierReasons.slice(), caps: this.getGpuCaps(), safeMode: isGpuSafeModeStored(),
       adapter: this._adapterInfo ? { ...this._adapterInfo } : null, gpuName: this._gpuName,
       features, limits: lim(this.device?.limits), adapterLimits: lim(this._adapter?.limits),
       canvas: { cssWidth: rect.width, cssHeight: rect.height, width: this.canvas?.width ?? 0, height: this.canvas?.height ?? 0,
-        windowDpr: (typeof window !== 'undefined' && window.devicePixelRatio) || 1 },
+        windowDpr: (typeof window !== 'undefined' && window.devicePixelRatio) || 1,
+        format: this.swapChainFormat, preferredFormat },
       status: this.getDeviceStatus(), lastLoss: readLastGpuLoss(),
       breadcrumbs: getGpuCrumbs(), openOps: getOpenGpuOps(), errors: getGpuErrors(),
       previousSession: this._prevSessionCrumbs,
@@ -1910,12 +1920,16 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         The canvas context is the bridge between the WebGPU rendering pipeline and the HTML canvas. 
         It’s where the WebGPU commands will output the rendered content.
 
-        Note: The swap chain format we use is bgra8unorm ("blue-green-red-alpha with 8 bits per channel and normalized values"). 
+        Note: The swap chain format is the device's PREFERRED canvas format (navigator.gpu.getPreferredCanvasFormat():
+        bgra8unorm on desktop Chrome / Windows, rgba8unorm on Android), chosen once here (canvas-format.ts, CRASH-6).
+        Any other format makes the compositor convert / copy every frame. Every pipeline + texture that targets the
+        canvas or lastFrameTex is built for this.swapChainFormat, and every read-back honours it (readbackToRgba).
         The swap chain format determines how the image data is represented in memory before being displayed on the screen.
         Also, alphaMode: 'premultiplied' is used. This setting indicates how the alpha channel (transparency) is handled. 
         'premultiplied' means that the color values have already been multiplied by the alpha value, which is a common way of 
         handling transparency in rendering.
         --------------------------------------------------------------------------------------------------------------------------*/
+        if (!this._canvasFormatChosen) { this.swapChainFormat = pickCanvasFormat(); this._canvasFormatChosen = true; }
         this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
         this.context.configure({
             device: unwrapDevice(this.device),
@@ -3046,16 +3060,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     private async _finishRealShot(p: RealShotPending): Promise<void> {
         try {
             await p.buf.mapAsync(GPUMapMode.READ);
-            const src = new Uint8Array(p.buf.getMappedRange());
-            const out = new Uint8ClampedArray(p.w * p.h * 4);
-            const bgra = String(p.format).startsWith('bgra');
-            for (let y = 0, d = 0; y < p.h; y++) {
-                const row = y * p.padded;
-                for (let x = 0; x < p.w; x++, d += 4) {
-                    const i = row + x * 4;
-                    out[d] = bgra ? src[i + 2] : src[i]; out[d + 1] = src[i + 1]; out[d + 2] = bgra ? src[i] : src[i + 2]; out[d + 3] = src[i + 3];
-                }
-            }
+            const out = readbackToRgba(new Uint8Array(p.buf.getMappedRange()), p.w, p.h, p.padded, p.format);   // B/R swapped only for BGRA
             p.buf.unmap(); p.buf.destroy();
             const r: RealFrameReadback = { rgba: out, width: p.w, height: p.h, format: p.format, source: p.source };
             for (const x of p.waiters) x.resolve(r);
@@ -4469,21 +4474,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         this.device.queue.submit([enc.finish()]);
         await readBuf.mapAsync(GPUMapMode.READ);
 
-        const src = new Uint8Array(readBuf.getMappedRange());
-        const rgba = new Uint8ClampedArray(w * h * 4);
-
-        // Converts BGRA to RGBA on CPU + strip padding
-        let dst = 0;
-        for (let y = 0; y < h; y++) {
-            const row = y * padded;
-            for (let x = 0; x < w; x++) {
-            const i = row + x * 4;
-            rgba[dst++] = src[i + 2]; // R
-            rgba[dst++] = src[i + 1]; // G
-            rgba[dst++] = src[i + 0]; // B
-            rgba[dst++] = src[i + 3]; // A
-            }
-        }
+        // Strip the row padding; swap B/R only when the canvas format is BGRA (CRASH-6: Android's is rgba8unorm).
+        const rgba = readbackToRgba(new Uint8Array(readBuf.getMappedRange()), w, h, padded, this.lastFrameTex?.format ?? this.swapChainFormat);
 
         readBuf.unmap();
         readBuf.destroy();
@@ -4895,25 +4887,11 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     this.device.queue.submit([enc.finish()]);
     await readBuf.mapAsync(GPUMapMode.READ);
 
-    const src = new Uint8Array(readBuf.getMappedRange());
-    const rgba = new Uint8ClampedArray(srcW * srcH * 4);
-    let dst = 0;
-    for (let row = 0; row < srcH; row++) {
-      const base = row * padded;
-      for (let col = 0; col < srcW; col++) {
-        const i = base + col * 4;
-        // bgra8unorm → RGBA. The frame is rendered with "over" blending onto a (possibly transparent) clear, so its
-        // alpha is PREMULTIPLIED — un-premultiply to straight alpha here, which canvas/ImageData/PNG expect (fixes
-        // dark halos on anti-aliased/semi-transparent edges). No-op for opaque pixels (a=255) → thumbnails unchanged.
-        const a = src[i + 3];
-        if (a === 0) { rgba[dst++] = 0; rgba[dst++] = 0; rgba[dst++] = 0; rgba[dst++] = 0; continue; }
-        const inv = a >= 255 ? 1 : 255 / a;
-        rgba[dst++] = src[i + 2] * inv;
-        rgba[dst++] = src[i + 1] * inv;
-        rgba[dst++] = src[i + 0] * inv;
-        rgba[dst++] = a;
-      }
-    }
+    // Canvas format → RGBA (B/R swapped only for BGRA, CRASH-6). The frame is rendered with "over" blending onto a
+    // (possibly transparent) clear, so its alpha is PREMULTIPLIED — un-premultiply to straight alpha here, which
+    // canvas/ImageData/PNG expect (fixes dark halos on anti-aliased/semi-transparent edges). No-op for opaque pixels
+    // (a=255) → thumbnails unchanged.
+    const rgba = readbackToRgba(new Uint8Array(readBuf.getMappedRange()), srcW, srcH, padded, this.lastFrameTex?.format ?? this.swapChainFormat, { unpremultiply: true });
     readBuf.unmap();
     readBuf.destroy();
 

@@ -1,7 +1,7 @@
 // pipeline-manager.ts
 export class PipelineManager {
     private device: GPUDevice;
-    private swapChainFormat: GPUTextureFormat = 'bgra8unorm';
+    private swapChainFormat: GPUTextureFormat;
     private sampleCount: number = 1; // 4x MSAA
 
     private shapePipeline!: GPURenderPipeline;
@@ -25,8 +25,11 @@ export class PipelineManager {
     private texturedBGL!: GPUBindGroupLayout;
     private texturedSampler!: GPUSampler;
   
-    constructor(device: GPUDevice) {
+    /** @param swapChainFormat the canvas format every pipeline here targets (they all draw into the canvas /
+     *  lastFrameTex): WebGPURenderer.getSwapChainFormat(), i.e. the device's preferred format (CRASH-6). */
+    constructor(device: GPUDevice, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
         this.device = device;
+        this.swapChainFormat = swapChainFormat;
 
         this.createBackgroundRenderPipeline();
         this.createGridOverlayRenderPipeline();

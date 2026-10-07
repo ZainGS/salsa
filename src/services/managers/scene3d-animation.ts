@@ -1132,14 +1132,18 @@ export class Scene3DAnimation {
                     const durSec = clip.endFrame / Math.max(1, clip.fps);
                     const fade = Math.min(0.25, durSec * 0.3);
                     const w = Math.max(0, Math.min(1, Math.min(tSec / fade, (durSec - tSec) / fade)));
+                    // No FK inside the clip apply: nothing below reads world matrices, and _finishIdleRig runs the
+                    // full FK pass on the final pose (§7.3d — was a wasted extra pass a frame). A non-parent-first rig
+                    // keeps it (its FK result depends on the previous world state, so the extra pass is not a no-op).
+                    const clipFK = !skel.isParentFirst();
                     if (w >= 0.999) {
-                        applySkeletonClipAtFrame(clip, skel, frame);
+                        applySkeletonClipAtFrame(clip, skel, frame, clipFK);
                         this._clearClipIK(skel, clip);
                     } else {
                         // snapshot the idle pose on the clip's rotation joints, apply the clip, slerp back by w
                         const idleQ = new Map<number, [number, number, number, number]>();
                         for (const tr of clip.tracks) if (tr.channel === 'rotation') idleQ.set(tr.jointIndex, [...skel.data.joints[tr.jointIndex].localRotation] as [number, number, number, number]);
-                        applySkeletonClipAtFrame(clip, skel, frame);
+                        applySkeletonClipAtFrame(clip, skel, frame, clipFK);
                         this._clearClipIK(skel, clip);
                         const tmp = quat.create();
                         for (const [ji, q0] of idleQ) {
@@ -1198,8 +1202,15 @@ export class Scene3DAnimation {
      *  Measures the CLEAN pose (scale reset first) so the span signal doesn't feed back on itself. */
     private _finishIdleRig(skel: Skeleton3D, rig: IdleRig, bodyMeshId: string): void {
         const ss = this._squashStretch.get(bodyMeshId);
-        const lb = ss?.enabled ? skel.data.joints.find(j => j.name === 'lowerback') : undefined;
-        const sp = ss?.enabled ? skel.data.joints.find(j => j.name === 'spine') : undefined;
+        const joints = skel.data.joints;
+        const lbI = ss?.enabled ? joints.findIndex(j => j.name === 'lowerback') : -1;
+        const spI = ss?.enabled ? joints.findIndex(j => j.name === 'spine') : -1;
+        const lb = lbI >= 0 ? joints[lbI] : undefined;
+        const sp = spI >= 0 ? joints[spI] : undefined;
+        // ONE full FK pass a frame (§7.3d). Every later pass only re-derives the subtrees whose inputs just changed
+        // (squash → the lowerback/spine scale; foot IK → the leg joints IK wrote) — bit-identical to the full passes
+        // it used to run (up to 4 a frame with squash + foot IK).
+        const sub = this._idleSubtrees; sub.length = 0;
         if (ss?.enabled && lb && sp) {
             lb.localScale = [1, 1, 1]; sp.localScale = [1, 1, 1];   // clean pose for the measurement
             skel.computeWorldMatrices();
@@ -1214,7 +1225,9 @@ export class Scene3DAnimation {
             const k = Math.max(0.88, Math.min(1.15, 1 + (ratio - 1) * ss.intensity));   // Y factor (clamped)
             const s = 1 / Math.sqrt(k);                                   // X/Z = volume-preserving
             lb.localScale = [s, k, s]; sp.localScale = [s, k, s];
-            skel.computeWorldMatrices();
+            sub.push(lbI, spI);
+            skel.recomputeSubtrees(sub);   // only lowerback's + spine's subtrees changed since the measuring pass
+            sub.length = 0;
         } else {
             skel.computeWorldMatrices();
         }
@@ -1225,8 +1238,8 @@ export class Scene3DAnimation {
         // from the 1st result (foot already near target → origDir ≈ newDir), collapsing the conversion error to ~0
         // so the feet lock solid. Cheap: 2 leg chains. (Bump to 3 if any residual chase remains.)
         if (rig.legMode === 'ik' && rig.legChains?.length) {
-            solveAllIKChains(skel); skel.computeWorldMatrices();
-            solveAllIKChains(skel); skel.computeWorldMatrices();
+            solveAllIKChains(skel, sub); skel.recomputeSubtrees(sub); sub.length = 0;   // each pass: only the IK-moved legs
+            solveAllIKChains(skel, sub); skel.recomputeSubtrees(sub); sub.length = 0;
         }
         skel.matricesDirty = true;
         this.host.keepSpringsAlive(rig.skelId, 250);
@@ -1238,6 +1251,8 @@ export class Scene3DAnimation {
     // a fresh Map rebuilt over ALL joints every frame) + reused quats (was quat.create() + an array literal
     // per joint-set, ~15/frame). WeakMap auto-frees when the skeleton is GC'd (no manual cleanup needed).
     private _idleIdxCache = new WeakMap<Skeleton3D, { n: number; idx: Map<string, number> }>();
+    /** Reused subtree-root list for _finishIdleRig's partial FK passes. */
+    private readonly _idleSubtrees: number[] = [];
     private readonly _idleTmpQuat = quat.create();
     private readonly _idleOutQuat = quat.create();
 

@@ -32,8 +32,8 @@ import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { IKChain } from '../../types/armature-3d';
-import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solver';
-import { solveAllConstraints } from '../../renderer/3d/constraint-solver';
+import { clearAllIKRotations } from '../../renderer/3d/ik-solver';
+import { solveIKAndConstraints } from '../../renderer/3d/constraint-solver';
 import { solveSpringBones, resetSpringState } from '../../renderer/3d/spring-bone-solver';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { constrainCharacterScale, geometryMinY } from '../../game/character-scale';
@@ -216,6 +216,8 @@ export class Scene3DArmature {
     private _ikDragPlaneNormal: vec3 = vec3.create();
     private _ikDragPlanePoint: vec3 = vec3.create();
     private _ikSolveCallback: (() => boolean) | null = null;
+    /** Reused joint-index list for solveIKAndConstraints (no per-frame allocation). */
+    private readonly _ikSolveScratch: number[] = [];
     // The per-frame spring solve registered by enableOrbitControls / torn down by disableOrbitControls.
     private _springSolveCallback: (() => boolean) | null = null;
     private _springLastTime = 0;
@@ -559,18 +561,9 @@ export class Scene3DArmature {
             const hasIK          = skel.data.ikChains?.some(c => c.enabled) ?? false;
             const hasConstraints = skel.data.joints.some(j => j.constraints?.length);
             if (!hasIK && !hasConstraints) return false;
-            // Step 1: FK world matrices
-            skel.computeWorldMatrices();
-            // Step 2: IK solve
-            if (hasIK) solveAllIKChains(skel);
-            // Step 3: constraints need post-IK world matrices
-            if (hasConstraints) {
-                skel.computeWorldMatrices();
-                solveAllConstraints(skel);
-            }
-            // Step 4: final world matrices with constraint overrides
-            skel.computeWorldMatrices();
-            skel.matricesDirty = true;
+            // FK → IK → constraints → final matrices, with ONE full FK pass: the post-IK and final passes are partial
+            // recomputes of only the subtrees the solvers changed (was up to 3 full passes a frame — §7.3d).
+            solveIKAndConstraints(skel, hasIK, hasConstraints, this._ikSolveScratch);
             return false;
         };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._ikSolveCallback, 'ik+constraints');

@@ -12,6 +12,7 @@ import { WebGPURenderer } from '../renderer/core/webgpu-renderer';
 import { EventEmitter } from '../renderer/util/event-emitter';
 import type { RasterSelectionEngine, SelectionTool, SelectionInfo, SelectionMode } from '../renderer/raster/selection/raster-selection-engine';
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
+import { TouchGestureTracker } from '../renderer/util/touch-gesture-tracker';
 
 type ScaleHandle = 'topLeft' | 'top' | 'topRight' | 'left' | 'right' | 'bottomLeft' | 'bottom' | 'bottomRight';
 
@@ -56,10 +57,24 @@ export class RasterSelectionService {
   // Lasso accumulator
   private lassoPoints: Array<{ x: number; y: number }> = [];
 
+  // TOUCH-5 (docs/ui/touch-controls.md): one-finger arbitration — a pinch / two-finger pan never leaves a marquee, a
+  // lasso, a deselect, a committed transform or a moved / scaled selection behind. Mouse and pen are unchanged.
+  private readonly touches = new TouchGestureTracker();
+  /** A finger press not acted on yet: a DRAG once it moves TOUCH_START_PX, the usual click when it lifts first,
+   *  nothing at all when a second finger lands first. */
+  private touchPress: { pointerId: number; pointerType: string; button: number; clientX: number; clientY: number } | null = null;
+  /** The finger driving the drag (its moves only), and whether its pointerdown is still being handled. */
+  private dragIsTouch = false;
+  private dragPointerId: number | null = null;
+  private touchDragStarting = false;
+  /** The transform when a finger's transform drag started (a pinch puts it back). */
+  private dragStartTransform: NonNullable<SelectionInfo['transform']> | null = null;
+
   // Bound listeners
-  private downBound = (e: PointerEvent) => this.onPointerDown(e);
-  private moveBound = (e: PointerEvent) => this.onPointerMove(e);
-  private upBound = (e: PointerEvent) => this.onPointerUp(e);
+  private downBound = (e: PointerEvent) => this.handleDown(e);
+  private moveBound = (e: PointerEvent) => this.handleMove(e);
+  private upBound = (e: PointerEvent) => this.handleUp(e);
+  private cancelBound = (e: PointerEvent) => this.handlePointerCancel(e);
 
   // Events for UI
   public onSelectionChanged = new EventEmitter<SelectionInfo>();
@@ -183,6 +198,101 @@ export class RasterSelectionService {
     removeZonelessListener(canvas, 'pointerdown', this.downBound);
     removeZonelessListener(canvas, 'pointermove', this.moveBound);
     removeZonelessListener(canvas, 'pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointercancel', this.cancelBound);
+  }
+
+  // ── Touch arbitration (TOUCH-5) ───────────────────────────────────
+
+  private async handleDown(ev: PointerEvent): Promise<void> {
+    const verdict = this.touches.down(ev);
+    if (verdict === 'gesture') { this.cancelTouchDrag(); return; }
+    if (verdict === 'ignore') return;
+    if (ev.pointerType !== 'touch') return this.onPointerDown(ev);
+    if (!this.isEnabled || ev.button !== 0 || this.isDragging || this.touchPress) return;
+    // Nothing happens yet: committing a transform / starting a marquee waits until the finger moves or lifts.
+    this.touchPress = { pointerId: ev.pointerId, pointerType: ev.pointerType, button: ev.button, clientX: ev.clientX, clientY: ev.clientY };
+  }
+
+  private async handleMove(ev: PointerEvent): Promise<void> {
+    if (ev.pointerType === 'touch') {
+      if (this.touches.blocked || this.touchDragStarting) return;
+      const p = this.touchPress;
+      if (p) {
+        if (ev.pointerId !== p.pointerId) return;
+        if (Math.hypot(ev.clientX - p.clientX, ev.clientY - p.clientY) < TouchGestureTracker.TOUCH_START_PX) return;
+        this.touchPress = null;
+        await this.startTouchDrag(p);
+      }
+      if (this.dragIsTouch && ev.pointerId !== this.dragPointerId) return;
+    } else if (this.dragIsTouch) return;
+    this.onPointerMove(ev);
+  }
+
+  private async handleUp(ev: PointerEvent): Promise<void> {
+    this.touches.up(ev);
+    if (ev.pointerType === 'touch') {
+      const p = this.touchPress;
+      if (p && p.pointerId === ev.pointerId) {
+        // A tap: the click it always was (deselect / magic wand / commit outside / enter transform).
+        this.touchPress = null;
+        await this.onPointerDown(p as unknown as PointerEvent);
+        await this.onPointerUp(ev);
+        return;
+      }
+      if (this.dragIsTouch && ev.pointerId !== this.dragPointerId) return;
+    } else if (this.dragIsTouch) return;
+    await this.onPointerUp(ev);
+    if (!this.isDragging) { this.dragIsTouch = false; this.dragPointerId = null; this.dragStartTransform = null; }
+  }
+
+  /** pointercancel: a finger press / drag is dropped and put back (mouse / pen: no change — not handled, as before). */
+  private handlePointerCancel(ev: PointerEvent): void {
+    this.touches.up(ev);
+    if (ev.pointerType !== 'touch') return;
+    if (this.touchPress?.pointerId === ev.pointerId) this.touchPress = null;
+    if (this.dragIsTouch && ev.pointerId === this.dragPointerId) this.cancelTouchDrag();
+  }
+
+  private async startTouchDrag(p: NonNullable<RasterSelectionService['touchPress']>): Promise<void> {
+    this.dragIsTouch = true;
+    this.dragPointerId = p.pointerId;
+    this.touchDragStarting = true;
+    try { await this.onPointerDown(p as unknown as PointerEvent); }
+    finally { this.touchDragStarting = false; }
+    const t = this.isTransformDrag ? this.getEngine()?.getSelectionInfo().transform : null;
+    this.dragStartTransform = t ? { ...t } : null;
+    if (!this.isDragging) { this.dragIsTouch = false; this.dragPointerId = null; return; }
+    if (this.touches.blocked) this.cancelTouchDrag();   // a second finger landed while the press was handled
+  }
+
+  /** A second finger (or pointercancel) during a FINGER drag: drop the marquee / lasso, or put the transform back
+   *  where the drag found it. No selection change, no deselect, no commit. A mouse / pen drag is left alone. */
+  private cancelTouchDrag(): void {
+    this.touchPress = null;
+    if (!this.dragIsTouch) return;
+    this.dragIsTouch = false;
+    this.dragPointerId = null;
+    if (!this.isDragging) return;
+    const engine = this.getEngine();
+    const s = this.dragStartTransform;
+    if (this.isTransformDrag) {
+      if (engine && s) engine.updateTransform(s.translateX, s.translateY, s.scaleX, s.scaleY, s.rotation);
+    } else if (engine) {
+      engine.dragPreview = null;
+      engine.dragLassoPoints = null;
+    }
+    this.isDragging = false;
+    this.isTransformDrag = false;
+    this.activeHandle = null;
+    this.handleDragInitialBounds = null;
+    this.handleDragInitialScale = null;
+    this.handleDragInitialTranslate = null;
+    this.dragStartTexel = null;
+    this.dragCurrentTexel = null;
+    this.dragStartTransform = null;
+    this.lassoPoints = [];
+    this.renderer.scheduleRender();
+    this.emitChanged();
   }
 
   // ── Pointer event handlers ────────────────────────────────────────
@@ -534,6 +644,7 @@ export class RasterSelectionService {
     addZonelessListener(canvas, 'pointerdown', this.downBound);
     addZonelessListener(canvas, 'pointermove', this.moveBound);
     addZonelessListener(canvas, 'pointerup', this.upBound);
+    addZonelessListener(canvas, 'pointercancel', this.cancelBound);
     this.eventListenersAttached = true;
   }
 
@@ -544,7 +655,9 @@ export class RasterSelectionService {
     removeZonelessListener(canvas, 'pointerdown', this.downBound);
     removeZonelessListener(canvas, 'pointermove', this.moveBound);
     removeZonelessListener(canvas, 'pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointercancel', this.cancelBound);
     this.eventListenersAttached = false;
+    this.touches.reset();
     this.attachListeners();
   }
 }

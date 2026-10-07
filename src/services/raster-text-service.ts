@@ -16,6 +16,7 @@ import { WebGPURenderer } from '../renderer/core/webgpu-renderer';
 import { RasterTextStamp, TextStampParams } from '../renderer/raster/core/raster-text-stamp';
 import { EventEmitter } from '../renderer/util/event-emitter';
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
+import { TouchGestureTracker } from '../renderer/util/touch-gesture-tracker';
 
 export interface RasterTextState {
   /** Whether a text entry is currently in progress. */
@@ -75,6 +76,21 @@ export class RasterTextService {
 
   // Bound event handlers
   private handleClickBound = (e: PointerEvent) => this.handleClick(e);
+  // TOUCH-5 (docs/ui/touch-controls.md): a FINGER places / commits text on LIFT, and only if no second finger joined —
+  // a pinch used to commit the text being typed (stamping it into the layer) and open a new entry per finger.
+  private readonly touches = new TouchGestureTracker();
+  private touchPress: { pointerId: number; button: number; clientX: number; clientY: number } | null = null;
+  private handleUpBound = (e: PointerEvent) => {
+    this.touches.up(e);
+    const p = this.touchPress;
+    if (!p || e.pointerType !== 'touch' || e.pointerId !== p.pointerId) return;
+    this.touchPress = null;
+    this.placeAt(p as unknown as PointerEvent);   // where the finger landed, as the press always did
+  };
+  private handleCancelBound = (e: PointerEvent) => {
+    this.touches.up(e);
+    if (this.touchPress?.pointerId === e.pointerId) this.touchPress = null;
+  };
   private handleKeyBound = (e: KeyboardEvent) => this.handleKey(e);
 
   constructor(interactionService: InteractionService, renderer: WebGPURenderer) {
@@ -194,16 +210,34 @@ export class RasterTextService {
   private attachListeners(): void {
     const canvas = this.interactionService.canvas;
     addZonelessListener(canvas, 'pointerdown', this.handleClickBound);
+    addZonelessListener(canvas, 'pointerup', this.handleUpBound);
+    addZonelessListener(canvas, 'pointercancel', this.handleCancelBound);
     window.addEventListener('keydown', this.handleKeyBound);
   }
 
   private removeListeners(): void {
     const canvas = this.interactionService.canvas;
     removeZonelessListener(canvas, 'pointerdown', this.handleClickBound);
+    removeZonelessListener(canvas, 'pointerup', this.handleUpBound);
+    removeZonelessListener(canvas, 'pointercancel', this.handleCancelBound);
     window.removeEventListener('keydown', this.handleKeyBound);
+    this.touches.reset();
+    this.touchPress = null;
   }
 
   private handleClick(e: PointerEvent): void {
+    const verdict = this.touches.down(e);
+    if (verdict === 'gesture') { this.touchPress = null; return; }   // a pinch: no text placed, nothing committed
+    if (verdict === 'ignore') return;
+    if (e.pointerType === 'touch') {
+      if (this.isEnabled && e.button === 0) this.touchPress = { pointerId: e.pointerId, button: e.button, clientX: e.clientX, clientY: e.clientY };
+      return;
+    }
+    this.placeAt(e);
+  }
+
+  /** Commit any active text and start a new entry at the pointer (mouse / pen: on press; finger: on lift). */
+  private placeAt(e: PointerEvent): void {
     if (!this.isEnabled || e.button !== 0) return;
 
     const texel = this.toTexelCoords(e);

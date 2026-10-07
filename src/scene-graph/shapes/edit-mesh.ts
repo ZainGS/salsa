@@ -255,12 +255,84 @@ export class EditMesh {
   /** Evaluates base mesh + modifier stack → GPU-ready MeshGeometry. */
   compile(): MeshGeometry {
     let data = this._toEditMeshData();
+    let modded = false;
     for (const mod of this.modifiers) {
-      if (mod.enabled) data = mod.apply(data);
+      if (mod.enabled) { data = mod.apply(data); modded = true; }
     }
     const gpu = _buildGpuMesh(data);
     this.lastCompileSourceVerts = gpu.sourceVerts;
+    // mobile-parity 7.3d: remember what this compile was made from, so a vertex drag can patch it in place
+    // (patchCompiledPositions). A modifier stack maps vertices to outputs non-trivially → no incremental path.
+    this._ic = modded ? null : {
+      geom: gpu, verts: this.vertices, faces: this.faces, halfEdges: this.halfEdges,
+      nv: this.vertices.length, nf: this.faces.length, nh: this.halfEdges.length,
+      pos: _snapshotPositions(this.vertices), src: gpu.sourceVerts, cornerStart: null, corners: null, triMark: null,
+    };
     return gpu;
+  }
+
+  /** Incremental-compile state of the last compile() (null = none / a modifier stack was applied). */
+  private _ic: IncrementalCompile | null = null;
+
+  /**
+   * mobile-parity 7.3d (Mesh Edit vertex drag): bring `geom` — the MeshGeometry the LAST compile() returned, edited
+   * IN PLACE — in line with the current vertex POSITIONS without a recompile. Only the triangles touching a vertex
+   * that moved since the last compile / patch are rewritten (their 3 corners' positions + the flat face normal and
+   * tangent, through the same arithmetic as compile(), so the bytes equal a fresh compile exactly). Valid only while
+   * the topology, UVs and colours are as at that compile: the vertex / face / half-edge ARRAYS must be the same
+   * objects with the same lengths (every topology operation rebuilds them) and no modifier may be enabled.
+   *
+   * Returns the rewritten OUTPUT-vertex spans flattened as [start, count, start, count, ...] in ascending order
+   * ([] = nothing moved), or null when the incremental path does not apply (the caller recompiles).
+   */
+  patchCompiledPositions(geom: MeshGeometry): number[] | null {
+    const ic = this._ic;
+    if (!ic || ic.geom !== geom || ic.verts !== this.vertices || ic.faces !== this.faces || ic.halfEdges !== this.halfEdges
+        || this.vertices.length !== ic.nv || this.faces.length !== ic.nf || this.halfEdges.length !== ic.nh) return null;
+    for (const mod of this.modifiers) if (mod.enabled) return null;
+    const out = geom.vertices as Float32Array, src = ic.src, nOut = src.length;
+    if (!(out instanceof Float32Array) || out.length !== nOut * FLOATS_PER_VERT) return null;
+    if (!ic.cornerStart) _buildCornerMap(ic);
+    const cs = ic.cornerStart!, corners = ic.corners!, mark = ic.triMark!, pos = ic.pos, verts = this.vertices;
+
+    // 1. Which vertices moved since the last compile / patch → the triangles that use them.
+    const dirty: number[] = [];
+    for (let v = 0, o = 0; v < verts.length; v++, o += 3) {
+      const p = verts[v];
+      if (p.x === pos[o] && p.y === pos[o + 1] && p.z === pos[o + 2]) continue;
+      pos[o] = p.x; pos[o + 1] = p.y; pos[o + 2] = p.z;
+      for (let k = cs[v]; k < cs[v + 1]; k++) {
+        const t = (corners[k] / 3) | 0;
+        if (!mark[t]) { mark[t] = 1; dirty.push(t); }
+      }
+    }
+    if (dirty.length === 0) return [];
+
+    // 2. Rewrite those triangles (positions + flat frame); UVs / colours / source map are untouched.
+    const fr = _FRAME;
+    for (const t of dirty) {
+      mark[t] = 0;
+      const c0 = t * 3;
+      const p0 = verts[src[c0]], p1 = verts[src[c0 + 1]], p2 = verts[src[c0 + 2]];
+      _triFrame(p0, p1, p2, fr);
+      _writeCorner(out, c0, p0, fr);
+      _writeCorner(out, c0 + 1, p1, fr);
+      _writeCorner(out, c0 + 2, p2, fr);
+    }
+
+    // 3. Coalesce into ascending output-vertex spans (a small gap is re-sent rather than split into another write).
+    dirty.sort((a, b) => a - b);
+    const spans: number[] = [];
+    let s = dirty[0] * 3, e = s + 3;
+    for (let i = 1; i < dirty.length; i++) {
+      const a = dirty[i] * 3;
+      if (a - e <= PATCH_SPAN_GAP) { e = a + 3; continue; }
+      spans.push(s, e - s);
+      s = a; e = a + 3;
+    }
+    spans.push(s, e - s);
+    if (spans.length / 2 > PATCH_MAX_SPANS) return [spans[0], spans[spans.length - 2] + spans[spans.length - 1] - spans[0]];
+    return spans;
   }
 
   /**
@@ -1980,6 +2052,79 @@ export class EditMesh {
   }
 }
 
+// ── Incremental compile (mobile-parity 7.3d: Mesh Edit vertex drag) ───────────
+
+/** What one compile() was made from (see EditMesh.patchCompiledPositions). */
+interface IncrementalCompile {
+  geom: MeshGeometry;
+  verts: EditVertex[]; faces: EditFace[]; halfEdges: EditHalfEdge[];
+  nv: number; nf: number; nh: number;
+  /** Vertex positions (doubles) as last written into `geom`. */
+  pos: Float64Array;
+  /** Output vertex → source vertex (compile's sourceVerts). */
+  src: Uint32Array;
+  /** Source vertex → its output corners (CSR), built on the first patch. */
+  cornerStart: Int32Array | null;
+  corners: Int32Array | null;
+  /** Per-triangle scratch flag for the patch (all zero between patches). */
+  triMark: Uint8Array | null;
+}
+
+/** Output-vertex gap (≈1.5 KB) below which two dirty spans are sent as one write. */
+const PATCH_SPAN_GAP = 32;
+/** Above this many spans a patch reports one covering span (one write beats hundreds of tiny ones). */
+const PATCH_MAX_SPANS = 64;
+
+function _snapshotPositions(verts: EditVertex[]): Float64Array {
+  const pos = new Float64Array(verts.length * 3);
+  for (let i = 0, o = 0; i < verts.length; i++, o += 3) { const v = verts[i]; pos[o] = v.x; pos[o + 1] = v.y; pos[o + 2] = v.z; }
+  return pos;
+}
+
+function _buildCornerMap(ic: IncrementalCompile): void {
+  const src = ic.src, nv = ic.nv;
+  const cs = new Int32Array(nv + 1);
+  for (let c = 0; c < src.length; c++) if (src[c] < nv) cs[src[c] + 1]++;
+  for (let v = 0; v < nv; v++) cs[v + 1] += cs[v];
+  const fill = cs.slice(0, nv);
+  const corners = new Int32Array(cs[nv]);
+  for (let c = 0; c < src.length; c++) if (src[c] < nv) corners[fill[src[c]]++] = c;
+  ic.cornerStart = cs; ic.corners = corners; ic.triMark = new Uint8Array((src.length / 3) | 0);
+}
+
+/** Scratch for _triFrame: [nx, ny, nz, tx, ty, tz]. */
+const _FRAME = new Float64Array(6);
+
+type P3 = { x: number; y: number; z: number };
+
+/** Flat-shading frame of triangle (p0, p1, p2): the unit face normal and a Gram-Schmidt tangent perpendicular to it,
+ *  into out[0..5]. The ONE implementation behind compile() and patchCompiledPositions (so both write identical bits). */
+function _triFrame(p0: P3, p1: P3, p2: P3, out: Float64Array): void {
+  const ax = p1.x - p0.x, ay = p1.y - p0.y, az = p1.z - p0.z;
+  const bx = p2.x - p0.x, by = p2.y - p0.y, bz = p2.z - p0.z;
+  let nx = ay * bz - az * by;
+  let ny = az * bx - ax * bz;
+  let nz = ax * by - ay * bx;
+  const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+  nx /= nl; ny /= nl; nz /= nl;
+  let tx = Math.abs(nx) > 0.9 ? 0 : 1;
+  let ty = Math.abs(nx) > 0.9 ? 1 : 0;
+  let tz = 0;
+  const dot = tx * nx + ty * ny + tz * nz;
+  tx -= dot * nx; ty -= dot * ny; tz -= dot * nz;
+  const tl = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+  tx /= tl; ty /= tl; tz /= tl;
+  out[0] = nx; out[1] = ny; out[2] = nz; out[3] = tx; out[4] = ty; out[5] = tz;
+}
+
+/** Write output vertex `c`'s position + flat frame (the UV at +6..7 and tangent w at +11 are left as compiled). */
+function _writeCorner(buf: Float32Array, c: number, p: P3, fr: Float64Array): void {
+  const o = c * FLOATS_PER_VERT;
+  buf[o] = p.x; buf[o + 1] = p.y; buf[o + 2] = p.z;
+  buf[o + 3] = fr[0]; buf[o + 4] = fr[1]; buf[o + 5] = fr[2];
+  buf[o + 8] = fr[3]; buf[o + 9] = fr[4]; buf[o + 10] = fr[5];
+}
+
 // ── GPU mesh builder ──────────────────────────────────────────────────────────
 
 /**
@@ -2010,29 +2155,16 @@ function _buildGpuMesh(data: EditMeshData): MeshGeometry & { vertexColors: Float
   const sourceVerts = new Uint32Array(vertCount);
 
   let vi = 0;
+  const fr = _FRAME;
   for (const [i0, i1, i2] of triList) {
     const triSrc = [i0, i1, i2];
     const p0 = data.vertices[i0];
     const p1 = data.vertices[i1];
     const p2 = data.vertices[i2];
 
-    // Face normal (flat shading)
-    const ax = p1.x - p0.x, ay = p1.y - p0.y, az = p1.z - p0.z;
-    const bx = p2.x - p0.x, by = p2.y - p0.y, bz = p2.z - p0.z;
-    let nx = ay * bz - az * by;
-    let ny = az * bx - ax * bz;
-    let nz = ax * by - ay * bx;
-    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-    nx /= nl; ny /= nl; nz /= nl;
-
-    // Gram-Schmidt tangent perpendicular to normal
-    let tx = Math.abs(nx) > 0.9 ? 0 : 1;
-    let ty = Math.abs(nx) > 0.9 ? 1 : 0;
-    let tz = 0;
-    const dot = tx * nx + ty * ny + tz * nz;
-    tx -= dot * nx; ty -= dot * ny; tz -= dot * nz;
-    const tl = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
-    tx /= tl; ty /= tl; tz /= tl;
+    // Face normal (flat shading) + Gram-Schmidt tangent — shared with the incremental drag patch (identical bits)
+    _triFrame(p0, p1, p2, fr);
+    const nx = fr[0], ny = fr[1], nz = fr[2], tx = fr[3], ty = fr[4], tz = fr[5];
 
     const ps = [p0, p1, p2];
     const uvs = [

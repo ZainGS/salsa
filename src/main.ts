@@ -49,7 +49,7 @@ async function startWebGPURendering(canvasId: string) {
     isRendererLive = true;
 
     // Get the device and pipelines from the WebGPU renderer
-    const pipelineManager = new PipelineManager(webgpuRenderer.getDevice());
+    const pipelineManager = new PipelineManager(webgpuRenderer.getDevice(), webgpuRenderer.getSwapChainFormat());   // the canvas format (CRASH-6)
 
     // Initialize caches and create the WebGPU render strategy for your shapes
     // Swap to dependency injection in the future if multiple renderers are
@@ -194,7 +194,7 @@ async function startWebGPURendering(canvasId: string) {
     // the document restore that follows re-registers every shape. (Constructors here register no callbacks.)
     webgpuRenderer.registerGpuResourceOwner('2d-render-stack', (device) => {
         TextureCache.clearGpuTextures();
-        rebuildInPlace(pipelineManager, new PipelineManager(device));
+        rebuildInPlace(pipelineManager, new PipelineManager(device, webgpuRenderer.getSwapChainFormat()));
         rebuildInPlace(bindGroupManager, new BindGroupManager(device, pipelineManager));
         rebuildInPlace(cacheService, new CacheService(device, interactionService, bindGroupManager, pipelineManager),
             ['sdfAtlas', 'textureArrayAtlas'] as never);   // the SDF tool + strategy hold these two

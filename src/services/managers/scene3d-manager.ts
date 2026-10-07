@@ -1441,6 +1441,9 @@ export class Scene3DManager {
     /** Re-upload vertices [start, start + count) of `mesh.geometry.vertices` after an IN-PLACE edit (no pool rebuild) — see
      *  Renderer3D.patchMeshVertices. The moving contact blobs (world-mover-shadows.ts) rewrite their quads with it. */
     patchMeshVertices3D(mesh: Mesh3D, start: number, count: number): boolean { return this.renderer3D?.patchMeshVertices?.(mesh, start, count) ?? false; }
+    /** mobile-parity 7.3d: after patchMeshVertices3D moved a mesh's vertex POSITIONS (the Mesh Edit drag fast path) —
+     *  its cached bounds and the shadow map refresh (Renderer3D.noteMeshVerticesMoved). */
+    noteMeshVerticesMoved3D(mesh: Mesh3D): void { this.renderer3D?.noteMeshVerticesMoved?.(mesh); }
     /** visual-polish #16: the Play player's feet (world space, the last rendered frame) + body height, or null outside
      *  Play. The city's moving contact blobs put one under the player. */
     get playerFeet3D(): { x: number; y: number; z: number; height: number; groundY: number } | null {

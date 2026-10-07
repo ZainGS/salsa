@@ -1,6 +1,11 @@
 import { mat4, quat, vec3 } from 'gl-matrix';
 import { Node } from './base/node';
-import type { SkeletonData, SkeletonAnimClip, IKChain, IKKeyframeTrack, SkeletonPose, SpringChain, SpringCollider } from '../../types/armature-3d';
+import type { SkeletonData, SkeletonAnimClip, IKChain, IKKeyframeTrack, SkeletonPose, SpringChain, SpringCollider, Joint3D } from '../../types/armature-3d';
+
+// FK scratch (computeWorldMatrices / recomputeSubtrees run synchronously, never re-entrant) — was two mat4
+// allocations per full pass.
+const _fkLocal = mat4.create() as Float32Array;
+const _fkTmp   = mat4.create() as Float32Array;
 
 /**
  * Skeleton3D — scene-graph node that owns a joint hierarchy.
@@ -75,47 +80,102 @@ export class Skeleton3D extends Node {
    */
   computeWorldMatrices(): void {
     const { joints } = this.data;
-    const local = mat4.create() as Float32Array;
-    const tmp   = mat4.create() as Float32Array;
+    for (const j of joints) this._fkJoint(j, joints);
+    this.matricesDirty = true;
+    this.poseVersion++;
+  }
 
-    for (const j of joints) {
-      const rot   = (j.constraintRotation ?? j.ikRotation ?? j.localRotation) as unknown as quat;
-      const scale = (j.constraintScale ?? j.localScale) as unknown as vec3;
-      mat4.fromRotationTranslationScale(
-        local as unknown as mat4,
-        rot,
-        j.localPosition as unknown as vec3,
-        scale,
-      );
-
-      if (j.parentIndex < 0) {
-        // Apply the skeleton NODE's own transform (the character's object transform) to the root, so it
-        // propagates to every joint → skinning AND bones follow it together. Identity node transform
-        // (the default for all existing skeletons) leaves this unchanged. See
-        // docs/specs/character-transform-on-skeleton.md.
-        mat4.mul(
-          j.worldMatrix as unknown as mat4,
-          this.objectTransform as unknown as mat4,
-          local as unknown as mat4,
-        );
-      } else {
-        mat4.mul(
-          j.worldMatrix as unknown as mat4,
-          joints[j.parentIndex].worldMatrix as unknown as mat4,
-          local as unknown as mat4,
-        );
-      }
-
-      // skinMatrix = worldMatrix × inverseBindMatrix
-      mat4.mul(
-        tmp as unknown as mat4,
-        j.worldMatrix as unknown as mat4,
-        j.inverseBindMatrix as unknown as mat4,
-      );
-      this.skinMatrices.set(tmp, j.index * 16);
+  /**
+   * PARTIAL FK (mobile-parity §7.3d): recompute world + skin matrices for the joints in `roots` and every
+   * descendant of them, leaving every other joint untouched. Use it after a solver changed the inputs
+   * (ikRotation / constraintRotation / constraintScale / localScale …) of ONLY those roots, on a skeleton whose
+   * other world matrices are already current — the result is then bit-identical to a full computeWorldMatrices()
+   * (same per-joint formula, parent-first order), at the cost of the affected subtrees only.
+   *
+   * A skeleton whose joints are not parent-first (a parent stored AFTER its child) falls back to the full pass,
+   * since the full pass's result there depends on the previous world state. Returns the number of joints
+   * recomputed (0 = nothing to do: no matricesDirty / poseVersion bump).
+   */
+  recomputeSubtrees(roots: ArrayLike<number>): number {
+    const { joints } = this.data;
+    const n = joints.length;
+    if (roots.length === 0 || n === 0) return 0;
+    let mark = this._subtreeMark;
+    if (mark.length < n) mark = this._subtreeMark = new Uint8Array(n);
+    else mark.fill(0, 0, n);
+    let any = false;
+    for (let r = 0; r < roots.length; r++) {
+      const i = roots[r];
+      if (i >= 0 && i < n) { mark[i] = 1; any = true; }
+    }
+    if (!any) return 0;
+    // Mark descendants in one parent-first sweep (a child inherits its parent's mark).
+    for (let i = 0; i < n; i++) {
+      const p = joints[i].parentIndex;
+      if (p >= i) { this.computeWorldMatrices(); return n; }   // not parent-first → full pass (exactness)
+      if (p >= 0 && mark[p]) mark[i] = 1;
+    }
+    let count = 0;
+    for (let i = 0; i < n; i++) {
+      if (!mark[i]) continue;
+      this._fkJoint(joints[i], joints);
+      count++;
     }
     this.matricesDirty = true;
     this.poseVersion++;
+    return count;
+  }
+
+  /** True when every joint's parent is stored before it (the order computeWorldMatrices assumes). Only then is a
+   *  full FK pass independent of the previous world state, so a redundant pass can be skipped without changing
+   *  the result. */
+  isParentFirst(): boolean {
+    const { joints } = this.data;
+    for (let i = 0; i < joints.length; i++) if (joints[i].parentIndex >= i) return false;
+    return true;
+  }
+
+  /** Scratch for recomputeSubtrees (joint marks); grown on demand. */
+  private _subtreeMark = new Uint8Array(0);
+
+  /** One joint's FK step: worldMatrix = parentWorld (or objectTransform at a root) × local(rot, pos, scale), then
+   *  its skin matrix. The ONE formula shared by the full and partial passes (so they agree bit for bit). */
+  private _fkJoint(j: Joint3D, joints: Joint3D[]): void {
+    const local = _fkLocal, tmp = _fkTmp;
+    const rot   = (j.constraintRotation ?? j.ikRotation ?? j.localRotation) as unknown as quat;
+    const scale = (j.constraintScale ?? j.localScale) as unknown as vec3;
+    mat4.fromRotationTranslationScale(
+      local as unknown as mat4,
+      rot,
+      j.localPosition as unknown as vec3,
+      scale,
+    );
+
+    if (j.parentIndex < 0) {
+      // Apply the skeleton NODE's own transform (the character's object transform) to the root, so it
+      // propagates to every joint → skinning AND bones follow it together. Identity node transform
+      // (the default for all existing skeletons) leaves this unchanged. See
+      // docs/specs/character-transform-on-skeleton.md.
+      mat4.mul(
+        j.worldMatrix as unknown as mat4,
+        this.objectTransform as unknown as mat4,
+        local as unknown as mat4,
+      );
+    } else {
+      mat4.mul(
+        j.worldMatrix as unknown as mat4,
+        joints[j.parentIndex].worldMatrix as unknown as mat4,
+        local as unknown as mat4,
+      );
+    }
+
+    // skinMatrix = worldMatrix × inverseBindMatrix
+    mat4.mul(
+      tmp as unknown as mat4,
+      j.worldMatrix as unknown as mat4,
+      j.inverseBindMatrix as unknown as mat4,
+    );
+    this.skinMatrices.set(tmp, j.index * 16);
   }
 
   /** Override one joint's local rotation (quaternion xyzw) and recompute. */

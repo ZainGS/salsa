@@ -346,6 +346,9 @@ export function applySkeletonClipAtFrame(
   clip: SkeletonAnimClip,
   skeleton: Skeleton3D,
   frame: number,
+  /** false = only write the joint/IK-chain inputs; the CALLER runs the FK pass (it edits the pose further first —
+   *  the idle-break blend). Skipping it is exact only when nothing reads world matrices before that pass. */
+  recompute = true,
 ): void {
   const { joints } = skeleton.data;
 
@@ -405,5 +408,5 @@ export function applySkeletonClipAtFrame(
     }
   }
 
-  skeleton.computeWorldMatrices();
+  if (recompute) skeleton.computeWorldMatrices();
 }

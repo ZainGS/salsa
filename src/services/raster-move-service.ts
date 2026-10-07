@@ -11,6 +11,7 @@ import { markRasterCompositeDirty } from '../renderer/raster/core/raster-composi
 import { InteractionService } from './interaction-service';
 import { WebGPURenderer } from '../renderer/core/webgpu-renderer';
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
+import { TouchGestureTracker } from '../renderer/util/touch-gesture-tracker';
 
 export class RasterMoveService {
   private interactionService: InteractionService;
@@ -31,10 +32,19 @@ export class RasterMoveService {
   private blitPipeline: GPUComputePipeline | null = null;
   private blitBGL: GPUBindGroupLayout | null = null;
 
+  // TOUCH-5 (docs/ui/touch-controls.md): a finger press does nothing until it moves TOUCH_START_PX (no snapshot, no
+  // staging copy — a tap or a pinch leaves no undo entry); a second finger during a finger drag puts the layer back
+  // where the drag found it. Mouse and pen are unchanged.
+  private readonly touches = new TouchGestureTracker();
+  private touchPress: { pointerId: number; button: number; clientX: number; clientY: number } | null = null;
+  private dragPointerId: number | null = null;
+  private dragIsTouch = false;
+
   // Bound listeners
-  private downBound = (e: PointerEvent) => this.onPointerDown(e);
-  private moveBound = (e: PointerEvent) => this.onPointerMove(e);
-  private upBound = (e: PointerEvent) => this.onPointerUp(e);
+  private downBound = (e: PointerEvent) => this.handleDown(e);
+  private moveBound = (e: PointerEvent) => this.handleMove(e);
+  private upBound = (e: PointerEvent) => this.handleUp(e);
+  private cancelBound = (e: PointerEvent) => this.handlePointerCancel(e);
 
   constructor(interactionService: InteractionService, renderer: WebGPURenderer) {
     this.interactionService = interactionService;
@@ -53,7 +63,68 @@ export class RasterMoveService {
     removeZonelessListener(canvas, 'pointerdown', this.downBound);
     removeZonelessListener(canvas, 'pointermove', this.moveBound);
     removeZonelessListener(canvas, 'pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointercancel', this.cancelBound);
     this.destroyStaging();
+  }
+
+  // ── Touch arbitration (TOUCH-5) ───────────────────────────────────
+
+  private handleDown(ev: PointerEvent): void {
+    const verdict = this.touches.down(ev);
+    if (verdict === 'gesture') { this.cancelTouchDrag(); return; }
+    if (verdict === 'ignore') return;
+    if (ev.pointerType !== 'touch') { this.onPointerDown(ev); return; }
+    if (!this.isEnabled || ev.button !== 0 || this.isDragging || this.touchPress) return;
+    this.touchPress = { pointerId: ev.pointerId, button: ev.button, clientX: ev.clientX, clientY: ev.clientY };
+  }
+
+  private handleMove(ev: PointerEvent): void {
+    if (ev.pointerType === 'touch') {
+      if (this.touches.blocked) return;
+      const p = this.touchPress;
+      if (p) {
+        if (ev.pointerId !== p.pointerId) return;
+        if (Math.hypot(ev.clientX - p.clientX, ev.clientY - p.clientY) < TouchGestureTracker.TOUCH_START_PX) return;
+        this.touchPress = null;
+        this.onPointerDown(p as unknown as PointerEvent);   // the drag starts where the finger landed
+        if (this.isDragging) { this.dragIsTouch = true; this.dragPointerId = p.pointerId; }
+      }
+      if (this.dragIsTouch && ev.pointerId !== this.dragPointerId) return;
+    } else if (this.dragIsTouch) return;
+    this.onPointerMove(ev);
+  }
+
+  private handleUp(ev: PointerEvent): void {
+    this.touches.up(ev);
+    if (ev.pointerType === 'touch') {
+      if (this.touchPress?.pointerId === ev.pointerId) { this.touchPress = null; return; }   // a tap moves nothing
+      if (this.dragIsTouch && ev.pointerId !== this.dragPointerId) return;
+    } else if (this.dragIsTouch) return;
+    this.dragIsTouch = false;
+    this.dragPointerId = null;
+    this.onPointerUp(ev);
+  }
+
+  private handlePointerCancel(ev: PointerEvent): void {
+    this.touches.up(ev);
+    if (ev.pointerType !== 'touch') return;
+    if (this.touchPress?.pointerId === ev.pointerId) this.touchPress = null;
+    if (this.dragIsTouch && ev.pointerId === this.dragPointerId) this.cancelTouchDrag();
+  }
+
+  /** A second finger (or pointercancel) during a FINGER drag: the layer goes back to its drag-start pixels (the
+   *  staging copy at offset 0 — byte-exact) and the drag ends. The snapshot taken when the drag began stays on the
+   *  undo stack (undoing it is a no-op). A mouse / pen drag is left alone. */
+  private cancelTouchDrag(): void {
+    this.touchPress = null;
+    if (!this.dragIsTouch) return;
+    this.dragIsTouch = false;
+    this.dragPointerId = null;
+    if (!this.isDragging) return;
+    const device = this.getDevice();
+    const activeTex = this.getActiveTexture();
+    if (device && activeTex && this.stagingTexture) this.applyOffset(device, activeTex, 0, 0);
+    this.finishDrag();
   }
 
   // ── Pointer handlers ──────────────────────────────────────────────
@@ -271,6 +342,7 @@ export class RasterMoveService {
     addZonelessListener(canvas, 'pointerdown', this.downBound);
     addZonelessListener(canvas, 'pointermove', this.moveBound);
     addZonelessListener(canvas, 'pointerup', this.upBound);
+    addZonelessListener(canvas, 'pointercancel', this.cancelBound);
     this.eventListenersAttached = true;
   }
 
@@ -281,7 +353,9 @@ export class RasterMoveService {
     removeZonelessListener(canvas, 'pointerdown', this.downBound);
     removeZonelessListener(canvas, 'pointermove', this.moveBound);
     removeZonelessListener(canvas, 'pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointercancel', this.cancelBound);
     this.eventListenersAttached = false;
+    this.touches.reset();
     this.attachListeners();
   }
 }

@@ -1630,6 +1630,12 @@ class ShapeManager {
     public onRasterStrokeStart(listener: (v: any) => void) { return this.rasterDrawingService?.onStrokeStart.subscribe(listener); }
     public onRasterStrokeUpdate(listener: (v: any) => void) { return this.rasterDrawingService?.onStrokeUpdate.subscribe(listener); }
     public onRasterStrokeEnd(listener: (v: any) => void) { return this.rasterDrawingService?.onStrokeEnd.subscribe(listener); }
+    /** TOUCH-5: a raster stroke was TAKEN BACK (a second finger made it a pinch, or a pen took over from a resting
+     *  finger): its pixels are already restored and it has no onRasterStrokeEnd — nothing to save, upload or undo.
+     *  `{ timestamp, began }` (began false = it never painted). */
+    public onRasterStrokeCancel(listener: (v: any) => void) { return this.rasterDrawingService?.onStrokeCancel.subscribe(listener); }
+    /** Abandon the live raster stroke the same way (pixels put back, no undo entry, no stroke end). False when none. */
+    public cancelRasterStroke(): boolean { return this.rasterDrawingService?.cancelActiveStroke() ?? false; }
 
     // Provide raster texture size to external clients
     public getRasterTextureSize(): { w:number, h:number } | null {
