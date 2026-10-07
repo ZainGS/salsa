@@ -32,6 +32,8 @@ import { Node } from "../scene-graph/shapes/base/node";
 import { recreateNode, type Shape2DRestoreDeps } from "./shape-serializer";
 import { RGBA } from "../types/rgba";
 import { LineDrawingService } from "./drawing/line-drawing-service";
+import { ShapeDragPlacement } from "./drawing/shape-drag-placement";
+import { sampleFramePixel, type SampledColor } from "./drawing/canvas-color-sample";
 import { ScribbleDrawingService } from "./drawing/scribble-drawing-service";
 import { TextDrawingService } from "./drawing/text-drawing-service";
 import { hexToRgba } from "../utils/color";
@@ -216,6 +218,7 @@ import type { CityLodStats } from './managers/world-lod-settings';
 import type { SimLodSettings, SimLodStats } from '../world/sim-lod';
 import { EphemeraService } from './ephemera/ephemera-service';
 import { EphemeraOverlay } from './ephemera/ephemera-overlay';
+import { recordPlacementAdded, deletePlacementUndoable, editPlacementUndoable, recordPlacementGeometry, rasterizePlacementsUndoable, placementsToTexels, type EphemeraUndoDeps } from './ephemera/ephemera-placement-undo';
 import { GROUND_SURFACES, resolveGroundRecipe, type GroundSurfaceName, type GroundSurfaceSpec } from '../world/ground-surfaces';
 import type { EphemeraElement, EphemeraElementSheet, IEphemeraGenerator, EphemeraCategory, EphemeraPlacement } from './ephemera/ephemera-types';
 import {
@@ -343,6 +346,12 @@ class ShapeManager {
     private connectorService?: ConnectorService;
     private shapeColor: RGBA = hexToRgba('#FFFFFF');
     private currentPreviewShape: Shape | null = null;
+    /** The shape tool whose ghost is out (setPreviewShape), for the drag-to-size placement's next ghost. */
+    private _previewShapeType: ShapeType | null = null;
+    /** Drag-to-size for the shape tools (UI review 2026-10-07 §3 #12) — created with the first ghost. */
+    private _shapeDrag: ShapeDragPlacement | null = null;
+    /** A drag just placed the shape: the host's click right after (its confirmPreviewShape) is that same press. */
+    private _skipNextPreviewConfirm = false;
     /** Number of sides for the next regular polygon created via the toolbar. */
     public defaultPolygonSides: number = 6;
     private layerManager!: LayerManager;
@@ -571,6 +580,10 @@ class ShapeManager {
             ephemera: this._ephemera,
             markPackageVectorLayerDirty: (layerId) => this._pkgComposite.vectorLayerDirty(layerId),
             meshEditFocusHidesContent: () => this.scene3d?.meshEditFocusHidesContent?.() ?? false,
+            placementGestureEnded: (layerId, placementId, before, kind) => {
+                recordPlacementGeometry(this._ephemeraUndoDeps(), layerId, placementId, before,
+                    kind === 'move' ? 'Move ephemera' : kind === 'resize' ? 'Resize ephemera' : 'Rotate ephemera');
+            },
         });
         // Let the free3D artboard-texture capture composite ephemera (a DOM overlay, not in the GPU frame) onto the
         // captured raster+vectors canvas, framed to the artboard — so the quad shows all three layers.
@@ -1403,6 +1416,8 @@ class ShapeManager {
         });
 
         if (result) {
+            // One undo step on the filled layer (a fill recorded none: Ctrl+Z after it undid the stroke BEFORE it).
+            await this.rasterLayerManager.getLayerById(activeLayerId)?.manager?.pushSnapshot?.({ noCoalesce: true });
             this.scheduleRender();
         }
         return result;
@@ -1487,7 +1502,10 @@ class ShapeManager {
                 : undefined,
         });
 
-        if (result) this.scheduleRender();
+        if (result) {
+            await this.rasterLayerManager.getLayerById(activeLayerId)?.manager?.pushSnapshot?.({ noCoalesce: true });   // one undo step
+            this.scheduleRender();
+        }
         return result;
     }
 
@@ -3220,6 +3238,11 @@ class ShapeManager {
     public setDefaultArrowheads(arrowStart: ArrowheadStyle, arrowEnd: ArrowheadStyle): void {
         this.lineDrawingService.defaultArrowStart = arrowStart;
         this.lineDrawingService.defaultArrowEnd = arrowEnd;
+    }
+
+    /** Stroke colour (hex) for newly drawn lines / arrows — the host's current colour (they drew a fixed grey). */
+    public setLineColor(color: string): void {
+        this.lineDrawingService.setStrokeColor(hexToRgba(color));
     }
 
     createStickyNote(x: number, y: number, text = "New note", color?: RGBA, signatureText?: string) {
@@ -9059,6 +9082,44 @@ class ShapeManager {
         return this.meshEdit.fillHole(meshId, boundaryHalfEdgeIdx);
     }
 
+    // ── Region ops (UI review 2026-10-07; docs/specs/edit-mesh-topology.md §12) — one undo step each ──
+
+    /** REGION extrude: connected faces of the set (null = the face selection) move as ONE piece along their average
+     *  normal with one ring of side walls (Blender's Extrude Region). The extruded faces stay selected. */
+    public extrudeRegion3D(meshId: string, fIdxSet: Iterable<number> | null, distance: number): boolean {
+        return this._redrawIf(this.meshEdit.extrudeRegion(meshId, fIdxSet, distance));
+    }
+
+    /** REGION inset: one border around each connected group of the set (null = the selection); a lone face insets as
+     *  {@link insetFace3D}. The inner faces stay selected. */
+    public insetRegion3D(meshId: string, fIdxSet: Iterable<number> | null, amount: number): boolean {
+        return this._redrawIf(this.meshEdit.insetRegion(meshId, fIdxSet, amount));
+    }
+
+    /** Subdivide every face of the set (null = the selection) at once, edge midpoints shared. Clears the selection. */
+    public subdivideFaces3D(meshId: string, fIdxSet: Iterable<number> | null): boolean {
+        return this._redrawIf(this.meshEdit.subdivideFaces(meshId, fIdxSet));
+    }
+
+    /** Cap every hole — or, when selected vertices / edges lie on holes, only those. Returns the number filled. */
+    public fillHoles3D(meshId: string): number {
+        const n = this.meshEdit.fillHoles(meshId);
+        this._redrawIf(n > 0);
+        return n;
+    }
+
+    /** Bridge the two edge loops the given (null = the selected) vertices form, in any pick order. */
+    public bridgeLoops3D(meshId: string, verts: Iterable<number> | null = null): boolean {
+        return this._redrawIf(this.meshEdit.bridgeLoops(meshId, verts));
+    }
+
+    /** A topology op changed the mesh: draw it now (the on-demand loop may be idle — a panel button is not a canvas
+     *  input). Returns `changed`. */
+    private _redrawIf(changed: boolean): boolean {
+        if (changed) this.scheduleRender();
+        return changed;
+    }
+
     /**
      * Extract the selected faces into a new sibling Mesh3D.
      * Returns the new mesh ID, or null if nothing is selected or the mesh has no EditMesh.
@@ -12108,6 +12169,10 @@ class ShapeManager {
 
     // Shape Preview
     setPreviewShape(shapeType: ShapeType, event: MouseEvent) {
+        // Drag-to-size: a press on the canvas now places / sizes the ghost (not the 2D select path)
+        this._previewShapeType = shapeType ?? null;
+        this.interactionService.shapePlacementActive = !!shapeType;
+        if (shapeType) this._ensureShapeDragPlacement(); else this._shapeDrag?.cancel();
         // Remove existing preview shape
         if (this.currentPreviewShape) {
             this.sceneGraph.root.removeChild(this.currentPreviewShape);
@@ -12162,6 +12227,7 @@ class ShapeManager {
     }
 
     updatePreviewShapePosition(event: MouseEvent) {
+        if (this._shapeDrag?.active) return;   // a press is placing / sizing the ghost
         if (this.currentPreviewShape) {
             const { x, y } = this.interactionService.toWorldCoords(event);
             this.currentPreviewShape.x = x;
@@ -12177,14 +12243,51 @@ class ShapeManager {
     }
 
     confirmPreviewShape() {
+        // The click that ends a drag-to-size press: that press already placed its shape
+        if (this._skipNextPreviewConfirm) { this._skipNextPreviewConfirm = false; this.emitSceneGraphChanged(); return; }
         if (this.currentPreviewShape) {
+            const placed = this.currentPreviewShape;
             this.currentPreviewShape.fillColor = this.shapeColor;
             this.currentPreviewShape.isPreview = false; // Convert to actual shape
             this.currentPreviewShape = null;
+            // One 2D undo step: undo takes the placed shape off again
+            const undo = this.interactionService.vectorUndo;
+            undo.commit(undo.begin(this.sceneGraph.root, []), 'Add shape', [placed]);
             this.endInteractive();
         }
         this.emitSceneGraphChanged();
     }
+
+    /** Drag-to-size for the shape tools (shape-drag-placement.ts): window pointer listeners, made with the first
+     *  ghost. A press on the canvas places the ghost; a drag sizes it corner to corner (Shift: square) and the release
+     *  commits it; a click still places the default size (through the host's confirmPreviewShape). */
+    private _ensureShapeDragPlacement(): void {
+        if (this._shapeDrag || typeof window === 'undefined') return;
+        const is = this.interactionService;
+        const drag = new ShapeDragPlacement({
+            preview: () => this.currentPreviewShape,
+            accepts: (e) => e.target === is.canvas && !is.playActive && !is.cameraOwnsView && !is.isPanToolSelected,
+            toWorld: (e) => is.toWorldCoords(e),
+            commit: (e) => {
+                const type = this._previewShapeType;
+                this.confirmPreviewShape();
+                this._skipNextPreviewConfirm = true;           // the host's click for this same press
+                if (type) this.setPreviewShape(type, e);       // the next ghost, at the release
+            },
+            render: () => this.scheduleRender(),
+        });
+        this._shapeDrag = drag;
+        window.addEventListener('pointerdown', (e) => {
+            this._skipNextPreviewConfirm = false;
+            if (this._previewShapeType) drag.pointerDown(e);
+        });
+        window.addEventListener('pointermove', (e) => { if (drag.active) drag.pointerMove(e); });
+        window.addEventListener('pointerup', (e) => { if (drag.active) drag.pointerUp(e); });
+        window.addEventListener('pointercancel', () => { if (drag.active) drag.cancel(); });
+    }
+
+    /** The shape tools size by drag (press-drag-release; a click places the default size). For hosts: feature check. */
+    public get shapeDragToSize(): boolean { return true; }
 
     enablePanningTool() {
         this.interactionService.isPanToolSelected = true;
@@ -14376,6 +14479,23 @@ class ShapeManager {
         const png = await _encodeRealFramePNG(frame, opts.opaque !== false);
         return { ...png, width: frame.width, height: frame.height, source: frame.source, format: frame.format, flags: _getRenderDebug() };
     }
+    /** EYEDROPPER (UI review 2026-10-07 §3 #10): the colour of the final composited frame (what the canvas shows: every
+     *  layer, 3D, post effects) at a viewport point (`clientX` / `clientY`, e.g. a pointer event's). Reads the next
+     *  frame back (captureRealFrame) — one sample per call, not per pointer move. Null off the canvas, or when no frame
+     *  could be read (no device / renderer suspended). */
+    public async sampleCanvasColor(clientX: number, clientY: number): Promise<SampledColor | null> {
+        const canvas = this.interactionService?.canvas;
+        if (!canvas || !this.webgpuRenderer) return null;
+        const rect = canvas.getBoundingClientRect();
+        if (clientX < rect.left || clientY < rect.top || clientX >= rect.right || clientY >= rect.bottom) return null;
+        try {
+            const frame = await this.webgpuRenderer.captureRealFrame();
+            return sampleFramePixel(frame, clientX - rect.left, clientY - rect.top, rect.width, rect.height);
+        } catch (e) {
+            console.warn('[Salsa] sampleCanvasColor: no frame to read', e);
+            return null;
+        }
+    }
     /** Retry a recovery (e.g. after 'failed', or with autoRecoverDevice off). Resolves true when rendering is back. */
     public recoverDevice(): Promise<boolean> { return this.webgpuRenderer.recoverDevice(); }
     /** Automatic recovery on loss (default on). */
@@ -15078,31 +15198,56 @@ class ShapeManager {
         height: number,
         rotation = 0,
         opacity = 1,
+        style?: Partial<Pick<EphemeraPlacement, 'blendMode' | 'glow' | 'feather'>>,
     ): EphemeraPlacement | null {
         const p = this._ephemera.addPlacement(layerId, typeId, params, x, y, width, height, rotation, opacity);
         if (p) {
-            this._pkgComposite.vectorLayerDirty(layerId);   // package vector layer → refresh its box composite
-            this.scheduleRender();                // ★ draw the overlay NOW: its render is a post-frame callback, so
-        }                                         //   without a scheduled frame the placement only appears on the next
-        return p;                                 //   frame a mouse-move happens to trigger ("Place on Canvas" lag).
+            // Blend / glow / feather at placement time belong to the same undo step as the placement itself.
+            if (style && Object.keys(style).length) this._ephemera.updatePlacement(layerId, p.id, style);
+            // One "Place ephemera" step on the 2D object undo stack. changed() also schedules the render that draws
+            // the overlay NOW: its render is a post-frame callback, so without a scheduled frame the placement only
+            // appeared on the next frame a mouse-move happened to trigger ("Place on Canvas" lag).
+            recordPlacementAdded(this._ephemeraUndoDeps(), layerId, p);
+        }
+        return p;
     }
 
-    /** Update position, size, rotation, opacity, or params of an existing placement. */
+    /** Update position, size, rotation, opacity, or params of an existing placement — ONE "Edit ephemera" step on the
+     *  2D object undo stack (nothing is recorded when nothing changed). */
     public updateEphemeraPlacement(
         layerId: string,
         placementId: string,
         updates: Partial<Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'params' | 'blendMode' | 'glow' | 'feather'>>,
     ): boolean {
-        const ok = this._ephemera.updatePlacement(layerId, placementId, updates);
-        if (ok) { this._pkgComposite.vectorLayerDirty(layerId); this.scheduleRender(); }   // redraw the overlay (post-frame callback)
-        return ok;
+        return editPlacementUndoable(this._ephemeraUndoDeps(), layerId, placementId,
+            () => this._ephemera.updatePlacement(layerId, placementId, updates));
     }
 
-    /** Remove a single placement from an ephemera layer. */
+    /** Remove a single placement from an ephemera layer — ONE "Delete ephemera" step (Ctrl+Z puts it back in place). */
     public deleteEphemeraPlacement(layerId: string, placementId: string): boolean {
-        const ok = this._ephemera.deletePlacement(layerId, placementId);
-        if (ok) { this._pkgComposite.vectorLayerDirty(layerId); this.scheduleRender(); }   // redraw the overlay so the removed placement clears
-        return ok;
+        return deletePlacementUndoable(this._ephemeraUndoDeps(), layerId, placementId);
+    }
+
+    /** Fires (with the vector layer id) whenever a layer's ephemera placements change — placed, edited, moved,
+     *  deleted, rasterized, or put back / redone by Ctrl+Z / Ctrl+Y — so a host placement list can refresh. */
+    public readonly onEphemeraPlacementsChanged = new EventEmitter<string>();
+
+    /** Wiring for ephemera-placement-undo.ts. */
+    private _ephemeraUndoDeps(): EphemeraUndoDeps {
+        return {
+            store: this._ephemera,
+            undo: this.interactionService.vectorUndo,
+            changed: (layerId) => {
+                const sel = this.getSelectedPlacement();
+                if (sel?.layerId === layerId && !this._ephemera.getPlacementsForLayer(layerId).some(p => p.id === sel.placementId)) {
+                    this.clearPlacementSelection();   // its placement was undone / deleted / rasterized away
+                }
+                this._pkgComposite.vectorLayerDirty(layerId);   // package vector layer → refresh its box composite
+                this.emitSceneGraphChanged();                   // the host autosaves on it
+                this.scheduleRender();                          // redraw the overlay (post-frame callback)
+                this.onEphemeraPlacementsChanged.emit(layerId);
+            },
+        };
     }
 
     /** Get all placements on an ephemera layer. */
@@ -15364,31 +15509,54 @@ class ShapeManager {
      * Uses a single OffscreenCanvas pass (one undo snapshot).
      */
     public async rasterizeEphemeraLayer(layerId: string, targetLayerId?: string): Promise<boolean> {
-        const rlm = this.rasterLayerManager;
-        if (!rlm) return false;
-        const target = targetLayerId ?? rlm.getSelectedLayerId();
-        if (!target) return false;
-
-        const placements = this._ephemera.getPlacementsForLayer(layerId)
-            .filter(p => p.visible);
-        if (placements.length === 0) return true;
-
-        return rlm.compositeMultipleImagesOntoLayer(target, placements);
+        return this._rasterizePlacements(layerId, targetLayerId);
     }
 
     /**
      * Rasterize a single named placement from an ephemera layer.
      */
     public async rasterizeEphemeraPlacement(layerId: string, placementId: string, targetLayerId?: string): Promise<boolean> {
-        const rlm = this.rasterLayerManager;
-        if (!rlm) return false;
-        const target = targetLayerId ?? rlm.getSelectedLayerId();
-        if (!target) return false;
-
         const p = this._ephemera.getPlacementsForLayer(layerId).find(x => x.id === placementId);
         if (!p || !p.visible) return false;
+        return this._rasterizePlacements(layerId, targetLayerId, [placementId]);
+    }
 
-        return rlm.compositeMultipleImagesOntoLayer(target, [p]);
+    /** Rasterize = burn the visible placements into a paint layer and remove them from the vector layer, as ONE step on
+     *  the 2D object undo stack (ephemera-placement-undo.ts; the pixels are one entry on the paint layer's history).
+     *  Target: `targetLayerId`, else the selected paint layer, else the first paint layer below the vector layer. */
+    private async _rasterizePlacements(layerId: string, targetLayerId?: string, placementIds?: string[]): Promise<boolean> {
+        const rlm = this.rasterLayerManager;
+        if (!rlm) return false;
+        const target = this._rasterizeTargetLayer(layerId, targetLayerId);
+        if (!target) return false;
+        return rasterizePlacementsUndoable({
+            ...this._ephemeraUndoDeps(),
+            raster: {
+                composite: (id, list) => rlm.compositeMultipleImagesOntoLayer(id, this._placementsToLayerPixels(id, list)),
+                historyMark: (id) => rlm.getLayerHistoryMark(id),
+                undo: (id) => rlm.undoForLayer(id),
+                redo: (id) => rlm.redoForLayer(id),
+            },
+        }, layerId, target, placementIds);
+    }
+
+    private _rasterizeTargetLayer(vectorLayerId: string, explicit?: string): string | null {
+        const rlm = this.rasterLayerManager!;
+        if (explicit) return rlm.hasRasterHistory(explicit) ? explicit : null;
+        const selected = rlm.getSelectedLayerId();
+        if (selected && rlm.hasRasterHistory(selected)) return selected;
+        const layers = rlm.getLayers();
+        const at = layers.findIndex(l => l.id === vectorLayerId);
+        const below = layers.slice(at + 1).find(l => rlm.hasRasterHistory(l.id));
+        return below?.id ?? layers.find(l => rlm.hasRasterHistory(l.id))?.id ?? null;
+    }
+
+    /** World-unit placements → the paint layer's texels (ephemera-placement-undo.ts placementsToTexels). */
+    private _placementsToLayerPixels(layerId: string, list: EphemeraPlacement[]): EphemeraPlacement[] {
+        const size = this.rasterLayerManager?.getLayerById(layerId)?.manager?.getTextureSize();
+        const b = this.webgpuRenderer?.getIllustrationBounds?.();
+        if (!size || !b || !(b.width > 0) || !(b.height > 0)) return list;
+        return placementsToTexels(list, b, size);
     }
 
     /**

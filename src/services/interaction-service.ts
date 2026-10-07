@@ -58,6 +58,10 @@ export class InteractionService {
      *  2D pointer interaction is off while it holds (the UI system's own hooks still run), and the editor overlays
      *  (selection box / gizmo / bone overlay / snap viz / camera frustum / emitter icons) are not drawn. */
     playActive: boolean = false;
+    /** True while a 2D shape tool (rectangle / circle / triangle / polygon) has its placement ghost out
+     *  (ShapeManager.setPreviewShape): a press on the canvas places / drag-sizes the shape, so the 2D
+     *  select / move / box-select path stays out of it (it used to grab the ghost under the pointer). */
+    shapePlacementActive: boolean = false;
     /**
      * 3D CLICK-PICK suppression predicate. While set, a left-click pick that lands on a mesh for
      * which this returns true is IGNORED by click-to-select (TransformController3D) — the click

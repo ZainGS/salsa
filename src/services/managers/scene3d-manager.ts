@@ -457,6 +457,32 @@ export interface SceneBudget3D {
 /** One layer of addFlatColorMeshGroup (a world-built flat-colour layer). */
 export type FlatColorLayer3D = { name: string; geometry: MeshGeometry; color: [number, number, number]; pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number }; ground?: { surface: GroundSurfaceName; tint?: [number, number, number]; tileMm?: number; groutMm?: number; jitter?: number; metersPerUnit?: number; weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty' }; castShadow?: boolean; water?: { deep?: [number, number, number]; shallow?: [number, number, number]; waveScale?: number; waveSpeed?: number; choppy?: number; glitter?: number }; emissive?: number; opacity?: number; instanceKey?: string; excludeFromFrame?: boolean; singleSided?: boolean; metal?: { tint?: [number, number, number]; streak?: [number, number, number]; roughness?: number; streakAmount?: number; grime?: number; scale?: number }; neon?: { glow?: [number, number, number]; accent?: [number, number, number]; scanDensity?: number; flicker?: number; scroll?: number; phase?: number }; leafCard?: boolean; glass?: boolean; radialFade?: boolean; noFog?: boolean | 'hardEdge'; outlineRanges?: { id: number; start: number; count: number }[]; reflect?: { strength?: number; roughness?: number }; renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean; wind?: FoliageWindSpec; foliageShade?: FoliageShadeSpec; instances?: { x: number; y: number; z: number; ry: number; s?: number; tint?: [number, number, number]; skin?: string; sv?: [number, number, number]; cs?: [number, number, number]; pi?: number }[]; arrayGroup?: boolean; propInst?: boolean; propXf?: Float32Array; garp?: { pool: string; slot: string; seed: number; skin?: string }; groundUvSample?: MeshGeometry; nearTwin?: { key: string; role: 'near' | 'far' | 'mid' | 'xfar'; dist: number; dist2?: number; uvFromNear?: boolean }; crowdInst?: { id: string } };
 
+/**
+ * Ortho framing: the half-HEIGHT a view needs to show a dx × dy × dz box (centred) from `viewDir` (target → eye), i.e.
+ * the box's extent ON SCREEN — its 8 corners on the camera's right / up axes — with the width fitted through `aspect`.
+ * A straight-on view (e.g. from +Z) gives exactly max(dy / 2, dx / 2 / aspect) as before; an oblique one (the Edit
+ * Mesh 3/4 entry view) fits the box's real silhouette instead of overflowing it. A view along `up` falls back to dx / dy.
+ */
+export function orthoFitHalfHeight(
+    dx: number, dy: number, dz: number,
+    viewDir: ArrayLike<number>, up: ArrayLike<number>, aspect: number,
+): number {
+    let halfW = dx * 0.5, halfV = dy * 0.5;
+    const fwd = vec3.fromValues(-viewDir[0], -viewDir[1], -viewDir[2]);
+    const right = vec3.cross(vec3.create(), fwd, vec3.fromValues(up[0], up[1], up[2]));
+    if (vec3.length(right) > 1e-6) {
+        vec3.normalize(right, right);
+        const upv = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), right, fwd));
+        halfW = 0; halfV = 0;
+        for (let c = 0; c < 8; c++) {
+            const ox = (c & 1 ? 0.5 : -0.5) * dx, oy = (c & 2 ? 0.5 : -0.5) * dy, oz = (c & 4 ? 0.5 : -0.5) * dz;
+            halfW = Math.max(halfW, Math.abs(ox * right[0] + oy * right[1] + oz * right[2]));
+            halfV = Math.max(halfV, Math.abs(ox * upv[0] + oy * upv[1] + oz * upv[2]));
+        }
+    }
+    return Math.max(halfV, halfW / Math.max(0.0001, aspect));
+}
+
 export class Scene3DManager {
     private ctx: ManagerContext;
 
@@ -1679,8 +1705,7 @@ export class Scene3DManager {
         if (cam.mode === 'perspective') {
             dist = Math.max(radius * padding, (radius * padding) / Math.tan(Math.max(0.1, cam.fov) * 0.5));
         } else {
-            const halfH = Math.max(dy * 0.5, (dx * 0.5) / Math.max(0.0001, cam.aspect));
-            cam.orthoSize = halfH * padding;
+            cam.orthoSize = Math.max(1e-6, orthoFitHalfHeight(dx, dy, dz, oldDir, cam.up, cam.aspect)) * padding;
             dist = Math.max(radius * 2, 2);
         }
 
@@ -8019,7 +8044,7 @@ export class Scene3DManager {
 
     /**
      * Set the visual style for the armature focus mode background.
-     * Default is 'wavy' (blue + cream animated wave pattern).
+     * Default is 'gradient' (a calm blue → cream gradient); 'wavy' (the animated wave pattern) is an option.
      * Call any time — takes effect on the next frame.
      */
     setArmatureBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void { return this._armature.setArmatureBgMode3D(opts); }
@@ -9192,7 +9217,11 @@ export class Scene3DManager {
      *  Independent of diffuse — no re-bake needed. */
     setIBLSpecularIntensity3D(v: number): void { this.renderer3D.setIBLSpecularIntensity(v); this.ctx.scheduleRender(); }
     /** Scale the DIFFUSE sky ambient independently of reflections. */
-    setIBLDiffuseIntensity3D(v: number): void { this.renderer3D.setIBLDiffuseIntensity(v); this.ctx.scheduleRender(); }
+    setIBLDiffuseIntensity3D(v: number): void {
+        this.renderer3D.setIBLDiffuseIntensity(v);
+        this._envMapIntensity = Math.max(0, v);   // saved as ibl.intensity: a reload kept the intensity of the last upload / bake
+        this.ctx.scheduleRender();
+    }
     /** Current (diffuse, specular) IBL intensities — for initialising two sliders. */
     getIBLIntensities3D(): { diffuse: number; specular: number } { return { diffuse: this.renderer3D.iblDiffuseIntensity, specular: this.renderer3D.iblSpecularIntensity }; }
     /** Bake ONLY the specular cube from the current sky (leaves the diffuse SH ambient as-is). */

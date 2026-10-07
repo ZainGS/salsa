@@ -3184,7 +3184,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       }
       // Mesh-edit 'dim' focus overlay, then the edit handles on top of the dim.
       this._renderer3D.drawMeshEditDimIfActive(passEncoder, w, h);
-      this._renderer3D.drawMeshEditOverlayIfActive(passEncoder);
+      this._renderer3D.drawMeshEditOverlayIfActive(passEncoder, h);
       // Vertex-snap double-circle viz — last (depth-always).
       if (!rdNoGizmo) this._renderer3D.drawSnapVizIfActive(passEncoder, h);
     }

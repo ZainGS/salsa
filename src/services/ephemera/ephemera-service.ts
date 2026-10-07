@@ -320,6 +320,24 @@ export class EphemeraService {
     return true;
   }
 
+  /** Remove one placement and RETURN it with its index (the very object, so an undo can put it back unchanged). */
+  takePlacement(layerId: string, placementId: string): { index: number; placement: EphemeraPlacement } | null {
+    const list = this._placements.get(layerId);
+    if (!list) return null;
+    const index = list.findIndex(x => x.id === placementId);
+    if (index < 0) return null;
+    const [placement] = list.splice(index, 1);
+    return { index, placement };
+  }
+
+  /** Put a placement taken by {@link takePlacement} back at `index` (clamped; no-op if its id is in the list again). */
+  reinsertPlacement(layerId: string, placement: EphemeraPlacement, index: number): void {
+    if (!this._placements.has(layerId)) this._placements.set(layerId, []);
+    const list = this._placements.get(layerId)!;
+    if (list.some(p => p.id === placement.id)) return;
+    list.splice(Math.min(Math.max(0, index), list.length), 0, placement);
+  }
+
   deleteAllPlacementsForLayer(layerId: string): void {
     this._placements.delete(layerId);
   }

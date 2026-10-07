@@ -613,6 +613,104 @@ export class MeshEditManager {
     return true;
   }
 
+  // ── Region ops (UI review 2026-10-07): one undo step each, the selection as the default target ──
+
+  /** One undoable topology edit: snapshot, run `op` (false = it changed nothing → no command), recompile, push. */
+  private _topologyEdit(meshId: string, description: string, op: (mesh: Mesh3D) => boolean): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const before = mesh.editMesh.toJSON();
+    if (!op(mesh)) return false;   // the region ops bail out before touching the mesh
+    mesh.syncFromEditMesh();
+    const after = mesh.editMesh!.toJSON();
+    this.pushCommand({
+      description,
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh = EditMesh.fromJSON(after); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /** The face set an op targets: the given one, else the face selection. */
+  private _facesOrSelection(fIdxSet: Iterable<number> | null): Set<number> {
+    return new Set(fIdxSet ?? this._selection?.faces ?? []);
+  }
+
+  /** REGION extrude (EditMesh.extrudeRegion): connected selected faces move as one piece with one ring of walls. The
+   *  extruded faces stay selected (they keep their indices), ready for the next extrude / G. */
+  extrudeRegion(meshId: string, fIdxSet: Iterable<number> | null, distance: number): boolean {
+    const set = this._facesOrSelection(fIdxSet);
+    if (set.size === 0) return false;
+    const ok = this._topologyEdit(meshId, set.size > 1 ? 'Extrude region' : 'Extrude face', m => m.editMesh!.extrudeRegion(set, distance).length > 0);
+    if (ok) this._reselectFaces(meshId, set);
+    return ok;
+  }
+
+  /** REGION inset (EditMesh.insetRegion): one border around each connected group. The inner faces stay selected. */
+  insetRegion(meshId: string, fIdxSet: Iterable<number> | null, amount: number): boolean {
+    const set = this._facesOrSelection(fIdxSet);
+    if (set.size === 0) return false;
+    const ok = this._topologyEdit(meshId, set.size > 1 ? 'Inset region' : 'Inset face', m => m.editMesh!.insetRegion(set, amount).length > 0);
+    if (ok) this._reselectFaces(meshId, set);
+    return ok;
+  }
+
+  /** Subdivide every selected face at once (shared edge midpoints). The selection is cleared (faces renumbered). */
+  subdivideFaces(meshId: string, fIdxSet: Iterable<number> | null): boolean {
+    const set = this._facesOrSelection(fIdxSet);
+    if (set.size === 0) return false;
+    const ok = this._topologyEdit(meshId, 'Subdivide faces', m => { const n = m.editMesh!.faces.length; m.editMesh!.subdivideFaces(set); return m.editMesh!.faces.length !== n; });
+    if (ok) this._clearSelectionGeometry(meshId);
+    return ok;
+  }
+
+  /** Cap every hole (or, when vertices / edges on a hole are selected, just those holes) — one undo step. Returns the
+   *  number of holes filled. */
+  fillHoles(meshId: string, touching?: Iterable<number> | null): number {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return 0;
+    let filter: Set<number> | null = touching ? new Set(touching) : null;
+    if (!touching && this._selection?.meshId === meshId) {
+      // The selection's vertices (+ the selected edges' ends) that lie on a hole pick which holes to fill.
+      const H = mesh.editMesh.halfEdges, s = new Set(this._selection.vertices);
+      for (const e of this._selection.edges) { const h = H[e]; if (h) { s.add(h.vertex); s.add(H[h.prev]?.vertex ?? -1); } }
+      const onHole = new Set(mesh.editMesh.boundaryLoops().flat());
+      const picked = [...s].filter(v => onHole.has(v));
+      if (picked.length) filter = new Set(picked);
+    }
+    let count = 0;
+    this._topologyEdit(meshId, 'Fill holes', m => (count = m.editMesh!.fillHoles(filter)) > 0);
+    if (count > 0) this._clearSelectionGeometry(meshId);
+    return count;
+  }
+
+  /** Bridge the two loops the given (else the selected) vertices form — order independent; for an edge selection
+   *  its end vertices. The selection is cleared. */
+  bridgeLoops(meshId: string, verts: Iterable<number> | null): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    let vs: Set<number>;
+    if (verts) vs = new Set(verts);
+    else {
+      vs = new Set(this._selection?.meshId === meshId ? this._selection.vertices : []);
+      if (vs.size === 0 && this._selection?.meshId === meshId) {
+        const H = mesh.editMesh.halfEdges;
+        for (const e of this._selection.edges) { const h = H[e]; if (h) { vs.add(h.vertex); vs.add(H[h.prev].vertex); } }
+      }
+    }
+    const ok = this._topologyEdit(meshId, 'Bridge edge loops', m => !!m.editMesh!.bridgeVertexLoops(vs));
+    if (ok) this._clearSelectionGeometry(meshId);
+    return ok;
+  }
+
+  /** After an op that keeps face indices: select exactly `faces` (fresh Sets — see _clearSelectionGeometry). */
+  private _reselectFaces(meshId: string, faces: Set<number>): void {
+    if (this._selection?.meshId !== meshId) return;
+    this._selection.vertices = new Set();
+    this._selection.edges = new Set();
+    this._selection.faces = new Set(faces);
+  }
+
   /** Delete a set of faces. */
   deleteFaces(meshId: string, fIdxSet: Set<number> | null): boolean {
     const mesh = this._getMesh(meshId);

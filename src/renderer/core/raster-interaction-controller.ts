@@ -405,7 +405,8 @@ export class RasterInteractionController {
       this.r.sdfTextDrawingService?.isEnabled ||
       this.r.rasterDrawingService?.isEnabled ||
       this.r.rasterSelectionService?.isEnabled ||
-      this.r.rasterMoveService?.isEnabled
+      this.r.rasterMoveService?.isEnabled ||
+      this.r.interactionService.shapePlacementActive
     ) {
       this.r.interactionService.clearSelectedNodes();
       this.r.scheduleRender();

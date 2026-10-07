@@ -118,3 +118,25 @@ describe('EphemeraOverlay', () => {
         expect(rot?.kind).toBe('rotate');
     });
 });
+
+describe('EphemeraOverlay canvas gesture → one undo step (UI review 2026-10-07)', () => {
+    it('reports the geometry at the first update once, when the gesture ends', () => {
+        const ended: { id: string; before: unknown; kind: string }[] = [];
+        const ov = makeOverlay();
+        (ov as unknown as { host: EphemeraOverlayHost }).host.placementGestureEnded = (_l, id, before, kind) => { ended.push({ id, before, kind }); };
+        eph.placements.set('L1', [pl({ id: 'p1', x: 0, y: 0 })]);
+        ov.movePlacementTo('L1', 'p1', 0.1, 0.1);
+        ov.movePlacementTo('L1', 'p1', 0.2, 0.3);
+        expect(ended).toEqual([]);
+        ov.endPlacementGesture();
+        expect(ended).toEqual([{ id: 'p1', before: { x: 0, y: 0, width: 0.4, height: 0.4, rotation: 0 }, kind: 'move' }]);
+        ov.endPlacementGesture();   // nothing open: no second report
+        expect(ended.length).toBe(1);
+        // A switch of kind (move → rotate) closes the first gesture
+        ov.movePlacementTo('L1', 'p1', 0.5, 0.5);
+        ov.applyPlacementRotate('L1', 'p1', 0, 0, 0, 0, 0, 1);
+        expect(ended.map(e => e.kind)).toEqual(['move', 'move']);
+        ov.endPlacementGesture();
+        expect(ended.map(e => e.kind)).toEqual(['move', 'move', 'rotate']);
+    });
+});

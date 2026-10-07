@@ -354,8 +354,11 @@ describe('Edit Mesh topology — selection, pick and overlay', () => {
     r.draw(pass, { mesh, selection: { meshId: mesh.id, vertices: new Set(), edges: new Set(), faces: new Set([0]) }, mode: 'face' }, cam);
     const lines = draws.find(d => d.pipe === 'MeshEditLine')!;
     expect(lines.count).toBe(12 * 2);
-    const tris = draws.find(d => d.pipe === 'MeshEditTri')!;
-    expect(tris.count).toBe(2 * 3 + 8 * 6);   // the quad's 2 fill triangles + one dot quad per (shared) vertex
+    // Two triangle draws: the fills under the wireframe (the quad's 2 triangles), then the handles over it — the
+    // selected face's 3 px outline (4 bands × 2 triangles) and a face dot per face (rim + core); no vertex dots in
+    // Face mode (UI review 2026-10-07 §3 #19).
+    const tris = draws.filter(d => d.pipe === 'MeshEditTri').map(d => d.count);
+    expect(tris).toEqual([2 * 3, 4 * 6 + 6 * 2 * 6]);
   });
 });
 

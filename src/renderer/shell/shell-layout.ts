@@ -438,6 +438,34 @@ export interface LayoutOpts {
   page?: number;
   /** Tile-size multiplier (zoom). */
   zoom?: number;
+  /** Smallest tile (device px). The tile otherwise follows the viewport width (~8 % of it), which made ~28 px tiles
+   *  on a phone; with a floor a narrow screen gets fewer, finger-sized columns instead. 0 / absent = no floor. */
+  minTilePx?: number;
+  /** Smallest tile-label font (device px). 0 / absent = no floor. */
+  minLabelPx?: number;
+  /** Compact (phone) layout: show only the rows the tiles need plus this many spare rows (not a screenful of empty
+   *  placeholder slots), spread the columns over the full width, and shrink the panel card to hug those rows
+   *  (anchored to the bottom). Absent = the card fills the area under the viewer with whole rows (desktop look). */
+  spareRows?: number;
+}
+
+/** Smallest home tile (CSS px) the Shell asks for (× DPR → {@link LayoutOpts.minTilePx}). */
+export const SHELL_MIN_TILE_CSS = 64;
+/** Smallest home tile label (CSS px). */
+export const SHELL_MIN_TILE_LABEL_CSS = 10;
+/** Viewport width (CSS px) below which the home uses the compact (phone) layout. */
+export const SHELL_COMPACT_BELOW_CSS = 600;
+
+/** The responsive options the Shell passes to {@link computeShellLayout} for a canvas of `viewportW` device px at
+ *  `dpr` device px per CSS px: a 64 px tile floor everywhere, and the compact layout (one spare row) on a phone. */
+export function shellResponsiveOpts(viewportW: number, dpr = 1): Pick<LayoutOpts, 'minTilePx' | 'minLabelPx' | 'spareRows'> {
+  const d = dpr > 0 ? dpr : 1;
+  const compact = viewportW / d < SHELL_COMPACT_BELOW_CSS;
+  return {
+    minTilePx: SHELL_MIN_TILE_CSS * d,
+    minLabelPx: SHELL_MIN_TILE_LABEL_CSS * d,
+    ...(compact ? { spareRows: 1 } : {}),
+  };
 }
 
 export function computeShellLayout(
@@ -465,20 +493,15 @@ export function computeShellLayout(
 
   const zoom = Math.max(0.5, Math.min(1.4, opts.zoom ?? 1));
   const arrowZone = theme.arrowZoneFrac * viewportW;
-  const colPitch = Math.max(8, theme.cellFrac * viewportW * zoom);
-  const tileSize = colPitch * theme.tileFrac;
-  const corner = tileSize * theme.cornerFrac;
-  const labelBand = tileSize * theme.labelBandFrac;
-  const rowPitch = colPitch + labelBand;
-  const fontPx = tileSize * theme.labelFontFrac;
-  const vGap = colPitch - tileSize;
+  const compact = opts.spareRows !== undefined;
+  const minPitch = Math.max(0, opts.minTilePx ?? 0) / theme.tileFrac;   // the pitch that gives the minimum tile
 
   // Floating frosted card, inset from the screen edges.
   const regionTop = theme.viewerFraction * viewportH;
   const cardX = theme.cardMarginXFrac * viewportW;
-  const cardY = regionTop + theme.cardGapTopFrac * viewportH;
+  let cardY = regionTop + theme.cardGapTopFrac * viewportH;
   const cardW = viewportW - 2 * cardX;
-  const cardH = viewportH - cardY - theme.cardGapBottomFrac * viewportH;
+  let cardH = viewportH - cardY - theme.cardGapBottomFrac * viewportH;
   const cardCorner = 0;                          // sharp Win9x window corners
   const panelTitleH = Math.max(20, Math.round(viewportH * 0.028));
   const regionHeight = viewportH - regionTop;
@@ -486,9 +509,26 @@ export function computeShellLayout(
   // Fit whole columns/rows inside the card BELOW the title bar (arrows live in
   // the side zones), then center the grid in the remaining area.
   const gridAvailW = cardW - 2 * arrowZone;
-  const columns = Math.max(1, Math.floor(gridAvailW / colPitch));
+  const basePitch = Math.max(8, theme.cellFrac * viewportW * zoom, minPitch);
+  const tileSize = basePitch * theme.tileFrac;
+  const columns = Math.max(1, Math.floor(gridAvailW / basePitch));
+  // Compact: the columns share the whole width (the labels get the room) — the tile stays the size asked for.
+  const colPitch = compact && gridAvailW > columns * basePitch ? gridAvailW / columns : basePitch;
+  const corner = tileSize * theme.cornerFrac;
+  const labelBand = tileSize * theme.labelBandFrac;
+  const rowPitch = colPitch + labelBand;
+  const fontPx = Math.max(tileSize * theme.labelFontFrac, opts.minLabelPx ?? 0);
+  const vGap = colPitch - tileSize;
+
   const gridAvailH = cardH - panelTitleH;
-  const rows = Math.max(1, Math.floor(gridAvailH / rowPitch));
+  const rowsFit = Math.max(1, Math.floor(gridAvailH / rowPitch));
+  let rows = rowsFit;
+  if (compact) {
+    // Only the rows the tiles need (+ spare), and the card hugs them, sitting on the bottom margin.
+    rows = Math.max(1, Math.min(rowsFit, Math.ceil(specs.length / columns) + Math.max(0, Math.floor(opts.spareRows!))));
+    const hugH = panelTitleH + rows * rowPitch + Math.max(0, colPitch - tileSize);
+    if (hugH < cardH) { cardY += cardH - hugH; cardH = hugH; }
+  }
 
   const left = cardX + (cardW - columns * colPitch) / 2;
   const top = cardY + panelTitleH + (cardH - panelTitleH - rows * rowPitch) / 2;
@@ -621,6 +661,8 @@ export interface ShellChipLayout {
  * `text + 2·padX` wide and at least {@link SHELL_CHIP_MIN_H_CSS} tall, so labels are never clipped. The font
  * follows the viewport height, clamped to 12–16 CSS px; if the row doesn't fit the width it first shrinks the
  * font (down to 12 px), then wraps chips onto further rows.
+ * `reserveRightPx` (device px, default 0): room kept free at the right end of the FIRST row (the host's top-right
+ * button cluster sits there); later rows use the full width.
  */
 export function layoutShellChips(
   labels: string[],
@@ -628,10 +670,13 @@ export function layoutShellChips(
   viewportW: number,
   viewportH: number,
   dpr = 1,
+  reserveRightPx = 0,
 ): ShellChipLayout {
   const d = dpr > 0 ? dpr : 1;
   const x0 = projectGridSideMargin(viewportW, d);
-  const maxRight = Math.max(x0 + 1, viewportW - x0);
+  const fullRight = Math.max(x0 + 1, viewportW - x0);
+  const firstRight = Math.max(x0 + 1, Math.min(fullRight, viewportW - Math.max(0, reserveRightPx)));
+  const maxRight = firstRight;
   const gap = 8 * d;
   const y0 = Math.min(64 * d, Math.max(12 * d, viewportH * 0.05));
   const minFont = clampShellFontPx(0, d);
@@ -649,7 +694,8 @@ export function layoutShellChips(
   const rects: Rgba[] = [];
   let x = x0, y = y0;
   for (const w of widths) {
-    if (x > x0 && x + w > maxRight) { x = x0; y += h + gap; }   // wrap (a lone over-wide chip still gets its row)
+    const rowRight = y === y0 ? firstRight : fullRight;
+    if (x > x0 && x + w > rowRight) { x = x0; y += h + gap; }   // wrap (a lone over-wide chip still gets its row)
     rects.push([x, y, w, h]);
     x += w + gap;
   }

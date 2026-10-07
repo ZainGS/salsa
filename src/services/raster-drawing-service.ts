@@ -150,6 +150,17 @@ export class RasterDrawingService {
     return !!(id && lm?.getLayerById?.(id)?.lockTransparency);
   }
 
+  /** False when the selected layer has no pixels (the 3D scene a loaded city document selects): a stroke there used
+   *  to paint the renderer's orphan fallback texture (invisible) and record no undo. No layer manager / no selection
+   *  (the legacy single-texture path) still paints. */
+  private selectedLayerTakesPaint(): boolean {
+    const lm = (this.renderer as unknown as { rasterLayerManager?: Partial<Pick<RasterLayerManager, 'getSelectedLayerId' | 'hasRasterHistory'>> })
+      .rasterLayerManager;
+    const id = lm?.getSelectedLayerId?.() ?? null;
+    if (!id || typeof lm?.hasRasterHistory !== 'function') return true;
+    return lm.hasRasterHistory(id);
+  }
+
   // ── Preset passthrough API (for ShapeManager / Frogmarks) ─────────
 
   /** Get the paint engine (if initialized). */
@@ -360,6 +371,7 @@ export class RasterDrawingService {
     // BRUSH-3: one stroke at a time. A second pointer (resting palm, pinch finger) or a duplicate pointerdown
     // used to restart the stroke mid-way AND take another interactive lease that end() never returned.
     if (this.isDrawing) return;
+    if (!this.selectedLayerTakesPaint()) return;
     this.isDrawing = true;
     this.strokePointerType = ev.pointerType ?? '';
     this.activePointerId = typeof ev.pointerId === 'number' ? ev.pointerId : null;

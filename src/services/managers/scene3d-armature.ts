@@ -62,6 +62,15 @@ function _jointAxisDir(a: GizmoAxis): vec3 {
         : a === 'xy' ? vec3.fromValues(0, 0, 1) : a === 'xz' ? vec3.fromValues(0, 1, 0) : vec3.fromValues(1, 0, 0);   // yz
 }
 /** Scratch vectors for the per-move ray / plane intersection (no allocation per pointer move). */
+/** Edit Mesh / UV entry view (UI review 2026-10-07 §3 #17): a 3/4 view from the front-right, above (radians; azimuth
+ *  0 = looking down −Z from +Z, positive = from +X), framed so the mesh fills ~60 % of the view (1 / 1.7). */
+export const EDIT_VIEW_AZIMUTH = 0.6;
+export const EDIT_VIEW_ELEVATION = 0.45;
+export const EDIT_VIEW_PADDING = 1.7;
+/** Re-entering the same mesh's edit view within this long after leaving it is a mode SWITCH: the camera is kept. */
+export const EDIT_CAMERA_KEEP_MS = 1500;
+const nowMs = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
 const _armTmpA = vec3.create();
 const _armTmpB = vec3.create();
 
@@ -192,6 +201,12 @@ export class Scene3DArmature {
      *  cameraOwnsView=false so its pan (which flows through the illustration weld) isn't blocked — but if it was
      *  entered from free3D (cameraOwnsView=true) we must put that back on exit so free3D pan stays decoupled. */
     private _meshEditPrevCameraOwnsView: boolean | null = null;
+    /** The mesh the current Edit Mesh / UV orbit was entered on (null = none). */
+    private _meshEditCamMeshId: string | null = null;
+    /** The Edit Mesh / UV camera at its last exit — re-used when the same mesh's edit view is re-entered right away
+     *  (a mode SWITCH: Edit Mesh ↔ UV editor exits one and enters the other in the same click), so switching modes
+     *  keeps the user's camera instead of re-framing (UI review 2026-10-07 §3 #17). */
+    private _lastEditCam: { meshId: string; target: [number, number, number]; azimuth: number; elevation: number; radius: number; zoom: number; at: number } | null = null;
 
     // ── (e) IK/FK + joint drag ───────────────────────────────────────────────────────────────────────
     private _isDraggingJoint = false;
@@ -710,22 +725,39 @@ export class Scene3DArmature {
         // and (b) the orbit update takes the edit-mesh (ortho) path, not the free3D (perspective) path.
         cam.mode = 'orthographic';
         const meshCenter = this.getMeshCenter(meshId);
+        const kept = this._takeKeptEditCamera(meshId);
+        this._meshEditCamMeshId = meshId;
 
-        // FRAME the mesh so it fills a good portion of the viewport, then seed Edit-Mesh mode's OWN
-        // ortho zoom from that framing. From here on the orbit update derives orthoSize from
-        // `_meshEditZoom` (below), NOT from the 2D illustration zoom — so the mesh is sized to itself
-        // (previously a small 3D mesh rendered at the 2D artboard's zoom came in tiny/far, worst from
-        // 3D-Free where the free camera had framed it large) and zooming here never touches the 2D zoom.
-        this.frameMesh(meshId, 1.7);
-        this._meshEditZoom = 1 / Math.max(0.0001, cam.orthoSize);
-
-        if (meshCenter) {
-            cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
-            this._orbitController?.syncFromCamera();
-            this._meshEditOrbitCenter = [meshCenter[0], meshCenter[1], meshCenter[2]];
+        if (kept && this._orbitController) {
+            // A mode switch on the same mesh (Edit Mesh ↔ UV): the user's camera, exactly as they left it.
+            cam.setTarget(kept.target[0], kept.target[1], kept.target[2]);
+            this._orbitController.radius = kept.radius;
+            this._orbitController.setSpherical(kept.azimuth, kept.elevation);
+            this._meshEditZoom = kept.zoom;
+            cam.orthoSize = 1 / Math.max(0.0001, kept.zoom);
+            this._meshEditOrbitCenter = meshCenter ? [meshCenter[0], meshCenter[1], meshCenter[2]] : [kept.target[0], kept.target[1], kept.target[2]];
         } else {
-            const t = cam.target;
-            this._meshEditOrbitCenter = [t[0], t[1], t[2]];
+            // A fresh entry: a 3/4 view (from the front-right, above) so the mesh reads as 3D, then FRAME it to ~60 % of
+            // the view and seed Edit-Mesh mode's OWN ortho zoom from that framing. From here on the orbit update derives
+            // orthoSize from `_meshEditZoom` (below), NOT from the 2D illustration zoom — so the mesh is sized to itself
+            // and zooming here never touches the 2D zoom. (It used to keep the 2D view's straight-on direction: a cube
+            // read as a flat square.)
+            if (meshCenter && this._orbitController) {
+                cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
+                this._orbitController.syncFromCamera();
+                this._orbitController.setSpherical(EDIT_VIEW_AZIMUTH, EDIT_VIEW_ELEVATION);
+            }
+            this.frameMesh(meshId, EDIT_VIEW_PADDING);
+            this._meshEditZoom = 1 / Math.max(0.0001, cam.orthoSize);
+
+            if (meshCenter) {
+                cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
+                this._orbitController?.syncFromCamera();
+                this._meshEditOrbitCenter = [meshCenter[0], meshCenter[1], meshCenter[2]];
+            } else {
+                const t = cam.target;
+                this._meshEditOrbitCenter = [t[0], t[1], t[2]];
+            }
         }
 
         // Framed = mesh centred in the view; no ortho offset.
@@ -753,6 +785,13 @@ export class Scene3DArmature {
     }
 
     disableMeshEditOrbit(): void {
+        // Remember this edit camera: entering the same mesh's edit view right away (a mode switch) keeps it.
+        const oc = this._orbitController, camNow = this.renderer3D.getCamera();
+        this._lastEditCam = this._meshEditCamMeshId && oc && this._meshEditZoom != null ? {
+            meshId: this._meshEditCamMeshId, target: [camNow.target[0], camNow.target[1], camNow.target[2]],
+            azimuth: oc.azimuth, elevation: oc.elevation, radius: oc.radius, zoom: this._meshEditZoom, at: nowMs(),
+        } : null;
+        this._meshEditCamMeshId = null;
         this.ctx.interactionService.suppressBoxSelect = false;
         this._meshEditOrbitCenter = null;
         this._meshEditOrthoX = 0;
@@ -771,6 +810,13 @@ export class Scene3DArmature {
         this._syncFocusBgLiveLoop();   // release any animated-bg live-loop hold
         this.disableOrbitControls();
         this._forceIllustrationResync();   // snap the camera back to the 2D view NOW (not on the next pan)
+    }
+
+    /** The kept edit camera for `meshId` when its edit view was left within {@link EDIT_CAMERA_KEEP_MS} (consumed). */
+    private _takeKeptEditCamera(meshId: string): NonNullable<Scene3DArmature['_lastEditCam']> | null {
+        const k = this._lastEditCam;
+        this._lastEditCam = null;
+        return k && k.meshId === meshId && nowMs() - k.at <= EDIT_CAMERA_KEEP_MS ? k : null;
     }
 
     enterMeshOrbit3D(meshId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {

@@ -136,7 +136,11 @@ export class RasterLayerManager {
     // resize all existing layer textures
     for (const layer of this.layers) {
       if (!layer.manager) continue; // skip 3D dividers and folders (no texture)
+      const before = layer.manager.getTexture?.();
       layer.texture = layer.manager.ensureTexture(w, h);
+      // reallocated: a history that is only the blank seed re-seeds at the new size (a new document is created at
+      // the window size, then sized — its first undo used to restore the window-size seed)
+      if (before && layer.texture !== before) void layer.manager.reseedPristineHistory?.();
     }
     this.notifyCompositionChanged();
     // A size change recreates each layer's GPUTexture (ensureTexture allocates a
@@ -255,9 +259,14 @@ export class RasterLayerManager {
     return true;
   }
 
+  /** Select the layer that paint / fill / import / raster undo act on. A vector / ephemera layer or a folder is never
+   *  that layer: false, the selection stays. (A host auto-picking `getLayers()[0]` — the default 'Vector' entry of a new
+   *  document — used to make every brush stroke paint an orphan texture with no undo entry.) The 3D scene stays
+   *  selectable: a loaded city document selects it. */
   public selectLayer(id: string): boolean {
     const l = this.layers.find(x => x.id === id);
     if (!l) return false;
+    if (l.type === 'vector' || l.type === 'ephemera' || l.type === 'folder') return false;
     this.selectedLayerId = id;
     // Notify renderer so it can point the paint engine at this layer's texture
     this.selectionCallback?.(l.texture ?? null, l.manager);
@@ -632,7 +641,10 @@ export class RasterLayerManager {
 
     const w = this.width, h = this.height;
 
-    void l.manager.pushSnapshot?.();
+    // The state BEFORE (a dedup no-op when it is already the current entry). Awaited + never coalesced, like the
+    // AFTER push below: it used to be the only push (un-awaited), so the burned pixels were never an entry and Ctrl+Z
+    // stepped back past the previous stroke as well (UI review 2026-10-07 §2b).
+    await l.manager.pushSnapshot?.({ noCoalesce: true });
 
     const existingBlob = await l.manager.exportToBlob('image/png');
     const existingBitmap = await createImageBitmap(existingBlob);
@@ -668,9 +680,16 @@ export class RasterLayerManager {
     );
     await this.device.queue.onSubmittedWorkDone();
     composited.close();
+    await l.manager.pushSnapshot?.({ noCoalesce: true });   // the burned state = ONE undo entry on this layer
 
     this.notifyCompositionChanged();
     return true;
+  }
+
+  /** The layer's raster undo-history entry tokens (RasterTextureManager.historyMark); null = no pixel history. */
+  public getLayerHistoryMark(id: string): { top: object | null; next: object | null } | null {
+    const l = this.layers.find(x => x.id === id);
+    return l?.manager?.historyMark?.() ?? null;
   }
 
   // Find the internal layer by id
@@ -795,17 +814,29 @@ export class RasterLayerManager {
   public async undoForLayer(id: string): Promise<boolean> {
     const l = this.layers.find(x => x.id === id);
     if (!l?.manager) return false;
+    const before = l.manager.getTexture?.() ?? null;
     const ok = !!(await l.manager.undo?.());
-    if (ok) this.notifyCompositionChanged();
+    if (ok) { this.adoptReallocatedTexture(l, before); this.notifyCompositionChanged(); }
     return ok;
   }
 
   public async redoForLayer(id: string): Promise<boolean> {
     const l = this.layers.find(x => x.id === id);
     if (!l?.manager) return false;
+    const before = l.manager.getTexture?.() ?? null;
     const ok = !!(await l.manager.redo?.());
-    if (ok) this.notifyCompositionChanged();
+    if (ok) { this.adoptReallocatedTexture(l, before); this.notifyCompositionChanged(); }
     return ok;
+  }
+
+  /** Undo / redo of an entry recorded at another size reallocates the manager's texture (its resize hook). The
+   *  layer entry kept the old — now destroyed — texture: the compositor drew it ("Destroyed texture used in a
+   *  submit") and the next stroke painted it (lost). Adopt the new one and re-point the paint engine. */
+  private adoptReallocatedTexture(l: RasterLayer, before: GPUTexture | null): void {
+    const now = l.manager?.getTexture?.() ?? null;
+    if (!now || now === before || l.texture !== before) return;   // unchanged, or an animated layer showing a cel
+    l.texture = now;
+    if (this.selectedLayerId === l.id) this.selectionCallback?.(now, l.manager);
   }
 
   /** True when `id` is a layer with its own pixel history (a paint layer), i.e. raster undo / redo can act on it. */

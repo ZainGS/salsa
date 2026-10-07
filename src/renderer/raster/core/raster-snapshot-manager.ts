@@ -64,6 +64,15 @@ export class RasterSnapshotManager {
     return { kinds: this.snapshots.map(s => s.kind), index: this.snapIndex, bytes };
   }
 
+  /** Identity tokens of the current entry (`top`) and the redo entry (`next`) — lets a caller that pushed an entry
+   *  tell later whether it is still the current one (ephemera rasterize undo). null = nothing there. */
+  public historyMark(): { top: object | null; next: object | null } {
+    return {
+      top: this.snapIndex >= 0 ? this.snapshots[this.snapIndex] ?? null : null,
+      next: this.snapshots[this.snapIndex + 1] ?? null,
+    };
+  }
+
   // ── Push ──────────────────────────────────────────────────────────
 
   /**
@@ -76,7 +85,8 @@ export class RasterSnapshotManager {
    * Prefer {@link pushPatch} (BEFORE read from the GPU, no invariant). Omit it (fills, filters, clears,
    * resizes) for the full-canvas readback.
    */
-  public async pushSnapshot(texture: GPUTexture, dirtyRect?: { x: number; y: number; w: number; h: number }): Promise<void> {
+  public async pushSnapshot(texture: GPUTexture, dirtyRect?: { x: number; y: number; w: number; h: number }, opts?: { noCoalesce?: boolean }): Promise<void> {
+    if (opts?.noCoalesce) this.lastSnapshotMs = 0;   // a one-shot edit (rasterize) must never be folded away
     // every push follows an edit, coalesced or not (device-lost shadow accuracy). BRUSH-5: the edit is reported to
     // the incremental layer composite here as well — the caller's rect, else the whole canvas — so a tool that
     // pushes a snapshot after writing a layer can never leave the screen stale.

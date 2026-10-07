@@ -120,6 +120,23 @@ export class RasterTextureManager {
     await this.ensureSnapshotMgr().initialize(this.texture);
   }
 
+  /**
+   * After a size change (the owner calls it when ensureTexture reallocated): a history that is still only its
+   * blank seed — nothing drawn yet, e.g. a new document sized right after its layers were made at the window size —
+   * is re-seeded from the texture at the NEW size. Undoing the first stroke used to restore the old-size seed,
+   * reallocating the layer to the window size, and the next stroke painted a destroyed texture. A history with real
+   * entries is kept (undo across a resize stays possible). A seed still in flight lands in the discarded stack.
+   */
+  public async reseedPristineHistory(): Promise<boolean> {
+    const mgr = this.snapshotMgr;
+    if (!mgr || !this.texture || this.width === 0 || this.height === 0) return false;
+    if (mgr.getStats().kinds.length > 1) return false;
+    mgr.destroy();
+    this.snapshotMgr = new RasterSnapshotManager(this.device);
+    await this.snapshotMgr.initialize(this.texture);
+    return true;
+  }
+
   // Expose current texture size
   public getTextureSize(): { w: number, h: number } {
     return { w: this.width, h: this.height };
@@ -131,9 +148,14 @@ export class RasterTextureManager {
   }
 
   /** Capture the current texture onto the undo stack (dedup + 40ms coalescing — see RasterSnapshotManager). */
-  public async pushSnapshot(): Promise<void> {
+  public async pushSnapshot(opts?: { noCoalesce?: boolean }): Promise<void> {
     if (!this.texture || this.width === 0 || this.height === 0) return;
-    await this.ensureSnapshotMgr().pushSnapshot(this.texture);
+    await this.ensureSnapshotMgr().pushSnapshot(this.texture, undefined, opts);
+  }
+
+  /** The undo history's current / redo entry tokens (see RasterSnapshotManager.historyMark); null before any push. */
+  public historyMark(): { top: object | null; next: object | null } | null {
+    return this.snapshotMgr ? this.snapshotMgr.historyMark() : null;
   }
 
   /** BRUSH-6: push a brush stroke's rect undo patch (see RasterSnapshotManager.pushPatch). `texture` is the

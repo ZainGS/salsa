@@ -169,6 +169,14 @@ function avgCol(list: RGBA[]): RGBA {
   return [r / n, g / n, b / n, a / n];
 }
 
+/** Undirected edge key "lo,hi" (the key the topology ops share). */
+function edgeKey(a: number, b: number): string { return a < b ? `${a},${b}` : `${b},${a}`; }
+
+function cross3(a: N3, b: N3): N3 { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+
+/** Unit vector (zero stays zero). */
+function norm3(a: N3): N3 { const l = Math.hypot(a[0], a[1], a[2]); return l > 1e-12 ? [a[0] / l, a[1] / l, a[2] / l] : [0, 0, 0]; }
+
 // ── Modifier interface ─────────────────────────────────────────────────────────
 
 export interface Modifier {
@@ -1852,6 +1860,426 @@ export class EditMesh {
       this._insetInto(faceLists, fi, amount);
     }
     this._buildTopology(faceLists);
+  }
+
+  // ── Region ops (Blender's region extrude / inset; UI review 2026-10-07) ─────────────────────────────────────────────
+
+  /**
+   * REGION extrude: each edge-connected group of the given faces moves as ONE piece along the group's (area-weighted)
+   * average normal by `distance`, with one ring of side quads around the group's outline only — no walls between
+   * selected faces and no torn top (`extrudeFaces` moves each face along its own normal, splitting the top). Vertices
+   * inside a group move in place; outline vertices are duplicated (the originals stay with the side walls and the rest
+   * of the mesh). The group's faces keep their indices (they are the new top) and their corner UVs / colours; side
+   * quads take the outline corners' UVs / colours, stretched up the wall. Returns the top faces then the new side faces.
+   */
+  extrudeRegion(fIdxSet: Iterable<number>, distance: number): number[] {
+    const faceLists = this._getAllFaceLists();
+    const sel = this._validFaces(fIdxSet, faceLists.length);
+    if (sel.length === 0) return [];
+    const { useCount, regions, touchedOutside } = this._regionInfo(faceLists, sel);
+    const sides: FaceList[] = [];
+    for (const region of regions) {
+      const n = this._regionNormal(faceLists, region);
+      const dx = n[0] * distance, dy = n[1] * distance, dz = n[2] * distance;
+      const outline = this._regionOutlineVerts(faceLists, region, useCount);
+      const remap = new Map<number, number>();
+      for (const vi of new Set(region.flatMap(fi => [...faceLists[fi]]))) {
+        const v = this.vertices[vi];
+        if (outline.has(vi) || touchedOutside.has(vi)) {
+          remap.set(vi, this.vertices.length);
+          this.vertices.push({ x: v.x + dx, y: v.y + dy, z: v.z + dz, color: [...v.color] as RGBA, halfEdge: -1, uv: v.uv ? [v.uv[0], v.uv[1]] : undefined });
+        } else {
+          v.x += dx; v.y += dy; v.z += dz;                // inside the region: only region faces use it
+        }
+      }
+      const R = (vi: number) => remap.get(vi) ?? vi;
+      for (const fi of region) {
+        const src = faceLists[fi], m = src.length;
+        for (let k = 0; k < m; k++) {
+          const a = src[k], b = src[(k + 1) % m];
+          if (useCount.get(edgeKey(a, b)) !== 1) continue;  // an edge between two selected faces: no wall
+          const ua = this._fuv(src, k), ub = this._fuv(src, (k + 1) % m);
+          const ca = this._fcol(src, k), cb = this._fcol(src, (k + 1) % m);
+          sides.push(faceList([a, b, R(b), R(a)], src.uvs ? [ua, ub, ub, ua] : null, src.smooth, src.cols ? [ca, cb, cb, ca] : null));
+        }
+        faceLists[fi] = faceList(src.map(R), src.uvs, src.smooth, src.cols);   // the moved top (custom normals dropped)
+      }
+    }
+    const firstSide = faceLists.length;
+    this._buildTopology([...faceLists, ...sides]);
+    return [...sel, ...sides.map((_, i) => firstSide + i)];
+  }
+
+  /**
+   * REGION inset: each edge-connected group of the given faces is inset as ONE piece — a ring of border quads around
+   * the group's outline only (Blender's Inset Faces, not Individual), its inner edges untouched. `amount` is a fraction
+   * like the single-face inset's: the border is `amount` × the group's mean centre-to-outline distance (a lone face is
+   * inset exactly as {@link insetFace}). Outline corners move along the bisector of their two outline edges inside the
+   * faces (a mitred, even border). The group's faces keep their indices (they are the inner faces). Returns them.
+   */
+  insetRegion(fIdxSet: Iterable<number>, amount: number): number[] {
+    const faceLists = this._getAllFaceLists();
+    const sel = this._validFaces(fIdxSet, faceLists.length);
+    if (sel.length === 0) return [];
+    const { useCount, regions } = this._regionInfo(faceLists, sel);
+    for (const region of regions) {
+      if (region.length === 1) { this._insetInto(faceLists, region[0], amount); continue; }   // the single-face inset, unchanged
+      // The outline: directed edges (face order) of the region used by one selected face only.
+      const edges: Array<{ fi: number; k: number; a: number; b: number; inward: N3 }> = [];
+      let cx = 0, cy = 0, cz = 0, cn = 0;
+      for (const fi of region) {
+        const f = faceLists[fi], m = f.length;
+        const fn = this._listNormal(f);
+        for (let k = 0; k < m; k++) {
+          const a = f[k], b = f[(k + 1) % m];
+          const va = this.vertices[a];
+          cx += va.x; cy += va.y; cz += va.z; cn++;
+          if (useCount.get(edgeKey(a, b)) !== 1) continue;
+          const vb = this.vertices[b];
+          // inside the face is to the LEFT of a→b seen from the normal: n × (b − a)
+          edges.push({ fi, k, a, b, inward: norm3(cross3(fn, [vb.x - va.x, vb.y - va.y, vb.z - va.z])) });
+        }
+      }
+      if (edges.length === 0) continue;                      // a closed region (the whole surface): no outline to inset
+      cx /= cn; cy /= cn; cz /= cn;
+      let meanDist = 0;
+      for (const e of edges) {
+        const va = this.vertices[e.a], vb = this.vertices[e.b];
+        const ab: N3 = [vb.x - va.x, vb.y - va.y, vb.z - va.z];
+        const len = Math.hypot(ab[0], ab[1], ab[2]) || 1;
+        const c = cross3([cx - va.x, cy - va.y, cz - va.z], ab);
+        meanDist += Math.hypot(c[0], c[1], c[2]) / len;
+      }
+      const d = Math.max(0, amount) * (meanDist / edges.length);
+      if (!(d > 0)) continue;
+      // Each outline vertex: the mitre of its outline edges' inward directions.
+      const inwardAt = new Map<number, N3[]>();
+      for (const e of edges) for (const v of [e.a, e.b]) { let l = inwardAt.get(v); if (!l) inwardAt.set(v, l = []); l.push(e.inward); }
+      const remap = new Map<number, number>();
+      const offsetLen = new Map<number, number>();
+      for (const [vi, dirs] of inwardAt) {
+        let m: N3 = [0, 0, 0];
+        for (const q of dirs) { m[0] += q[0]; m[1] += q[1]; m[2] += q[2]; }
+        m = norm3(m);
+        let cosMin = 1;
+        for (const q of dirs) cosMin = Math.min(cosMin, m[0] * q[0] + m[1] * q[1] + m[2] * q[2]);
+        const len = d / Math.max(0.25, cosMin);              // mitre (capped at 4× for very sharp corners)
+        const v = this.vertices[vi];
+        remap.set(vi, this.vertices.length);
+        offsetLen.set(vi, len);
+        this.vertices.push({ x: v.x + m[0] * len, y: v.y + m[1] * len, z: v.z + m[2] * len, color: [...v.color] as RGBA, halfEdge: -1, uv: v.uv ? [v.uv[0], v.uv[1]] : undefined });
+      }
+      // The region's faces take the inner vertices; their outline corners' UVs slide toward the face's UV centre by
+      // the same fraction the corner moved toward the face centre (a close, cheap stand-in for a true UV offset).
+      const innerUV = new Map<number, Array<UV | undefined>>();
+      for (const fi of region) {
+        const f = faceLists[fi], m = f.length;
+        let fx = 0, fy = 0, fz = 0;
+        for (const vi of f) { fx += this.vertices[vi].x / m; fy += this.vertices[vi].y / m; fz += this.vertices[vi].z / m; }
+        const uvs = f.map((_, k) => this._fuv(f, k));
+        const uvC = avgUV(uvs);
+        const inner = uvs.map((u, k) => {
+          const L = offsetLen.get(f[k]);
+          if (L === undefined) return u;
+          const v = this.vertices[f[k]];
+          const dist = Math.hypot(fx - v.x, fy - v.y, fz - v.z) || 1;
+          return lerpUV(u, uvC, Math.min(0.95, L / dist));
+        });
+        innerUV.set(fi, inner);
+      }
+      const border: FaceList[] = [];
+      for (const e of edges) {
+        const f = faceLists[e.fi], m = f.length, k1 = (e.k + 1) % m;
+        const inner = innerUV.get(e.fi)!;
+        const ca = this._fcol(f, e.k), cb = this._fcol(f, k1);
+        border.push(faceList([e.a, e.b, remap.get(e.b)!, remap.get(e.a)!],
+          f.uvs ? [this._fuv(f, e.k), this._fuv(f, k1), inner[k1], inner[e.k]] : null, f.smooth, f.cols ? [ca, cb, cb, ca] : null));
+      }
+      for (const fi of region) {
+        const f = faceLists[fi];
+        faceLists[fi] = faceList(f.map(vi => remap.get(vi) ?? vi), f.uvs ? innerUV.get(fi)! : null, f.smooth, f.cols);
+      }
+      faceLists.push(...border);
+    }
+    this._buildTopology(faceLists);
+    return sel;
+  }
+
+  /**
+   * Subdivide every given face at once (Blender's Subdivide on a face selection): a centre vertex per face and ONE
+   * midpoint per edge, shared by the selected faces on both sides — a selected grid stays a clean grid (subdividing
+   * the faces one by one gave n-gons with doubled midpoints, and the indices shifted after the first). Unselected
+   * neighbours gain the midpoints on their shared edges (no crack). A single face matches {@link subdivideFace}.
+   */
+  subdivideFaces(fIdxSet: Iterable<number>): void {
+    const faceLists = this._getAllFaceLists();
+    const sel = this._validFaces(fIdxSet, faceLists.length).filter(fi => faceLists[fi].length >= 3);
+    if (sel.length === 0) return;
+    const selSet = new Set(sel);
+    const edgeMid = new Map<string, number>();
+    const quads: FaceList[] = [];
+    for (const fi of sel) {
+      const fv = faceLists[fi], n = fv.length;
+      let cx = 0, cy = 0, cz = 0, cr = 0, cg = 0, cb = 0, ca = 0;
+      for (const vi of fv) {
+        const v = this.vertices[vi];
+        cx += v.x / n; cy += v.y / n; cz += v.z / n;
+        cr += v.color[0] / n; cg += v.color[1] / n; cb += v.color[2] / n; ca += v.color[3] / n;
+      }
+      const centerIdx = this.vertices.length;
+      this.vertices.push({ x: cx, y: cy, z: cz, color: [cr, cg, cb, ca], halfEdge: -1 });
+      const mids: number[] = [];
+      for (let k = 0; k < n; k++) {
+        const a = fv[k], b = fv[(k + 1) % n], key = edgeKey(a, b);
+        let mid = edgeMid.get(key);
+        if (mid === undefined) {
+          const va = this.vertices[a], vb = this.vertices[b];
+          mid = this.vertices.length;
+          this.vertices.push({
+            x: (va.x + vb.x) / 2, y: (va.y + vb.y) / 2, z: (va.z + vb.z) / 2,
+            color: [(va.color[0] + vb.color[0]) / 2, (va.color[1] + vb.color[1]) / 2, (va.color[2] + vb.color[2]) / 2, (va.color[3] + vb.color[3]) / 2],
+            halfEdge: -1,
+          });
+          edgeMid.set(key, mid);
+        }
+        mids.push(mid);
+      }
+      const cu = fv.map((_, k) => this._fuv(fv, k)), cC = avgUV(cu), has = !!fv.uvs;
+      const cc = fv.map((_, k) => this._fcol(fv, k)), ccC = avgCol(cc), hasC = !!fv.cols;
+      for (let k = 0; k < n; k++) {
+        const kp = (k - 1 + n) % n;
+        quads.push(faceList([fv[k], mids[k], centerIdx, mids[kp]],
+          has ? [cu[k], lerpUV(cu[k], cu[(k + 1) % n], 0.5), cC, lerpUV(cu[kp], cu[k], 0.5)] : null, fv.smooth,
+          hasC ? [cc[k], lerpCol(cc[k], cc[(k + 1) % n], 0.5), ccC, lerpCol(cc[kp], cc[k], 0.5)] : null));
+      }
+    }
+    const points = new Map<string, { idx: number; vA: number; t: number }>();
+    for (const [key, idx] of edgeMid) points.set(key, { idx, vA: +key.slice(0, key.indexOf(',')), t: 0.5 });
+    const kept = faceLists.filter((_, fi) => !selSet.has(fi)).map(f => this._insertEdgePoints(f, points));
+    this._buildTopology([...kept, ...quads]);
+  }
+
+  /**
+   * The open boundary loops (holes) as vertex rings, in the order the faces' own boundary half-edges run (each ring
+   * once). Walks like {@link fillHole}; a ring that cannot be closed (non-manifold) is skipped.
+   */
+  boundaryLoops(): number[][] {
+    const H = this.halfEdges;
+    const seen = new Set<number>();
+    const loops: number[][] = [];
+    for (let start = 0; start < H.length; start++) {
+      if (H[start].twin !== -1 || seen.has(start)) continue;
+      const verts: number[] = [];
+      const hes: number[] = [];
+      let he = start, ok = false;
+      for (let guard = 0; guard < 100000; guard++) {
+        hes.push(he);
+        verts.push(H[he].vertex);
+        const next = this._nextBoundaryHalfEdge(H[he].vertex);
+        if (next < 0) break;
+        if (next === start) { ok = true; break; }
+        if (hes.includes(next)) break;                       // a figure-eight through a non-manifold vertex
+        he = next;
+      }
+      for (const h of hes) seen.add(h);
+      if (ok && verts.length >= 3) loops.push(verts);
+    }
+    return loops;
+  }
+
+  /** The boundary half-edge (twin −1) leaving vertex `v` (−1 if none) — the rotation {@link fillHole} uses. */
+  private _nextBoundaryHalfEdge(v: number): number {
+    const H = this.halfEdges;
+    const vertHe = this.vertices[v]?.halfEdge ?? -1;
+    if (vertHe < 0) return -1;
+    let cur = vertHe;
+    for (let g = 0; g < 1000; g++) {
+      if (H[cur].twin === -1) return cur;
+      cur = H[H[cur].twin].next;
+      if (cur === vertHe) break;
+    }
+    return -1;
+  }
+
+  /**
+   * Cap EVERY hole at once (one face per boundary loop, facing outward) — or, with `touching`, only the holes that
+   * contain one of those vertices. Returns the number of holes filled. (`fillHole` caps one loop by half-edge index.)
+   */
+  fillHoles(touching?: ReadonlySet<number> | null): number {
+    let loops = this.boundaryLoops();
+    if (touching && touching.size > 0) loops = loops.filter(l => l.some(v => touching.has(v)));
+    if (loops.length === 0) return 0;
+    const faceLists = this._getAllFaceLists();
+    for (const l of loops) faceLists.push([...l].reverse());  // reversed: the cap twins the loop and faces outward (see fillHole)
+    this._buildTopology(faceLists);
+    return loops.length;
+  }
+
+  /**
+   * Bridge the two edge loops the given vertices form, whatever order they were picked in (Bridge Loops used to split
+   * the selection by click order). The vertices are grouped by the mesh edges between them (boundary edges first, so
+   * two holes facing each other bridge even when other edges join them), each group ordered by walking its edges —
+   * closed rings or open chains of equal length. Boundary loops are oriented so the new quads twin the existing
+   * boundary half-edges (outward facing, manifold); the second loop is rotated to the start that pairs the closest
+   * vertices. Returns the new face indices, or null when the vertices don't form two such loops.
+   */
+  bridgeVertexLoops(verts: Iterable<number>): number[] | null {
+    const vs = new Set<number>();
+    for (const v of verts) if (v >= 0 && v < this.vertices.length) vs.add(v);
+    if (vs.size < 4) return null;
+    const H = this.halfEdges;
+    const collect = (boundaryOnly: boolean): Map<number, Set<number>> => {
+      const adj = new Map<number, Set<number>>();
+      for (let hi = 0; hi < H.length; hi++) {
+        const he = H[hi];
+        if (boundaryOnly ? he.twin !== -1 : (he.twin >= 0 && he.twin < hi)) continue;
+        const a = H[he.prev].vertex, b = he.vertex;
+        if (!vs.has(a) || !vs.has(b)) continue;
+        if (!adj.has(a)) adj.set(a, new Set());
+        if (!adj.has(b)) adj.set(b, new Set());
+        adj.get(a)!.add(b); adj.get(b)!.add(a);
+      }
+      return adj;
+    };
+    const loopsOf = (adj: Map<number, Set<number>>): Array<{ verts: number[]; ring: boolean }> | null => {
+      if ([...vs].some(v => !adj.has(v))) return null;
+      const out: Array<{ verts: number[]; ring: boolean }> = [];
+      const done = new Set<number>();
+      for (const v0 of [...vs].sort((a, b) => a - b)) {
+        if (done.has(v0)) continue;
+        // component
+        const comp: number[] = [];
+        const stack = [v0];
+        done.add(v0);
+        while (stack.length) { const v = stack.pop()!; comp.push(v); for (const w of adj.get(v)!) if (!done.has(w)) { done.add(w); stack.push(w); } }
+        if (comp.some(v => adj.get(v)!.size > 2)) return null;
+        const ends = comp.filter(v => adj.get(v)!.size === 1).sort((a, b) => a - b);
+        const ring = ends.length === 0;
+        if (!ring && ends.length !== 2) return null;
+        const order: number[] = [];
+        let prev = -1, cur = ring ? Math.min(...comp) : ends[0];
+        for (let g = 0; g < comp.length; g++) {
+          order.push(cur);
+          const next = [...adj.get(cur)!].filter(w => w !== prev).sort((a, b) => a - b)[0];
+          if (next === undefined || (ring && next === order[0])) break;
+          prev = cur; cur = next;
+        }
+        if (order.length !== comp.length) return null;
+        out.push({ verts: order, ring });
+      }
+      return out;
+    };
+    let loops = loopsOf(collect(true));
+    if (!loops || loops.length !== 2) loops = loopsOf(collect(false));
+    if (!loops || loops.length !== 2) return null;
+    let [A, B] = loops;
+    if (A.verts.length !== B.verts.length || A.ring !== B.ring) return null;
+    const n = A.verts.length, ring = A.ring;
+    // Boundary direction: +1 = the faces' boundary half-edge runs list[i] → list[i+1], −1 = against, 0 = unknown.
+    const dirOf = (list: number[]): number => {
+      for (let i = 0; i + 1 < list.length; i++) {
+        const a = list[i], b = list[i + 1];
+        for (const he of H) {
+          if (he.twin !== -1) continue;
+          const from = H[he.prev].vertex;
+          if (from === a && he.vertex === b) return 1;
+          if (from === b && he.vertex === a) return -1;
+        }
+      }
+      return 0;
+    };
+    // The quad [A[i], A[i+1], B[i+1], B[i]] runs A[i] → A[i+1] and B[i+1] → B[i]: loop A must run AGAINST its boundary
+    // half-edges and loop B ALONG them for the quads to twin them.
+    let a = A.verts, b = B.verts;
+    if (dirOf(a) === 1) a = [...a].reverse();
+    const bDir = dirOf(b);
+    const dist2 = (p: number, q: number) => { const P = this.vertices[p], Q = this.vertices[q]; return (P.x - Q.x) ** 2 + (P.y - Q.y) ** 2 + (P.z - Q.z) ** 2; };
+    const cost = (list: number[], s: number) => { let c = 0; for (let i = 0; i < n; i++) c += dist2(a[i], list[(i + s) % n]); return c; };
+    const candidates: number[][] = [];
+    const bRev = [...b].reverse();
+    if (bDir === 1) candidates.push(b); else if (bDir === -1) candidates.push(bRev); else candidates.push(b, bRev);
+    let best: number[] = candidates[0], bestCost = Infinity;
+    for (const list of candidates) {
+      for (let s = 0; s < (ring ? n : 1); s++) {
+        const c = cost(list, s);
+        if (c < bestCost - 1e-12) { bestCost = c; best = ring ? list.map((_, i) => list[(i + s) % n]) : list; }
+      }
+    }
+    // An open chain with no boundary orientation: pair the nearer ends.
+    if (!ring && bDir === 0 && cost(bRev, 0) < cost(b, 0) - 1e-12) best = bRev;
+    b = best;
+    const faceLists = this._getAllFaceLists();
+    const first = faceLists.length;
+    const count = ring ? n : n - 1;
+    for (let i = 0; i < count; i++) {
+      const i1 = (i + 1) % n;
+      faceLists.push([a[i], a[i1], b[i1], b[i]]);
+    }
+    this._buildTopology(faceLists);
+    return Array.from({ length: count }, (_, i) => first + i);
+  }
+
+  /** The valid, distinct face indices of `set`, ascending. */
+  private _validFaces(set: Iterable<number>, faceCount: number): number[] {
+    return [...new Set(set)].filter(fi => Number.isInteger(fi) && fi >= 0 && fi < faceCount).sort((x, y) => x - y);
+  }
+
+  /** For region ops: undirected edge → how many SELECTED faces use it, the selection's edge-connected groups, and
+   *  the vertices an unselected face uses. */
+  private _regionInfo(faceLists: FaceList[], sel: number[]): { useCount: Map<string, number>; regions: number[][]; touchedOutside: Set<number> } {
+    const useCount = new Map<string, number>();
+    const byEdge = new Map<string, number[]>();
+    for (const fi of sel) {
+      const f = faceLists[fi], m = f.length;
+      for (let k = 0; k < m; k++) {
+        const key = edgeKey(f[k], f[(k + 1) % m]);
+        useCount.set(key, (useCount.get(key) ?? 0) + 1);
+        let l = byEdge.get(key); if (!l) byEdge.set(key, l = []); l.push(fi);
+      }
+    }
+    const parent = new Map<number, number>(sel.map(fi => [fi, fi]));
+    const find = (x: number): number => { while (parent.get(x)! !== x) { parent.set(x, parent.get(parent.get(x)!)!); x = parent.get(x)!; } return x; };
+    for (const l of byEdge.values()) for (let i = 1; i < l.length; i++) { const r0 = find(l[0]), r1 = find(l[i]); if (r0 !== r1) parent.set(r1, r0); }
+    const groups = new Map<number, number[]>();
+    for (const fi of sel) { const r = find(fi); let g = groups.get(r); if (!g) groups.set(r, g = []); g.push(fi); }
+    const selSet = new Set(sel);
+    const touchedOutside = new Set<number>();
+    faceLists.forEach((f, fi) => { if (!selSet.has(fi)) for (const v of f) touchedOutside.add(v); });
+    return { useCount, regions: [...groups.values()], touchedOutside };
+  }
+
+  /** The vertices on a region's outline (edges used by one selected face). */
+  private _regionOutlineVerts(faceLists: FaceList[], region: number[], useCount: Map<string, number>): Set<number> {
+    const out = new Set<number>();
+    for (const fi of region) {
+      const f = faceLists[fi], m = f.length;
+      for (let k = 0; k < m; k++) if (useCount.get(edgeKey(f[k], f[(k + 1) % m])) === 1) { out.add(f[k]); out.add(f[(k + 1) % m]); }
+    }
+    return out;
+  }
+
+  /** A region's area-weighted average normal (unit; the first face's normal when the areas cancel). */
+  private _regionNormal(faceLists: FaceList[], region: number[]): N3 {
+    let x = 0, y = 0, z = 0;
+    for (const fi of region) { const a = this._listArea(faceLists[fi]); x += a[0]; y += a[1]; z += a[2]; }
+    const l = Math.hypot(x, y, z);
+    return l > 1e-12 ? [x / l, y / l, z / l] : this._listNormal(faceLists[region[0]]);
+  }
+
+  /** Newell area vector of a vertex loop (length = 2 × area, direction = the face normal). */
+  private _listArea(f: number[]): N3 {
+    let x = 0, y = 0, z = 0;
+    for (let k = 0; k < f.length; k++) {
+      const p = this.vertices[f[k]], q = this.vertices[f[(k + 1) % f.length]];
+      x += (p.y - q.y) * (p.z + q.z); y += (p.z - q.z) * (p.x + q.x); z += (p.x - q.x) * (p.y + q.y);
+    }
+    return [x, y, z];
+  }
+
+  /** Unit normal of a vertex loop (Newell; +Z when degenerate). */
+  private _listNormal(f: number[]): N3 {
+    const a = this._listArea(f), l = Math.hypot(a[0], a[1], a[2]);
+    return l > 1e-12 ? [a[0] / l, a[1] / l, a[2] / l] : [0, 0, 1];
   }
 
   /** Delete all faces in the set. */

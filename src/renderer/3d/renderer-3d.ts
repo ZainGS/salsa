@@ -1401,14 +1401,15 @@ export class Renderer3D {
 
   // ── Armature focus background ──────────────────────────────────────────────
   private _armatureBgPass: ArmatureBgPass | null = null;
-  private _armatureBgOpts: ArmatureBgOptions = { mode: 'wavy' };
+  // Default: the calm gradient (UI review 2026-10-07 §3 #18) — 'wavy' stays an option (it animates: holds the live loop).
+  private _armatureBgOpts: ArmatureBgOptions = { mode: 'gradient' };
   private _armatureModeActive = false;
 
   // ── Mesh-edit / UV focus background ────────────────────────────────────────
   // Same full-screen background system as armature, shown while editing/painting a
   // mesh so the 2D illustration content behind it is hidden for a clean workspace.
   private _meshEditBgActive = false;
-  private _meshEditBgOpts: ArmatureBgOptions = { mode: 'wavy' };
+  private _meshEditBgOpts: ArmatureBgOptions = { mode: 'gradient' };
 
   // ── Global scene background (Skybox) ───────────────────────────────────────
   private _sceneBgPass: ArmatureBgPass | null = null;
@@ -3601,11 +3602,12 @@ export class Renderer3D {
    * Called unconditionally from webgpu-renderer after all mesh draws so it renders
    * even when there are no regular (non-skinned) meshes — e.g. after Bind Mesh.
    */
-  drawMeshEditOverlayIfActive(pass: GPURenderPassEncoder): void {
+  drawMeshEditOverlayIfActive(pass: GPURenderPassEncoder, canvasHeight?: number): void {
     const editData = (RD.on && RD.f.noMeshEditOverlays) ? null : this._meshEditDataForPass(pass);
     this._meshEditDataPass = null; this._meshEditDataMemo = null;   // the overlay is the frame's last reader
     if (!this._meshEditOverlay || !editData) return;
-    this._meshEditOverlay.draw(pass, editData, this.camera);
+    // canvasHeight: the handles (dots, 3 px selected edges) are sized in screen pixels
+    this._meshEditOverlay.draw(pass, editData, this.camera, canvasHeight);
     // The element-transform gizmo on the selection's centroid (on top of the wireframe; hidden by the no-gizmo debug flag)
     const g = editData.gizmo;
     if (g && this._gizmoRenderer && !(RD.on && RD.f.noGizmo)) {

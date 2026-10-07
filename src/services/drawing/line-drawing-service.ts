@@ -27,7 +27,23 @@ export class LineDrawingService {
 
     private handlePointerDownBound = (event: PointerEvent) => this.handlePointerDown(event);
     private handlePointerMoveBound = (event: PointerEvent) => this.handlePointerMove(event);
+    private handlePointerUpBound = (event: PointerEvent) => this.handlePointerUp(event);
     private handleKeyDownBound = (event: KeyboardEvent) => this.handleKeyDown(event);
+
+    /** Screen distance (CSS px) a press must travel before its release finishes the line (press-drag-release);
+     *  a shorter press is a click and the line waits for a second click. A finger gets more slack. */
+    public static readonly DRAG_PX = 6;
+    public static readonly TOUCH_DRAG_PX = 10;
+    /** The press that started the current line (null once the line is in click-click mode or finished). */
+    private _press: { pointerId: number; clientX: number; clientY: number; slop: number; dragged: boolean } | null = null;
+    /** Undo capture for the line being drawn (one 'Draw line' step on finish). */
+    private _undoToken: ReturnType<InteractionService['vectorUndo']['begin']> | null = null;
+
+    /** Stroke colour for new lines / arrows (the host's current colour). */
+    public setStrokeColor(color: RGBA): void {
+        this.strokeColor = { ...color };
+    }
+    public getStrokeColor(): RGBA { return { ...this.strokeColor }; }
 
     constructor(interactionService: InteractionService, 
                 sceneGraph: SceneGraph, 
@@ -64,6 +80,8 @@ export class LineDrawingService {
         const canvas = this.interactionService.canvas;
         canvas.addEventListener("pointerdown", this.handlePointerDownBound);
         canvas.addEventListener("pointermove", this.handlePointerMoveBound);
+        // The release may land off the canvas (a drag past its edge): listen on the window.
+        window.addEventListener("pointerup", this.handlePointerUpBound);
         window.addEventListener("keydown", this.handleKeyDownBound);
 
         this.eventListenersAttached = true;
@@ -74,17 +92,18 @@ export class LineDrawingService {
     
         canvas.removeEventListener("pointerdown", this.handlePointerDownBound);
         canvas.removeEventListener("pointermove", this.handlePointerMoveBound);
+        window.removeEventListener("pointerup", this.handlePointerUpBound);
         window.removeEventListener("keydown", this.handleKeyDownBound);
-    
+
         this.eventListenersAttached = false;
         this.attachEventListeners();
     }
 
-    // ── Click-click drawing flow ────────────────────────────────────
-    //  1st click  → create line, start drawing
-    //  move       → update endpoint in real time
-    //  2nd click  → commit line
-    //  Escape     → cancel drawing
+    // ── Drawing flow (UI review 2026-10-07 §2b / §3 #12) ────────────
+    //  press-drag-release → the line runs from the press to the release (one gesture)
+    //  click, move, click → click-click still works: a press that doesn't travel DRAG_PX
+    //                       leaves the line following the pointer until the next press
+    //  Escape / right-click → cancel drawing
 
     private handlePointerDown(event: PointerEvent) {
         if (!this.isEnabled) return;
@@ -99,16 +118,41 @@ export class LineDrawingService {
         if (event.button !== 0) return;
 
         if (!this.isDrawing) {
-            // ── First click: start a new line ──
+            // ── Press: start a new line (finished by this press's release after a drag, or by a 2nd click) ──
             this.startDrawing(event);
+            this._press = {
+                pointerId: event.pointerId,
+                clientX: event.clientX, clientY: event.clientY,
+                slop: event.pointerType === 'touch' ? LineDrawingService.TOUCH_DRAG_PX : LineDrawingService.DRAG_PX,
+                dragged: false,
+            };
+        } else if (this._press && event.pointerId !== this._press.pointerId) {
+            // A second finger mid-drag (a pinch): drop the half-made line instead of finishing it there.
+            this.cancelDrawing();
         } else {
             // ── Second click: finish the line ──
             this.finishDrawing(event);
         }
     }
 
+    /** The press that started the line is released: after a drag it finishes the line there (press-drag-release);
+     *  a click (no drag) leaves the line following the pointer for click-click. */
+    private handlePointerUp(event: PointerEvent) {
+        const press = this._press;
+        if (!press || event.pointerId !== press.pointerId) return;
+        this._press = null;
+        if (!this.isEnabled || !this.isDrawing) return;
+        const dragged = press.dragged || Math.hypot(event.clientX - press.clientX, event.clientY - press.clientY) >= press.slop;
+        if (dragged) this.finishDrawing(event);
+    }
+
     private handlePointerMove(event: PointerEvent) {
         if (!this.isDrawing || !this.currentLine) return;
+        const press = this._press;
+        if (press && !press.dragged && event.pointerId === press.pointerId &&
+            Math.hypot(event.clientX - press.clientX, event.clientY - press.clientY) >= press.slop) {
+            press.dragged = true;
+        }
 
         requestAnimationFrame(() => {
             let { x, y } = this.interactionService.toWorldCoords(event);
@@ -151,6 +195,8 @@ export class LineDrawingService {
         this.currentLine.isStaging = true;
         this.currentLine.arrowStart = this.defaultArrowStart;
         this.currentLine.arrowEnd = this.defaultArrowEnd;
+        // One undo step for the finished line (begin before it is attached: the commit sees it as added)
+        this._undoToken = this.interactionService.vectorUndo?.begin(this.sceneGraph.root, []) ?? null;
 
         // Bind start if snapped
         if (startSnap) {
@@ -182,8 +228,14 @@ export class LineDrawingService {
         }
 
         this.currentLine.isStaging = false;
+        const line = this.currentLine;
         this.isDrawing = false;
         this.currentLine = null;
+        this._press = null;
+        if (this._undoToken) {
+            this.interactionService.vectorUndo.commit(this._undoToken, 'Draw line', [line]);
+            this._undoToken = null;
+        }
         this.interactionService.onSceneGraphChanged.emit();
         this.interactionService.endInteractive();
     }
@@ -194,6 +246,8 @@ export class LineDrawingService {
             this.sceneGraph.root.removeChild(this.currentLine);
             this.currentLine = null;
         }
+        this._press = null;
+        this._undoToken = null;
         this.isDrawing = false;
         this.interactionService.onSceneGraphChanged.emit();
         this.interactionService.endInteractive();

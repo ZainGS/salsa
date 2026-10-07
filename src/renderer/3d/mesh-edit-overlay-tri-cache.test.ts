@@ -84,7 +84,7 @@ describe('MeshEditOverlayRenderer tri (vertex dots / fills) cache', () => {
     const f1 = frame(camera(0), d);
     expect(r.triBuilds).toBe(1);
     expect(f1.triWrites).toHaveLength(1);
-    expect(f1.tri).toEqual([{ pipe: 'MeshEditTri', count: 18 }]);   // 3 vertices × 2 triangles
+    expect(f1.tri).toEqual([{ pipe: 'MeshEditTri', count: 36 }]);   // 3 vertices × (rim + core) × 2 triangles; no fills
     const f2 = frame(camera(3), d);                                  // a pan: same right / up axes
     expect(r.triBuilds).toBe(1);
     expect(f2.triWrites).toHaveLength(0);
@@ -124,6 +124,75 @@ describe('MeshEditOverlayRenderer tri (vertex dots / fills) cache', () => {
     const { r, data, frame } = setup();
     const d: MeshEditDrawData = { ...data, mode: 'vertex', selection: sel() as never, showWireframe: false };
     frame(camera(), d); frame(camera(), d);
+    expect(r.triBuilds).toBe(2);
+  });
+});
+
+describe('MeshEditOverlayRenderer selection readability (UI review 2026-10-07 §3 #19)', () => {
+  const sel = () => ({ meshId: 'm', vertices: new Set<number>(), faces: new Set<number>(), edges: new Set<number>() });
+  /** An ortho camera looking down −Z: right = +X, up = +Y. */
+  function ortho(orthoSize: number): Camera3D {
+    const vp = new Float32Array(16); vp[0] = vp[5] = vp[10] = vp[15] = 1;
+    const v = new Float32Array(16); v[0] = v[5] = v[10] = v[15] = 1;
+    return { getViewProjectionMatrix: () => vp, getViewMatrix: () => v, mode: 'orthographic', orthoSize, fov: 1, position: [0, 0, 5] } as unknown as Camera3D;
+  }
+  function run(d: Partial<MeshEditDrawData>, H?: number, cam = ortho(2)) {
+    const { device, writes } = fakeDevice();
+    const r = new MeshEditOverlayRenderer(device, 'bgra8unorm');
+    const t = triMesh();
+    const p = fakePass();
+    r.draw(p.pass, { mesh: t.mesh, selection: sel() as never, mode: 'vertex', showWireframe: true, ...d } as MeshEditDrawData, cam, H);
+    return { tri: p.draws.filter(x => x.pipe === 'MeshEditTri').map(x => x.count), lines: p.draws.filter(x => x.pipe === 'MeshEditLine'), writes };
+  }
+
+  it('vertex dots are a fixed SCREEN size (black core on a light rim): 4.5 / 3 px at 0.01 world units per pixel', () => {
+    const { writes } = run({ mode: 'vertex' }, 400);           // orthoSize 2 → 4 world units over 400 px
+    const tri = writes.find(w => w.floats.length === 3 * 2 * 6 * 7)!.floats;
+    expect(tri[0]).toBeCloseTo(-0.045, 6);                    // vertex 0's rim: −(right + up) × 4.5 px
+    expect(tri[6 * 7]).toBeCloseTo(-0.03, 6);                 // its core: 3 px
+    expect([tri[6 * 7 + 3], tri[6 * 7 + 4], tri[6 * 7 + 5]]).toEqual([expect.closeTo(0.04), expect.closeTo(0.04), expect.closeTo(0.04)]);   // black
+  });
+
+  it('a selected vertex is orange; no vertex dots outside Vertex mode', () => {
+    const s = sel(); s.vertices.add(1);
+    const v = run({ mode: 'vertex', selection: s as never }, 400);
+    const tri = v.writes.find(w => w.floats.length === 3 * 2 * 6 * 7)!.floats;
+    const core1 = (1 * 2 + 1) * 6 * 7;                        // vertex 1: rim quad, then core quad
+    expect([tri[core1 + 3], tri[core1 + 4], tri[core1 + 5]]).toEqual([1, expect.closeTo(0.55), 0]);
+    expect(run({ mode: 'edge' }, 400).tri).toEqual([]);        // nothing selected, no dots
+  });
+
+  it('Face mode: a face dot per face; a selected face = fill (under the wireframe) + a 3 px outline (over it)', () => {
+    expect(run({ mode: 'face' }, 400).tri).toEqual([2 * 6]);  // one face dot (rim + core)
+    const s = sel(); s.faces.add(0);
+    const f = run({ mode: 'face', selection: s as never }, 400);
+    expect(f.tri).toEqual([3, 3 * 6 + 2 * 6]);                // the fill; then 3 outline bands + the dot
+  });
+
+  it('Edge mode: a selected edge is a 3 px band (2 triangles) drawn after the wireframe', () => {
+    const s = sel(); s.edges.add(0);
+    const { device } = fakeDevice();
+    const r = new MeshEditOverlayRenderer(device, 'bgra8unorm');
+    const t = triMesh();
+    const order: string[] = [];
+    const pass = {
+      setPipeline: (p: { label?: string }) => { order.push(p.label ?? ''); },
+      setBindGroup: () => {}, setVertexBuffer: () => {}, draw: () => {},
+    } as unknown as GPURenderPassEncoder;
+    r.draw(pass, { mesh: t.mesh, selection: s as never, mode: 'edge', showWireframe: true }, ortho(2), 400);
+    expect(order).toEqual(['MeshEditLine', 'MeshEditLineRear', 'MeshEditTri']);
+  });
+
+  it('the handles resize when the zoom (pixel scale) changes, not on an ortho pan', () => {
+    const { device } = fakeDevice();
+    const r = new MeshEditOverlayRenderer(device, 'bgra8unorm');
+    const t = triMesh();
+    const d: MeshEditDrawData = { mesh: t.mesh, selection: sel() as never, mode: 'vertex', showWireframe: true };
+    const p = fakePass();
+    r.draw(p.pass, d, ortho(2), 400);
+    r.draw(p.pass, d, { ...ortho(2), position: [3, 0, 5] } as unknown as Camera3D, 400);   // a pan: same scale
+    expect(r.triBuilds).toBe(1);
+    r.draw(p.pass, d, ortho(1), 400);                                                       // zoomed in
     expect(r.triBuilds).toBe(2);
   });
 });

@@ -11,6 +11,11 @@ import {
   PROJECT_TILE_W_COMPACT_CSS,
   PROJECT_TILE_ASPECT,
   SHELL_CHIP_MIN_H_CSS,
+  computeShellLayout,
+  shellResponsiveOpts,
+  SHELL_MIN_TILE_CSS,
+  SHELL_COMPACT_BELOW_CSS,
+  type ShellTileSpec,
   type ShellRenderModel,
 } from './shell-layout';
 
@@ -204,5 +209,83 @@ describe('project card title font', () => {
     // DPR scales the clamp.
     expect(projectCardTitleFontPx('Cat', 300, 40, 2, measure)).toBe(27);
     expect(projectCardTitleFontPx('Cat', 300, 200, 2, measure)).toBe(32);
+  });
+});
+
+// ── Responsive home (UI review 2026-10-07 §3 #22): tile floor, fewer columns, few empty slots on a phone ──
+
+const homeSpecs = (n: number): ShellTileSpec[] =>
+  Array.from({ length: n }, (_, i) => ({ id: `s${i}`, kind: 'system', selected: false, hovered: false, label: `App ${i}` }));
+
+describe('computeShellLayout — responsive (tile floor + compact phone layout)', () => {
+  const layout = (cssW: number, cssH: number, dpr: number, n = 5) =>
+    computeShellLayout(cssW * dpr, cssH * dpr, homeSpecs(n), { page: 0, zoom: 0.85, ...shellResponsiveOpts(cssW * dpr, dpr) });
+
+  for (const dpr of [1, 1.5, 3]) {
+    it(`phone 390×844 @${dpr}x: tiles ≥ ${SHELL_MIN_TILE_CSS} CSS px, ≤ 5 columns, one spare row, no tiny empties`, () => {
+      const m = layout(390, 844, dpr);
+      expect(m.grid.tileSize / dpr).toBeGreaterThanOrEqual(SHELL_MIN_TILE_CSS - 1e-6);
+      expect(m.grid.columns).toBeLessThanOrEqual(5);
+      expect(m.grid.columns).toBeGreaterThanOrEqual(3);
+      // rows = the rows 5 tiles need + 1 spare (was ~9 rows × 10 columns of ~28 px discs)
+      expect(m.grid.rows).toBe(Math.ceil(5 / m.grid.columns) + 1);
+      expect(m.grid.columns * m.grid.rows - 5).toBeLessThan(m.grid.columns * 2);
+      // every tile and the card stay on screen; the card hugs its rows and sits on the bottom margin
+      for (const t of m.tiles) {
+        expect(t.rect[0]).toBeGreaterThanOrEqual(0);
+        expect(t.rect[0] + t.rect[2]).toBeLessThanOrEqual(390 * dpr + 1e-6);
+        expect(t.rect[1] + t.rect[3]).toBeLessThanOrEqual(m.grid.cardY + m.grid.cardH + 1e-6);
+      }
+      expect(m.grid.cardY).toBeGreaterThanOrEqual(m.grid.regionTop);
+      expect(m.grid.cardY + m.grid.cardH).toBeCloseTo(844 * dpr * (1 - 0.035), 3);
+      // labels are readable (≥ 10 CSS px; were ~4 px)
+      for (const l of m.labels) expect(l.fontPx / dpr).toBeGreaterThanOrEqual(10 - 1e-6);
+    });
+  }
+
+  it('desktop keeps the full-card 3DS grid (no floor kicks in, rows fill the card)', () => {
+    const plain = computeShellLayout(1920, 1080, homeSpecs(5), { page: 0, zoom: 0.85 });
+    const resp = layout(1920, 1080, 1);
+    expect(resp.grid.columns).toBe(plain.grid.columns);
+    expect(resp.grid.rows).toBe(plain.grid.rows);
+    expect(resp.grid.tileSize).toBeCloseTo(plain.grid.tileSize, 6);
+    expect(resp.grid.cardH).toBeCloseTo(plain.grid.cardH, 6);
+  });
+
+  it('a portrait tablet gets fewer, bigger columns than the width-only rule', () => {
+    const plain = computeShellLayout(800, 1280, homeSpecs(5), { page: 0, zoom: 0.85 });
+    const resp = layout(800, 1280, 1);
+    expect(plain.grid.tileSize).toBeLessThan(SHELL_MIN_TILE_CSS);
+    expect(resp.grid.tileSize).toBeGreaterThanOrEqual(SHELL_MIN_TILE_CSS - 1e-6);
+    expect(resp.grid.columns).toBeLessThan(plain.grid.columns);
+  });
+
+  it('compact applies only below the phone width', () => {
+    expect(shellResponsiveOpts((SHELL_COMPACT_BELOW_CSS - 1) * 2, 2).spareRows).toBe(1);
+    expect(shellResponsiveOpts(SHELL_COMPACT_BELOW_CSS * 2, 2).spareRows).toBeUndefined();
+  });
+
+  it('many carts on a phone: rows stop at what fits and the rest pages', () => {
+    const m = layout(390, 844, 2, 40);
+    expect(m.pageCount).toBeGreaterThan(1);
+    expect(m.grid.cardY).toBeGreaterThanOrEqual(m.grid.regionTop);
+  });
+});
+
+describe('layoutShellChips — keeps the first row clear of the top-right cluster', () => {
+  it('wraps the second chip when the reserve leaves no room for it, later rows use the full width', () => {
+    const labels = ['‹ Back', '+ New Project'];
+    const free = layoutShellChips(labels, measure, 390, 844, 1);
+    expect(free.rects[1][1]).toBe(free.rects[0][1]);              // one row without a reserve
+    const res = layoutShellChips(labels, measure, 390, 844, 1, 260);
+    expect(res.rects[0][0] + res.rects[0][2]).toBeLessThanOrEqual(390 - 260 + 1e-6);
+    expect(res.rects[1][1]).toBeGreaterThan(res.rects[0][1]);      // wrapped below the cluster
+  });
+
+  it('a small reserve changes nothing when everything fits', () => {
+    const a = layoutShellChips(['‹ Back'], measure, 1280, 800, 1);
+    const b = layoutShellChips(['‹ Back'], measure, 1280, 800, 1, 200);
+    expect(b.rects).toEqual(a.rects);
+    expect(b.fontPx).toBe(a.fontPx);
   });
 });

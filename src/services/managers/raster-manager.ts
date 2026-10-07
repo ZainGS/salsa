@@ -402,7 +402,10 @@ export class RasterManager {
             tolerance: options?.tolerance ?? 32, gapClosing: options?.gapClosing ?? 0,
             contiguous: options?.contiguous ?? true, referenceTexture, selectionMask: selMask,
         });
-        if (result) this.ctx.scheduleRender();
+        if (result) {
+            await this.layerMgr.getLayerById(activeLayerId)?.manager?.pushSnapshot?.({ noCoalesce: true });   // one undo step
+            this.ctx.scheduleRender();
+        }
         return result;
     }
 
@@ -440,7 +443,10 @@ export class RasterManager {
             selectionMask: this._rasterSelectionService?.getSelectionInfo()?.hasSelection
                 ? (this._rasterSelectionService as any)?.engine?.getMaskTexture() ?? undefined : undefined,
         });
-        if (result) this.ctx.scheduleRender();
+        if (result) {
+            await this.layerMgr.getLayerById(activeLayerId)?.manager?.pushSnapshot?.({ noCoalesce: true });   // one undo step
+            this.ctx.scheduleRender();
+        }
         return result;
     }
 

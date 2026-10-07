@@ -12,7 +12,13 @@ export interface EphemeraOverlayHost {
     markPackageVectorLayerDirty(layerId: string): void;
     /** True while the mesh-edit / UV focus background is up (opaque) → suppress the 2D overlay. */
     meshEditFocusHidesContent(): boolean;
+    /** A canvas move / resize / rotate gesture on a placement ended (pointer up): `before` is its geometry at the
+     *  gesture's first update — the facade records it as one undo step. */
+    placementGestureEnded?(layerId: string, placementId: string, before: PlacementGeometry, kind: PlacementGestureKind): void;
 }
+
+export type PlacementGestureKind = 'move' | 'resize' | 'rotate';
+type PlacementGeometry = Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation'>;
 
 /**
  * Ephemera SVG overlay + placement interaction — the live, non-destructive rendering of vector
@@ -348,8 +354,40 @@ export class EphemeraOverlay {
         return Math.abs(lx) <= p.width * 0.5 && Math.abs(ly) <= p.height * 0.5;
     }
 
+    // ── Canvas gesture → one undo step ──────────────────────────────
+    // The renderer reports only the per-move updates (no gesture end), so the first update of a gesture records the
+    // placement's geometry and a one-shot pointerup / pointercancel listener ends it (UI review 2026-10-07 §2b).
+    private _gesture: { layerId: string; placementId: string; kind: PlacementGestureKind; before: PlacementGeometry; off: () => void } | null = null;
+
+    private _beginGesture(layerId: string, placementId: string, kind: PlacementGestureKind): void {
+        const g = this._gesture;
+        if (g && g.layerId === layerId && g.placementId === placementId && g.kind === kind) return;
+        if (g) this.endPlacementGesture();
+        const p = this._ephemera.getPlacementsForLayer(layerId).find(pl => pl.id === placementId);
+        if (!p) return;
+        let off = (): void => {};
+        const target = typeof window !== 'undefined' ? window : null;
+        if (target) {
+            const end = (): void => this.endPlacementGesture();
+            target.addEventListener('pointerup', end, true);
+            target.addEventListener('pointercancel', end, true);
+            off = () => { target.removeEventListener('pointerup', end, true); target.removeEventListener('pointercancel', end, true); };
+        }
+        this._gesture = { layerId, placementId, kind, before: { x: p.x, y: p.y, width: p.width, height: p.height, rotation: p.rotation }, off };
+    }
+
+    /** End the current canvas gesture (the pointerup listener calls this; tests / hosts may too). */
+    public endPlacementGesture(): void {
+        const g = this._gesture;
+        if (!g) return;
+        this._gesture = null;
+        g.off();
+        this.host.placementGestureEnded?.(g.layerId, g.placementId, g.before, g.kind);
+    }
+
     /** Move a placement to a new position (called by the renderer drag handler). */
     public movePlacementTo(layerId: string, placementId: string, newX: number, newY: number): void {
+        this._beginGesture(layerId, placementId, 'move');
         this._ephemera.updatePlacement(layerId, placementId, { x: newX, y: newY });
         this._pkgVectorLayerDirty(layerId);   // debounced — a drag settles into one proxy re-render
         this.scheduleRender();
@@ -444,6 +482,7 @@ export class EphemeraOverlay {
     ): void {
         const p = this._ephemera.getPlacementsForLayer(layerId).find(pl => pl.id === placementId);
         if (!p) return;
+        this._beginGesture(layerId, placementId, 'resize');
 
         const MIN_SIZE = 0.005;
         const rad = p.rotation * Math.PI / 180;
@@ -485,6 +524,7 @@ export class EphemeraOverlay {
         startAngle: number, startRotation: number,
         dragX: number, dragY: number,
     ): void {
+        this._beginGesture(layerId, placementId, 'rotate');
         const currentAngle = Math.atan2(dragY - centerY, dragX - centerX);
         const delta = (currentAngle - startAngle) * (180 / Math.PI);
         this._ephemera.updatePlacement(layerId, placementId, { rotation: startRotation + delta });

@@ -43,6 +43,7 @@ import {
   ShellFrameStats, ShellPerfHud, formatShellHud, type ShellDebugFlags,
 } from './shell-perf';
 import { GpuFrameTimer } from '../core/gpu-frame-timer';
+import { whenStylesheetLoaded } from './shell-chrome-logic';
 
 export const FONT_FAMILY = '"Bungee", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 
@@ -59,20 +60,26 @@ export const TITLEBAR_FONT = '"MS PGothic", "DotGothic16", sans-serif';
  * CSP blocks fonts.googleapis.com this will just fall back.
  */
 let _fontPromise: Promise<void> | null = null;
+/** Longest wait for the Google Fonts stylesheet before the Shell gives up on its web fonts (offline, CSP). */
+const FONT_SHEET_TIMEOUT_MS = 8000;
 export function ensureShellFont(): Promise<void> {
   if (_fontPromise) return _fontPromise;
   _fontPromise = (async () => {
     if (typeof document === 'undefined' || !document.fonts) return;
     try {
       const ID = 'shell-fonts';
-      if (!document.getElementById(ID)) {
-        const link = document.createElement('link');
+      let link = document.getElementById(ID) as HTMLLinkElement | null;
+      if (!link) {
+        link = document.createElement('link');
         link.id = ID;
         link.rel = 'stylesheet';
         // Bungee (display/labels) + DotGothic16 (titlebar fallback for non-Windows).
         link.href = 'https://fonts.googleapis.com/css2?family=Bungee&family=DotGothic16&display=swap';
         document.head.appendChild(link);
       }
+      // The @font-face rules arrive with the stylesheet: a fonts.load() before it has loaded matches no face and
+      // resolves at once (the first-load fallback-font bug). Wait for the sheet (bounded), then load the faces.
+      await whenStylesheetLoaded(link, FONT_SHEET_TIMEOUT_MS);
       await Promise.all([
         document.fonts.load('400 32px "Bungee"'),
         document.fonts.load('400 32px "DotGothic16"'),
