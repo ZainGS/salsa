@@ -1192,7 +1192,7 @@ describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
     const prev = { g: R3.gpuDriven, l: R3.gpuDrivenLean, rc: R3.rangeCulling };
     R3.gpuDriven = true; R3.gpuDrivenLean = false; R3.rangeCulling = false;
     try {
-      // covered: plain, Cel + rim, painted metal; NOT covered (today's pipelines): procedural ground, stripes
+      // plain, Cel + rim, painted metal, procedural ground, stripes: every single-material key is covered (phase 2)
       meshes.forEach((m, i) => {
         if (!/^m\d+$/.test(m.name)) return;
         if (i % 5 === 1) m.material.metalShade = true;
@@ -1215,11 +1215,11 @@ describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
         compared++;
       }
       expect(compared).toBeGreaterThan(5);
-      // the slot read-back key = the material key; covered iff no heavy feature
+      // the slot read-back key = the material key (patternParams.z / .w included); every single-material key covered
       let covered = 0;
       for (const m of meshes) if (m.submeshes.length === 0 && m._r3Slot >= 0) {
         expect(m._r3FK, m.name).toBe(R3.splitKeyOfMesh(m));
-        expect(m._r3FK >= 0, m.name).toBe(!m.material.groundShade && (m.material.patternMode ?? 'none') === 'none');
+        expect(m._r3FK >= 0, m.name).toBe(true);
         if (m._r3FK >= 0) covered++;
       }
       expect(covered).toBeGreaterThan(20);
@@ -1236,7 +1236,7 @@ describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
       const st = r.setShaderSplit({});
       expect(st.pipelines).toBeGreaterThanOrEqual(3);
       expect(st.list.every((e: { key: string }) => e.key.startsWith('U|') || e.key.startsWith('T|'))).toBe(true);
-      for (const n of ['opaqueUntexturedPlainPipeline', 'opaqueUntexturedNoCullPlainPipeline', 'transparentUntexturedPipeline']) {
+      for (const n of ['opaqueUntexturedPlainPipeline', 'opaqueUntexturedNoCullPlainPipeline', 'transparentUntexturedPipeline', 'opaqueUntexturedPipeline', 'opaqueUntexturedNoCullPipeline']) {
         expect(r.pipeline.handleOf(n).ready, n).toBe(false);
       }
       // switching the split off keeps the draw order and drops the split ids

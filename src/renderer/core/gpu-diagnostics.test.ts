@@ -158,9 +158,9 @@ describe('caps application', () => {
     expect(TextEffectEngine.htmlInCanvasMode()).toBe('none');
     expect(GPUPipelineCache.defaultMaxConcurrentWarm).toBe(1);
     proto.applyGpuCaps.call(fake, { ...SAFE_CAPS }, false);
-    expect(Renderer3D.caps).toMatchObject({ shadows: false, ssao: false, ssr: false, taa: false });
+    expect(Renderer3D.caps).toMatchObject({ shadows: false, ssao: false, ssr: false, taa: false, shaderSplitMaxKeys: 40 });   // (shader split key cap: mobile / safe 40)
     proto.applyGpuCaps.call(fake, { ...DESKTOP_CAPS }, false);
-    expect(Renderer3D.caps).toEqual({ gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true });
+    expect(Renderer3D.caps).toEqual({ gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true, shaderSplitMaxKeys: 96 });
     expect(Renderer3D.gpuDrivenActive).toBe(true);
     expect(TextEffectEngine.htmlInCanvasAllowed).toBe(true);
     expect(GPUPipelineCache.defaultMaxConcurrentWarm).toBe(2);

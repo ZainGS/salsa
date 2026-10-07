@@ -49,7 +49,7 @@ for (const f of VARIANT_FAMILIES) for (const mod of [0, (5 << 2) | 0x40000000]) 
 }
 
 // SHADER SPLIT (shaders/mesh-fs-generate.ts): the generated fragment modules get the same checks - the families
-// (BASE / ALL) per layout, every render style alone, and every feature alone (shader-split.md §6.1.7).
+// (BASE / ALL) per layout, every render style alone, every feature alone and every ground mode alone (shader-split.md §6.1.7).
 const split: Record<string, string> = {};
 for (const tex of [false, true]) for (const shadow of [false, true]) {
   const base: MeshFsKey = { tex, shadow, debug: false, ssrInline: false, lean: false, f16: false, styles: 1, feat: 0, pat: 0, gm: 0 };
@@ -57,6 +57,7 @@ for (const tex of [false, true]) for (const shadow of [false, true]) {
   for (let st = 0; st < 8; st++) keys.push({ ...base, styles: 1 << st });
   for (const f of MF_NAMES) keys.push({ ...base, feat: MF[f] | MF.ENV_SPEC });
   for (let m = 1; m <= 7; m++) keys.push({ ...base, pat: 1 << m });
+  for (let g = 0; g < 22; g++) keys.push({ ...base, feat: MF.GROUND | MF.ENV_SPEC, gm: 1 << g });   // per-mode ground keys (phase 2)
   for (const k of keys) split[meshFsKeyString(k)] = generateMeshFs(k);
 }
 

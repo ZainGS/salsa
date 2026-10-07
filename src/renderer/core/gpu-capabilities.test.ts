@@ -70,7 +70,7 @@ describe('detectGpuTier', () => {
 describe('caps', () => {
   it('desktop caps are the engine defaults (no behaviour change)', () => {
     expect(capsForTier('desktop')).toEqual({ gpuDriven: true, shaderVariants: true, htmlInCanvas: true, maxDpr: Infinity, maxCanvasPixels: Infinity,
-      warmConcurrency: 2, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true });
+      warmConcurrency: 2, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true, shaderSplitMaxKeys: 96 });
   });
   it('mobile: CPU path, no variants, no HTML-in-canvas, DPR 1.5, ~2.5 MP, one compile at a time, still focus bg', () => {
     const c = capsForTier('mobile');

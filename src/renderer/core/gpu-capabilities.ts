@@ -41,6 +41,9 @@ export interface GpuCaps {
   /** The edit-mode focus background's 'wavy' theme may ANIMATE (false = drawn frozen, so it never holds the render
    *  loop live — mobile-parity 7.3b P3; the chosen theme itself is kept). */
   animatedFocusBg: boolean;
+  /** SHADER SPLIT key cap (shader-split.md §4.5): distinct exact mesh fragment keys compiled per device before new
+   *  keys are widened to broader shared ones (MeshFsPipelines.maxKeys). Bounds compile work, not memory. */
+  shaderSplitMaxKeys: number;
 }
 
 /** Today's engine defaults: desktop behaviour is unchanged. */
@@ -48,7 +51,7 @@ export const DESKTOP_CAPS: Readonly<GpuCaps> = Object.freeze({
   gpuDriven: true, shaderVariants: true, htmlInCanvas: true,
   maxDpr: Infinity, maxCanvasPixels: Infinity, warmConcurrency: 2,
   shadows: true, ssao: true, ssr: true, taa: true,
-  animatedFocusBg: true,
+  animatedFocusBg: true, shaderSplitMaxKeys: 96,
 });
 
 /** Phones / tablets: the CPU draw path, the uber-shader only, no HTML-in-canvas, DPR ≤ 1.5 and ≤ 2.5 MP, one compile
@@ -57,7 +60,7 @@ export const MOBILE_CAPS: Readonly<GpuCaps> = Object.freeze({
   ...DESKTOP_CAPS,
   gpuDriven: false, shaderVariants: false, htmlInCanvas: false,
   maxDpr: 1.5, maxCanvasPixels: 2_500_000, warmConcurrency: 1,
-  animatedFocusBg: false,
+  animatedFocusBg: false, shaderSplitMaxKeys: 40,
 });
 
 /** Safe mode (crash loop / ?salsaSafe=1): the mobile caps plus shadows / SSAO / SSR / TAA off. */

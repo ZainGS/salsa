@@ -7489,6 +7489,9 @@ class ShapeManager {
      *  ('none' | 'noTexSample' | 'minimal') picks the RENDER-1 bisect keys, and the test knobs `forceFallback` /
      *  `noFallback` / `slowCompileMs` exercise the fallback and hold paths. Returns the state + keys, compiled / pending
      *  pipelines, sizes, compile ms and the exact / fallback / held selection counters. */
+    // (phase 2: also `noStandIn` (shadow stand-in off), `maxKeys` (key cap, session), `exclude` (families on today's
+    // pipelines, per machine: 'patterns' | 'windows' | 'adScreens' | 'ground' | 'water' | 'leaf' | 'triplanar' | 'phase2'),
+    // `clearJournal`; the result adds standIn / widened / exactKeys / maxKeys / journal / exclude.)
     public setShaderSplit3D(o: Parameters<Renderer3D['setShaderSplit']>[0] = {}): ReturnType<Renderer3D['setShaderSplit']> { const r = this.renderer3D.setShaderSplit(o); this.scheduleRender(); return r; }
     public getShaderSplit3D(): ReturnType<Renderer3D['setShaderSplit']> { return this.renderer3D.setShaderSplit({}); }
     /** P15 diagnostics: records / draw order / buckets, the GPU-reported counters (one frame late, `age`), rebuilds,

@@ -61,7 +61,76 @@ function injectLibraryDirectives(lib: string): string {
     if (n !== 1) throw new Error(`mesh3d-fs-template: library anchor found ${n} times (drifted?): ${anchor.trim()}`);
     out = out.replace(anchor, repl);
   }
-  return out;
+  return injectGroundModeDirectives(out);
+}
+
+/** PER-MODE GROUND KEYS (shader-split.md §3.4 / phase 2): wrap every mode arm of groundSurface and groundHeightM in
+ *  `//#if GM_<n>`, so a ground key compiles only its own tiler(s). Lines are only wrapped (an `else if` line is split
+ *  into `else` + `if`, which the golden normalisation reads as the same text), never changed, so the all-modes key
+ *  equals today's dispatch. A key without GM_0 (the ashlar fall-through) returns a zero result there instead: that
+ *  path is unreachable for every mesh of the key (meshFsGroundModeIndex maps every mode outside 1..21 to GM_0).
+ *  Every expected arm must be found exactly once, so a drifted library throws at module load. */
+function injectGroundModeDirectives(lib: string): string {
+  const lines = lib.split('\n');
+  const find = (from: number, pred: (l: string) => boolean, what: string): number => {
+    for (let i = from; i < lines.length; i++) if (pred(lines[i])) return i;
+    throw new Error(`mesh3d-fs-template: ground dispatch anchor not found (drifted?): ${what}`);
+  };
+  const armRe = /^\s*(?:else\s+)?if \(mi == (\d+)\)/;
+  /** The arms between lines [a, b): [mode, first line, last line] (braces balanced per arm). */
+  const arms = (a: number, b: number): [number, number, number][] => {
+    const out: [number, number, number][] = [];
+    for (let i = a; i < b; i++) {
+      const m = armRe.exec(lines[i]);
+      if (!m) { if (lines[i].trim() && !lines[i].trim().startsWith('//')) throw new Error(`mesh3d-fs-template: unexpected ground dispatch line: ${lines[i].trim()}`); continue; }
+      let depth = 0, j = i;
+      for (; j < b; j++) { const code = lines[j].replace(/\/\/.*$/, ''); for (const ch of code) depth += ch === '{' ? 1 : ch === '}' ? -1 : 0; if (depth === 0) break; }
+      if (depth !== 0) throw new Error('mesh3d-fs-template: unbalanced ground dispatch arm');
+      out.push([Number(m[1]), i, j]); i = j;
+    }
+    return out;
+  };
+  const expect = (got: number[], want: number[], what: string): void => {
+    if (got.slice().sort((x, y) => x - y).join() !== want.slice().sort((x, y) => x - y).join()) throw new Error(`mesh3d-fs-template: ground dispatch ${what} arms drifted: ${got.join()}`);
+  };
+  const range = (a: number, b: number): number[] => Array.from({ length: b - a + 1 }, (_, i) => a + i);
+  const gm = (ms: number[]): string => ms.map((m) => `GM_${m}`).join(' || ');
+  const edits: { at: number; end: number; repl: string[] }[] = [];
+
+  // groundSurface: independent early-return arms 1..21, then the ashlar fall-through (mode 0)
+  const s0 = find(find(0, (l) => l.startsWith('fn groundSurface('), 'fn groundSurface'), (l) => l === '  let p = uv * uvM;', 'groundSurface p');
+  const sEnd = find(s0, (l) => l === '  return groundAshlar(p, base, seam, groutW, p0, p1, jitter);', 'groundSurface ashlar');
+  const sArms = arms(s0 + 1, sEnd);
+  expect(sArms.map((a) => a[0]), range(1, 21), 'groundSurface');
+  for (const [m, a, b] of sArms) edits.push({ at: a, end: b, repl: [`//#if GM_${m}`, ...lines.slice(a, b + 1), '//#endif'] });
+  edits.push({ at: sEnd, end: sEnd, repl: ['//#if GM_0', lines[sEnd], '//#else', '  var gz: GroundOut;', '  return gz;', '//#endif'] });
+
+  // groundHeightM: early-return arms (3, 4, 20, 21, 6), then the cell chain (if / else if ... / else = mode 0)
+  const h0 = find(find(0, (l) => l.startsWith('fn groundHeightM('), 'fn groundHeightM'), (l) => l === '  let mi = i32(mode + 0.5);', 'groundHeightM mi');
+  const hVar = find(h0, (l) => l === '  var c: vec3<f32>;', 'groundHeightM var c');
+  const hElse = find(hVar, (l) => l === '  else { c = groundCell(p, p0, p1); }', 'groundHeightM else');
+  const hRet = find(hElse, (l) => l === '  return gr_cellHeight(vec2<f32>(c.x, c.y), c.z, groutW);', 'groundHeightM return');
+  if (hRet !== hElse + 1) throw new Error('mesh3d-fs-template: groundHeightM tail drifted');
+  const hEarly = arms(h0 + 1, hVar);
+  expect(hEarly.map((a) => a[0]), [3, 4, 20, 21, 6], 'groundHeightM early');
+  for (const [m, a, b] of hEarly) edits.push({ at: a, end: b, repl: [`//#if GM_${m}`, ...lines.slice(a, b + 1), '//#endif'] });
+  const chain = arms(hVar + 1, hElse);
+  const chainModes = chain.map((a) => a[0]);
+  expect(chainModes, [1, 2, 5, 7, 8, ...range(9, 19)], 'groundHeightM chain');
+  const tailModes = [0, ...chainModes];
+  const repl: string[] = [`//#if ${gm(tailModes)}`, lines[hVar]];
+  chain.forEach(([m, a, b], j) => {
+    const body = lines.slice(a, b + 1);
+    body[0] = body[0].replace(/^(\s*)else\s+if /, '$1if ');
+    repl.push(`//#if GM_${m}`);
+    if (j > 0) repl.push(`//#if ${gm(chainModes.slice(0, j))}`, '  else', '//#endif');
+    repl.push(...body, '//#endif');
+  });
+  repl.push('//#if GM_0', `//#if ${gm(chainModes)}`, '  else', '//#endif', '  { c = groundCell(p, p0, p1); }', '//#endif', lines[hRet], '//#else', '  return 0.0;', '//#endif');
+  edits.push({ at: hVar, end: hRet, repl });
+
+  for (const e of edits.sort((x, y) => y.at - x.at)) lines.splice(e.at, e.end - e.at + 1, ...e.repl);
+  return lines.join('\n');
 }
 
 /** The pattern footprint the tiled pattern modes (1-5) read as winWL.w: EXACTLY the w windowsPattern computes

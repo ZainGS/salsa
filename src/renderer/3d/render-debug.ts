@@ -98,7 +98,7 @@ export type RenderDebugFlags = {
   /** Turn P21 shader variants on even where the GPU tier caps them off (mobile / safe): meshes use the smaller
    *  specialised fragment shaders. Takes effect after a RELOAD. RENDER-1 test. */
   forceShaderVariants: boolean;
-  /** SHADER SPLIT phase 1 (docs/specs/shader-split.md): meshes whose features the split covers draw with small
+  /** SHADER SPLIT phases 1-2 (docs/specs/shader-split.md): meshes whose features the split covers draw with small
    *  generated fragment shaders (only their features compiled in) instead of the uber-shader; the same pixels. The
    *  same switch as localStorage salsa.shaderSplit = 'on' / sm.setShaderSplit3D. Reload for the full effect (the
    *  boot warm-up then skips the uber pipelines the split replaces). RENDER-1 test. */
@@ -133,7 +133,7 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'dbgFlagBits', label: 'Mesh colour = material flags (green = rim)' },
   { key: 'tinyMeshFS', label: 'Tiny mesh shader (test; reload)' },
   { key: 'forceShaderVariants', label: 'Force shader variants (test; reload)' },
-  { key: 'forceShaderSplit', label: 'Shader split (phase 1; reload)' },
+  { key: 'forceShaderSplit', label: 'Shader split (phase 2; reload)' },
   { key: 'noMeshEditOverlays', label: 'No mesh-edit / UV-paint overlays' },
   { key: 'noRearEdges', label: 'No mesh-edit rear edges' },
   { key: 'noBackground3D', label: 'No 3D background (focus bg)' },

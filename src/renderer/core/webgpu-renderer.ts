@@ -87,6 +87,7 @@ import { SelectionOverlayRenderer } from "../raster/selection/selection-overlay-
 import type { SelectionOverlayState } from "../raster/selection/selection-overlay-renderer";
 import { LiveTextNode } from "../../scene-graph/shapes/live-text";
 import { Renderer3D } from '../3d/renderer-3d';
+import { MeshFsPipelines } from '../3d/mesh-fs-pipelines';
 import { Camera3D } from '../3d/camera-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
@@ -1251,6 +1252,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     const rc = Renderer3D.caps;
     rc.gpuDriven = c.gpuDriven; rc.shaderVariants = c.shaderVariants;
     rc.shadows = c.shadows; rc.ssao = c.ssao; rc.ssr = c.ssr; rc.taa = c.taa; rc.animatedFocusBg = c.animatedFocusBg !== false;
+    if (Number.isFinite(c.shaderSplitMaxKeys) && c.shaderSplitMaxKeys > 0) rc.shaderSplitMaxKeys = MeshFsPipelines.maxKeys = Math.floor(c.shaderSplitMaxKeys);
     TextEffectEngine.htmlInCanvasAllowed = c.htmlInCanvas;
     GPUPipelineCache.defaultMaxConcurrentWarm = Math.max(1, Math.floor(c.warmConcurrency));
     const pc = this.device ? GPUPipelineCache.peek(this.device) : null;

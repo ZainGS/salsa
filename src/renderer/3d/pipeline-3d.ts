@@ -294,6 +294,11 @@ export class Pipeline3D {
   private _skinnedVbLayout!: GPUVertexBufferLayout;
   private _skinnedTexVS!: GPUShaderModule;
   private _skinnedUntexVS!: GPUShaderModule;
+  /** Phase 2 axes: the vertex-colour VS + its two vertex buffers, the face-kit multiply target, the post-overlay
+   *  depth state (the same objects today's pipelines of those axes use). */
+  private _vcVS!: GPUShaderModule;
+  private _vcVbLayouts!: GPUVertexBufferLayout[];
+  private _faceMultiplyTarget!: GPUColorTargetState;
   /** The uber-shader pipelines the split replaces for the meshes it covers (opaque / no-cull x textured x plain / full
    *  x shadow, transparent, skinned): left out of the boot warm while the split is on (they still compile on demand
    *  for the meshes the split does not cover). */
@@ -305,9 +310,11 @@ export class Pipeline3D {
   /** The pipeline descriptor of split axis `axis` around generated fragment module `fs`: the same states, layouts and
    *  vertex paths as today's pipeline of that axis (only the fragment module differs). */
   private _describeMeshFs(axis: MeshFsAxis, key: MeshFsKey, fs: GPUShaderModule, label: string): GPURenderPipelineDescriptor {
-    const skinned = axis === 'skinned';
-    if (skinned && key.shadow) throw new Error('Pipeline3D: skinned meshes have no shadow-receiving pipeline');
-    const transparent = axis === 'transparent' || axis === 'transparentNoCull';
+    const skinned = axis === 'skinned' || axis === 'skinnedFaceMultiply';
+    if ((skinned || axis === 'vertexColour' || axis === 'postOverlay') && key.shadow) throw new Error(`Pipeline3D: the ${axis} axis has no shadow-receiving pipeline`);
+    if ((axis === 'postOverlay' || axis === 'skinnedFaceMultiply') && !key.tex) throw new Error(`Pipeline3D: the ${axis} axis is textured only`);
+    if (axis === 'vertexColour' && key.tex) throw new Error('Pipeline3D: the vertexColour axis is untextured only');
+    const transparent = axis === 'transparent' || axis === 'transparentNoCull' || axis === 'postOverlay';
     const layout = skinned
       ? (key.tex ? this._pipelineLayoutSkinnedTextured : this._pipelineLayoutSkinnedUntextured)
       : key.tex ? (key.shadow ? this._pipelineLayoutShadowTextured : this._pipelineLayoutTextured)
@@ -316,10 +323,13 @@ export class Pipeline3D {
       label, layout,
       vertex: skinned
         ? { module: key.tex ? this._skinnedTexVS : this._skinnedUntexVS, entryPoint: 'vs_main', buffers: [this._skinnedVbLayout] }
-        : { module: this._vsModule, entryPoint: 'vs_main', buffers: [this._vbLayout] },
-      fragment: { module: fs, entryPoint: 'fs_main', targets: [transparent ? this._transparentTarget : this._opaqueTarget] },
-      primitive: { topology: 'triangle-list', cullMode: axis === 'opaque' || axis === 'transparent' ? 'back' : 'none', frontFace: 'ccw' },
-      depthStencil: transparent ? this._transparentDS : this._opaqueDS,
+        : axis === 'vertexColour' ? { module: this._vcVS, entryPoint: 'vs_main', buffers: this._vcVbLayouts }
+          : { module: this._vsModule, entryPoint: 'vs_main', buffers: [this._vbLayout] },
+      fragment: { module: fs, entryPoint: 'fs_main', targets: [axis === 'skinnedFaceMultiply' ? this._faceMultiplyTarget : transparent ? this._transparentTarget : this._opaqueTarget] },
+      primitive: { topology: 'triangle-list', cullMode: axis === 'opaque' || axis === 'transparent' || axis === 'vertexColour' ? 'back' : 'none', frontFace: 'ccw' },
+      depthStencil: axis === 'postOverlay' ? { format: 'depth24plus-stencil8', depthWriteEnabled: true, depthCompare: 'less' }
+        : axis === 'skinnedFaceMultiply' ? { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'less' }
+          : transparent ? this._transparentDS : this._opaqueDS,
     };
   }
 
@@ -584,6 +594,9 @@ export class Pipeline3D {
       const split = shaderSplitActive();
       if (split) {
         for (const axis of ['opaqueNoCull', 'opaque'] as const) for (const tex of [false, true]) this._meshFs.warm(axis, meshFsBaseKey(tex, false, false, false), PIPELINE_PRIORITY.COMMON);
+        // the seen-keys journal: the keys this device drew last time, after the BASE fallbacks (spec §5.3)
+        const nj = this._meshFs.warmJournal(PIPELINE_PRIORITY.COMMON);
+        if (nj > 0) console.log(`[Salsa][shader-split] warming ${nj} journalled keys`);
       }
       const pending = this._pipeEntries.filter(e => !e.handle.ready && !(split && this._splitReplaced.has(e.handle)));
       const t0 = performance.now();
@@ -957,6 +970,7 @@ export class Pipeline3D {
         ],
       },
     ];
+    this._vcVS = vcVertexModule; this._vcVbLayouts = vcVertexBufferLayouts;   // shader split (vertexColour axis)
     this._opaqueVertexColor = this._reg({
       layout: this._pipelineLayoutUntextured,
       vertex: {
@@ -1105,15 +1119,16 @@ export class Pipeline3D {
     // FACE KIT overlays (face-features.ts): the plain skinned textured shaders, MULTIPLY-blended over the lit skin.
     // The overlay is unlit (style 6, white) and its texture is a PREMULTIPLIED multiplier m·a, so the blend gives
     // dst·(m·a) + dst·(1 − a) = dst·mix(1, m, a). Destination alpha kept; depth tested, never written.
+    this._faceMultiplyTarget = {
+      format: this.swapChainFormat,
+      blend: {
+        color: { srcFactor: 'dst', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' },
+      },
+    };
     this._skinnedFaceMultiply = this._reg({
       ...skinnedPlainDesc(this._pipelineLayoutSkinnedTextured, skinnedTexVertModule, plainSkinnedFragTex),
-      fragment: { module: plainSkinnedFragTex, entryPoint: 'fs_main', targets: [{
-        format: this.swapChainFormat,
-        blend: {
-          color: { srcFactor: 'dst', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-          alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' },
-        },
-      }] },
+      fragment: { module: plainSkinnedFragTex, entryPoint: 'fs_main', targets: [this._faceMultiplyTarget] },
       depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'less' },
     });
 
@@ -1124,6 +1139,7 @@ export class Pipeline3D {
       this._opaqueTexturedPlainShadow, this._opaqueUntexturedPlainShadow, this._opaqueTexturedNoCullPlainShadow, this._opaqueUntexturedNoCullPlainShadow,
       this._transparentTextured, this._transparentUntextured, this._transparentTexturedNoCull, this._transparentUntexturedNoCull,
       this._skinnedOpaqueTextured, this._skinnedOpaqueUntextured, this._skinnedOpaqueTexturedPlain, this._skinnedOpaqueUntexturedPlain,
+      this._opaqueVertexColor, this._postOverlayTextured, this._skinnedFaceMultiply,   // (phase 2 axes)
     ]) this._splitReplaced.add(a.handle);
   }
 
