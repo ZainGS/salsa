@@ -3761,6 +3761,18 @@ class ShapeManager {
         this.scene3d.setViewGizmoPosition(position);
     }
 
+    /** Host hide / show of the nav gizmo (Toggle UI, viewer mode). Sticky: modes that create the gizmo later keep it
+     *  hidden until `setViewGizmoHidden3D(false)`. The gizmo also hides on its own while its canvas is detached or
+     *  has no size, and is disposed when the renderer swaps to another canvas (host route change). */
+    public setViewGizmoHidden3D(hidden: boolean): void {
+        this.scene3d.setViewGizmoHidden(hidden);
+    }
+
+    /** True while the nav gizmo exists and is displayed. */
+    public isViewGizmoVisible3D(): boolean {
+        return this.scene3d.isViewGizmoVisible();
+    }
+
     /** Get the current orbit controller (if active). */
     public getOrbitController(): OrbitController | undefined {
         return this.scene3d.getOrbitController();

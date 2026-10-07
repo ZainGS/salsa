@@ -1,10 +1,17 @@
 /**
  * ViewGizmo — Navigation gizmo overlay for 3D camera control.
  *
- * Renders a small fixed-positioned 2D canvas anchored to the top-right corner
- * of the WebGPU canvas, showing the live XYZ camera orientation.
+ * Renders a small fixed-positioned 2D canvas anchored to a corner of the WebGPU
+ * canvas, showing the live XYZ camera orientation.
  * - Drag anywhere on the widget to orbit the camera.
  * - Click an axis handle to snap to that standard view.
+ *
+ * Visibility (2026-10-07, "the world gizmo stays on screen after leaving an illustration"): the overlay lives on
+ * document.body, so it used to outlive its canvas — a host route change removed the WebGPU canvas and the gizmo kept
+ * floating over the next page (Shell / dashboard / board). It now hides itself whenever its canvas is disconnected or
+ * has no size (display:none, collapsed pane), whenever the host hides it (setHidden: Toggle UI, viewer mode) and under
+ * the render-debug noViewGizmo switch. Its default z-index (VIEW_GIZMO_Z) sits BELOW host panels / dialogs (it was
+ * 9000, which drew it over the export modal and the side panels).
  */
 
 import { Camera3D } from './camera-3d';
@@ -20,6 +27,11 @@ const SPOKE = SIZE / 2 - 18 * SCALE;   // axis length (= 0.35·SIZE; keeps the s
 const R_POS = 13 * SCALE;              // +axis handle radius
 const R_NEG = 7  * SCALE;              // -axis handle radius
 const PAD   = 12;   // px from canvas edge (screen inset — independent of gizmo size)
+/** Default stacking order: above the canvas and its own overlays (handle canvas 5, ephemera overlay 10), below host
+ *  toolbars / panels (~999+) and modals (9000+). Override per host with ViewGizmoPosition.zIndex. */
+export const VIEW_GIZMO_Z = 900;
+/** Class on the overlay element, so a host can find / style it (e.g. hide it with its own UI chrome). */
+export const VIEW_GIZMO_CLASS = 'salsa-view-gizmo';
 
 interface AxisDef {
     dir:      [number, number, number];
@@ -51,6 +63,8 @@ export interface ViewGizmoPosition {
     offsetX?: number;
     /** Inset (px) from the top edge. Default PAD (12). Lets the host clear an overlay toolbar. */
     offsetY?: number;
+    /** CSS z-index of the overlay. Default VIEW_GIZMO_Z (900): under host panels and dialogs. */
+    zIndex?: number;
 }
 
 export class ViewGizmo {
@@ -67,8 +81,19 @@ export class ViewGizmo {
     private _startX = 0;
     private _startY = 0;
     private _hasMoved = false;
-    private _ro: ResizeObserver;
-    private _pos: Required<ViewGizmoPosition> = { corner: 'top-left', offsetX: PAD, offsetY: PAD + 14 };
+    private _ro: ResizeObserver | null;
+    private _pos: Required<ViewGizmoPosition> = { corner: 'top-left', offsetX: PAD, offsetY: PAD + 14, zIndex: VIEW_GIZMO_Z };
+    private _destroyed = false;
+
+    // Visibility inputs (see the file header). The element is shown only when ALL allow it.
+    /** Host hide (Toggle UI / viewer mode / a host-owned mode): setHidden. */
+    private _hostHidden = false;
+    /** Render debug (render-debug.ts noViewGizmo). */
+    private _rdHidden = false;
+    /** The canvas had a non-zero on-screen box at the last measure (0×0 = removed / display:none / collapsed). */
+    private _canvasHasBox = true;
+    /** What the element currently shows (display written only when this changes). */
+    private _shown = true;
 
     constructor(
         canvas3d: HTMLCanvasElement,
@@ -87,9 +112,10 @@ export class ViewGizmo {
         const el = document.createElement('canvas');
         el.width  = SIZE;
         el.height = SIZE;
+        el.className = VIEW_GIZMO_CLASS;
         el.style.cssText = [
             'position:fixed',
-            'z-index:9000',
+            `z-index:${this._pos.zIndex}`,
             'cursor:grab',
             'touch-action:none',
             'user-select:none',
@@ -101,11 +127,15 @@ export class ViewGizmo {
 
         this._reposition();
 
-        // Track canvas resize / scroll / layout changes
-        this._ro = new ResizeObserver(() => this._reposition());
-        this._ro.observe(canvas3d);
-        window.addEventListener('scroll', this._reposition, true);
-        window.addEventListener('resize', this._reposition);
+        // Track canvas resize / scroll / layout changes. The ResizeObserver also reports the canvas going to 0×0 when
+        // the host removes it or hides it (display:none), which is what hides the gizmo after a route change even
+        // when no frame runs any more (the editor renderer is suspended on the Shell).
+        this._ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(this._reposition) : null;
+        this._ro?.observe(canvas3d);
+        // Zoneless (zone audit M8): a plain capture-phase window scroll listener woke Angular change detection on
+        // every scroll anywhere in the app for as long as the gizmo lived.
+        addZonelessListener(window, 'scroll', this._reposition, true);
+        addZonelessListener(window, 'resize', this._reposition);
 
         // Use the element itself for move/up — pointer capture routes all events here. Zoneless so hovering
         // the view gizmo doesn't wake Angular CD on every pointermove (see zoneless-listeners).
@@ -117,14 +147,57 @@ export class ViewGizmo {
 
     // ── Position tracking ──────────────────────────────────────────
 
+    /** The overlay element (a 2D canvas on document.body). */
+    get element(): HTMLCanvasElement { return this._el; }
+    /** The WebGPU canvas the gizmo is anchored to. */
+    get canvas(): HTMLCanvasElement { return this._canvas3d; }
+    /** True while the overlay is actually displayed. */
+    get visible(): boolean { return this._shown && !this._destroyed; }
+
     /** Change the gizmo's placement at runtime (host layout / panel changes). */
     setPosition(position: ViewGizmoPosition): void {
         this._pos = { ...this._pos, ...position };
+        this._el.style.zIndex = String(this._pos.zIndex);
         this._reposition();
     }
 
+    /** Re-anchor to another WebGPU canvas (the observer moves with it). */
+    setCanvas(canvas: HTMLCanvasElement): void {
+        if (canvas === this._canvas3d || this._destroyed) return;
+        this._ro?.unobserve(this._canvas3d);
+        this._canvas3d = canvas;
+        this._ro?.observe(canvas);
+        this._reposition();
+    }
+
+    /** Host hide / show (Toggle UI, viewer mode, a host mode that owns the corner). Independent of the other inputs. */
+    setHidden(hidden: boolean): void {
+        if (this._hostHidden === hidden) return;
+        this._hostHidden = hidden;
+        if (hidden) this._syncVisibility();
+        else this._reposition();   // re-measure: the canvas may have moved while the gizmo was hidden
+    }
+
+    /** Is the anchor canvas in the document? (`isConnected` is missing only on non-DOM test stubs → assume yes.) */
+    private _canvasConnected(): boolean {
+        return (this._canvas3d as { isConnected?: boolean }).isConnected !== false;
+    }
+
+    /** Apply the combined visibility; returns whether the gizmo is shown. Cheap (no layout read). */
+    private _syncVisibility(): boolean {
+        const show = !this._destroyed && !this._hostHidden && !this._rdHidden && this._canvasHasBox && this._canvasConnected();
+        if (show !== this._shown) {
+            this._shown = show;
+            this._el.style.display = show ? '' : 'none';
+        }
+        return show;
+    }
+
     private _reposition = (): void => {
+        if (this._destroyed) return;
         const r = this._canvas3d.getBoundingClientRect();
+        this._canvasHasBox = r.width > 0 && r.height > 0;
+        if (!this._syncVisibility()) return;
         const { corner, offsetX, offsetY } = this._pos;
         // Position relative to the WebGPU canvas's on-screen rect. offsetX/offsetY let the host inset past an
         // overlay toolbar/panel so the gizmo lands in the VISIBLE canvas area.
@@ -219,13 +292,15 @@ export class ViewGizmo {
 
     // ── Drawing ───────────────────────────────────────────────────
 
-    /** Render debug (render-debug.ts noViewGizmo): the overlay canvas is hidden; written only when it changes. */
-    private _rdHidden = false;
-
     draw(): void {
+        if (this._destroyed) return;
+        // Per frame: only the cheap inputs (render-debug switch, canvas still connected). The canvas BOX is measured
+        // by the ResizeObserver / window listeners, never here (no layout read in the frame callback).
         const rdHide = RD.on && RD.f.noViewGizmo;
-        if (rdHide !== this._rdHidden) { this._rdHidden = rdHide; this._el.style.visibility = rdHide ? 'hidden' : ''; }
-        if (rdHide) return;
+        const wasShown = this._shown;
+        this._rdHidden = rdHide;
+        if (!this._syncVisibility()) return;
+        if (!wasShown) this._reposition();   // just came back: place it before drawing
         const ctx = this._ctx;
         ctx.clearRect(0, 0, SIZE, SIZE);
 
@@ -318,9 +393,13 @@ export class ViewGizmo {
     }
 
     destroy(): void {
-        this._ro.disconnect();
-        window.removeEventListener('scroll',   this._reposition, true);
-        window.removeEventListener('resize',   this._reposition);
+        if (this._destroyed) return;
+        this._destroyed = true;
+        this._dragging = false;
+        this._ro?.disconnect();
+        this._ro = null;
+        removeZonelessListener(window, 'scroll',   this._reposition, true);
+        removeZonelessListener(window, 'resize',   this._reposition);
         removeZonelessListener(this._el, 'pointerdown',   this._onDown);
         removeZonelessListener(this._el, 'pointermove',   this._onMove);
         removeZonelessListener(this._el, 'pointerup',     this._onUp);

@@ -1786,6 +1786,12 @@ export class Scene3DManager {
     /** Hide the view gizmo and remove its frame callback. */
     disableViewGizmo(): void { return this._armature.disableViewGizmo(); }
 
+    /** Host hide of the nav gizmo (Toggle UI / viewer mode). Sticky across the modes that create / destroy it. */
+    setViewGizmoHidden(hidden: boolean): void { return this._armature.setViewGizmoHidden(hidden); }
+
+    /** True while the nav gizmo exists and is displayed. */
+    isViewGizmoVisible(): boolean { return this._armature.isViewGizmoVisible(); }
+
     disableOrbitControls(): void { return this._armature.disableOrbitControls(); }
 
     /** TOUCH-3 "Navigate" lock: true = ONE finger orbits the 3D camera in every mode (tool modes included: City / Edit

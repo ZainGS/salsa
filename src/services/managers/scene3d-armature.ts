@@ -150,6 +150,8 @@ export class Scene3DArmature {
     private _orbitDriftCleanup: (() => void) | null = null;
     private _orbitDriftRaf = 0;
     private _viewGizmoPos?: import('../../renderer/3d/view-gizmo').ViewGizmoPosition;
+    /** Host hide flag (setViewGizmoHidden) — applied to every gizmo instance, current and future. */
+    private _viewGizmoHidden = false;
 
     // ── (a) gizmo ────────────────────────────────────────────────────────────────────────────────────
     private _gizmoRenderer?: GizmoRenderer;
@@ -610,9 +612,15 @@ export class Scene3DArmature {
     }
 
     enableViewGizmo(position?: import('../../renderer/3d/view-gizmo').ViewGizmoPosition): void {
-        if (this._viewGizmo || !this._orbitController) return;
+        if (!this._orbitController) return;
         const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
         if (!canvas) return;
+        if (this._viewGizmo) {
+            // Never leave a gizmo anchored to a canvas the renderer no longer draws to (a canvas swap with no
+            // reattach): move it onto the current one instead of keeping the stale anchor.
+            if (this._viewGizmo.canvas !== canvas) this._viewGizmo.setCanvas(canvas);
+            return;
+        }
         this._viewGizmo = new ViewGizmo(
             canvas,
             this.renderer3D.getCamera(),
@@ -620,6 +628,7 @@ export class Scene3DArmature {
             () => this.ctx.scheduleRender(),
             position ?? this._viewGizmoPos,
         );
+        if (this._viewGizmoHidden) this._viewGizmo.setHidden(true);
         this._viewGizmo.draw();
         this._viewGizmoFrameCb = () => { this._viewGizmo?.draw(); return false; };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._viewGizmoFrameCb, 'viewGizmo');
@@ -629,6 +638,16 @@ export class Scene3DArmature {
         this._viewGizmoPos = position;
         this._viewGizmo?.setPosition(position);
     }
+
+    /** Host hide of the nav gizmo (Toggle UI, viewer mode): survives the gizmo being torn down and re-created by mode
+     *  changes; independent of whether any mode currently shows one. */
+    setViewGizmoHidden(hidden: boolean): void {
+        this._viewGizmoHidden = hidden;
+        this._viewGizmo?.setHidden(hidden);
+    }
+
+    /** True while a nav gizmo exists AND is displayed (not host-hidden, its canvas attached and sized). */
+    isViewGizmoVisible(): boolean { return !!this._viewGizmo?.visible; }
 
     disableViewGizmo(): void {
         this._viewGizmo?.destroy();
@@ -669,6 +688,11 @@ export class Scene3DArmature {
     reattachCanvasListeners(): void {
         const canvas = this.ctx.webgpuRenderer.getCanvas();
         if (!canvas) return;
+        // The nav gizmo belongs to the canvas it was made for: a SWAP means that canvas (and the page around it) is
+        // gone — Frogmarks' route change to a board / package editor / player. Keeping it re-anchored here would show
+        // the illustration's gizmo over a board; the next view-state apply (every document load) re-creates it on the
+        // new canvas if the loaded document is in a 3D camera mode.
+        if (this._viewGizmo && this._viewGizmo.canvas !== canvas) this.disableViewGizmo();
         this._orbitController?.attach(canvas as HTMLCanvasElement);
         this._transformController?.attach(canvas as HTMLCanvasElement);   // 3D select + gizmo (also self-heals in its sync callback)
         if (this._boneOverlayExplicit) {
