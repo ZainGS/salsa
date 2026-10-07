@@ -40,9 +40,30 @@ import { constrainCharacterScale, geometryMinY } from '../../game/character-scal
 import type { UndoManager3D } from './undo-manager-3d';
 import type { Scene3DCharacter } from './scene3d-character';
 import type { Scene3DWeightPaint } from './scene3d-weight-paint';
+import { ArmaturePointerGesture, type ArmClientRect } from './armature-pointer-gesture';
+import { claimPointerEvent } from '../../renderer/util/pointer-claims';
 
 /** Short random id (module-local, mirrors the Scene3DManager helper). Used by addIKChain. */
 const _nanoid = () => Math.random().toString(36).slice(2, 10);
+
+/** What an armature press grabs (TOUCH-9 pick-on-down): bone placement (a tap), the FK rotate ring, the joint move
+ *  gizmo (with its drag plane start), an IK handle, a tail sphere or a head sphere. */
+export type ArmTarget =
+    | { kind: 'place' }
+    | { kind: 'rotate'; joint: number; axis: 'x' | 'y' | 'z' }
+    | { kind: 'axis'; joint: number; axis: Exclude<GizmoAxis, null>; startPt: vec3; jointStart: vec3 }
+    | { kind: 'ik'; handle: IKHandleHit }
+    | { kind: 'tail'; joint: number }
+    | { kind: 'head'; joint: number };
+
+/** World direction of a joint-gizmo axis (a plane handle → its normal). */
+function _jointAxisDir(a: GizmoAxis): vec3 {
+    return a === 'x' ? vec3.fromValues(1, 0, 0) : a === 'y' ? vec3.fromValues(0, 1, 0) : a === 'z' ? vec3.fromValues(0, 0, 1)
+        : a === 'xy' ? vec3.fromValues(0, 0, 1) : a === 'xz' ? vec3.fromValues(0, 1, 0) : vec3.fromValues(1, 0, 0);   // yz
+}
+/** Scratch vectors for the per-move ray / plane intersection (no allocation per pointer move). */
+const _armTmpA = vec3.create();
+const _armTmpB = vec3.create();
 
 /** Ray → axis-aligned-bounding-box intersection; returns the near hit distance (≥0) or null on a miss.
  *  Module-local, mirrors the Scene3DManager helper — used by the array-instance pick inside the gizmo closure. */
@@ -892,6 +913,14 @@ export class Scene3DArmature {
         this._meshEditWheelCleanup = () => canvas.removeEventListener('wheel', onWheel, { capture: true });
     }
 
+    /** After a reframe set cam.orthoSize: a decoupled ortho creator view (Edit Mesh / surface paint / group orbit)
+     *  re-derives orthoSize from `_meshEditZoom` every frame, so adopt the framed size (else Frame only re-targets). */
+    reseedDecoupledZoom(): void {
+        const cam = this.renderer3D.getCamera();
+        if (this._meshEditZoom == null || cam.mode !== 'orthographic') return;
+        this._meshEditZoom = 1 / Math.max(0.0001, cam.orthoSize);
+    }
+
     private _removeMeshEditWheel(): void {
         this._meshEditWheelCleanup?.();
         this._meshEditWheelCleanup = null;
@@ -1686,6 +1715,8 @@ export class Scene3DArmature {
             },
             isInMeshEditMode: () => this._isMeshEditModeFn?.() ?? false,
             isBoneOverlayActive: () => this._boneOverlayExplicit,
+            isAdditiveSelect: () => this.ctx.interactionService.additiveSelect3D === true,
+            isSnapLatched: () => this.ctx.interactionService.snapLatch3D === true,
             isInputSuppressed: () => this.host.isPlaying,
             // Per-mesh click-select suppression (Package-Creator paint target — see InteractionService).
             isPickSuppressed: (meshId: string) => this.ctx.interactionService.pickSuppressed3D?.(meshId) ?? false,
@@ -2012,629 +2043,603 @@ export class Scene3DArmature {
         }
     }
 
+    // ── Armature overlay pointer input (mobile-parity TOUCH-9 / TOUCH-16, docs/ui/touch-controls.md §3b) ──────────
+    // Pointer events (capture phase, so it runs before the orbit controller) driven through ArmaturePointerGesture:
+    // the press PICKS (pick-on-down — it used to read the mousemove hover index, which a finger never sets), a finger
+    // gets ×2 hit radii and a delayed drag start, a 2nd finger / pointercancel CANCELS a drag and restores the pose +
+    // joint selection exactly (no undo entry), and a finger never hovers (the mesh hover outline used to stick on the
+    // last tapped mesh). Mouse behaviour is unchanged apart from: hover is coalesced to one pick per frame, and a drag
+    // keeps going outside the canvas (pointer capture) instead of stopping on mouseleave.
+
+    /** The overlay's pointer state machine — null until the listeners are bound. */
+    private _armGesture: ArmaturePointerGesture<ArmTarget> | null = null;
+    /** Puts back what the live drag changed (pose + joint selection) — a 2nd finger / pointercancel runs it. */
+    private _armRestore: (() => void) | null = null;
+    /** The mesh id the pointer hover last set and the renderer's hovered-id set it produced: hovering the same mesh
+     *  again is a no-op (it used to allocate a Set + schedule a render on every mouse move). */
+    private _ptrHoverId: string | null = null;
+    private _ptrHoverSet: Set<string> | null = null;
+    /** TOUCH-8: joint / tail / IK handle / joint-gizmo hit radii multiplier under a finger. */
+    static readonly TOUCH_HIT_SCALE = 2;
+
+    /** True while an armature drag (joint, tail, joint gizmo, IK handle) or a finger press about to become one owns a
+     *  pointer. Hosts use it to skip per-move UI work. */
+    get isArmatureDragActive(): boolean { return this._armGesture?.busy ?? false; }
+
     private _setupBoneOverlayListeners(): void {
         if (this._boneOverlayListenerCleanup) return; // already set up
-        const canvas = this.ctx.webgpuRenderer.getCanvas();
-        if (!canvas) return;
+        const el = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!el) return;
+        const raf = typeof requestAnimationFrame === 'function';
+        const toPx = (x: number, y: number, r: ArmClientRect): { x: number; y: number } => ({
+            x: (x - r.left) * (el.width / (r.width || 1)),
+            y: (y - r.top) * (el.height / (r.height || 1)),
+        });
+        const gesture = new ArmaturePointerGesture<ArmTarget>({
+            measure: () => el.getBoundingClientRect(),
+            capture: (id) => { try { el.setPointerCapture(id); } catch { /* pointer already gone */ } },
+            release: (id) => { try { if (el.hasPointerCapture?.(id)) el.releasePointerCapture(id); } catch { /* gone */ } },
+            requestFrame: (cb) => (raf ? requestAnimationFrame(cb) : (setTimeout(cb, 16) as unknown as number)),
+            cancelFrame: (id) => { if (raf) cancelAnimationFrame(id); else clearTimeout(id); },
+        }, {
+            pick: (x, y, r, touch) => { const p = toPx(x, y, r); return this._armPick(p.x, p.y, el.width, el.height, touch); },
+            isTap: (t) => t.kind === 'place',
+            tap: (_t, x, y, r) => { const p = toPx(x, y, r); this._placeBoneAt(p.x, p.y, el.width, el.height); },
+            pendingMove: (_t, x, y, r) => { const p = toPx(x, y, r); this._bonePlacementPreview(p.x, p.y, el.width, el.height); },
+            begin: (t, x, y, r) => this._armBegin(t, x, y),
+            move: (x, y, r) => { const p = toPx(x, y, r); this._armDragMove(x, y, p.x, p.y, el.width, el.height); },
+            end: () => this._armEnd(),
+            cancel: () => this._armCancel(),
+            hover: (x, y, r) => { if (this.host.isPlaying) return; const p = toPx(x, y, r); this._armHover(p.x, p.y, el.width, el.height); },
+            claim: (e) => claimPointerEvent(e),
+        });
+        this._armGesture = gesture;
 
-            // Canvas hover: update joint hover highlight; drive drag-to-move when dragging.
-            const onMouseMove = (e: MouseEvent) => {
-                // Play mode (Round 8): no hover pick (a full-scene raycast per mouse move under pointer-lock, and
-                // the hover silhouette pass it feeds), no joint hover, no drags.
-                if (this.host.isPlaying) return;
-                const el = canvas as HTMLCanvasElement;
-                const rect = el.getBoundingClientRect();
-                const scaleX = el.width  / rect.width;
-                const scaleY = el.height / rect.height;
-                const px = (e.clientX - rect.left) * scaleX;
-                const py = (e.clientY - rect.top)  * scaleY;
+        // The old mousedown handler stopped the mousedown of a press it took (so e.g. a document mousedown listener never
+        // saw a joint click); the compat mousedown that follows a taken MOUSE pointerdown is stopped the same way.
+        let stopMouseDown = false;
+        // Play mode (Round 8): no hover pick (a full-scene raycast per mouse move under pointer-lock), no joint hover,
+        // no drags. Up / cancel always run so a drag can never stay stuck.
+        const onDown = (e: PointerEvent) => {
+            if (this.host.isPlaying) return;
+            const took = gesture.down(e);
+            if (e.pointerType !== 'touch') stopMouseDown = took;
+        };
+        const onMouseDown = (e: MouseEvent) => { if (stopMouseDown) { stopMouseDown = false; e.stopPropagation(); } };
+        const onMove = (e: PointerEvent) => { if (!this.host.isPlaying || gesture.busy) gesture.move(e); };
+        const onUp = (e: PointerEvent) => gesture.up(e);
+        const onCancel = (e: PointerEvent) => gesture.cancel(e);
+        const onLost = (e: PointerEvent) => gesture.lostCapture(e);
+        const onLeave = () => { gesture.leave(); if (!gesture.busy) this._armClearHover(); };
 
-                // ── IK handle drag (target or pole) ─────────────────────────
-                if (this._draggingIKHandle && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    const chain = skel?.data.ikChains?.find(c => c.id === this._draggingIKHandle!.chainId);
-                    if (skel && chain) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                        const denom = vec3.dot(dir as unknown as vec3, this._ikDragPlaneNormal);
-                        if (Math.abs(denom) > 1e-6) {
-                            const toPlane = vec3.sub(vec3.create(), this._ikDragPlanePoint, origin as unknown as vec3);
-                            const t = vec3.dot(toPlane, this._ikDragPlaneNormal) / denom;
-                            if (t > 0) {
-                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
-                                if (this._draggingIKHandle!.handleType === 'target') {
-                                    chain.target = [worldPt[0], worldPt[1], worldPt[2]];
-                                } else {
-                                    chain.poleTarget = [worldPt[0], worldPt[1], worldPt[2]];
-                                }
-                                this.ctx.scheduleRender();
-                            }
-                        }
-                    }
-                    return;
+        addZonelessListener(el, 'pointerdown',   onDown,   { capture: true });
+        addZonelessListener(el, 'pointermove',   onMove,   { capture: true });
+        addZonelessListener(el, 'pointerup',     onUp,     { capture: true });
+        addZonelessListener(el, 'pointercancel', onCancel, { capture: true });
+        addZonelessListener(el, 'lostpointercapture', onLost, { capture: true });
+        addZonelessListener(el, 'pointerleave',  onLeave);
+        addZonelessListener(el, 'mousedown',     onMouseDown);
+        this._boneOverlayListenerCleanup = () => {
+            removeZonelessListener(el, 'pointerdown',   onDown,   { capture: true });
+            removeZonelessListener(el, 'pointermove',   onMove,   { capture: true });
+            removeZonelessListener(el, 'pointerup',     onUp,     { capture: true });
+            removeZonelessListener(el, 'pointercancel', onCancel, { capture: true });
+            removeZonelessListener(el, 'lostpointercapture', onLost, { capture: true });
+            removeZonelessListener(el, 'pointerleave',  onLeave);
+            removeZonelessListener(el, 'mousedown',     onMouseDown);
+            gesture.reset();   // a live drag ends normally (its pose kept); a pending finger press is dropped
+            if (this._armGesture === gesture) this._armGesture = null;
+        };
+    }
+
+    /** Ray-test the armature handles at canvas px (x, y): the selected joint's gizmo axis (move / rotate), an IK handle,
+     *  else a joint head / tail sphere (only when neither of the first two is under the pointer — the hover rule).
+     *  Hidden handles (the gizmo during weight paint / bone placement, IK handles during weight paint) aren't hit. */
+    private _armHitTest(skel: Skeleton3D, x: number, y: number, w: number, h: number, touch: boolean): {
+        origin: vec3; dir: vec3; axis: GizmoAxis; ik: IKHandleHit | null; head: number | null; tail: number | null;
+    } {
+        const gr = this._gizmoRenderer!;
+        const camera = this.renderer3D.getCamera();
+        const { origin, dir } = this._picker.castRay(x, y, w, h, camera);
+        const wp = this._weightPaint.isActive();
+        gr.hitScale = touch ? Scene3DArmature.TOUCH_HIT_SCALE : 1;
+        try {
+            let axis: GizmoAxis = null;
+            if (this._selectedJointIndex !== null && !this._selectedJointIsTail && !wp && !this._bonePlacementMode) {
+                const j = skel.data.joints[this._selectedJointIndex];
+                if (j) {
+                    const p: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
+                    axis = this._armatureToolMode === 'rotate'
+                        ? gr.hitTestJointRotateGizmo(origin, dir, p, camera)
+                        : gr.hitTestJointGizmo(origin, dir, p, camera);
                 }
+            }
+            let ik: IKHandleHit | null = null;
+            if (!wp) {
+                const chains = (skel.data.ikChains ?? []).filter(c => c.enabled);
+                if (chains.length > 0) ik = gr.hitTestIKTargets(origin, dir, chains, camera);
+            }
+            let head: number | null = null, tail: number | null = null;
+            if (!axis && !ik) {
+                const bv = this.renderer3D.getBoneVisibility();   // hidden bones aren't clickable
+                const hit = gr.hitTestJoint(origin, dir, skel, camera, bv.spring, bv.fk);
+                if (hit) { if (hit.isTail) tail = hit.index; else head = hit.index; }
+            }
+            return { origin, dir, axis, ik, head, tail };
+        } finally {
+            gr.hitScale = 1;
+        }
+    }
 
-                // ── FK rotate drag ───────────────────────────────────────────
-                if (this._isRotatingJoint && this._rotatingJointIdx !== null && this._rotatingJointAxis && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const dx = e.clientX - this._rotatingLastClientX;
-                        const dy = e.clientY - this._rotatingLastClientY;
-                        this._rotatingLastClientX = e.clientX;
-                        this._rotatingLastClientY = e.clientY;
-                        this._rotatingJointAccAngle += (dx + dy) * 0.01;
-                        const a = this._rotatingJointAccAngle * 0.5;
-                        const s = Math.sin(a), c = Math.cos(a);
-                        const ax = this._rotatingJointAxis;
-                        const dq: [number, number, number, number] =
-                            ax === 'x' ? [s, 0, 0, c] :
-                            ax === 'y' ? [0, s, 0, c] :
-                                         [0, 0, s, c];
-                        // Compose: delta * initialRotation (pre-multiply so delta is in world space)
-                        const [ix, iy, iz, iw] = this._rotatingJointInitialQuat;
-                        const [dx2, dy2, dz2, dw2] = dq;
-                        const newQ: [number, number, number, number] = [
-                            dw2*ix + dx2*iw + dy2*iz - dz2*iy,
-                            dw2*iy - dx2*iz + dy2*iw + dz2*ix,
-                            dw2*iz + dx2*iy - dy2*ix + dz2*iw,
-                            dw2*iw - dx2*ix - dy2*iy - dz2*iz,
-                        ];
-                        skel.setJointRotation(this._rotatingJointIdx, newQ);
-                        this.ctx.scheduleRender();
-                    }
-                    return;
+    /** What a press at canvas px (x, y) grabs (pick-on-down), in the old mousedown's priority: bone placement, the FK
+     *  rotate ring, the joint move gizmo, an IK handle, a tail sphere, a head sphere. Null = let the press through. */
+    private _armPick(x: number, y: number, w: number, h: number, touch: boolean): ArmTarget | null {
+        if (this._bonePlacementMode && this._bonePlacementSkeletonId) return { kind: 'place' };
+        // Only intercept presses when the armature panel is explicitly open.
+        if (!this._boneOverlayExplicit || !this._boneOverlaySkeletonId || !this._gizmoRenderer) return null;
+        const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+        if (!skel) return null;
+        const hit = this._armHitTest(skel, x, y, w, h, touch);
+        const sel = this._selectedJointIndex;
+        if (this._armatureToolMode === 'rotate' && sel !== null && skel.data.joints[sel]
+            && (hit.axis === 'x' || hit.axis === 'y' || hit.axis === 'z')) {
+            return { kind: 'rotate', joint: sel, axis: hit.axis };
+        }
+        if (this._armatureToolMode === 'move' && hit.axis !== null && sel !== null && skel.data.joints[sel]) {
+            const jg = skel.data.joints[sel];
+            const camera = this.renderer3D.getCamera();
+            const origin = hit.origin, dir = hit.dir;
+            const worldPos = vec3.fromValues(jg.worldMatrix[12], jg.worldMatrix[13], jg.worldMatrix[14]);
+            const axisDir = _jointAxisDir(hit.axis);
+            const isPlane = hit.axis === 'xy' || hit.axis === 'xz' || hit.axis === 'yz';
+            let normal: vec3;
+            if (isPlane) {
+                normal = vec3.clone(axisDir);
+            } else {
+                const camDir = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position as unknown as vec3, worldPos));
+                normal = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir)));
+            }
+            const denom = vec3.dot(normal, dir);
+            if (Math.abs(denom) > 1e-6) {
+                const t = vec3.dot(normal, vec3.subtract(vec3.create(), worldPos, origin)) / denom;
+                if (t > 0) {
+                    return { kind: 'axis', joint: sel, axis: hit.axis, startPt: vec3.scaleAndAdd(vec3.create(), origin, dir, t), jointStart: worldPos };
                 }
+            }
+        }
+        if (hit.ik) {
+            const chain = skel.data.ikChains?.find(c => c.id === hit.ik!.chainId);
+            if (chain && (hit.ik.handleType !== 'pole' || chain.poleTarget)) return { kind: 'ik', handle: { ...hit.ik } };
+        }
+        if (hit.tail !== null && !this._weightPaint.isActive() && skel.data.joints[hit.tail]) return { kind: 'tail', joint: hit.tail };
+        if (hit.head !== null && skel.data.joints[hit.head]) return { kind: 'head', joint: hit.head };
+        return null;
+    }
 
-                // ── Joint gizmo axis drag ────────────────────────────────────
-                if (this._isDraggingJointAxis && this._dragJointAxisAxis && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const j = skel.data.joints[this._selectedJointIndex];
-                        if (j) {
-                            const camera = this.renderer3D.getCamera();
-                            const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                            const axisStr = this._dragJointAxisAxis;
-                            const axisDir: vec3 = axisStr === 'x' ? vec3.fromValues(1,0,0) :
-                                                  axisStr === 'y' ? vec3.fromValues(0,1,0) :
-                                                  axisStr === 'z' ? vec3.fromValues(0,0,1) :
-                                                  axisStr === 'xy' ? vec3.fromValues(0,0,1) :
-                                                  axisStr === 'xz' ? vec3.fromValues(0,1,0) :
-                                                                    vec3.fromValues(1,0,0); // yz
-                            const isPlane = axisStr === 'xy' || axisStr === 'xz' || axisStr === 'yz';
-                            let normal: vec3;
-                            if (isPlane) {
-                                normal = axisDir;
-                            } else {
-                                const camDir = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position as unknown as vec3, this._dragJointAxisJointStart));
-                                normal = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir)));
-                            }
-                            const denom = vec3.dot(normal, dir as unknown as vec3);
-                            if (Math.abs(denom) > 1e-6) {
-                                const diff = vec3.subtract(vec3.create(), this._dragJointAxisJointStart, origin as unknown as vec3);
-                                const t = vec3.dot(normal, diff) / denom;
-                                if (t > 0) {
-                                    const curPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
-                                    const disp = vec3.subtract(vec3.create(), curPt, this._dragJointAxisStartPt);
-                                    let newWorldPos: vec3;
-                                    if (isPlane) {
-                                        newWorldPos = vec3.add(vec3.create(), this._dragJointAxisJointStart, disp);
-                                    } else {
-                                        const projDist = vec3.dot(disp, axisDir);
-                                        newWorldPos = vec3.scaleAndAdd(vec3.create(), this._dragJointAxisJointStart, axisDir, projDist);
-                                    }
-                                    const invParent = mat4.create();
-                                    if (j.parentIndex >= 0) {
-                                        mat4.invert(invParent, skel.data.joints[j.parentIndex].worldMatrix as unknown as mat4);
-                                    }
-                                    const localPt = vec3.transformMat4(vec3.create(), newWorldPos, invParent);
-                                    this.moveBone3D(skel.id, this._selectedJointIndex, [localPt[0], localPt[1], localPt[2]]);
-                                }
-                            }
-                        }
-                    }
-                    return;
-                }
+    /** Start the drag the press picked (at the PRESS point — a finger's drag starts a frame / a few px later). Takes a
+     *  snapshot so {@link _armCancel} can put the pose and the joint selection back exactly. */
+    private _armBegin(t: ArmTarget, clientX: number, clientY: number): boolean {
+        if (t.kind === 'place') return false;
+        const skel = this._boneOverlaySkeletonId ? this.getSkeleton(this._boneOverlaySkeletonId) : null;
+        if (!skel) return false;
+        const joints = skel.data.joints;
+        const cam = this.renderer3D.getCamera();
+        // Camera-facing drag plane normal (head / tail drags).
+        vec3.sub(this._dragPlaneNormal, cam.position as unknown as vec3, cam.target as unknown as vec3);
+        vec3.normalize(this._dragPlaneNormal, this._dragPlaneNormal);
+        const holdOrbit = () => { if (this._orbitController) this._orbitController.enabled = false; };
+        const prevSel = this._selectedJointIndex, prevTail = this._selectedJointIsTail;
+        const restoreSelection = () => {
+            this._selectedJointIndex = prevSel;
+            this._selectedJointIsTail = prevTail;
+            this.renderer3D.setSelectedJoint(prevSel, prevTail);
+        };
 
-                // ── Joint drag-to-move ───────────────────────────────────────
-                // While the user holds the mouse down on a joint sphere, we
-                // intersect the mouse ray with a camera-facing plane locked to
-                // the joint's world position at drag start, then convert the
-                // resulting world position back into the joint's local space.
-                if (this._isDraggingJoint && this._dragJointIdx !== null && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-
-                        // Ray-plane intersection: plane through _dragPlanePoint, normal _dragPlaneNormal
-                        const denom = vec3.dot(dir as unknown as vec3, this._dragPlaneNormal);
-                        if (Math.abs(denom) > 1e-6) {
-                            const toPlane = vec3.sub(vec3.create(), this._dragPlanePoint, origin as unknown as vec3);
-                            const t = vec3.dot(toPlane, this._dragPlaneNormal) / denom;
-                            if (t > 0) {
-                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
-                                const j = skel.data.joints[this._dragJointIdx];
-                                if (j) {
-                                    // Convert world position → joint local space by inverting parent world matrix.
-                                    // For root joints there is no parent, so local = world.
-                                    const invParent = mat4.create();
-                                    if (j.parentIndex >= 0) {
-                                        mat4.invert(invParent, skel.data.joints[j.parentIndex].worldMatrix as unknown as mat4);
-                                    }
-                                    const localPt = vec3.transformMat4(vec3.create(), worldPt, invParent);
-                                    this.moveBone3D(skel.id, this._dragJointIdx, [localPt[0], localPt[1], localPt[2]]);
-                                }
-                            }
-                        }
-                    }
-
-                // Tail drag: move the tail sphere (updates tailOffset in the joint's own local frame).
-                } else if (this._isDraggingTail && this._dragTailJointIdx !== null && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                        const denom = vec3.dot(dir as unknown as vec3, this._dragPlaneNormal);
-                        if (Math.abs(denom) > 1e-6) {
-                            const toPlane = vec3.sub(vec3.create(), this._dragPlanePoint, origin as unknown as vec3);
-                            const t = vec3.dot(toPlane, this._dragPlaneNormal) / denom;
-                            if (t > 0) {
-                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
-                                const j = skel.data.joints[this._dragTailJointIdx];
-                                if (j) {
-                                    // Convert world position → joint's own local frame.
-                                    const invJoint = mat4.create();
-                                    mat4.invert(invJoint, j.worldMatrix as unknown as mat4);
-                                    const localPt = vec3.transformMat4(vec3.create(), worldPt, invJoint);
-                                    skel.setJointTailOffset(this._dragTailJointIdx, [localPt[0], localPt[1], localPt[2]]);
-                                    this.ctx.scheduleRender();
-                                }
-                            }
-                        }
-                    }
-                    return; // skip hover logic while dragging
-                }
-
-                // ── Tail-follow preview for two-click root bone placement ────
-                if (this._bonePlacementMode && this._bonePlacementPendingIdx !== null && this._bonePlacementSkeletonId) {
-                    const skel = this.getSkeleton(this._bonePlacementSkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                        const meshHit = this._picker.pickMesh(px, py, el.width, el.height, camera, this.getAllMeshes());
-                        let wX: number, wY: number, wZ: number;
-                        if (meshHit) {
-                            [wX, wY, wZ] = meshHit.hitPoint;
-                        } else {
-                            // Off-mesh: project onto camera-facing plane at the joint's depth
-                            const j0 = skel.data.joints[this._bonePlacementPendingIdx];
-                            const jDepth = j0 ? vec3.distance(
-                                [j0.worldMatrix[12], j0.worldMatrix[13], j0.worldMatrix[14]] as unknown as vec3,
-                                camera.position as unknown as vec3,
-                            ) : 2;
-                            wX = origin[0] + dir[0] * jDepth;
-                            wY = origin[1] + dir[1] * jDepth;
-                            wZ = origin[2] + dir[2] * jDepth;
-                        }
-                        const j = skel.data.joints[this._bonePlacementPendingIdx];
-                        if (j) {
-                            const invJ = mat4.create();
-                            mat4.invert(invJ, j.worldMatrix as unknown as mat4);
-                            const lt = vec3.transformMat4(vec3.create(), [wX, wY, wZ] as unknown as vec3, invJ);
-                            skel.setJointTailOffset(this._bonePlacementPendingIdx, [lt[0], lt[1], lt[2]]);
-                            this.ctx.scheduleRender();
-                        }
-                    }
-                    // fall through to joint hover logic (shows the pending joint as selected)
-                }
-
-                // ── Normal hover (no drag active) ────────────────────────────
-                // Suppress mesh hover highlight during bone placement — clicks belong to bone system.
-                if (!this._bonePlacementMode) {
-                    const hit = this.pick3D(px, py, el.width, el.height);
-                    this.setHoveredMesh(hit?.meshId ?? null);
-                }
-
-                if (this._gizmoRenderer && this._boneOverlayExplicit && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-
-                        // ── Joint gizmo hover (head-selected only; switches with tool mode) ──
-                        let gizmoAxis: GizmoAxis = null;
-                        if (this._selectedJointIndex !== null && !this._selectedJointIsTail) {
-                            const j = skel.data.joints[this._selectedJointIndex];
-                            if (j) {
-                                const wp: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
-                                gizmoAxis = this._armatureToolMode === 'rotate'
-                                    ? this._gizmoRenderer.hitTestJointRotateGizmo(origin as unknown as vec3, dir as unknown as vec3, wp, camera)
-                                    : this._gizmoRenderer.hitTestJointGizmo(origin as unknown as vec3, dir as unknown as vec3, wp, camera);
-                            }
-                        }
-                        if (gizmoAxis !== this._jointGizmoHoveredAxis) {
-                            this._jointGizmoHoveredAxis = gizmoAxis;
-                            this.renderer3D.setJointGizmoHoveredAxis(gizmoAxis);
-                            this.ctx.scheduleRender();
-                        }
-
-                        // ── IK handle hover (target or pole) ─────────────────────────
-                        const enabledChains = (skel.data.ikChains ?? []).filter(c => c.enabled);
-                        if (enabledChains.length > 0) {
-                            const hit = this._gizmoRenderer.hitTestIKTargets(origin, dir, enabledChains, camera);
-                            const same = hit?.chainId === this._hoveredIKHandle?.chainId
-                                      && hit?.handleType === this._hoveredIKHandle?.handleType;
-                            if (!same) {
-                                this._hoveredIKHandle = hit;
-                                this.renderer3D.setHoveredIKHandle(hit);
-                                this.ctx.scheduleRender();
-                            }
-                        } else if (this._hoveredIKHandle !== null) {
-                            this._hoveredIKHandle = null;
-                            this.renderer3D.setHoveredIKHandle(null);
-                            this.ctx.scheduleRender();
-                        }
-
-                        // ── Joint sphere hover (skip if over gizmo or IK handle) ────
-                        if (!gizmoAxis && !this._hoveredIKHandle) {
-                            const bv = this.renderer3D.getBoneVisibility();   // hidden bones aren't clickable
-                            const hit = this._gizmoRenderer.hitTestJoint(origin, dir, skel, camera, bv.spring, bv.fk);
-                            const newHead = hit && !hit.isTail ? hit.index : null;
-                            const newTail = hit &&  hit.isTail ? hit.index : null;
-                            if (newHead !== this._hoveredJointIndex || newTail !== this._hoveredTailJointIndex) {
-                                this._hoveredJointIndex     = newHead;
-                                this._hoveredTailJointIndex = newTail;
-                                this.renderer3D.setHoveredJoint(newHead);
-                                this.renderer3D.setHoveredTailJoint(newTail);
-                                this.ctx.scheduleRender();
-                            }
-                        } else if (this._hoveredJointIndex !== null || this._hoveredTailJointIndex !== null) {
-                            this._hoveredJointIndex     = null;
-                            this._hoveredTailJointIndex = null;
-                            this.renderer3D.setHoveredJoint(null);
-                            this.renderer3D.setHoveredTailJoint(null);
-                            this.ctx.scheduleRender();
-                        }
-                    }
-                }
-            };
-
-            // Joint click / bone placement click
-            const onMouseDown = (e: MouseEvent) => {
-                // Plain LEFT click only (2026-09-29): Alt+left orbits here (altOrbitOnly), middle pans, right is
-                // look / pan — none may pick a joint, select a mesh or place a bone (they all did).
-                if (e.button !== 0 || e.altKey || this.host.isPlaying) return;
-                const el2 = canvas as HTMLCanvasElement;
-                const rect2 = el2.getBoundingClientRect();
-                const px2 = (e.clientX - rect2.left) * (el2.width  / rect2.width);
-                const py2 = (e.clientY - rect2.top)  * (el2.height / rect2.height);
-
-                // ── Bone placement mode ────────────────────────────────────────
-                if (this._bonePlacementMode && this._bonePlacementSkeletonId) {
-                    const skel = this.getSkeleton(this._bonePlacementSkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px2, py2, el2.width, el2.height, camera);
-
-                        // Guard: re-indexing on deletion can make cached index stale.
-                        const rawParent = this._selectedJointIndex ?? -1;
-                        const parentIdx = (rawParent >= 0 && rawParent < skel.data.joints.length) ? rawParent : -1;
-                        if (rawParent !== parentIdx) {
-                            this._selectedJointIndex = null;
-                            this.renderer3D.setSelectedJoint(null);
-                        }
-
-                        if (parentIdx >= 0) {
-                            // ── Child bone: single click ─────────────────────────────────────
-                            // Tail-selected → head snaps to parent's tail (extend chain).
-                            // Head-selected → head placed at parent's own position (branch here).
-                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
-                            if (!meshHit) { e.stopPropagation(); return; } // must hit mesh
-
-                            const pj = skel.data.joints[parentIdx];
-                            const localPos: [number, number, number] = this._selectedJointIsTail
-                                ? [...pj.tailOffset] as [number, number, number]
-                                : [0, 0, 0];
-                            const newIdx = skel.addJoint(parentIdx, localPos, `joint_${skel.data.joints.length}`);
-                            const nj = skel.data.joints[newIdx];
-                            const invNJ = mat4.create();
-                            mat4.invert(invNJ, nj.worldMatrix as unknown as mat4);
-                            const [hX, hY, hZ] = meshHit.hitPoint;
-                            const tailLocal = vec3.transformMat4(vec3.create(), [hX, hY, hZ] as unknown as vec3, invNJ);
-                            skel.setJointTailOffset(newIdx, [tailLocal[0], tailLocal[1], tailLocal[2]]);
-
-                            // Always select the new bone's tail — it's a leaf so the tail sphere renders.
-                            // isTail=true means Add Bone immediately after will extend the chain from here.
-                            this._selectedJointIndex = newIdx;
-                            this._selectedJointIsTail = true;
-                            this.renderer3D.setSelectedJoint(newIdx, true);
-                            this._bonePlacementMode = false;
-                            this._bonePlacementSkeletonId = null;
-                            this._bonePlacementPendingIdx = null;
-                            this.renderer3D.setBonePlacementActive(false);
-                            this.ctx.emitSceneGraphChanged();
-                            this.ctx.scheduleRender();
-
-                        } else if (this._bonePlacementPendingIdx === null) {
-                            // ── Root bone phase 1: head click — must hit mesh ──────────────
-                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
-                            if (!meshHit) { e.stopPropagation(); return; }
-
-                            const [hX, hY, hZ] = meshHit.hitPoint;
-                            // Add joint; tail will be updated live by mousemove → second click finalizes.
-                            const newIdx = skel.addJoint(-1, [hX, hY, hZ], `joint_${skel.data.joints.length}`);
-                            skel.setJointTailOffset(newIdx, [0, 0.05, 0]); // tiny placeholder until tail click
-                            this._bonePlacementPendingIdx = newIdx;
-                            this._selectedJointIndex = newIdx;
-                            this.renderer3D.setSelectedJoint(newIdx);
-                            this.ctx.scheduleRender();
-
-                        } else {
-                            // ── Root bone phase 2: tail click — must hit mesh ─────────────
-                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
-                            if (!meshHit) { e.stopPropagation(); return; } // keep phase alive
-
-                            const pendingIdx = this._bonePlacementPendingIdx;
-                            const j = skel.data.joints[pendingIdx];
-                            if (j) {
-                                const [tX, tY, tZ] = meshHit.hitPoint;
-                                const invJ = mat4.create();
-                                mat4.invert(invJ, j.worldMatrix as unknown as mat4);
-                                const lt = vec3.transformMat4(vec3.create(), [tX, tY, tZ] as unknown as vec3, invJ);
-                                skel.setJointTailOffset(pendingIdx, [lt[0], lt[1], lt[2]]);
-                            }
-                            // Switch selection to tail now that the bone is fully placed
-                            this._selectedJointIsTail = true;
-                            this.renderer3D.setSelectedJoint(pendingIdx, true);
-                            this._bonePlacementMode = false;
-                            this._bonePlacementSkeletonId = null;
-                            this._bonePlacementPendingIdx = null;
-                            this.renderer3D.setBonePlacementActive(false);
-                            this.ctx.emitSceneGraphChanged();
-                            this.ctx.scheduleRender();
-                        }
-                    }
-                    e.stopPropagation();
-                    return;
-                }
-
-                // ── Normal: select hovered joint and begin drag ──────────────
-                // Only intercept clicks when the armature panel is explicitly open.
-                if (!this._boneOverlayExplicit || !this._boneOverlaySkeletonId) return;
-
-                const cam = this.renderer3D.getCamera();
-                const pos = cam.position as unknown as vec3;
-                const tgt = cam.target  as unknown as vec3;
-                vec3.sub(this._dragPlaneNormal, pos, tgt);
-                vec3.normalize(this._dragPlaneNormal, this._dragPlaneNormal);
-
-                // ── FK rotate drag start ─────────────────────────────────────
-                if (this._armatureToolMode === 'rotate' && this._jointGizmoHoveredAxis !== null
-                    && (this._jointGizmoHoveredAxis === 'x' || this._jointGizmoHoveredAxis === 'y' || this._jointGizmoHoveredAxis === 'z')
-                    && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
-                    const skelR = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skelR) {
-                        const jr = skelR.data.joints[this._selectedJointIndex];
-                        if (jr) {
-                            this._isRotatingJoint = true;
-                            this._rotatingJointIdx = this._selectedJointIndex;
-                            this._rotatingJointAxis = this._jointGizmoHoveredAxis as 'x' | 'y' | 'z';
-                            this._rotatingJointInitialQuat = [...jr.localRotation] as [number,number,number,number];
-                            this._rotatingJointAccAngle = 0;
-                            this._rotatingLastClientX = e.clientX;
-                            this._rotatingLastClientY = e.clientY;
-                            this.renderer3D.setJointGizmoDraggingAxis(this._jointGizmoHoveredAxis);
-                            if (this._orbitController) this._orbitController.enabled = false;
-                            e.stopPropagation();
-                            return;
-                        }
-                    }
-                }
-
-                // ── Joint gizmo axis drag start ──────────────────────────────
-                if (this._armatureToolMode === 'move' && this._jointGizmoHoveredAxis !== null && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
-                    const skelG = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skelG) {
-                        const jg = skelG.data.joints[this._selectedJointIndex];
-                        if (jg) {
-                            const camera = this.renderer3D.getCamera();
-                            const { origin, dir } = this._picker.castRay(px2, py2, el2.width, el2.height, camera);
-                            const worldPos = vec3.fromValues(jg.worldMatrix[12], jg.worldMatrix[13], jg.worldMatrix[14]);
-                            const axisStr = this._jointGizmoHoveredAxis;
-                            const axisDir: vec3 = axisStr === 'x' ? vec3.fromValues(1,0,0) :
-                                                  axisStr === 'y' ? vec3.fromValues(0,1,0) :
-                                                  axisStr === 'z' ? vec3.fromValues(0,0,1) :
-                                                  axisStr === 'xy' ? vec3.fromValues(0,0,1) :
-                                                  axisStr === 'xz' ? vec3.fromValues(0,1,0) :
-                                                                    vec3.fromValues(1,0,0); // yz
-                            const isPlane = axisStr === 'xy' || axisStr === 'xz' || axisStr === 'yz';
-                            let normal: vec3;
-                            if (isPlane) {
-                                normal = vec3.clone(axisDir);
-                            } else {
-                                const camDir = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position as unknown as vec3, worldPos));
-                                normal = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir)));
-                            }
-                            const denom = vec3.dot(normal, dir as unknown as vec3);
-                            if (Math.abs(denom) > 1e-6) {
-                                const diff = vec3.subtract(vec3.create(), worldPos, origin as unknown as vec3);
-                                const t = vec3.dot(normal, diff) / denom;
-                                if (t > 0) {
-                                    this._isDraggingJointAxis = true;
-                                    this._dragJointAxisAxis = axisStr;
-                                    vec3.scaleAndAdd(this._dragJointAxisStartPt, origin as unknown as vec3, dir as unknown as vec3, t);
-                                    vec3.copy(this._dragJointAxisJointStart, worldPos);
-                                    this.renderer3D.setJointGizmoDraggingAxis(axisStr);
-                                    // Prevent the orbit controller from also starting a drag on this same click.
-                                    if (this._orbitController) this._orbitController.enabled = false;
-                                    e.stopPropagation();
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ── IK handle drag start (target or pole) ─────────────────────
-                if (this._hoveredIKHandle && this._boneOverlaySkeletonId) {
-                    const skelIK = this.getSkeleton(this._boneOverlaySkeletonId);
-                    const chainIK = skelIK?.data.ikChains?.find(c => c.id === this._hoveredIKHandle!.chainId);
-                    const isPole = this._hoveredIKHandle!.handleType === 'pole';
-                    if (skelIK && chainIK && (!isPole || chainIK.poleTarget)) {
-                        this._draggingIKHandle = { ...this._hoveredIKHandle! };
-                        this.renderer3D.setDraggingIKHandle(this._draggingIKHandle);
-                        // Build camera-facing drag plane at the handle's current position
-                        const handlePos = isPole ? chainIK.poleTarget! : chainIK.target;
-                        const camPos = this.renderer3D.getCamera().position as unknown as vec3;
-                        const camTgt = this.renderer3D.getCamera().target  as unknown as vec3;
-                        vec3.sub(this._ikDragPlaneNormal, camPos, camTgt);
-                        vec3.normalize(this._ikDragPlaneNormal, this._ikDragPlaneNormal);
-                        vec3.set(this._ikDragPlanePoint, handlePos[0], handlePos[1], handlePos[2]);
-                        if (this._orbitController) this._orbitController.enabled = false;
-                        e.stopPropagation();
-                        return;
-                    }
-                }
-
-                // ── Tail handle drag ──────────────────────────────────────────
-                if (this._hoveredTailJointIndex !== null && !this._weightPaint.isActive()) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const j = skel.data.joints[this._hoveredTailJointIndex];
-                        if (j) {
-                            // Select the owning joint so panel XYZ inputs activate
-                            this._selectedJointIndex = this._hoveredTailJointIndex;
-                            this._selectedJointIsTail = true; // tail sphere → extend-chain semantics
-                            this.renderer3D.setSelectedJoint(this._selectedJointIndex, true);
-                            this.ctx.emitSceneGraphChanged();
-                            // Drag plane at the tail world position
-                            const wm = j.worldMatrix;
-                            const to = j.tailOffset ?? [0, 0.3, 0];
-                            vec3.set(this._dragPlanePoint,
-                                wm[0]*to[0] + wm[4]*to[1] + wm[8]*to[2]  + wm[12],
-                                wm[1]*to[0] + wm[5]*to[1] + wm[9]*to[2]  + wm[13],
-                                wm[2]*to[0] + wm[6]*to[1] + wm[10]*to[2] + wm[14],
-                            );
-                            if (this._orbitController) this._orbitController.enabled = false;
-                            this._isDraggingTail   = true;
-                            this._dragTailJointIdx = this._hoveredTailJointIndex;
-                        }
-                    }
-                    e.stopPropagation();
-                    return;
-                }
-
-                // ── Head sphere drag ──────────────────────────────────────────
-                if (this._hoveredJointIndex === null) return;
-
-                // Select the clicked joint and emit so the panel syncs
-                this._selectedJointIndex = this._hoveredJointIndex;
-                this._selectedJointIsTail = false; // head sphere → branch-here semantics
-                this.renderer3D.setSelectedJoint(this._selectedJointIndex);
+        switch (t.kind) {
+            case 'rotate': {
+                const jr = joints[t.joint];
+                if (!jr) return false;
+                const q0 = [...jr.localRotation] as [number, number, number, number];
+                this._isRotatingJoint = true;
+                this._rotatingJointIdx = t.joint;
+                this._rotatingJointAxis = t.axis;
+                this._rotatingJointInitialQuat = [...q0] as [number, number, number, number];
+                this._rotatingJointAccAngle = 0;
+                this._rotatingLastClientX = clientX;
+                this._rotatingLastClientY = clientY;
+                this.renderer3D.setJointGizmoDraggingAxis(t.axis);
+                holdOrbit();
+                this._armRestore = () => skel.setJointRotation(t.joint, q0);
+                return true;
+            }
+            case 'axis': {
+                const j = joints[t.joint];
+                if (!j) return false;
+                const p0 = [...j.localPosition] as [number, number, number];
+                this._isDraggingJointAxis = true;
+                this._dragJointAxisAxis = t.axis;
+                vec3.copy(this._dragJointAxisStartPt, t.startPt);
+                vec3.copy(this._dragJointAxisJointStart, t.jointStart);
+                this.renderer3D.setJointGizmoDraggingAxis(t.axis);
+                holdOrbit();
+                this._armRestore = () => skel.moveJoint(t.joint, p0);
+                return true;
+            }
+            case 'ik': {
+                const chain = skel.data.ikChains?.find(c => c.id === t.handle.chainId);
+                if (!chain) return false;
+                const isPole = t.handle.handleType === 'pole';
+                const handlePos = isPole ? chain.poleTarget : chain.target;
+                if (!handlePos) return false;
+                const target0 = [...chain.target] as [number, number, number];
+                const pole0 = chain.poleTarget ? [...chain.poleTarget] as [number, number, number] : undefined;
+                this._draggingIKHandle = { ...t.handle };
+                this.renderer3D.setDraggingIKHandle(this._draggingIKHandle);
+                vec3.sub(this._ikDragPlaneNormal, cam.position as unknown as vec3, cam.target as unknown as vec3);
+                vec3.normalize(this._ikDragPlaneNormal, this._ikDragPlaneNormal);
+                vec3.set(this._ikDragPlanePoint, handlePos[0], handlePos[1], handlePos[2]);
+                holdOrbit();
+                this._armRestore = () => { chain.target = target0; if (pole0) chain.poleTarget = pole0; };
+                return true;
+            }
+            case 'tail': {
+                const j = joints[t.joint];
+                if (!j) return false;
+                const off0 = [...j.tailOffset] as [number, number, number];
+                // Select the owning joint so panel XYZ inputs activate (tail sphere → extend-chain semantics).
+                this._selectedJointIndex = t.joint;
+                this._selectedJointIsTail = true;
+                this.renderer3D.setSelectedJoint(t.joint, true);
+                this.ctx.emitSceneGraphChanged();
+                const wm = j.worldMatrix, to = j.tailOffset ?? [0, 0.3, 0];
+                vec3.set(this._dragPlanePoint,
+                    wm[0]*to[0] + wm[4]*to[1] + wm[8]*to[2]  + wm[12],
+                    wm[1]*to[0] + wm[5]*to[1] + wm[9]*to[2]  + wm[13],
+                    wm[2]*to[0] + wm[6]*to[1] + wm[10]*to[2] + wm[14],
+                );
+                holdOrbit();
+                this._isDraggingTail = true;
+                this._dragTailJointIdx = t.joint;
+                this._armRestore = () => { skel.setJointTailOffset(t.joint, off0); restoreSelection(); };
+                return true;
+            }
+            case 'head': {
+                const j = joints[t.joint];
+                if (!j) return false;
+                // Select the pressed joint and emit so the panel syncs (head sphere → branch-here semantics).
+                this._selectedJointIndex = t.joint;
+                this._selectedJointIsTail = false;
+                this.renderer3D.setSelectedJoint(t.joint);
                 this.ctx.emitSceneGraphChanged();
                 this.ctx.scheduleRender();
+                // Dragging is suppressed during weight paint — pressing a joint just selects it.
+                const p0 = [...j.localPosition] as [number, number, number];
+                if (!this._weightPaint.isActive()) {
+                    holdOrbit();
+                    this._isDraggingJoint = true;
+                    this._dragJointIdx = t.joint;
+                    vec3.set(this._dragPlanePoint, j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]);
+                    this._armRestore = () => { skel.moveJoint(t.joint, p0); restoreSelection(); };
+                } else {
+                    this._armRestore = restoreSelection;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
 
-                // Begin drag: lock a camera-facing plane to the joint world position.
-                // Dragging is suppressed during weight paint — clicking a joint just selects it.
-                const skelHead = this.getSkeleton(this._boneOverlaySkeletonId);
-                if (skelHead && !this._weightPaint.isActive()) {
-                    const j = skelHead.data.joints[this._hoveredJointIndex];
-                    if (j) {
-                        if (this._orbitController) this._orbitController.enabled = false;
-                        this._isDraggingJoint = true;
-                        this._dragJointIdx = this._hoveredJointIndex;
-                        vec3.set(this._dragPlanePoint, j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]);
-                    }
-                }
-                e.stopPropagation(); // prevent mesh deselect on joint click
-            };
+    /** Ray (canvas px) ∩ the plane through `point` with `normal`, or null (parallel / behind the camera). */
+    private _armRayPlane(x: number, y: number, w: number, h: number, point: vec3, normal: vec3): vec3 | null {
+        const { origin, dir } = this._picker.castRay(x, y, w, h, this.renderer3D.getCamera());
+        const o = origin, d = dir;
+        const denom = vec3.dot(d, normal);
+        if (Math.abs(denom) <= 1e-6) return null;
+        const t = vec3.dot(vec3.sub(_armTmpA, point, o), normal) / denom;
+        if (t <= 0) return null;
+        return vec3.scaleAndAdd(_armTmpB, o, d, t);
+    }
 
-            // End drag on mouse-up; emit so panel refreshes final position.
-            const onMouseUp = () => {
-                // Re-enable orbit after joint drag — but not if weight paint mode is holding it disabled.
-                if (this._orbitController && !this._weightPaint.isActive()) this._orbitController.enabled = true;
-                if (this._draggingIKHandle) {
-                    this._draggingIKHandle = null;
-                    this.renderer3D.setDraggingIKHandle(null);
-                    this.ctx.emitSceneGraphChanged();
-                }
-                if (this._isRotatingJoint) {
-                    this._isRotatingJoint = false;
-                    this._rotatingJointIdx = null;
-                    this._rotatingJointAxis = null;
-                    this.renderer3D.setJointGizmoDraggingAxis(null);
-                    this.ctx.emitSceneGraphChanged();
-                }
-                if (this._isDraggingJointAxis) {
-                    this._isDraggingJointAxis = false;
-                    this._dragJointAxisAxis = null;
-                    this.renderer3D.setJointGizmoDraggingAxis(null);
-                    this.ctx.emitSceneGraphChanged();
-                }
-                if (this._isDraggingJoint) {
-                    this._isDraggingJoint = false;
-                    this._dragJointIdx = null;
-                    this.ctx.emitSceneGraphChanged();
-                }
-                if (this._isDraggingTail) {
-                    this._isDraggingTail   = false;
-                    this._dragTailJointIdx = null;
-                    this.ctx.emitSceneGraphChanged();
-                }
-            };
+    /** One drag step (client + canvas px). Joint moves write the skeleton directly + render: the panel / outliner
+     *  refresh ONCE at the end (moveBone3D's per-move scene-graph event bumped the structure version and refreshed the
+     *  armature panel every frame of a drag). */
+    private _armDragMove(clientX: number, clientY: number, x: number, y: number, w: number, h: number): void {
+        const skel = this._boneOverlaySkeletonId ? this.getSkeleton(this._boneOverlaySkeletonId) : null;
+        if (!skel) return;
 
-            const onMouseLeave = () => {
-                this.setHoveredMesh(null);
-                if (this._draggingIKHandle) {
-                    this._draggingIKHandle = null;
-                    this.renderer3D.setDraggingIKHandle(null);
-                }
-                if (this._hoveredIKHandle) {
-                    this._hoveredIKHandle = null;
-                    this.renderer3D.setHoveredIKHandle(null);
-                    this.ctx.scheduleRender();
-                }
-                if (this._isRotatingJoint) {
-                    this._isRotatingJoint = false;
-                    this._rotatingJointIdx = null;
-                    this._rotatingJointAxis = null;
-                    this.renderer3D.setJointGizmoDraggingAxis(null);
-                }
-                if (this._isDraggingJointAxis) {
-                    this._isDraggingJointAxis = false;
-                    this._dragJointAxisAxis = null;
-                    this.renderer3D.setJointGizmoDraggingAxis(null);
-                }
-                if (this._isDraggingJoint) {
-                    this._isDraggingJoint = false;
-                    this._dragJointIdx = null;
-                }
-                if (this._isDraggingTail) {
-                    this._isDraggingTail   = false;
-                    this._dragTailJointIdx = null;
-                }
-                if (this._hoveredJointIndex !== null) {
-                    this._hoveredJointIndex = null;
-                    this.renderer3D.setHoveredJoint(null);
-                    this.ctx.scheduleRender();
-                }
-                if (this._jointGizmoHoveredAxis !== null) {
-                    this._jointGizmoHoveredAxis = null;
-                    this.renderer3D.setJointGizmoHoveredAxis(null);
-                    this.ctx.scheduleRender();
-                }
-            };
+        // ── IK handle drag (target or pole) ─────────────────────────
+        if (this._draggingIKHandle) {
+            const chain = skel.data.ikChains?.find(c => c.id === this._draggingIKHandle!.chainId);
+            const p = chain ? this._armRayPlane(x, y, w, h, this._ikDragPlanePoint, this._ikDragPlaneNormal) : null;
+            if (chain && p) {
+                if (this._draggingIKHandle.handleType === 'target') chain.target = [p[0], p[1], p[2]];
+                else chain.poleTarget = [p[0], p[1], p[2]];
+                this.ctx.scheduleRender();
+            }
+            return;
+        }
 
-            addZonelessListener((canvas as HTMLCanvasElement), 'mousemove', onMouseMove);
-            addZonelessListener((canvas as HTMLCanvasElement), 'mouseleave', onMouseLeave);
-            addZonelessListener((canvas as HTMLCanvasElement), 'mousedown', onMouseDown);
-            addZonelessListener((canvas as HTMLCanvasElement), 'mouseup',   onMouseUp);
-            this._boneOverlayListenerCleanup = () => {
-                removeZonelessListener((canvas as HTMLCanvasElement), 'mousemove',  onMouseMove);
-                removeZonelessListener((canvas as HTMLCanvasElement), 'mouseleave', onMouseLeave);
-                removeZonelessListener((canvas as HTMLCanvasElement), 'mousedown',  onMouseDown);
-                removeZonelessListener((canvas as HTMLCanvasElement), 'mouseup',    onMouseUp);
-            };
+        // ── FK rotate drag ───────────────────────────────────────────
+        if (this._isRotatingJoint && this._rotatingJointIdx !== null && this._rotatingJointAxis) {
+            const dx = clientX - this._rotatingLastClientX;
+            const dy = clientY - this._rotatingLastClientY;
+            this._rotatingLastClientX = clientX;
+            this._rotatingLastClientY = clientY;
+            this._rotatingJointAccAngle += (dx + dy) * 0.01;
+            const a = this._rotatingJointAccAngle * 0.5;
+            const s = Math.sin(a), c = Math.cos(a);
+            const ax = this._rotatingJointAxis;
+            const dq: [number, number, number, number] = ax === 'x' ? [s, 0, 0, c] : ax === 'y' ? [0, s, 0, c] : [0, 0, s, c];
+            // Compose: delta * initialRotation (pre-multiply so delta is in world space)
+            const [ix, iy, iz, iw] = this._rotatingJointInitialQuat;
+            const [dx2, dy2, dz2, dw2] = dq;
+            skel.setJointRotation(this._rotatingJointIdx, [
+                dw2*ix + dx2*iw + dy2*iz - dz2*iy,
+                dw2*iy - dx2*iz + dy2*iw + dz2*ix,
+                dw2*iz + dx2*iy - dy2*ix + dz2*iw,
+                dw2*iw - dx2*ix - dy2*iy - dz2*iz,
+            ]);
+            this.ctx.scheduleRender();
+            return;
+        }
+
+        // ── Joint gizmo axis drag ────────────────────────────────────
+        if (this._isDraggingJointAxis && this._dragJointAxisAxis && this._selectedJointIndex !== null) {
+            const j = skel.data.joints[this._selectedJointIndex];
+            if (!j) return;
+            const camera = this.renderer3D.getCamera();
+            const axisStr = this._dragJointAxisAxis;
+            const axisDir = _jointAxisDir(axisStr);
+            const isPlane = axisStr === 'xy' || axisStr === 'xz' || axisStr === 'yz';
+            let normal: vec3;
+            if (isPlane) {
+                normal = axisDir;
+            } else {
+                const camDir = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position as unknown as vec3, this._dragJointAxisJointStart));
+                normal = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir)));
+            }
+            const curPt = this._armRayPlane(x, y, w, h, this._dragJointAxisJointStart, normal);
+            if (!curPt) return;
+            const disp = vec3.subtract(vec3.create(), curPt, this._dragJointAxisStartPt);
+            const newWorldPos = isPlane
+                ? vec3.add(vec3.create(), this._dragJointAxisJointStart, disp)
+                : vec3.scaleAndAdd(vec3.create(), this._dragJointAxisJointStart, axisDir, vec3.dot(disp, axisDir));
+            const invParent = mat4.create();
+            if (j.parentIndex >= 0) mat4.invert(invParent, skel.data.joints[j.parentIndex].worldMatrix as unknown as mat4);
+            const lp = vec3.transformMat4(vec3.create(), newWorldPos, invParent);
+            skel.moveJoint(this._selectedJointIndex, [lp[0], lp[1], lp[2]]);
+            this.ctx.scheduleRender();
+            return;
+        }
+
+        // ── Joint drag-to-move: the ray ∩ a camera-facing plane locked to the joint's world position at drag start,
+        //    converted back into the joint's local space (root joints: local = world). ──
+        if (this._isDraggingJoint && this._dragJointIdx !== null) {
+            const j = skel.data.joints[this._dragJointIdx];
+            const p = j ? this._armRayPlane(x, y, w, h, this._dragPlanePoint, this._dragPlaneNormal) : null;
+            if (!j || !p) return;
+            const invParent = mat4.create();
+            if (j.parentIndex >= 0) mat4.invert(invParent, skel.data.joints[j.parentIndex].worldMatrix as unknown as mat4);
+            const lp = vec3.transformMat4(vec3.create(), p, invParent);
+            skel.moveJoint(this._dragJointIdx, [lp[0], lp[1], lp[2]]);
+            this.ctx.scheduleRender();
+            return;
+        }
+
+        // ── Tail drag: tailOffset in the joint's own local frame ─────
+        if (this._isDraggingTail && this._dragTailJointIdx !== null) {
+            const j = skel.data.joints[this._dragTailJointIdx];
+            const p = j ? this._armRayPlane(x, y, w, h, this._dragPlanePoint, this._dragPlaneNormal) : null;
+            if (!j || !p) return;
+            const invJoint = mat4.create();
+            mat4.invert(invJoint, j.worldMatrix as unknown as mat4);
+            const lp = vec3.transformMat4(vec3.create(), p, invJoint);
+            skel.setJointTailOffset(this._dragTailJointIdx, [lp[0], lp[1], lp[2]]);
+            this.ctx.scheduleRender();
+        }
+    }
+
+    /** Clear every drag flag (+ the renderer's dragging state) and give the orbit back — unless weight paint is
+     *  holding it disabled. */
+    private _armClearDrag(): void {
+        if (this._orbitController && !this._weightPaint.isActive()) this._orbitController.enabled = true;
+        if (this._draggingIKHandle) { this._draggingIKHandle = null; this.renderer3D.setDraggingIKHandle(null); }
+        if (this._isRotatingJoint || this._isDraggingJointAxis) this.renderer3D.setJointGizmoDraggingAxis(null);
+        this._isRotatingJoint = false;
+        this._rotatingJointIdx = null;
+        this._rotatingJointAxis = null;
+        this._isDraggingJointAxis = false;
+        this._dragJointAxisAxis = null;
+        this._isDraggingJoint = false;
+        this._dragJointIdx = null;
+        this._isDraggingTail = false;
+        this._dragTailJointIdx = null;
+    }
+
+    /** The drag finished: keep the result and emit ONCE so the panel refreshes the final position. */
+    private _armEnd(): void {
+        this._armRestore = null;
+        this._armClearDrag();
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** The drag was taken back (a 2nd finger → pinch / orbit, or pointercancel): pose + joint selection restored
+     *  exactly, no undo entry. */
+    private _armCancel(): void {
+        const restore = this._armRestore;
+        this._armRestore = null;
+        this._armClearDrag();
+        restore?.();
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Mouse / pen hover (one per frame): the mesh hover outline, the root-bone tail preview, and the joint / gizmo /
+     *  IK hover highlights. A finger never hovers (TOUCH-16). */
+    private _armHover(x: number, y: number, w: number, h: number): void {
+        this._bonePlacementPreview(x, y, w, h);
+        // Suppress mesh hover highlight during bone placement — clicks belong to the bone system.
+        if (!this._bonePlacementMode) {
+            const id = this.pick3D(x, y, w, h)?.meshId ?? null;
+            if (id !== this._ptrHoverId || this.renderer3D.getHoveredMeshIds() !== this._ptrHoverSet) {
+                this.setHoveredMesh(id);
+                this._ptrHoverId = id;
+                this._ptrHoverSet = this.renderer3D.getHoveredMeshIds();
+            }
+        }
+        if (!this._gizmoRenderer || !this._boneOverlayExplicit || !this._boneOverlaySkeletonId) return;
+        const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+        if (!skel) return;
+        const hit = this._armHitTest(skel, x, y, w, h, false);
+        if (hit.axis !== this._jointGizmoHoveredAxis) {
+            this._jointGizmoHoveredAxis = hit.axis;
+            this.renderer3D.setJointGizmoHoveredAxis(hit.axis);
+            this.ctx.scheduleRender();
+        }
+        const ik = hit.ik;
+        if (ik?.chainId !== this._hoveredIKHandle?.chainId || ik?.handleType !== this._hoveredIKHandle?.handleType) {
+            this._hoveredIKHandle = ik;
+            this.renderer3D.setHoveredIKHandle(ik);
+            this.ctx.scheduleRender();
+        }
+        if (hit.head !== this._hoveredJointIndex || hit.tail !== this._hoveredTailJointIndex) {
+            this._hoveredJointIndex = hit.head;
+            this._hoveredTailJointIndex = hit.tail;
+            this.renderer3D.setHoveredJoint(hit.head);
+            this.renderer3D.setHoveredTailJoint(hit.tail);
+            this.ctx.scheduleRender();
+        }
+    }
+
+    /** The pointer left the canvas (or a finger lifted): drop every hover highlight. */
+    private _armClearHover(): void {
+        if (this.renderer3D.getHoveredMeshIds().size > 0 || this._ptrHoverId !== null) {
+            this.setHoveredMesh(null);
+            this._ptrHoverId = null;
+            this._ptrHoverSet = this.renderer3D.getHoveredMeshIds();
+        }
+        if (this._hoveredIKHandle) {
+            this._hoveredIKHandle = null;
+            this.renderer3D.setHoveredIKHandle(null);
+            this.ctx.scheduleRender();
+        }
+        if (this._hoveredJointIndex !== null || this._hoveredTailJointIndex !== null) {
+            this._hoveredJointIndex = null;
+            this._hoveredTailJointIndex = null;
+            this.renderer3D.setHoveredJoint(null);
+            this.renderer3D.setHoveredTailJoint(null);
+            this.ctx.scheduleRender();
+        }
+        if (this._jointGizmoHoveredAxis !== null) {
+            this._jointGizmoHoveredAxis = null;
+            this.renderer3D.setJointGizmoHoveredAxis(null);
+            this.ctx.scheduleRender();
+        }
+    }
+
+    /** Root-bone placement, phase 2: the pending joint's tail follows the pointer (onto the mesh, else a
+     *  camera-facing plane at the joint's depth). */
+    private _bonePlacementPreview(x: number, y: number, w: number, h: number): void {
+        if (!this._bonePlacementMode || this._bonePlacementPendingIdx === null || !this._bonePlacementSkeletonId) return;
+        const skel = this.getSkeleton(this._bonePlacementSkeletonId);
+        const j = skel?.data.joints[this._bonePlacementPendingIdx];
+        if (!skel || !j) return;
+        const camera = this.renderer3D.getCamera();
+        const { origin, dir } = this._picker.castRay(x, y, w, h, camera);
+        const meshHit = this._picker.pickMesh(x, y, w, h, camera, this.getAllMeshes());
+        let wX: number, wY: number, wZ: number;
+        if (meshHit) {
+            [wX, wY, wZ] = meshHit.hitPoint;
+        } else {
+            const jDepth = vec3.distance(
+                [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]] as unknown as vec3,
+                camera.position as unknown as vec3,
+            );
+            wX = origin[0] + dir[0] * jDepth;
+            wY = origin[1] + dir[1] * jDepth;
+            wZ = origin[2] + dir[2] * jDepth;
+        }
+        const invJ = mat4.create();
+        mat4.invert(invJ, j.worldMatrix as unknown as mat4);
+        const lt = vec3.transformMat4(vec3.create(), [wX, wY, wZ] as unknown as vec3, invJ);
+        skel.setJointTailOffset(this._bonePlacementPendingIdx, [lt[0], lt[1], lt[2]]);
+        this.ctx.scheduleRender();
+    }
+
+    /** Bone placement press (mouse) / tap (finger) at canvas px: a child bone from the selected joint, or the root
+     *  bone's head then tail. Every placement must hit a mesh (a miss keeps the phase alive). */
+    private _placeBoneAt(x: number, y: number, w: number, h: number): void {
+        if (!this._bonePlacementMode || !this._bonePlacementSkeletonId) return;
+        const skel = this.getSkeleton(this._bonePlacementSkeletonId);
+        if (!skel) return;
+        const camera = this.renderer3D.getCamera();
+
+        // Guard: re-indexing on deletion can make cached index stale.
+        const rawParent = this._selectedJointIndex ?? -1;
+        const parentIdx = (rawParent >= 0 && rawParent < skel.data.joints.length) ? rawParent : -1;
+        if (rawParent !== parentIdx) {
+            this._selectedJointIndex = null;
+            this.renderer3D.setSelectedJoint(null);
+        }
+
+        const meshHit = this._picker.pickMesh(x, y, w, h, camera, this.getAllMeshes());
+        if (!meshHit) return;   // must hit the mesh
+
+        if (parentIdx >= 0) {
+            // ── Child bone: single press ─────────────────────────────────────
+            // Tail-selected → head snaps to parent's tail (extend chain). Head-selected → head at the parent (branch).
+            const pj = skel.data.joints[parentIdx];
+            const localPos: [number, number, number] = this._selectedJointIsTail
+                ? [...pj.tailOffset] as [number, number, number]
+                : [0, 0, 0];
+            const newIdx = skel.addJoint(parentIdx, localPos, `joint_${skel.data.joints.length}`);
+            const nj = skel.data.joints[newIdx];
+            const invNJ = mat4.create();
+            mat4.invert(invNJ, nj.worldMatrix as unknown as mat4);
+            const [hX, hY, hZ] = meshHit.hitPoint;
+            const tailLocal = vec3.transformMat4(vec3.create(), [hX, hY, hZ] as unknown as vec3, invNJ);
+            skel.setJointTailOffset(newIdx, [tailLocal[0], tailLocal[1], tailLocal[2]]);
+            // Always select the new bone's tail — it's a leaf so the tail sphere renders; Add Bone again extends it.
+            this._selectedJointIndex = newIdx;
+            this._selectedJointIsTail = true;
+            this.renderer3D.setSelectedJoint(newIdx, true);
+            this._endBonePlacement();
+        } else if (this._bonePlacementPendingIdx === null) {
+            // ── Root bone phase 1: head ──────────────────────────────────────
+            const [hX, hY, hZ] = meshHit.hitPoint;
+            // Add the joint; its tail follows the pointer (preview) until the second press finalizes it.
+            const newIdx = skel.addJoint(-1, [hX, hY, hZ], `joint_${skel.data.joints.length}`);
+            skel.setJointTailOffset(newIdx, [0, 0.05, 0]); // tiny placeholder until the tail press
+            this._bonePlacementPendingIdx = newIdx;
+            this._selectedJointIndex = newIdx;
+            this.renderer3D.setSelectedJoint(newIdx);
+            this.ctx.scheduleRender();
+        } else {
+            // ── Root bone phase 2: tail ──────────────────────────────────────
+            const pendingIdx = this._bonePlacementPendingIdx;
+            const j = skel.data.joints[pendingIdx];
+            if (j) {
+                const [tX, tY, tZ] = meshHit.hitPoint;
+                const invJ = mat4.create();
+                mat4.invert(invJ, j.worldMatrix as unknown as mat4);
+                const lt = vec3.transformMat4(vec3.create(), [tX, tY, tZ] as unknown as vec3, invJ);
+                skel.setJointTailOffset(pendingIdx, [lt[0], lt[1], lt[2]]);
+            }
+            // Switch selection to the tail now that the bone is fully placed
+            this._selectedJointIsTail = true;
+            this.renderer3D.setSelectedJoint(pendingIdx, true);
+            this._endBonePlacement();
+        }
+    }
+
+    private _endBonePlacement(): void {
+        this._bonePlacementMode = false;
+        this._bonePlacementSkeletonId = null;
+        this._bonePlacementPendingIdx = null;
+        this.renderer3D.setBonePlacementActive(false);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
     }
 
     disableTransformControls(): void {

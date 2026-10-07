@@ -202,6 +202,14 @@ export class InteractionService {
      *  Scene3DArmature; null = no 3D touch navigation. */
     public touchGestures3D: (() => boolean) | null = null;
 
+    /** TOUCH-10 (docs/ui/touch-controls.md): the ADDITIVE-SELECT latch. While on, a 3D select press / tap (object
+     *  select in TransformController3D, vertex / edge / face select in mesh edit) adds to the selection exactly like
+     *  Shift does — a tablet has no Shift. Set through sm.setAdditiveSelect3D. */
+    public additiveSelect3D = false;
+    /** TOUCH-10: the SNAP latch. While on, 3D gizmo drags snap (grid / angle / scale step / vertex) exactly like holding
+     *  Ctrl does. Set through sm.setSnapToggle3D. */
+    public snapLatch3D = false;
+
     public adjustZoom(delta: number, mouseX: number, mouseY: number, illustrationMode?: boolean, illustrationBounds?: { width: number; height: number }) {
     // free3D nav owns zoom via its orbit-controller dolly — a 2D zoom gesture (e.g. Ctrl+scroll) here must not
     // change the shared 2D zoomFactor and shift the artboard view underneath.

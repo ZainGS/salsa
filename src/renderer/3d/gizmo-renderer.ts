@@ -759,6 +759,17 @@ function jointTailWorldPos(j: import('../../types/armature-3d').Joint3D): [numbe
  * Build the full bone overlay geometry for a skeleton.
  * Model space = world space (matrix = identity on draw).
  */
+/** Persistent upload staging for the bone overlay (perf, mobile-parity TOUCH-9 pass): it used to allocate ~470 KB of
+ *  typed arrays EVERY frame the armature showed. Safe to share: drawBoneOverlay writeBuffer()s them (a copy) at once. */
+let _boneScratch: { vf: Float32Array; vi: Uint32Array; lvf: Float32Array } | null = null;
+function boneScratch(): { vf: Float32Array; vi: Uint32Array; lvf: Float32Array } {
+  return _boneScratch ??= {
+    vf: new Float32Array(MAX_BONE_VERTS * 7),
+    vi: new Uint32Array(MAX_BONE_IDXS),
+    lvf: new Float32Array(MAX_BONE_EDGE_VERTS * 7),
+  };
+}
+
 function buildBoneOverlayGeometry(
   skeleton: Skeleton3D,
   jointRadius: number,
@@ -835,9 +846,7 @@ function buildBoneOverlayGeometry(
     const vertCount     = verts.length / 7;
     const idxCount      = idxs.length;
     const lineVertCount = lineV.length / 7;
-    const vf  = new Float32Array(MAX_BONE_VERTS * 7);
-    const vi  = new Uint32Array(MAX_BONE_IDXS);
-    const lvf = new Float32Array(MAX_BONE_EDGE_VERTS * 7);
+    const { vf, vi, lvf } = boneScratch();
     if (vertCount > 0)     { vf.set(verts, 0); vi.set(idxs, 0); }
     if (lineVertCount > 0) { lvf.set(lineV, 0); }
     return { verts: vf, idxs: vi, vertCount, idxCount, lineVerts: lvf, lineVertCount };
@@ -921,9 +930,7 @@ function buildBoneOverlayGeometry(
   const vertCount     = verts.length / 7;
   const idxCount      = idxs.length;
   const lineVertCount = lineV.length / 7;
-  const vf  = new Float32Array(MAX_BONE_VERTS * 7);
-  const vi  = new Uint32Array(MAX_BONE_IDXS);
-  const lvf = new Float32Array(MAX_BONE_EDGE_VERTS * 7);
+  const { vf, vi, lvf } = boneScratch();
   if (vertCount > 0)     { vf.set(verts, 0); vi.set(idxs, 0); }
   if (lineVertCount > 0) { lvf.set(lineV, 0); }
   return { verts: vf, idxs: vi, vertCount, idxCount, lineVerts: lvf, lineVertCount };
@@ -2315,8 +2322,9 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     const inv = 1 / joints.length;
     const center = vec3.fromValues(cx * inv, cy * inv, cz * inv);
     const visualR     = GizmoRenderer.computeGizmoScale(camera, center) * 0.07;
-    const headHitR2   = (visualR * 1.8) ** 2;
-    const tailHitR2   = (visualR * 0.75 * 1.8) ** 2;
+    const hs          = this.hitScale;   // TOUCH-8: ×2 under a finger
+    const headHitR2   = (visualR * 1.8 * hs) ** 2;
+    const tailHitR2   = (visualR * 0.75 * 1.8 * hs) ** 2;
 
     let bestT    = Infinity;
     let bestIdx: number | null = null;
@@ -2446,12 +2454,13 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       if (t !== null && t > 0 && t < bestT) { bestT = t; bestAxis = axis; }
     }
 
-    tryHit('x',  hitAxisCylinder(lO, lD, 'x', HIT_RADIUS_AXIS));
-    tryHit('y',  hitAxisCylinder(lO, lD, 'y', HIT_RADIUS_AXIS));
-    tryHit('z',  hitAxisCylinder(lO, lD, 'z', HIT_RADIUS_AXIS));
-    tryHit('xy', hitPlane(lO, lD, 'xy'));
-    tryHit('xz', hitPlane(lO, lD, 'xz'));
-    tryHit('yz', hitPlane(lO, lD, 'yz'));
+    const hs = this.hitScale;   // TOUCH-8: ×2 under a finger
+    tryHit('x',  hitAxisCylinder(lO, lD, 'x', HIT_RADIUS_AXIS * hs));
+    tryHit('y',  hitAxisCylinder(lO, lD, 'y', HIT_RADIUS_AXIS * hs));
+    tryHit('z',  hitAxisCylinder(lO, lD, 'z', HIT_RADIUS_AXIS * hs));
+    tryHit('xy', hitPlane(lO, lD, 'xy', hs));
+    tryHit('xz', hitPlane(lO, lD, 'xz', hs));
+    tryHit('yz', hitPlane(lO, lD, 'yz', hs));
 
     return bestAxis;
   }
@@ -2517,9 +2526,10 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
       if (t !== null && t > 0 && t < bestT) { bestT = t; bestAxis = axis; }
     }
 
-    tryHit('x', hitRotateRing(lO, lD, 'x'));
-    tryHit('y', hitRotateRing(lO, lD, 'y'));
-    tryHit('z', hitRotateRing(lO, lD, 'z'));
+    const hs = this.hitScale;   // TOUCH-8: ×2 under a finger
+    tryHit('x', hitRotateRing(lO, lD, 'x', hs));
+    tryHit('y', hitRotateRing(lO, lD, 'y', hs));
+    tryHit('z', hitRotateRing(lO, lD, 'z', hs));
 
     return bestAxis;
   }
@@ -2625,9 +2635,9 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     const center = vec3.fromValues(firstTarget[0], firstTarget[1], firstTarget[2]);
     const baseScale = GizmoRenderer.computeGizmoScale(camera, center);
     const tgtR  = baseScale * 0.085;
-    const tgtHitR2  = (tgtR  * 1.8) ** 2;
+    const tgtHitR2  = (tgtR  * 1.8 * this.hitScale) ** 2;   // TOUCH-8: ×2 under a finger
     const poleR = tgtR * 0.75;
-    const poleHitR2 = (poleR * 1.8) ** 2;
+    const poleHitR2 = (poleR * 1.8 * this.hitScale) ** 2;
 
     let bestT: number = Infinity;
     let bestHit: IKHandleHit | null = null;

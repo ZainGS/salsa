@@ -212,85 +212,91 @@ export class MeshEditOverlayRenderer {
       lm[2]*ox + lm[6]*oy + lm[10]*oz + lm[14],
     ];
 
-    const triV: number[] = [];
     const lineV: number[] = [];
 
-    // ── 0. UV cross-highlight hover tint ──────────────────────────────────
-    if (data.hoveredFaces) {
-      for (const fi of data.hoveredFaces) {
-        const face = em.faces[fi];
-        if (!face) continue;
-        const wv: [number, number, number][] = [];
-        let hi = face.halfEdge;
-        for (let guard = 0; guard < 64; guard++) {
-          const v = em.vertices[em.halfEdges[hi].vertex];
-          wv.push(toW(v.x, v.y, v.z));
-          hi = em.halfEdges[hi].next;
-          if (hi === face.halfEdge) break;
+    // ── 0–2. Fills + vertex dots (triangle-list) ──────────────────────────
+    // TOUCH-9/10 perf: the tri VB (UV hover tint, selected-face fills, one camera-facing quad per vertex) is rebuilt
+    // only when something it is made of changed — the camera's right / up axes, the selection, the hover tint, or
+    // the edit mesh / local matrix (which the wireframe snapshot below compares exactly when the wireframe is on).
+    // It used to be rebuilt every frame through a growing number[] + a tuple per vertex, then copied and uploaded.
+    const showWire = data.showWireframe !== false;
+    const wireDirty = this._wireframeChanged(em, lm, mode, selection, showWire);
+    const geomSame = showWire && !wireDirty;
+    if (!this._triInputsSame(rx, ry, rz, ux, uy, uz, mode, selection, data.hoveredFaces) || !geomSame) {
+      const fill: number[] = [];
+      const fillFaces = (faces: Iterable<number>, col: readonly [number, number, number, number]) => {
+        for (const fi of faces) {
+          const face = em.faces[fi];
+          if (!face) continue;
+          const wv: [number, number, number][] = [];
+          let hi = face.halfEdge;
+          for (let guard = 0; guard < 64; guard++) {
+            const v = em.vertices[em.halfEdges[hi].vertex];
+            wv.push(toW(v.x, v.y, v.z));
+            hi = em.halfEdges[hi].next;
+            if (hi === face.halfEdge) break;
+          }
+          if (wv.length < 3) continue;
+          const w0 = wv[0];
+          for (let i = 1; i < wv.length - 1; i++) {
+            pushV(fill, w0,        col);
+            pushV(fill, wv[i],     col);
+            pushV(fill, wv[i + 1], col);
+          }
         }
-        if (wv.length < 3) continue;
-        const w0 = wv[0];
-        for (let i = 1; i < wv.length - 1; i++) {
-          pushV(triV, w0,    C_HOVER_FACE);
-          pushV(triV, wv[i], C_HOVER_FACE);
-          pushV(triV, wv[i + 1], C_HOVER_FACE);
+      };
+      // 0. UV cross-highlight hover tint
+      if (data.hoveredFaces) fillFaces(data.hoveredFaces, C_HOVER_FACE);
+      // 1. Face fills (selected faces)
+      if (mode === 'face' && selection) fillFaces(selection.faces, C_SEL_FACE);
+      // 2. Vertex billboard quads — mesh-edit mode only (in UV / paint mode, selection === null, the orange vertex
+      //    handles are just clutter on the model). Written straight into the staging array.
+      const V = em.vertices;
+      const total = fill.length + (selection ? V.length * 42 : 0);
+      if (!this._triScratch || this._triScratch.length < total) {
+        this._triScratch = new Float32Array(Math.max(512 * 7, Math.ceil(total * 1.5)));
+      }
+      const out = this._triScratch;
+      out.set(fill, 0);
+      let o = fill.length;
+      if (selection) {
+        const m = lm;
+        for (let vi = 0; vi < V.length; vi++) {
+          const v = V[vi];
+          if (!v) continue;
+          const wx = m[0]*v.x + m[4]*v.y + m[8]*v.z  + m[12];
+          const wy = m[1]*v.x + m[5]*v.y + m[9]*v.z  + m[13];
+          const wz = m[2]*v.x + m[6]*v.y + m[10]*v.z + m[14];
+          const isSel = mode === 'vertex' && selection.vertices.has(vi);
+          const col   = isSel ? C_SEL_VERT : C_UNSEL_VERT;
+          const h     = isSel ? VERT_HALF_SEL : VERT_HALF;
+          // Four corners of the billboard quad; two triangles (CCW): (bl, br, tl), (br, tr, tl)
+          const x0 = wx + (-rx - ux) * h, y0 = wy + (-ry - uy) * h, z0 = wz + (-rz - uz) * h;
+          const x1 = wx + ( rx - ux) * h, y1 = wy + ( ry - uy) * h, z1 = wz + ( rz - uz) * h;
+          const x2 = wx + (-rx + ux) * h, y2 = wy + (-ry + uy) * h, z2 = wz + (-rz + uz) * h;
+          const x3 = wx + ( rx + ux) * h, y3 = wy + ( ry + uy) * h, z3 = wz + ( rz + uz) * h;
+          o = putV(out, o, x0, y0, z0, col); o = putV(out, o, x1, y1, z1, col); o = putV(out, o, x2, y2, z2, col);
+          o = putV(out, o, x1, y1, z1, col); o = putV(out, o, x3, y3, z3, col); o = putV(out, o, x2, y2, z2, col);
         }
       }
-    }
-
-    // ── 1. Face fills (selected faces, triangle-list) ─────────────────────
-    if (mode === 'face' && selection) {
-      for (const fi of selection.faces) {
-        const face = em.faces[fi];
-        if (!face) continue;
-        const wv: [number, number, number][] = [];
-        let hi = face.halfEdge;
-        for (let guard = 0; guard < 64; guard++) {
-          const v = em.vertices[em.halfEdges[hi].vertex];
-          wv.push(toW(v.x, v.y, v.z));
-          hi = em.halfEdges[hi].next;
-          if (hi === face.halfEdge) break;
+      this._triFloats = o;
+      this.triBuilds++;
+      if (o > 0) {
+        const bytes = o * 4;
+        if (!this._triBuf || this._triCap < bytes) {
+          this._triBuf?.destroy();
+          // 1.5x headroom (4-byte aligned) so growth during vertex drags recreates the buffer rarely (audit 5.13).
+          this._triCap  = Math.max((Math.ceil(bytes * 1.5) + 3) & ~3, 512 * GIZMO_VERTEX_STRIDE);
+          this._triBuf  = this.device.createBuffer({ size: this._triCap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
         }
-        if (wv.length < 3) continue;
-        const w0 = wv[0];
-        for (let i = 1; i < wv.length - 1; i++) {
-          pushV(triV, w0,    C_SEL_FACE);
-          pushV(triV, wv[i], C_SEL_FACE);
-          pushV(triV, wv[i + 1], C_SEL_FACE);
-        }
+        this.device.queue.writeBuffer(this._triBuf, 0, out, 0, o);
       }
-    }
-
-    // ── 2. Vertex billboard quads — mesh-edit mode only ───────────────────
-    // In UV / paint mode (selection === null) the orange vertex handles are
-    // just clutter on the model, so skip them.
-    if (selection) for (let vi = 0; vi < em.vertices.length; vi++) {
-      const v = em.vertices[vi];
-      if (!v) continue;
-      const [wx, wy, wz] = toW(v.x, v.y, v.z);
-      const isSel = mode === 'vertex' && !!selection?.vertices.has(vi);
-      const col   = isSel ? C_SEL_VERT : C_UNSEL_VERT;
-      const h     = isSel ? VERT_HALF_SEL : VERT_HALF;
-      // Four corners of the billboard quad
-      const x0 = wx + (-rx - ux) * h, y0 = wy + (-ry - uy) * h, z0 = wz + (-rz - uz) * h;
-      const x1 = wx + ( rx - ux) * h, y1 = wy + ( ry - uy) * h, z1 = wz + ( rz - uz) * h;
-      const x2 = wx + (-rx + ux) * h, y2 = wy + (-ry + uy) * h, z2 = wz + (-rz + uz) * h;
-      const x3 = wx + ( rx + ux) * h, y3 = wy + ( ry + uy) * h, z3 = wz + ( rz + uz) * h;
-      // Two triangles (CCW): (bl, br, tl), (br, tr, tl)
-      triV.push(x0, y0, z0, col[0], col[1], col[2], col[3]);
-      triV.push(x1, y1, z1, col[0], col[1], col[2], col[3]);
-      triV.push(x2, y2, z2, col[0], col[1], col[2], col[3]);
-      triV.push(x1, y1, z1, col[0], col[1], col[2], col[3]);
-      triV.push(x3, y3, z3, col[0], col[1], col[2], col[3]);
-      triV.push(x2, y2, z2, col[0], col[1], col[2], col[3]);
     }
 
     // ── 3. Edge wireframe (unique edges, line-list) ───────────────────────
     // Skipped when the UV editor's "Wireframe" toggle is off (showWireframe === false).
     // P4 (mobile-parity 7.3b): the wireframe doesn't depend on the camera, so its vertex buffer is rebuilt only when
     // something it is made of changed (see _wireframeChanged — an exact compare, no version counters to miss).
-    const showWire = data.showWireframe !== false;
-    const wireDirty = this._wireframeChanged(em, lm, mode, selection, showWire);
     if (wireDirty && showWire) for (let hi = 0; hi < em.halfEdges.length; hi++) {
       const he = em.halfEdges[hi];
       if (he.twin >= 0 && he.twin < hi) continue; // skip duplicate of each pair
@@ -306,28 +312,12 @@ export class MeshEditOverlayRenderer {
       lineV.push(wTo[0],   wTo[1],   wTo[2],   col[0], col[1], col[2], col[3]);
     }
 
-    // ── Upload and draw tri geometry ──────────────────────────────────────
-    if (triV.length > 0) {
-      const bytes = triV.length * 4;
-      if (!this._triBuf || this._triCap < bytes) {
-        this._triBuf?.destroy();
-        // PERF (audit 5.13): 1.5x headroom (4-byte aligned) so per-pointer-move
-        // growth during vertex drags recreates the buffer rarely, only on true
-        // overflow of the padded capacity.
-        this._triCap  = Math.max((Math.ceil(bytes * 1.5) + 3) & ~3, 512 * GIZMO_VERTEX_STRIDE);
-        this._triBuf  = this.device.createBuffer({ size: this._triCap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-      }
-      // Reuse the persistent staging array while capacity suffices (audit 5.13);
-      // writeBuffer gets an explicit element count so spare capacity never uploads.
-      if (!this._triScratch || this._triScratch.length < triV.length) {
-        this._triScratch = new Float32Array(this._triCap / 4);
-      }
-      this._triScratch.set(triV);
-      this.device.queue.writeBuffer(this._triBuf, 0, this._triScratch, 0, triV.length);
+    // ── Draw tri geometry (uploaded only when rebuilt, above) ─────────────
+    if (this._triFloats > 0 && this._triBuf) {
       pass.setPipeline(this._triPipe.get()!);
       pass.setBindGroup(0, this._uniBG);   // cached — uniform buffer never recreated
       pass.setVertexBuffer(0, this._triBuf);
-      pass.draw(triV.length / 7);
+      pass.draw(this._triFloats / 7);
     }
 
     // ── Upload (only when rebuilt) and draw line geometry ─────────────────
@@ -363,6 +353,43 @@ export class MeshEditOverlayRenderer {
       pass.draw(this._lineFloats / 7);
       }
     }
+  }
+
+  // ── Tri cache (fills + vertex dots) ───────────────────────────────────────
+  /** Floats in the cached tri VB (0 = nothing to draw). */
+  private _triFloats = 0;
+  private readonly _tcCam = new Float64Array(6);
+  private _tcMode: MeshEditSelectionMode | null = null;
+  private _tcHasSel = false;
+  private _tcVSel: number[] = [];
+  private _tcFSel: number[] = [];
+  private _tcHover: number[] | null = null;
+  /** Diagnostics / tests: tri VB rebuilds. */
+  public triBuilds = 0;
+
+  /** True when the tri VB's non-geometry inputs (camera right / up, mode, selection, hover tint) equal the last
+   *  build's — the caller checks the geometry. The snapshot is refreshed when they differ. */
+  private _triInputsSame(
+    rx: number, ry: number, rz: number, ux: number, uy: number, uz: number,
+    mode: MeshEditSelectionMode, selection: EditSelection | null, hovered: Set<number> | undefined,
+  ): boolean {
+    const C = this._tcCam;
+    const vSel = selection && mode === 'vertex' ? selection.vertices : null;
+    const fSel = selection && mode === 'face' ? selection.faces : null;
+    const setEq = (a: number[], b: Set<number> | null) => (b ? a.length === b.size && a.every(x => b.has(x)) : a.length === 0);
+    const same = this.triBuilds > 0
+      && C[0] === rx && C[1] === ry && C[2] === rz && C[3] === ux && C[4] === uy && C[5] === uz
+      && this._tcMode === mode && this._tcHasSel === !!selection
+      && setEq(this._tcVSel, vSel) && setEq(this._tcFSel, fSel)
+      && (hovered ? !!this._tcHover && setEq(this._tcHover, hovered) : this._tcHover === null);
+    if (!same) {
+      C[0] = rx; C[1] = ry; C[2] = rz; C[3] = ux; C[4] = uy; C[5] = uz;
+      this._tcMode = mode; this._tcHasSel = !!selection;
+      this._tcVSel = vSel ? [...vSel] : [];
+      this._tcFSel = fSel ? [...fSel] : [];
+      this._tcHover = hovered ? [...hovered] : null;
+    }
+    return same;
   }
 
   // ── Wireframe cache (P4) ──────────────────────────────────────────────────
@@ -450,6 +477,12 @@ export class MeshEditOverlayRenderer {
 }
 
 // ── Module-private helper ─────────────────────────────────────────────────────
+
+/** Write one vertex (position + colour, 7 floats) at `o`; returns the next offset. */
+function putV(out: Float32Array, o: number, x: number, y: number, z: number, col: readonly [number, number, number, number]): number {
+  out[o] = x; out[o + 1] = y; out[o + 2] = z; out[o + 3] = col[0]; out[o + 4] = col[1]; out[o + 5] = col[2]; out[o + 6] = col[3];
+  return o + 7;
+}
 
 function pushV(
   arr: number[],

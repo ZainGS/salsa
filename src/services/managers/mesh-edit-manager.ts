@@ -149,6 +149,67 @@ export class MeshEditManager {
     return this._selection?.meshId === meshId ? this._selection : null;
   }
 
+  /** World-space AABB of the edited mesh's selected vertices / edges / faces ("Frame selected", TOUCH-10), or of the
+   *  whole edit mesh when nothing is selected (or `wholeMesh`). Null when `meshId` isn't being edited or has no vertices. */
+  selectionWorldBounds(meshId: string, wholeMesh = false): { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number } | null {
+    const mesh = this._getMesh(meshId);
+    const em = mesh?.editMesh;
+    if (!mesh || !em || em.vertices.length === 0) return null;
+    const idx = new Set<number>();
+    const sel = wholeMesh ? null : this.getSelection(meshId);
+    if (sel) {
+      for (const v of sel.vertices) idx.add(v);
+      for (const h of sel.edges) {
+        const he = em.halfEdges[h];
+        if (!he) continue;
+        idx.add(he.vertex);
+        const prev = em.halfEdges[he.prev];
+        if (prev) idx.add(prev.vertex);
+      }
+      for (const f of sel.faces) {
+        const face = em.faces[f];
+        if (!face) continue;
+        let hi = face.halfEdge;
+        for (let guard = 0; guard < 256; guard++) {
+          const he = em.halfEdges[hi];
+          if (!he) break;
+          idx.add(he.vertex);
+          hi = he.next;
+          if (hi === face.halfEdge) break;
+        }
+      }
+    }
+    const m = mesh.localMatrix as unknown as Float32Array;
+    let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    const add = (v: { x: number; y: number; z: number } | undefined) => {
+      if (!v) return;
+      const x = m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12];
+      const y = m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13];
+      const z = m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14];
+      if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
+    };
+    if (idx.size > 0) for (const i of idx) add(em.vertices[i]);
+    else for (const v of em.vertices) add(v);
+    if (!Number.isFinite(minX)) return null;
+    return { minX, minY, minZ, maxX, maxY, maxZ };
+  }
+
+  /** A copy of the selection (TOUCH-5: a finger press that turns into a pinch puts it back with restoreSelection). */
+  snapshotSelection(meshId: string): { vertices: number[]; edges: number[]; faces: number[] } | null {
+    const sel = this.getSelection(meshId);
+    return sel ? { vertices: [...sel.vertices], edges: [...sel.edges], faces: [...sel.faces] } : null;
+  }
+
+  /** Put back a {@link snapshotSelection} (null = no selection). Fresh Sets, never cleared in place: an undo command's
+   *  redo may hold the old Set (see _clearSelectionGeometry). */
+  restoreSelection(meshId: string, snap: { vertices: number[]; edges: number[]; faces: number[] } | null): void {
+    const sel = this._ensureSelection(meshId);
+    sel.vertices = new Set(snap?.vertices ?? []);
+    sel.edges = new Set(snap?.edges ?? []);
+    sel.faces = new Set(snap?.faces ?? []);
+  }
+
   // ── Destructive operations ────────────────────────────────────────────────
 
   /** Move vertex by delta. Pushes to undo stack. */

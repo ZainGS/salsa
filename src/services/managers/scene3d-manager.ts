@@ -1639,7 +1639,14 @@ export class Scene3DManager {
     private frameMeshes(meshes: Mesh3D[], padding: number): boolean {
         const bounds = this.computeWorldBounds(meshes);
         if (!bounds) return false;
+        return this.frameWorldBounds3D(bounds, padding);
+    }
 
+    /** Frame a world-space AABB from the current view direction (perspective: dolly to fit; ortho: orthoSize). In a
+     *  decoupled ortho creator view (Edit Mesh / surface paint / group orbit) its own zoom is re-seeded too — that
+     *  view derives orthoSize from it every frame, so before this a frame only re-targeted (TOUCH-10 Frame). */
+    frameWorldBounds3D(bounds: { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number }, padding = 1.25): boolean {
+        if (![bounds.minX, bounds.minY, bounds.minZ, bounds.maxX, bounds.maxY, bounds.maxZ].every(Number.isFinite)) return false;
         const cam = this.renderer3D.getCamera();
         const cx = (bounds.minX + bounds.maxX) * 0.5;
         const cy = (bounds.minY + bounds.maxY) * 0.5;
@@ -1684,8 +1691,34 @@ export class Scene3DManager {
         // Sync orbit controller spherical state so subsequent orbit/zoom doesn't
         // snap back to the pre-framing camera position.
         this._armature.getOrbitController()?.syncFromCamera();
+        this._armature.reseedDecoupledZoom();
         this.ctx.scheduleRender();
         return true;
+    }
+
+    /** TOUCH-10 "Frame selected" outside Edit Mesh: the selected meshes, else everything. False in the armature
+     *  (its ortho camera follows the 2D view's zoom, so it can't be framed from here). Edit Mesh frames its selection
+     *  through ShapeManager.frameSelected3D. */
+    frameSelection3D(padding = 1.4): boolean {
+        if (this._armature.isBoneOverlayActive()) return false;
+        const meshes: Mesh3D[] = [];
+        for (const id of this.renderer3D.getSelectedMeshIds()) { const m = this.getMesh(id); if (m) meshes.push(m); }
+        return (meshes.length > 0 && this.frameMeshes(meshes, padding)) || this.frameAllMeshes(padding);
+    }
+
+    /** True while an armature drag (joint / tail / joint gizmo / IK handle) or a finger press about to become one owns
+     *  a pointer (hosts skip per-move UI work). */
+    isArmatureDragActive3D(): boolean { return this._armature.isArmatureDragActive; }
+
+    /** Pause the procedural idle on a phone / tablet (or safe-mode) GPU tier while an edit mode is up (mobile-parity
+     *  TOUCH-9/10 perf): it held the render loop live every vsync for the whole session — armature posing already
+     *  stops its pose work, Edit Mesh doesn't need a breathing character. Desktop tiers are unchanged. */
+    private _pauseIdleForEditMode(reason: 'meshEdit' | 'armature', on: boolean): void {
+        if (on) {
+            const tier = this.ctx.webgpuRenderer?.getGpuTier?.().tier;
+            if (tier !== 'mobile' && tier !== 'safe') return;
+        }
+        this.setIdleAnimationPaused(reason, on);
     }
 
     private computeWorldBounds(meshes: Mesh3D[]): { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number } | null {
@@ -1786,6 +1819,7 @@ export class Scene3DManager {
     enableMeshEditOrbit(meshId: string): void {
         if (!this._inCameraSubMode()) this._captureCurrentPose();   // snapshot the mode we're leaving (first entry only) so exit restores it exactly
         this._armature.enableMeshEditOrbit(meshId);
+        this._pauseIdleForEditMode('meshEdit', true);
     }
 
     /** Disable orbit and clean up mesh edit orbit state, then RESTORE the view mode the user was actually in.
@@ -1794,6 +1828,7 @@ export class Scene3DManager {
      *  (the armature teardown's `_forceIllustrationResync` only handles the 2D-entry case). Idempotent for 2D. */
     disableMeshEditOrbit(): void {
         this._armature.disableMeshEditOrbit();
+        this._pauseIdleForEditMode('meshEdit', false);
         this._applyViewState();
     }
 
@@ -7932,6 +7967,7 @@ export class Scene3DManager {
         // free-3D view (the camera bug on leaving armature mode).
         if (skeletonId !== null && !this._inCameraSubMode() && !this._armatureEntryCaptured) this._captureCurrentPose();
         this._armature.showBoneOverlay3D(skeletonId, meshId);
+        this._pauseIdleForEditMode('armature', skeletonId !== null);
         if (skeletonId === null && (wasActive || this._armatureEntryCaptured)) this._applyViewState();
         if (skeletonId === null) this._armatureEntryCaptured = false;
     }

@@ -85,6 +85,11 @@ export interface TransformControllerCallbacks {
    * both suppressed — viewport clicks belong to the bone interaction handlers.
    */
   isBoneOverlayActive?(): boolean;
+  /** TOUCH-10: the host's additive-select latch (sm.setAdditiveSelect3D) — a press / tap adds to the selection like
+   *  Shift (touch has no Shift). */
+  isAdditiveSelect?(): boolean;
+  /** TOUCH-10: the host's snap latch (sm.setSnapToggle3D) — gizmo drags snap like Ctrl is held. */
+  isSnapLatched?(): boolean;
   /**
    * Return true if click-to-select must IGNORE a pick landing on this mesh (the event still
    * propagates — e.g. to an armed surface-paint handler). Package-Creator mode suppresses its
@@ -309,7 +314,11 @@ export class TransformController3D {
   get hoveredAxis(): GizmoAxis { return this._hoveredAxis; }
   get hoveredCorner(): number | null { return this._hoveredCorner; }
   /** True when Ctrl is held and snapping is active. Frogmarks can display a visual indicator. */
-  get snapActive(): boolean { return this._ctrlHeld; }
+  get snapActive(): boolean { return this._snapOn; }
+  /** Snapping is on: Ctrl held, or the host's snap latch (TOUCH-10). */
+  private get _snapOn(): boolean { return this._ctrlHeld || !!this.cb.isSnapLatched?.(); }
+  /** A selecting press adds to the selection: Shift, or the host's additive latch (TOUCH-10). */
+  private _additive(e: { shiftKey?: boolean }): boolean { return !!e.shiftKey || !!this.cb.isAdditiveSelect?.(); }
 
   /** Non-null while a rotation drag is active; gives the accumulated angle in degrees. */
   get dragAngleDeg(): number | null {
@@ -617,10 +626,10 @@ export class TransformController3D {
     // TOUCH-6: a finger SELECTS on pointerUP (if it hasn't moved past TAP_SLOP_PX) — on pointerdown every orbit /
     // free-look drag would also select whatever was under the finger. The mouse keeps select-on-down.
     if (isTouch) {
-      this._pendingTap = { id: e.pointerId ?? 0, clientX: e.clientX, clientY: e.clientY, shift: e.shiftKey };
+      this._pendingTap = { id: e.pointerId ?? 0, clientX: e.clientX, clientY: e.clientY, shift: this._additive(e) };
       return;
     }
-    this._selectAt(x, y, e.shiftKey);
+    this._selectAt(x, y, this._additive(e));
   }
 
   /** Click / tap SELECTION at canvas device-pixel (x, y): emitter icons first, then the mesh raycast, then the
@@ -1026,7 +1035,7 @@ export class TransformController3D {
         sx = u; sy = u; sz = u;
       }
 
-      if (this._ctrlHeld) {
+      if (this._snapOn) {
         const snapScale = (v: number) => {
           const s = Math.round(Math.abs(v) / this.snapScaleStep) * this.snapScaleStep;
           return Math.max(this.snapScaleStep, s) * (v < 0 ? -1 : 1);
@@ -1113,7 +1122,7 @@ export class TransformController3D {
 
     // ── Snap handling ─────────────────────────────────────────────
     this._snapViz = null;  // recomputed below only in vertex-snap mode
-    if (this._ctrlHeld) {
+    if (this._snapOn) {
       if (this._snapMode === 'vertex') {
         // Compute proposed centroid after delta
         let icx = 0, icy = 0, icz = 0, count = 0;
@@ -1211,7 +1220,7 @@ export class TransformController3D {
       }
     }
 
-    if (this._ctrlHeld) {
+    if (this._snapOn) {
       angle = Math.round(angle / this.snapAngle) * this.snapAngle;
     }
 
@@ -1300,7 +1309,7 @@ export class TransformController3D {
     }
 
     let factor = Math.max(0.01, 1 + effectiveDrag / 200);
-    if (this._ctrlHeld) {
+    if (this._snapOn) {
       factor = Math.max(this.snapScaleStep, Math.round(factor / this.snapScaleStep) * this.snapScaleStep);
     }
 

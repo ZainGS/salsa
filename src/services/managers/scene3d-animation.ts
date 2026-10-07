@@ -823,10 +823,12 @@ export class Scene3DAnimation {
         if (!this._idleSolveCallback) {
             this._idleSolveCallback = () => {
                 if (this._idleRigs.size === 0) return false;
-                if (this._idlePauses.size > 0) return false;   // paused (e.g. UV paint on a tablet): no pose work, no keep-alive
                 // Armature posing pauses the idle — except for a body playing a clip OVER its idle (playClipOverIdle).
                 const posing = this.host.isBoneOverlayActive();
+                // Kept in step even while paused (the armature pauses the idle on a tablet): entering posing must still
+                // snap to the clean base, and leaving it must still re-capture the pose as the new base.
                 this._syncIdleWithPosing(posing);   // enter → snap to the clean base; leave → the new pose BECOMES the base
+                if (this._idlePauses.size > 0) return false;   // paused (e.g. UV paint on a tablet): no pose work, no keep-alive
                 if (posing && ![...this._idleBreaks.values()].some(b => b.active?.overIdle)) return false;
                 const now = performance.now();
                 let animating = false;

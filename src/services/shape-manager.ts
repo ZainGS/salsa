@@ -203,6 +203,7 @@ import { UI_KIT_TRANSITIONS, UI_KIT_CLIPS, type UIKitWidget, type UIKitKind, typ
 import { UISoundPlayer } from '../ui/ui-sound';
 import type { UIStateMachine, UILayerData, UIEvent, UIValue, ShapeInteractionProps, TransitionAnimation, HtmlFormElement } from '../ui/ui-types';
 import { MeshEditPointerController, type MeshEditSelectionMode } from './managers/mesh-edit-pointer-controller';
+import { isPointerEventClaimed } from '../renderer/util/pointer-claims';
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
 import type { ResolutionScaleSettings, ResolutionScaleState } from '../renderer/core/resolution-scaler';
@@ -895,6 +896,7 @@ class ShapeManager {
             this.meshEdit,
             (cmd) => this.scene3d.pushCommand3D(cmd),
             () => ctx.scheduleRender(),
+            { isAdditive: () => this.interactionService.additiveSelect3D === true },   // TOUCH-10 additive latch
         );
         // Suppress the transform gizmo's object-selection click while mesh edit
         // OR UV edit is active, so pointer controllers can handle picks uncontested.
@@ -3455,6 +3457,39 @@ class ShapeManager {
     public getTouchNavigate3D(): boolean { return this.scene3d.getTouchNavigate3D(); }
     /** Frame the mesh under a client (CSS) point, or everything when nothing is there (what a touch double-tap does). */
     public frameAtClient3D(clientX: number, clientY: number): boolean { return this.scene3d.frameAtClient3D(clientX, clientY); }
+    /** TOUCH-10 (docs/ui/touch-controls.md §3c): the ADDITIVE-SELECT latch — while on, a 3D select press / tap adds to
+     *  the selection like Shift (object select, and vertex / edge / face select in Edit Mesh). A tablet has no Shift. */
+    public setAdditiveSelect3D(on: boolean): void { this.interactionService.additiveSelect3D = !!on; }
+    public getAdditiveSelect3D(): boolean { return this.interactionService.additiveSelect3D === true; }
+    /** TOUCH-10: the SNAP latch — while on, 3D gizmo drags snap (grid / angle / scale step / vertex) like holding Ctrl. */
+    public setSnapToggle3D(on: boolean): void { this.interactionService.snapLatch3D = !!on; }
+    public getSnapToggle3D(): boolean { return this.interactionService.snapLatch3D === true; }
+    /** TOUCH-10 "Frame selected": in Edit Mesh the selected vertices / edges / faces (else the whole mesh), otherwise
+     *  the selected meshes (else everything). False when nothing could be framed (e.g. in the armature, whose camera
+     *  follows the 2D view zoom). */
+    public frameSelected3D(padding = 1.4): boolean {
+        const id = this.meshEdit.activeMeshId;
+        if (!id) return this.scene3d.frameSelection3D(padding);
+        const b = this.meshEdit.selectionWorldBounds(id);
+        if (!b) return false;
+        // A single vertex / a flat selection has no extent: keep at least a tenth of the whole mesh in view.
+        const all = this.meshEdit.selectionWorldBounds(id, true) ?? b;
+        const minHalf = 0.05 * Math.max(all.maxX - all.minX, all.maxY - all.minY, all.maxZ - all.minZ, 1e-3);
+        const grow = (lo: number, hi: number): [number, number] => {
+            const c = (lo + hi) / 2, h = Math.max((hi - lo) / 2, minHalf);
+            return [c - h, c + h];
+        };
+        const [minX, maxX] = grow(b.minX, b.maxX), [minY, maxY] = grow(b.minY, b.maxY), [minZ, maxZ] = grow(b.minZ, b.maxZ);
+        return this.scene3d.frameWorldBounds3D({ minX, minY, minZ, maxX, maxY, maxZ }, padding);
+    }
+    /** Whether a capture-phase 3D tool (UV paint, the armature) claimed this pointer event — it then lets the press
+     *  through for the camera's pinch / orbit, but no other tool (a mesh pick) may act on it. */
+    public isPointerEventClaimed3D(e: object): boolean { return isPointerEventClaimed(e); }
+    /** True while an armature drag (joint / tail / joint gizmo / IK handle) or a finger press about to become one, or
+     *  an Edit Mesh vertex drag, owns a pointer — hosts can skip per-move UI work (change detection). */
+    public isEditDragActive3D(): boolean {
+        return this.scene3d.isArmatureDragActive3D() || this._meshEditPointerController.isBusy;
+    }
     /** Fires with the new sneak state (for a HUD badge). */
     public get onPlayerSneakChanged3D(): import('../renderer/util/event-emitter').EventEmitter<boolean> { return this.scene3d.onPlayerSneakChanged; }
     /** The active gait while playing: 'walk' | 'run' | 'sneak' (null when not playing). */
