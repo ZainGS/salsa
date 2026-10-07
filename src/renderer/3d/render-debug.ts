@@ -92,6 +92,9 @@ export type RenderDebugFlags = {
   dbgShadowFactor: boolean;
   /** Mesh fragment shader: skip the sparkle / glint term (sparse white light-scaled glints). */
   noSparkle: boolean;
+  /** Mesh fragment shader: decide the sparkle term from a fresh read of the instance flags at its site, not the value
+   *  computed at the top of the shader (tests a mobile shader-compiler corruption of a long-lived value). */
+  lateSparkleFlags: boolean;
   /** Mesh fragment shader: the material flag bits as a colour (red = sparkle, green = rim, on dark blue). */
   dbgFlagBits: boolean;
   /** Every 3D pass that LOADS depth / stencil clears it instead (overlays lose depth occlusion). */
@@ -122,6 +125,7 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'noShadowReceive', label: 'No shadow receive' },
   { key: 'dbgShadowFactor', label: 'Mesh colour = shadow factor' },
   { key: 'noSparkle', label: 'No sparkle / glint' },
+  { key: 'lateSparkleFlags', label: 'Sparkle: re-read flag where used' },
   { key: 'dbgFlagBits', label: 'Mesh colour = material flags (red = sparkle)' },
   { key: 'noMeshEditOverlays', label: 'No mesh-edit / UV-paint overlays' },
   { key: 'noRearEdges', label: 'No mesh-edit rear edges' },
@@ -216,12 +220,13 @@ export function renderDebugShadeMode(): number {
 
 /** The mesh fragment shader debug bits (IBLUniforms.dbgFlags): 1 = clamp the texture-array layer indices,
  *  2 = NaN / Inf highlight (dbgNanCheck), 4 = safe lighting maths (safeLightingMath), 8 = no shadow receive,
- *  16 = shadow factor as colour, 32 = no sparkle / glint. */
+ *  16 = shadow factor as colour, 32 = no sparkle / glint, 64 = sparkle decided from a fresh flags read. */
 export function renderDebugShaderBits(): number {
   if (!RD.on) return 0;
   const f = RD.f;
   return (f.clampTexLayers ? 1 : 0) | (f.dbgNanCheck ? 2 : 0) | (f.safeLightingMath ? 4 : 0)
-    | (f.noShadowReceive ? 8 : 0) | (f.dbgShadowFactor ? 16 : 0) | (f.noSparkle ? 32 : 0);
+    | (f.noShadowReceive ? 8 : 0) | (f.dbgShadowFactor ? 16 : 0) | (f.noSparkle ? 32 : 0)
+    | (f.lateSparkleFlags ? 64 : 0);
 }
 
 /** The canvas context alpha mode: 'premultiplied' (the default), 'opaque' under forceOpaqueAlpha. */

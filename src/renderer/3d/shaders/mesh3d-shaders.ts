@@ -3516,8 +3516,12 @@ fn fs_main(
 
   // Sparkle / glint — sparse twinkling micro-glints (the metal "glisten in the light"). Scintillates as the camera /
   // light move; twinkles over scene time (ps1Config2.z). Bright + light-tinted so it reads as a reflection.
-  // RENDER DEBUG noSparkle (ibl.dbgFlags 32, uniform): skip the sparkle / glint term.
-  if ((sparkleOn || starSparkle) && (u32(ibl.dbgFlags) & 32u) == 0u) {
+  // RENDER DEBUG noSparkle (ibl.dbgFlags 32, uniform): skip the sparkle / glint term. dbgFlags 64 = decide it from a
+  // FRESH read of the instance flags here instead of the sparkleOn / starSparkle computed at the top (RENDER-1: tests a
+  // mobile-compiler corruption of a long-lived value; off = today's condition exactly).
+  let rdSpkLate = (u_instances[instanceIdx].flags & 4352u) != 0u;
+  let rdSpkOn = select(sparkleOn || starSparkle, rdSpkLate, (u32(ibl.dbgFlags) & 64u) != 0u);
+  if (rdSpkOn && (u32(ibl.dbgFlags) & 32u) == 0u) {
     var spk = 0.0;
     if (starSparkle) { spk = sparkleStar(worldPos, N, scene.ps1Config2.z, 45.0); }          // ✦ anime star bling
     else             { spk = sparkleGlint(worldPos, N, rdNormalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
@@ -4357,8 +4361,12 @@ fn fs_main(
   lit = lit + scene.lightColor.rgb * waterGlint;
 
   // Sparkle / glint — sparse twinkling micro-glints (the metal "glisten in the light"). See the textured fragment.
-  // RENDER DEBUG noSparkle (ibl.dbgFlags 32, uniform): skip the sparkle / glint term.
-  if ((sparkleOn || starSparkle) && (u32(ibl.dbgFlags) & 32u) == 0u) {
+  // RENDER DEBUG noSparkle (ibl.dbgFlags 32, uniform): skip the sparkle / glint term. dbgFlags 64 = decide it from a
+  // FRESH read of the instance flags here instead of the sparkleOn / starSparkle computed at the top (RENDER-1: tests a
+  // mobile-compiler corruption of a long-lived value; off = today's condition exactly).
+  let rdSpkLate = (u_instances[instanceIdx].flags & 4352u) != 0u;
+  let rdSpkOn = select(sparkleOn || starSparkle, rdSpkLate, (u32(ibl.dbgFlags) & 64u) != 0u);
+  if (rdSpkOn && (u32(ibl.dbgFlags) & 32u) == 0u) {
     var spk = 0.0;
     if (starSparkle) { spk = sparkleStar(worldPos, N, scene.ps1Config2.z, 45.0); }          // ✦ anime star bling
     else             { spk = sparkleGlint(worldPos, N, rdNormalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
