@@ -196,6 +196,8 @@ const DEFAULT_COLOR2: [number, number, number, number] = [0.94, 0.92, 0.85, 1.0]
 const DEFAULT_DIM    = 0.50;
 
 const UNIFORM_FLOATS = 16; // 64 bytes / 4
+/** The time a frozen ('animate' false) wavy background is drawn at — a few seconds in, where the waves are developed. */
+const FROZEN_TIME_S = 6.0;
 
 export class ArmatureBgPass {
     private _device:    GPUDevice;
@@ -259,15 +261,16 @@ export class ArmatureBgPass {
         });
     }
 
-    /** Draw the background. Skip if mode is 'none'. `view` (the camera basis) is only read by the 'sky' mode. */
-    draw(pass: GPURenderPassEncoder, opts: ArmatureBgOptions, canvasW: number, canvasH: number, view?: SkyDomeView | null): void {
+    /** Draw the background. Skip if mode is 'none'. `view` (the camera basis) is only read by the 'sky' mode.
+     *  `animate` false = the time-driven 'wavy' pattern is drawn frozen (a still frame; per-machine caps). */
+    draw(pass: GPURenderPassEncoder, opts: ArmatureBgOptions, canvasW: number, canvasH: number, view?: SkyDomeView | null, animate = true): void {
         if (opts.mode === 'none') return;
         if (opts.mode === 'sky' && opts.sky && view) {
             this._sky ??= new SkyDomePass(this._device, this._format);
             if (this._sky.draw(pass, opts.sky, view, canvasW, canvasH)) return;   // else: still compiling → the gradient below
         }
 
-        const t   = (performance.now() - this._startTime) / 1000.0;
+        const t   = animate ? (performance.now() - this._startTime) / 1000.0 : FROZEN_TIME_S;
         // Checkers falls back to green/yellow (not the wavy blue/cream) when no colors are given.
         const isCheck = opts.mode === 'checkers';
         const c1  = opts.color1      ?? (isCheck ? CHECKERS_GREEN  : DEFAULT_COLOR1);

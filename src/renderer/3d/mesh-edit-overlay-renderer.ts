@@ -287,7 +287,11 @@ export class MeshEditOverlayRenderer {
 
     // ── 3. Edge wireframe (unique edges, line-list) ───────────────────────
     // Skipped when the UV editor's "Wireframe" toggle is off (showWireframe === false).
-    if (data.showWireframe !== false) for (let hi = 0; hi < em.halfEdges.length; hi++) {
+    // P4 (mobile-parity 7.3b): the wireframe doesn't depend on the camera, so its vertex buffer is rebuilt only when
+    // something it is made of changed (see _wireframeChanged — an exact compare, no version counters to miss).
+    const showWire = data.showWireframe !== false;
+    const wireDirty = this._wireframeChanged(em, lm, mode, selection, showWire);
+    if (wireDirty && showWire) for (let hi = 0; hi < em.halfEdges.length; hi++) {
       const he = em.halfEdges[hi];
       if (he.twin >= 0 && he.twin < hi) continue; // skip duplicate of each pair
       const prevHe = em.halfEdges[he.prev];
@@ -326,35 +330,114 @@ export class MeshEditOverlayRenderer {
       pass.draw(triV.length / 7);
     }
 
-    // ── Upload and draw line geometry ─────────────────────────────────────
-    if (lineV.length > 0) {
-      const bytes = lineV.length * 4;
-      if (!this._lineBuf || this._lineCap < bytes) {
-        this._lineBuf?.destroy();
-        // PERF (audit 5.13): same 1.5x headroom as the tri buffer above.
-        this._lineCap  = Math.max((Math.ceil(bytes * 1.5) + 3) & ~3, 256 * GIZMO_VERTEX_STRIDE);
-        this._lineBuf  = this.device.createBuffer({ size: this._lineCap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    // ── Upload (only when rebuilt) and draw line geometry ─────────────────
+    if (wireDirty) {
+      this._lineFloats = lineV.length;
+      if (lineV.length > 0) {
+        const bytes = lineV.length * 4;
+        if (!this._lineBuf || this._lineCap < bytes) {
+          this._lineBuf?.destroy();
+          // PERF (audit 5.13): same 1.5x headroom as the tri buffer above.
+          this._lineCap  = Math.max((Math.ceil(bytes * 1.5) + 3) & ~3, 256 * GIZMO_VERTEX_STRIDE);
+          this._lineBuf  = this.device.createBuffer({ size: this._lineCap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+        }
+        if (!this._lineScratch || this._lineScratch.length < lineV.length) {
+          this._lineScratch = new Float32Array(this._lineCap / 4);
+        }
+        this._lineScratch.set(lineV);
+        this.device.queue.writeBuffer(this._lineBuf, 0, this._lineScratch, 0, lineV.length);
       }
-      if (!this._lineScratch || this._lineScratch.length < lineV.length) {
-        this._lineScratch = new Float32Array(this._lineCap / 4);
-      }
-      this._lineScratch.set(lineV);
-      this.device.queue.writeBuffer(this._lineBuf, 0, this._lineScratch, 0, lineV.length);
-
+    }
+    if (this._lineFloats > 0 && this._lineBuf) {
       // Front/visible edges — always-on-top solid lines (existing behaviour).
       pass.setPipeline(this._linePipe.get()!);
       pass.setBindGroup(0, this._uniBG);   // cached — uniform buffer never recreated
       pass.setVertexBuffer(0, this._lineBuf);
-      pass.draw(lineV.length / 7);
+      pass.draw(this._lineFloats / 7);
 
       // Rear/occluded edges — stippled dashes only where depth test fails. (Render debug noRearEdges skips them.)
       if (!(RD.on && RD.f.noRearEdges)) {
       pass.setPipeline(this._lineRearPipe.get()!);
       pass.setBindGroup(0, this._uniBG);
       pass.setVertexBuffer(0, this._lineBuf);
-      pass.draw(lineV.length / 7);
+      pass.draw(this._lineFloats / 7);
       }
     }
+  }
+
+  // ── Wireframe cache (P4) ──────────────────────────────────────────────────
+  // The line VB holds world-space edge endpoints + colours: a function of the edit mesh (vertex positions, half-edge
+  // topology, seams), the mesh's local matrix, the selection mode + selected edges (edge mode) and the wireframe
+  // toggle. Nothing camera-dependent. Each frame those inputs are compared EXACTLY against a snapshot of the last
+  // build (no version counters — vertex drags and seam edits write the edit mesh in place), which costs a read of
+  // the arrays but none of the build: no per-edge tuples, no number[] growth, no upload.
+  /** Floats in the cached line VB (0 = nothing to draw). */
+  private _lineFloats = 0;
+  private _wfEm: unknown = null;
+  private _wfShow = false;
+  private _wfEdgeSel = false;
+  private readonly _wfLm = new Float64Array(16);
+  private _wfVRef: unknown[] = [];
+  private _wfPos = new Float64Array(0);
+  private _wfHe = new Int32Array(0);
+  private _wfSel: number[] = [];
+  /** Diagnostics / tests: wireframe VB rebuilds. */
+  public wireframeBuilds = 0;
+
+  /** True (and the snapshot refreshed) when the wireframe's inputs differ from the last build's. */
+  private _wireframeChanged(
+    em: NonNullable<Mesh3D['editMesh']>, lm: Float32Array, mode: MeshEditSelectionMode,
+    selection: EditSelection | null, show: boolean,
+  ): boolean {
+    const edgeSel = mode === 'edge' && !!selection;
+    let same = this._wfEm === em && this._wfShow === show && this._wfEdgeSel === edgeSel;
+    if (same) for (let i = 0; i < 16; i++) if (this._wfLm[i] !== lm[i]) { same = false; break; }
+    const V = em.vertices, H = em.halfEdges;
+    if (same && show) {
+      if (this._wfVRef.length !== V.length || this._wfHe.length !== H.length * 4) same = false;
+      else {
+        const P = this._wfPos, R = this._wfVRef;
+        for (let i = 0; i < V.length; i++) {
+          const v = V[i];
+          if (R[i] !== v || (v && (P[i * 3] !== v.x || P[i * 3 + 1] !== v.y || P[i * 3 + 2] !== v.z))) { same = false; break; }
+        }
+        if (same) {
+          const E = this._wfHe;
+          for (let i = 0; i < H.length; i++) {
+            const he = H[i], o = i * 4;
+            if (E[o] !== he.twin || E[o + 1] !== he.prev || E[o + 2] !== he.vertex || E[o + 3] !== (he.isSeam ? 1 : 0)) { same = false; break; }
+          }
+        }
+        if (same && edgeSel) {
+          const sel = selection!.edges;
+          if (sel.size !== this._wfSel.length) same = false;
+          else for (const e of this._wfSel) if (!sel.has(e)) { same = false; break; }
+        }
+      }
+    }
+    if (same) return false;
+    // Changed → snapshot what this build reads.
+    this._wfEm = em; this._wfShow = show; this._wfEdgeSel = edgeSel;
+    for (let i = 0; i < 16; i++) this._wfLm[i] = lm[i];
+    if (show) {
+      if (this._wfPos.length !== V.length * 3) this._wfPos = new Float64Array(V.length * 3);
+      this._wfVRef.length = V.length;
+      for (let i = 0; i < V.length; i++) {
+        const v = V[i];
+        this._wfVRef[i] = v;
+        if (v) { this._wfPos[i * 3] = v.x; this._wfPos[i * 3 + 1] = v.y; this._wfPos[i * 3 + 2] = v.z; }
+      }
+      if (this._wfHe.length !== H.length * 4) this._wfHe = new Int32Array(H.length * 4);
+      for (let i = 0; i < H.length; i++) {
+        const he = H[i], o = i * 4;
+        this._wfHe[o] = he.twin; this._wfHe[o + 1] = he.prev; this._wfHe[o + 2] = he.vertex; this._wfHe[o + 3] = he.isSeam ? 1 : 0;
+      }
+      this._wfSel = edgeSel ? [...selection!.edges] : [];
+    } else {
+      this._wfVRef.length = 0; this._wfPos = new Float64Array(0); this._wfHe = new Int32Array(0); this._wfSel = [];
+    }
+    this.wireframeBuilds++;
+    return true;
   }
 
   // ── Cleanup ───────────────────────────────────────────────────────────────

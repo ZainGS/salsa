@@ -857,7 +857,7 @@ export class Renderer3D {
   /** PER-MACHINE CAPS (gpu-capabilities.ts, mobile-parity CRASH-8): what this device may run, applied by WebGPURenderer
    *  at start-up and on every device recovery. They clamp the switches at render time and never change a document
    *  setting or a stored preference (the getters that feed the save keep returning the authored values). */
-  static readonly caps = { gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true };
+  static readonly caps = { gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true };
   /** The GPU-driven path is on (the switch AND the device cap). */
   static get gpuDrivenActive(): boolean { return Renderer3D.gpuDriven && Renderer3D.caps.gpuDriven; }
   /** P21 shader variants are on (the switch AND the device cap). */
@@ -3561,9 +3561,24 @@ export class Renderer3D {
    * even when there are no regular (non-skinned) meshes — e.g. after Bind Mesh.
    */
   drawMeshEditOverlayIfActive(pass: GPURenderPassEncoder): void {
-    if (!this._meshEditOverlay || !this._meshEditDataFn || (RD.on && RD.f.noMeshEditOverlays)) return;
-    const editData = this._meshEditDataFn();
-    if (editData) this._meshEditOverlay.draw(pass, editData, this.camera);
+    const editData = (RD.on && RD.f.noMeshEditOverlays) ? null : this._meshEditDataForPass(pass);
+    this._meshEditDataPass = null; this._meshEditDataMemo = null;   // the overlay is the frame's last reader
+    if (!this._meshEditOverlay || !editData) return;
+    this._meshEditOverlay.draw(pass, editData, this.camera);
+  }
+
+  /** The mesh-edit data provider's result for THIS frame. mobile-parity 7.3b P4: the selection gizmo and the overlay
+   *  both need it in the same pass, and the provider (UV hover-face sets, selection lookups) used to run twice per
+   *  frame. Memoised by the pass encoder — a new frame is a new encoder. */
+  private _meshEditDataPass: GPURenderPassEncoder | null = null;
+  private _meshEditDataMemo: MeshEditDrawData | null = null;
+  private _meshEditDataForPass(pass: GPURenderPassEncoder): MeshEditDrawData | null {
+    if (!this._meshEditOverlay || !this._meshEditDataFn) return null;
+    if (this._meshEditDataPass !== pass) {
+      this._meshEditDataPass = pass;
+      this._meshEditDataMemo = this._meshEditDataFn();
+    }
+    return this._meshEditDataMemo;
   }
 
   setSelectedMeshIds(ids: Set<string>): void { this._selectedMeshIds = new Set(ids); }
@@ -3602,7 +3617,7 @@ export class Renderer3D {
 
   drawSelectionGizmoIfActive(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
     if (!this._gizmoRenderer) return;
-    const editData = this._meshEditOverlay && this._meshEditDataFn ? this._meshEditDataFn() : null;
+    const editData = this._meshEditDataForPass(pass);   // memoised: the overlay reads the same result below
     if (editData) return;
     if (this._arrayGizmoData) {
       this._gizmoRenderer.drawArrayGizmo(pass, this._arrayGizmoData, this.camera, this._arrayHandleHovered);
@@ -3699,7 +3714,7 @@ export class Renderer3D {
     if (this._meshEditBgActive) {
       const mode = this._meshEditBgOpts.mode;
       if (mode !== 'dim' && mode !== 'none') {
-        this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH, mode === 'sky' ? this._skyDomeView(canvasW, canvasH) : null);
+        this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH, mode === 'sky' ? this._skyDomeView(canvasW, canvasH) : null, Renderer3D.caps.animatedFocusBg);
       }
       return;
     }
@@ -3728,6 +3743,11 @@ export class Renderer3D {
   /** Set the mesh-edit focus background style (same options as armature). */
   setMeshEditBgMode(opts: ArmatureBgOptions): void { this._meshEditBgOpts = { ...opts }; }
   getMeshEditBgMode(): ArmatureBgOptions { return { ...this._meshEditBgOpts }; }
+  /** The mesh-edit focus background is showing AND animates over time ('wavy', unless this machine's caps freeze it —
+   *  mobile-parity 7.3b P3), i.e. it needs a frame every vsync. The live-loop holds key on this. */
+  get meshEditBgAnimating(): boolean {
+    return this._meshEditBgActive && this._meshEditBgOpts.mode === 'wavy' && Renderer3D.caps.animatedFocusBg;
+  }
 
   /** True when the mesh-edit focus background is active AND opaque (wavy/solid/gradient)
    *  — i.e. it fully hides the 2D content, so foreground 2D layers should be skipped too

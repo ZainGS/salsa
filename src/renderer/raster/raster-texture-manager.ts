@@ -57,6 +57,7 @@ export class RasterTextureManager {
     this.texture = undefined; this.width = 0; this.height = 0;
     this.stagingBuffer = undefined; this.stagingSize = 0;
     this.snapshotMgr = undefined; this.legacyBrush = undefined;
+    this._paneReadBuf = undefined; this._paneReadBufSize = 0; this._paneReadBusy = false;
   }
 
   ensureTexture(w: number, h: number) {
@@ -221,16 +222,74 @@ export class RasterTextureManager {
    * Lets the UV paint controller show live paint as the UV-editor background
    * each (throttled) frame without an async createImageBitmap round-trip.
    */
-  public async readToCanvas(target: HTMLCanvasElement | OffscreenCanvas): Promise<void> {
-    const back = await this._readbackRGBA();
-    if (!back) return;
-    const { rgba, w, h } = back;
+  public async readToCanvas(target: HTMLCanvasElement | OffscreenCanvas, rect?: { x: number; y: number; w: number; h: number } | null): Promise<void> {
+    // S3 (mobile-parity 7.3b): the live UV-pane preview runs this several times a second while painting. It reuses
+    // ONE MAP_READ buffer and ONE full-size ImageData, reads back only `rect` when given (the stroke's region — the
+    // rest of `target` already shows the texture), and copies the rows with one `set` when the padded row pitch
+    // equals the tight one (row-wise sets otherwise) instead of a per-pixel JS loop.
+    const tex = this.texture;
+    const w = this.width, h = this.height;
+    if (!tex || w === 0 || h === 0) return;
+    const resized = target.width !== w || target.height !== h;
     if (target.width !== w) target.width = w;
     if (target.height !== h) target.height = h;
-    const ctx = (target as any).getContext('2d') as CanvasRenderingContext2D | null;
-    if (!ctx) return;
-    ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+    // A resized canvas was cleared → the whole texture. Otherwise clamp the rect (null / empty = the whole texture).
+    let x = 0, y = 0, rw = w, rh = h;
+    if (rect && !resized) {
+      x = Math.max(0, Math.floor(rect.x)); y = Math.max(0, Math.floor(rect.y));
+      rw = Math.min(w, Math.ceil(rect.x + rect.w)) - x; rh = Math.min(h, Math.ceil(rect.y + rect.h)) - y;
+      if (rw <= 0 || rh <= 0) return;
+    }
+    const row = rw * 4;
+    const padded = Math.ceil(row / 256) * 256;
+    const bytes = padded * rh;
+    // One reusable buffer (sized for the whole texture); a second read while it's mapped gets a temporary one.
+    const fullBytes = Math.ceil((w * 4) / 256) * 256 * h;
+    let buf: GPUBuffer;
+    const reuse = !this._paneReadBusy;
+    if (reuse) {
+      if (!this._paneReadBuf || this._paneReadBufSize < fullBytes) {
+        this._paneReadBuf?.destroy();
+        this._paneReadBuf = this.device.createBuffer({ size: fullBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        this._paneReadBufSize = fullBytes;
+      }
+      buf = this._paneReadBuf;
+      this._paneReadBusy = true;
+    } else {
+      buf = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    }
+    try {
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToBuffer(
+        { texture: tex, origin: { x, y } },
+        { buffer: buf, bytesPerRow: padded, rowsPerImage: rh },
+        { width: rw, height: rh, depthOrArrayLayers: 1 },
+      );
+      this.device.queue.submit([enc.finish()]);
+      await buf.mapAsync(GPUMapMode.READ, 0, bytes);
+      const src = new Uint8Array(buf.getMappedRange(0, bytes));
+      let img = this._paneImage;
+      if (!img || img.width !== w || img.height !== h) img = this._paneImage = new ImageData(w, h);
+      const dst = img.data;
+      const fullRow = w * 4;
+      if (x === 0 && rw === w && padded === row) {
+        dst.set(src.subarray(0, row * rh), y * fullRow);
+      } else {
+        for (let r = 0; r < rh; r++) dst.set(src.subarray(r * padded, r * padded + row), (y + r) * fullRow + x * 4);
+      }
+      buf.unmap();
+      const ctx = (target as any).getContext('2d') as CanvasRenderingContext2D | null;
+      if (ctx) ctx.putImageData(img, 0, 0, x, y, rw, rh);
+    } finally {
+      if (reuse) this._paneReadBusy = false;
+      else buf.destroy();
+    }
   }
+  /** readToCanvas's reusable MAP_READ buffer + full-size ImageData (see S3 above). */
+  private _paneReadBuf?: GPUBuffer;
+  private _paneReadBufSize = 0;
+  private _paneReadBusy = false;
+  private _paneImage: ImageData | null = null;
 
   private ensureStagingBuffer(minSize: number) {
     if (this.stagingBuffer && this.stagingSize >= minSize) return;
@@ -300,6 +359,8 @@ export class RasterTextureManager {
     this.texture = undefined;
     this.stagingBuffer?.destroy();
     this.stagingBuffer = undefined;
+    if (!this._paneReadBusy) this._paneReadBuf?.destroy();   // (a read in flight unmaps it; the device frees it later)
+    this._paneReadBuf = undefined; this._paneReadBufSize = 0; this._paneImage = null;
     this.snapshotMgr?.destroy();
     this.snapshotMgr = undefined;
   }

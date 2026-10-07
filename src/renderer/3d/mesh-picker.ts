@@ -87,7 +87,17 @@ export class MeshPicker {
   private readonly _aabbCache = new Map<string, { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number } | null>();
 
   // CPU-skinned positions per skinned mesh — rebuilt when the skeleton pose changes (poseVersion).
-  private readonly _skinCache = new Map<string, { poseVer: number; verts: Float32Array }>();
+  // `src`: the base vertex array it was skinned from (a geometry rebuild re-skins). `bvh`: a BVH over THIS pose's
+  // verts, built once the pose has held still for a few picks (see _skinnedBVH) — dropped with the pose.
+  private readonly _skinCache = new Map<string, {
+    poseVer: number; verts: Float32Array; src: Float32Array; epoch: number;
+    firstPickAt: number; picks: number; bvh: MeshBVH | null; bvhIdx?: Uint32Array;
+  }>();
+  /** A skinned pose must have been picked this many times, over at least SKIN_BVH_SETTLE_MS, before it gets a BVH:
+   *  a pose that changes every frame (a live idle / clip) keeps the linear scan (one scan per pose is cheaper than a
+   *  build per pose); a still pose (UV paint with the idle paused, a posed character) is picked in O(log n). */
+  static readonly SKIN_BVH_MIN_PICKS = 3;
+  static readonly SKIN_BVH_SETTLE_MS = 50;
   private readonly _ident = mat4.create();
 
   /**
@@ -103,9 +113,13 @@ export class MeshPicker {
     const skel = mesh.skeleton, base = mesh.geometry, ji = mesh.jointIndices, jw = mesh.jointWeights;
     if (!skel || !base || !ji || !jw || skel.skinMatrices.length === 0) return null;
     let cached = this._skinCache.get(mesh.id);
-    if (!cached || cached.poseVer !== skel.poseVersion || cached.verts.length !== base.vertices.length) {
+    if (!cached || cached.poseVer !== skel.poseVersion || cached.verts.length !== base.vertices.length || cached.src !== base.vertices) {
       const M = skel.skinMatrices, stride = FLOATS_PER_VERT, n = base.vertices.length / stride;
-      const verts = base.vertices.slice();
+      // mobile-parity 7.3b P2: re-skin INTO the cached array (a fresh base.vertices.slice() per pose version was a
+      // full-mesh allocation per pick during idle animation). Seeded from base so normals / UVs / unweighted
+      // positions are the base values, exactly like the copy was. (Its skinned BVH is keyed to this pose — see below.)
+      const verts = cached && cached.verts.length === base.vertices.length ? cached.verts : new Float32Array(base.vertices.length);
+      verts.set(base.vertices);
       for (let v = 0; v < n; v++) {
         const o = v * stride;
         const bx = base.vertices[o], by = base.vertices[o + 1], bz = base.vertices[o + 2];
@@ -121,7 +135,7 @@ export class MeshPicker {
         }
         if (wsum > 1e-6) { verts[o] = px; verts[o + 1] = py; verts[o + 2] = pz; }   // else keep the base (unweighted) position
       }
-      cached = { poseVer: skel.poseVersion, verts };
+      cached = { poseVer: skel.poseVersion, verts, src: base.vertices, epoch: (cached?.epoch ?? 0) + 1, firstPickAt: -1, picks: 0, bvh: null };
       this._skinCache.set(mesh.id, cached);
     }
     return { verts: cached.verts, modelMat: (mesh.transformViaSkeleton ? this._ident : mesh.localMatrix) as mat4 };
@@ -514,6 +528,23 @@ export class MeshPicker {
    *  geometry-derived caches (BVH, boxes, CPU-skinned copy) key on Mesh3D.blendVersion instead — dropped here when it
    *  moved and rebuilt LAZILY by the next pick (never per frame / per weight change). */
   private readonly _blendSeen = new Map<string, number>();
+  /** The BVH of a skinned mesh's CURRENT cached pose, built once that pose has been picked SKIN_BVH_MIN_PICKS times
+   *  over SKIN_BVH_SETTLE_MS (null until then → the caller scans linearly). It references the cached verts, which are
+   *  only re-skinned for a NEW pose (a new cache entry, so the BVH goes with the old one). */
+  private _skinnedBVH(meshId: string, idxs: Uint32Array): MeshBVH | null {
+    const c = this._skinCache.get(meshId);
+    if (!c) return null;
+    if (c.bvh && c.bvhIdx === idxs) return c.bvh;
+    c.bvh = null;
+    const now = performance.now();
+    if (c.picks === 0) c.firstPickAt = now;
+    c.picks++;
+    if (c.picks < MeshPicker.SKIN_BVH_MIN_PICKS || now - c.firstPickAt < MeshPicker.SKIN_BVH_SETTLE_MS) return null;
+    c.bvh = MeshBVH.build(c.verts, idxs);
+    c.bvhIdx = idxs;
+    return c.bvh;
+  }
+
   private _syncBlend(mesh: Mesh3D): void {
     const v = mesh.blendVersion;
     if (v === 0) return;
@@ -578,9 +609,11 @@ export class MeshPicker {
     let hitU   = 0;
     let hitV   = 0;
 
-    if (!mesh.gpuDirty && !skin) {
-      // ── BVH path — static geometry ──────────────────────────────────────────
-      let bvh = this._bvhCache.get(mesh.id);
+    // A skinned mesh whose pose has held still gets a BVH over that pose's verts (P2); else it keeps the linear scan.
+    const skinBvh = skin && !mesh.gpuDirty ? this._skinnedBVH(mesh.id, idxs) : null;
+    if ((!mesh.gpuDirty && !skin) || skinBvh) {
+      // ── BVH path — static geometry (or a settled skinned pose) ──────────────
+      let bvh = skinBvh ?? this._bvhCache.get(mesh.id);
       if (!bvh) {
         let t0 = 0;
         if (this._bvhBudgetOn) {

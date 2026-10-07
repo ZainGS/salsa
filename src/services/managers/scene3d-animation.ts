@@ -823,6 +823,7 @@ export class Scene3DAnimation {
         if (!this._idleSolveCallback) {
             this._idleSolveCallback = () => {
                 if (this._idleRigs.size === 0) return false;
+                if (this._idlePauses.size > 0) return false;   // paused (e.g. UV paint on a tablet): no pose work, no keep-alive
                 // Armature posing pauses the idle — except for a body playing a clip OVER its idle (playClipOverIdle).
                 const posing = this.host.isBoneOverlayActive();
                 this._syncIdleWithPosing(posing);   // enter → snap to the clean base; leave → the new pose BECOMES the base
@@ -931,10 +932,11 @@ export class Scene3DAnimation {
             // (1) START the renderer's OWN live rAF loop (`play()`) — Salsa renders every frame on its own, independent
             //     of the host. Cooperative with the focus-bg hold: _syncCohortLiveLoop only starts a loop nothing else
             //     already drives, and only the cohort that started it pauses it (never stomp a clip/other owner).
-            this.host.setIdleLiveHold(true);
+            // (While paused — setIdleAnimationPaused — neither hold is taken; resuming takes them.)
+            if (this._idlePauses.size === 0) this.host.setIdleLiveHold(true);
             // (2) ALSO emit the interactive signal (renderer + host both subscribe) so a host that composites the 3D
             //     view on-demand keeps re-compositing too.
-            if (!wasOn) this.ctx.interactionService.beginInteractive();
+            if (!wasOn && this._idlePauses.size === 0) this.ctx.interactionService.beginInteractive();
         } else {
             const rig = this._idleRigs.get(bodyMeshId);
             const posedLive = !!rig && this._posingSkels.delete(rig.skelId);   // turned off mid-posing → keep the pose being made
@@ -947,11 +949,41 @@ export class Scene3DAnimation {
                 skel.computeWorldMatrices(); skel.matricesDirty = true;
             }
             this._idleRigs.delete(bodyMeshId);
-            if (wasOn) this.ctx.interactionService.endInteractive();   // release the interactive signal
-            if (this._idleRigs.size === 0) this.host.setIdleLiveHold(false);   // last idle off → release our hold (focus-bg may still need the loop)
+            const paused = this._idlePauses.size > 0;   // paused → the holds were already released
+            if (wasOn && !paused) this.ctx.interactionService.endInteractive();   // release the interactive signal
+            if (this._idleRigs.size === 0 && !paused) this.host.setIdleLiveHold(false);   // last idle off → release our hold (focus-bg may still need the loop)
         }
         this.ctx.scheduleRender();
     }
+
+    /** Reasons the idle is paused (e.g. 'uvPaint'). While any is set the idle callback does no pose work and holds
+     *  neither the live loop nor the interactive signal; the characters stay in their current pose. */
+    private readonly _idlePauses = new Set<string>();
+    /**
+     * Pause / resume EVERY procedural idle for `reason` (mobile-parity 7.3b P3: UV paint on a tablet — the idle re-poses
+     * the rig every frame, so the loop renders every vsync and the skinned pick re-skins per move). The rigs stay
+     * registered; resuming re-takes the holds exactly as setIdleAnimation(on) took them and the idle carries on from
+     * absolute time (like a SIM-LOD skip). Reasons nest: the idle runs again when the last one is cleared.
+     */
+    setIdleAnimationPaused(reason: string, paused: boolean): void {
+        const was = this._idlePauses.size > 0;
+        if (paused) this._idlePauses.add(reason); else this._idlePauses.delete(reason);
+        const now = this._idlePauses.size > 0;
+        if (was === now) return;
+        const n = this._idleRigs.size;
+        if (n > 0) {
+            if (now) {
+                for (let i = 0; i < n; i++) this.ctx.interactionService.endInteractive();
+                this.host.setIdleLiveHold(false);
+            } else {
+                this.host.setIdleLiveHold(true);
+                for (let i = 0; i < n; i++) this.ctx.interactionService.beginInteractive();
+            }
+        }
+        this.ctx.scheduleRender();
+    }
+    /** Whether the idle is paused (any reason). */
+    isIdleAnimationPaused(): boolean { return this._idlePauses.size > 0; }
     /** Whether a body currently has the idle animation running. */
     isIdleAnimating(bodyMeshId: string): boolean { return this._idleRigs.has(bodyMeshId); }
 

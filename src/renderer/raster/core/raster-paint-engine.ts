@@ -217,6 +217,31 @@ export class RasterPaintEngine {
     this.scheduleRender();
   }
 
+  /** Open / close a dab batch around several {@link addStrokePoints} calls (UV paint changes the per-dab size scale
+   *  between points of one frame): everything in between goes to the GPU as ONE submit. Nests. */
+  public beginDabBatch(): void { this.brushEngine.beginBatch(); }
+  public endDabBatch(): void { this.brushEngine.endBatch(); this.scheduleRender(); }
+
+  /** Pen-up / pen-down inside the live stroke — see BrushEngine.liftTo. False when the caller must end + restart. */
+  public liftStroke(runEnd: PointerInput, next: PointerInput, nextSizeScale?: number): boolean {
+    const ok = this.brushEngine.liftTo(runEnd, next, nextSizeScale);
+    if (ok) this.scheduleRender();
+    return ok;
+  }
+
+  /** Abandon the live stroke: its pixels are put back (GPU only) and no undo entry is made. True when the stroke
+   *  had painted something that was restored. */
+  public cancelStroke(): boolean {
+    const restored = this.brushEngine.abortStroke();
+    this.scheduleRender();
+    return restored;
+  }
+
+  /** The live stroke's touched region so far (padded, unclamped), or null — for a mid-stroke preview readback. */
+  public peekStrokeDirtyRect(): { x: number; y: number; w: number; h: number } | null {
+    return this.brushEngine.peekStrokeDirtyRect();
+  }
+
   /**
    * Finish the stroke and build its undo patch (BRUSH-6): the BEFORE/AFTER pixels of the region the stroke wrote,
    * read from the GPU (two small readbacks — no full-canvas readback, no clone of the previous snapshot).

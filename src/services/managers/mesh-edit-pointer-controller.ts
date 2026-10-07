@@ -20,6 +20,7 @@ import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
+import { isPointerEventClaimed } from '../../renderer/util/pointer-claims';
 
 export type MeshEditSelectionMode = 'vertex' | 'face' | 'edge';
 
@@ -127,6 +128,8 @@ export class MeshEditPointerController {
       this._touchIds.add(e.pointerId ?? 0);
       // A 2nd finger is a camera gesture: cancel (restore) the vertex drag the first finger started; never pick.
       if (this._touchIds.size > 1) { this._cancelDrag(); return; }
+      // 7.3b P1: a finger UV paint took (not stopped, so the orbit controller can pinch) is a brush stroke — no pick.
+      if (isPointerEventClaimed(e)) return;
     }
     this._pickScale = e.pointerType === 'touch' ? TOUCH_PICK_SCALE : 1;
 

@@ -181,7 +181,7 @@ import { Scene3DParticles } from './scene3d-particles';
 import { Scene3DHtmlTextures } from './scene3d-html-textures';
 import { Scene3DModifiers } from './scene3d-modifiers';
 import { Scene3DPrimitives } from './scene3d-primitives';
-import { Scene3DSurfacePaint } from './scene3d-surface-paint';
+import { Scene3DSurfacePaint, type SurfacePaintHandlers } from './scene3d-surface-paint';
 import { Scene3DMaterials } from './scene3d-materials';
 import { Scene3DArrays } from './scene3d-arrays';
 import { Scene3DGrouping } from './scene3d-grouping';
@@ -838,7 +838,7 @@ export class Scene3DManager {
         // calling it and on the interactive count never desyncing (the mesh-edit "bg freezes when I stop orbiting" bug).
         this.ctx.webgpuRenderer.addPreRenderCallback(() => {
             const r = this.renderer3D;
-            return r.meshEditBgActive && r.getMeshEditBgMode().mode === 'wavy';
+            return r.meshEditBgAnimating;   // 'wavy', unless this machine's caps freeze it (mobile: a still frame)
         });
         // ★ Same on-demand keep-alive for the ANIMATED hover outline. Its scrolling-pattern phase is read from
         // performance.now() each frame, so it freezes the instant frames stop scheduling — i.e. when the pointer
@@ -1030,6 +1030,9 @@ export class Scene3DManager {
     setIdleAnimation(bodyMeshId: string, on: boolean, intensity = 1): void { this._animation.setIdleAnimation(bodyMeshId, on, intensity); }
     /** Whether a body currently has the idle animation running. */
     isIdleAnimating(bodyMeshId: string): boolean { return this._animation.isIdleAnimating(bodyMeshId); }
+    /** Pause / resume every procedural idle for `reason` (nests by reason; see Scene3DAnimation.setIdleAnimationPaused). */
+    setIdleAnimationPaused(reason: string, paused: boolean): void { this._animation.setIdleAnimationPaused(reason, paused); }
+    isIdleAnimationPaused(): boolean { return this._animation.isIdleAnimationPaused(); }
 
     /** Start/stop the renderer's live rAF loop for the cooperative idle + focus-bg cohort. Starts the
      *  loop when EITHER wants it and nothing external already drives it (so we never pause a clip/ghost
@@ -1056,7 +1059,7 @@ export class Scene3DManager {
      *  Coordinated with the idle hold via {@link _syncCohortLiveLoop}; exit always releases. */
     private _syncFocusBgLiveLoop(): void {
         const r = this.renderer3D;
-        const need = r.meshEditBgActive && r.getMeshEditBgMode().mode === 'wavy';
+        const need = r.meshEditBgAnimating;   // 'wavy' and animated on this machine (mobile caps freeze it — 7.3b P3)
         if (need === this._focusBgHeldLive) return;   // no change (keeps begin/endInteractive balanced)
         this._focusBgHeldLive = need;
         if (need) this.ctx.interactionService.beginInteractive();
@@ -7503,7 +7506,7 @@ export class Scene3DManager {
      * Enter 3D surface-paint input for `meshId`: left-drag on the mesh in the viewport raycasts to a UV coord and
      * calls `handlers` (the UVPaintController's stroke API). Alt-drag (orbit) and middle/right (pan) pass through.
      */
-    enterSurfacePaintInput(meshId: string, handlers: { begin: (u: number, v: number, p: number, s?: number) => void; move: (u: number, v: number, p: number, s?: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void }): void {
+    enterSurfacePaintInput(meshId: string, handlers: SurfacePaintHandlers): void {
         this._surfacePaint.enter(meshId, handlers);
     }
 
@@ -7514,7 +7517,7 @@ export class Scene3DManager {
 
     /** Multi-mesh variant of {@link enterSurfacePaintInput}: raycast a SET of meshes (the box's panels) and
      *  paint whichever is hit. The panel ids are resolved per-event so a hierarchy rebuild (setDimensions) is safe. */
-    enterSurfacePaintInputMulti(meshIds: string[], handlers: { begin: (u: number, v: number, p: number, s?: number) => void; move: (u: number, v: number, p: number, s?: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void }): void {
+    enterSurfacePaintInputMulti(meshIds: string[], handlers: SurfacePaintHandlers): void {
         this._surfacePaint.enterMulti(meshIds, handlers);
     }
 

@@ -192,6 +192,10 @@ export class UVCanvasRenderer {
   /** The bound canvas — the UV paint controller attaches pointer listeners here. */
   get element(): HTMLCanvasElement { return this.canvas; }
 
+  /** Max device-pixel ratio of the auto-sized backing store ({@link syncBackingStore}). Infinity = the window's DPR.
+   *  ShapeManager.createUVCanvasRenderer sets it from the GPU tier's caps (mobile: 1.5), like the main canvas. */
+  maxDpr = Infinity;
+
   /** Match the canvas backing store to its CSS layout size × devicePixelRatio, so 1 backing px maps
    *  to 1 device px (no CSS stretch skew). No-op while the canvas is unlaid-out (clientWidth 0) or
    *  already in sync. All pane math (uvToCanvas / canvasToUV / letterbox) is in BACKING-store px —
@@ -200,7 +204,9 @@ export class UVCanvasRenderer {
     const c = this.canvas;
     const cw = c.clientWidth ?? 0, ch = c.clientHeight ?? 0;
     if (!cw || !ch) return false;
-    const dpr = typeof devicePixelRatio === 'number' && devicePixelRatio > 0 ? devicePixelRatio : 1;
+    const winDpr = typeof devicePixelRatio === 'number' && devicePixelRatio > 0 ? devicePixelRatio : 1;
+    // Capped by this machine's maxDpr (the mobile tier's 1.5 — the pane redraws while painting; see {@link maxDpr}).
+    const dpr = Number.isFinite(this.maxDpr) && this.maxDpr > 0 ? Math.min(winDpr, this.maxDpr) : winDpr;
     const bw = Math.max(1, Math.round(cw * dpr));
     const bh = Math.max(1, Math.round(ch * dpr));
     if (c.width === bw && c.height === bh) return false;

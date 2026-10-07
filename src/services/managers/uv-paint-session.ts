@@ -154,9 +154,10 @@ export class UVPaintSessionController {
         // while painting so only the outward (painted) side ever shows; restore on exit.
         this._doubleSided = { meshId, prev: mesh.material.doubleSided };
         mesh.material.doubleSided = false;
-        if (!this.controller) {
-            this.controller = new UVPaintController(device, () => this.sm.scheduleRender());
-        }
+        if (!this.controller) this.controller = this._newController(device);
+        // P3 (mobile-parity 7.3b): on a phone / tablet the procedural idle pauses while painting — it re-poses the
+        // rig every frame, which keeps the loop rendering every vsync and re-skins the garment for every pick.
+        this._setIdlePaused(this._isMobileTier());
         // uvRenderer omitted → the UV pane is hidden; the user paints only on the
         // 3D mesh (surface input below drives the same texture). With a pane, both
         // views are wired and stay in sync.
@@ -178,11 +179,13 @@ export class UVPaintSessionController {
         // coord and drives the same controller, so a stroke on either view paints
         // the same texture (and both update via the controller's readback).
         this.sm.scene3d.enterSurfacePaintInput(meshId, {
-            begin: (u, v, p, s) => this.controller?.strokeBeginUV(u, v, p, s),
-            move:  (u, v, p, s) => this.controller?.strokeMoveUV(u, v, p, s),
-            end:   () => this.controller?.strokeEndUV(),
-            // Hover the mesh → ring on the UV pane at the corresponding spot.
+            begin:  (u, v, p, s, info) => this.controller?.strokeBeginUV(u, v, p, s, info),
+            move:   (u, v, p, s, t) => this.controller?.strokeMoveUV(u, v, p, s, t),
+            end:    (t) => this.controller?.strokeEndUV(t),
+            cancel: () => this.controller?.strokeCancelUV(),   // a second finger: the stroke is taken back (pinch)
+            // Hover the mesh → ring on the UV pane at the corresponding spot (only raycast when the pane shows it).
             hover: (uv) => this.controller?.setLinkCursorUV(uv),
+            wantsHover: () => !!this.controller?.wantsLinkCursor(),
         });
         this.kind = 'character';
         this.sm.scheduleRender();
@@ -192,6 +195,7 @@ export class UVPaintSessionController {
     exit(): void {
         this.controller?.exit();   // clears the active target → activeMeshId() is null below
         this.sm.scene3d.exitSurfacePaintInput();
+        this._setIdlePaused(false);   // P3: the idle resumes exactly as before (no-op when it wasn't paused)
         // Restore the mesh's original double-sided setting.
         if (this._doubleSided) {
             const m = this.sm.scene3d.getMesh(this._doubleSided.meshId);
@@ -248,9 +252,7 @@ export class UVPaintSessionController {
         // pointing at the character mesh, so this package session's exit later restored double-sided on the
         // WRONG object. exitUVPaintMode3D is a safe no-op when nothing is active.
         if (this.controller?.isActive()) this.exit();
-        if (!this.controller) {
-            this.controller = new UVPaintController(device, () => this.sm.scheduleRender());
-        }
+        if (!this.controller) this.controller = this._newController(device);
         // We never open a UV editor here (would clobber net UVs), so no editor to close on exit.
         this._openedEditor = null;
         // No UV pane → the session is just a state holder (paintCursor). Reuse an open one if any, else
@@ -291,13 +293,37 @@ export class UVPaintSessionController {
         this.controller.onStrokeEnd = hooks.onStrokeEnd ?? null;
         // Paint on the 3D box: raycast ALL panels → the hit panel's net UV → the same controller/texture.
         this.sm.scene3d.enterSurfacePaintInputMulti(meshIds, {
-            begin: (u, v, p) => this.controller?.strokeBeginUV(u, v, p),
-            move:  (u, v, p) => this.controller?.strokeMoveUV(u, v, p),
-            end:   () => this.controller?.strokeEndUV(),   // onStrokeEnd handles the sync
+            begin:  (u, v, p, _s, info) => this.controller?.strokeBeginUV(u, v, p, 1, info),
+            move:   (u, v, p, _s, t) => this.controller?.strokeMoveUV(u, v, p, 1, t),
+            end:    (t) => this.controller?.strokeEndUV(t),   // onStrokeEnd handles the sync
+            cancel: () => this.controller?.strokeCancelUV(),   // a second finger: the stroke is taken back (pinch)
         });
         this.kind = 'packaging';
         this.sm.scheduleRender();
         return true;
+    }
+
+    /** The shared controller, with its once-per-frame dab drain hooked to the renderer's pre-render callbacks (S2). */
+    private _newController(device: GPUDevice): UVPaintController {
+        const r = this.sm.webgpuRenderer;
+        return new UVPaintController(device, () => this.sm.scheduleRender(), r ? {
+            add: (cb) => r.addPreRenderCallback(cb, 'uvPaintStroke'),
+            remove: (cb) => r.removePreRenderCallback(cb),
+        } : null);
+    }
+
+    /** A phone / tablet (or safe-mode) GPU tier (gpu-capabilities.ts). */
+    private _isMobileTier(): boolean {
+        const tier = this.sm.webgpuRenderer?.getGpuTier?.().tier;
+        return tier === 'mobile' || tier === 'safe';
+    }
+
+    /** Whether THIS session paused the idle (so exit resumes only what it paused). */
+    private _idlePaused = false;
+    private _setIdlePaused(paused: boolean): void {
+        if (paused === this._idlePaused) return;
+        this._idlePaused = paused;
+        this.sm.scene3d.setIdleAnimationPaused('uvPaint', paused);
     }
 
     /** Copy the live 2D brush (active preset + color + erase) from the illustration

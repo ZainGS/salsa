@@ -335,3 +335,57 @@ describe('Scene3DAnimation — the idle skips characters the renderer culled (R6
         } finally { spy.mockRestore(); }
     });
 });
+
+describe('Scene3DAnimation — setIdleAnimationPaused (mobile-parity 7.3b P3: UV paint on a tablet)', () => {
+    const rafG = globalThis as unknown as { requestAnimationFrame?: (cb: FrameRequestCallback) => number };
+    rafG.requestAnimationFrame ??= () => 0;
+    it('pausing releases the live-loop hold + interactive signal and stops the pose work; resuming restores both exactly', () => {
+        const skel = new Skeleton3D({ name: 'S', joints: [{ ...joint(0, -1), name: 'hips' }, { ...joint(1, 0), name: 'spine' }, { ...joint(2, 1), name: 'chest' }], clips: [] });
+        skel.isProceduralBody = true;
+        const body = Object.create(SkinnedMesh3D.prototype) as SkinnedMesh3D;
+        Object.defineProperty(body, 'id', { value: 'body' });
+        Object.assign(body, { skeleton: skel, skeletonId: skel.id, isProceduralBody: true });
+        const cbs: (() => boolean)[] = [];
+        let interactive = 0, liveHold = false;
+        const ctx = {
+            scheduleRender: () => {}, emitSceneGraphChanged: () => {}, sceneGraph: { root: { children: [skel] } },
+            webgpuRenderer: { addPreRenderCallback: (cb: () => boolean) => { if (!cbs.includes(cb)) cbs.push(cb); } },
+            interactionService: { beginInteractive: () => { interactive++; }, endInteractive: () => { interactive--; } },
+        } as unknown as ManagerContext;
+        const host: Scene3DAnimationHost = {
+            getSkeleton: (id) => (id === skel.id ? skel : null), keepSpringsAlive: () => {}, applyAllKeyframesAtFrame: () => {},
+            getMesh: (id) => (id === 'body' ? body : null), getAllMeshes: () => [body], getBodyParams: () => null,
+            getBoneOverlaySkeletonId: () => null, findClip: () => null, startScrollAnimation: () => {}, clearScrollFrames: () => {},
+            isBoneOverlayActive: () => false, setIdleLiveHold: (on) => { liveHold = on; },
+        };
+        const anim = new Scene3DAnimation(ctx, host);
+        const tick = () => cbs.map((cb) => cb()).some(Boolean);
+        anim.setIdleAnimation('body', true);
+        expect(interactive).toBe(1); expect(liveHold).toBe(true);
+        expect(tick()).toBe(true);
+
+        anim.setIdleAnimationPaused('uvPaint', true);
+        expect(anim.isIdleAnimationPaused()).toBe(true);
+        expect(interactive).toBe(0); expect(liveHold).toBe(false);
+        const v0 = skel.poseVersion;
+        expect(tick()).toBe(false);                    // no keep-alive → the loop can go back to on-demand
+        expect(skel.poseVersion).toBe(v0);             // and no pose work
+        anim.setIdleAnimationPaused('uvPaint', true);  // idempotent
+        expect(interactive).toBe(0);
+
+        anim.setIdleAnimationPaused('other', true);    // reasons nest
+        anim.setIdleAnimationPaused('uvPaint', false);
+        expect(anim.isIdleAnimationPaused()).toBe(true);
+        expect(interactive).toBe(0);
+        anim.setIdleAnimationPaused('other', false);
+        expect(anim.isIdleAnimationPaused()).toBe(false);
+        expect(interactive).toBe(1); expect(liveHold).toBe(true);
+        expect(tick()).toBe(true);
+
+        // Turning the idle off WHILE paused, then resuming, leaves the counters balanced (nothing left held).
+        anim.setIdleAnimationPaused('uvPaint', true);
+        anim.setIdleAnimation('body', false);
+        anim.setIdleAnimationPaused('uvPaint', false);
+        expect(interactive).toBe(0); expect(liveHold).toBe(false);
+    });
+});

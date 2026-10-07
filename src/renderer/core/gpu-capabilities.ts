@@ -38,6 +38,9 @@ export interface GpuCaps {
   ssr: boolean;
   /** Temporal AA may run (false = treated as mode 'off'; the per-machine TAA preference is kept). */
   taa: boolean;
+  /** The edit-mode focus background's 'wavy' theme may ANIMATE (false = drawn frozen, so it never holds the render
+   *  loop live — mobile-parity 7.3b P3; the chosen theme itself is kept). */
+  animatedFocusBg: boolean;
 }
 
 /** Today's engine defaults: desktop behaviour is unchanged. */
@@ -45,13 +48,16 @@ export const DESKTOP_CAPS: Readonly<GpuCaps> = Object.freeze({
   gpuDriven: true, shaderVariants: true, htmlInCanvas: true,
   maxDpr: Infinity, maxCanvasPixels: Infinity, warmConcurrency: 2,
   shadows: true, ssao: true, ssr: true, taa: true,
+  animatedFocusBg: true,
 });
 
-/** Phones / tablets: the CPU draw path, the uber-shader only, no HTML-in-canvas, DPR ≤ 1.5 and ≤ 2.5 MP, one compile at a time. */
+/** Phones / tablets: the CPU draw path, the uber-shader only, no HTML-in-canvas, DPR ≤ 1.5 and ≤ 2.5 MP, one compile
+ *  at a time, a still (frozen 'wavy') focus background. */
 export const MOBILE_CAPS: Readonly<GpuCaps> = Object.freeze({
   ...DESKTOP_CAPS,
   gpuDriven: false, shaderVariants: false, htmlInCanvas: false,
   maxDpr: 1.5, maxCanvasPixels: 2_500_000, warmConcurrency: 1,
+  animatedFocusBg: false,
 });
 
 /** Safe mode (crash loop / ?salsaSafe=1): the mobile caps plus shadows / SSAO / SSR / TAA off. */

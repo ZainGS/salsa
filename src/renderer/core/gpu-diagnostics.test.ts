@@ -150,7 +150,7 @@ describe('caps application', () => {
   it('mobile caps switch GPU-driven / variants / HTML-in-canvas / warm concurrency off; desktop restores the defaults', () => {
     const fake: Record<string, unknown> = { _indirectFirstInstance: true };
     proto.applyGpuCaps.call(fake, { ...MOBILE_CAPS }, false);
-    expect(Renderer3D.caps).toMatchObject({ gpuDriven: false, shaderVariants: false, shadows: true, ssao: true, ssr: true, taa: true });
+    expect(Renderer3D.caps).toMatchObject({ gpuDriven: false, shaderVariants: false, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: false });
     expect(Renderer3D.gpuDrivenActive).toBe(false);
     expect(Renderer3D.shaderVariantsActive).toBe(false);
     expect(Renderer3D.gpuDriven).toBe(true);           // the switch / preference itself is untouched
@@ -160,7 +160,7 @@ describe('caps application', () => {
     proto.applyGpuCaps.call(fake, { ...SAFE_CAPS }, false);
     expect(Renderer3D.caps).toMatchObject({ shadows: false, ssao: false, ssr: false, taa: false });
     proto.applyGpuCaps.call(fake, { ...DESKTOP_CAPS }, false);
-    expect(Renderer3D.caps).toEqual({ gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true });
+    expect(Renderer3D.caps).toEqual({ gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true });
     expect(Renderer3D.gpuDrivenActive).toBe(true);
     expect(TextEffectEngine.htmlInCanvasAllowed).toBe(true);
     expect(GPUPipelineCache.defaultMaxConcurrentWarm).toBe(2);

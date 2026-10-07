@@ -409,6 +409,72 @@ export class BrushEngine {
     return this.isActive;
   }
 
+  /**
+   * Abandon the live stroke: the texture goes back to its stroke-start pixels (BrushStampPipeline.abortStroke — GPU
+   * only, no readback) and no undo patch is made. UV paint uses it when a second finger turns a stroke into a pinch.
+   * Returns true when the stroke had written something that was put back.
+   */
+  public abortStroke(): boolean {
+    if (!this.isActive) return false;
+    const restored = this.stampPipeline.abortStroke();
+    this.isActive = false;
+    this.targetTexture = null;
+    this.strokeVertices = [];
+    this._dirty = null;
+    this._maxDabRadius = 0;
+    return restored;
+  }
+
+  /**
+   * Pen-up / pen-down INSIDE the live stroke (UV paint seam jump): finish the current run at `runEnd` exactly like
+   * endStroke would (the stabilizer catch-up dabs), then start a new run at `next` exactly like beginStroke would
+   * (fresh stabilizer, spacing, velocity and smudge pickup; a dab at the new point) — with no interpolated line in
+   * between and without ending the stroke (no undo patch, no base copy). One stroke = one undo step.
+   * False (nothing done) when no stroke is live or the preset draws a stroke-texture strip: the strip is one
+   * polyline over the whole stroke, so it would bridge the gap — the caller ends + restarts instead.
+   * `nextSizeScale` (optional): the new run's size scale, applied after the old run's catch-up dabs.
+   */
+  public liftTo(runEnd: PointerInput, next: PointerInput, nextSizeScale?: number): boolean {
+    if (!this.isActive || !this.targetTexture || !this.preset) return false;
+    if (this.preset.strokeTexture?.enabled) return false;
+    this.stampPipeline.clearProvisional();
+    const flushed = this.stabilizer.flush({ x: runEnd.x, y: runEnd.y, pressure: runEnd.pressure, timestamp: runEnd.timestamp });
+    for (const pt of flushed) {
+      this.collectStrokeVertex(pt);
+      this.interpolateDabs(pt);
+    }
+    if (nextSizeScale !== undefined) this.setSizeScale(nextSizeScale);
+    this.distanceSinceLastDab = 0;
+    this.currentVelocity = 0;
+    this.stabilizer.reset();
+    this._smudgeColor = [0, 0, 0, 0];
+    this._smudgeReadbackPending = false;
+    const smoothed = this.stabilizer.push({
+      x: next.x, y: next.y, pressure: next.pressure, timestamp: next.timestamp, tiltX: next.tiltX, tiltY: next.tiltY,
+    });
+    this.collectStrokeVertex(smoothed);
+    this.stampDab(smoothed.x, smoothed.y, smoothed.pressure, smoothed.timestamp, smoothed.tiltX ?? 0, smoothed.tiltY ?? 0);
+    this.lastDabX = smoothed.x;
+    this.lastDabY = smoothed.y;
+    this.lastDabTime = smoothed.timestamp;
+    this.lastDabPressure = smoothed.pressure;
+    this.lastDabTiltX = smoothed.tiltX ?? 0;
+    this.lastDabTiltY = smoothed.tiltY ?? 0;
+    return true;
+  }
+
+  /** The live stroke's touched region so far (dab centres, padded like {@link takeStrokeDirtyRect}) WITHOUT
+   *  consuming it, or null. A live preview (the UV pane readback) reads just this region mid-stroke. */
+  public peekStrokeDirtyRect(): { x: number; y: number; w: number; h: number } | null {
+    const d = this._dirty;
+    if (!d) return null;
+    const pad = Math.ceil(this._maxDabRadius * 2 + 64);
+    return {
+      x: Math.floor(d.x0 - pad), y: Math.floor(d.y0 - pad),
+      w: Math.ceil(d.x1 - d.x0 + 2 * pad), h: Math.ceil(d.y1 - d.y0 + 2 * pad),
+    };
+  }
+
   // ── Provisional (predicted) tail — BRUSH-4 stroke prediction ──────
 
   /** Upper bound on dabs in one provisional tail (bounded dispatches; a longer tail is cut short). */

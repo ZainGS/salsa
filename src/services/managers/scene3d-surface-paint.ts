@@ -5,9 +5,11 @@
  * A left-drag on the target mesh raycasts to a UV [0,1] coordinate (barycentric-interpolating the hit triangle's
  * vertex UVs) and forwards it to the host's stroke handlers — the UVPaintController's begin/move/end API — so a
  * stroke on the 3D view paints the same texture as the UV pane. Alt-drag (orbit) and middle/right (pan) pass
- * through untouched; a stroke that starts off-mesh is let through to selection/orbit.
+ * through untouched; a stroke that starts off-mesh is let through to selection/orbit. Touch: fingers are never
+ * consumed (the orbit controller pinches / two-finger orbits) and a second finger takes the stroke back — see
+ * {@link SurfacePaintGesture} (mobile-parity 7.3b P1).
  *
- * State is just the active handlers + the drawing flag + a listener-cleanup thunk — no scene mutation, no undo.
+ * State is just the active handlers + the pointer state machine + a listener-cleanup thunk — no scene mutation, no undo.
  * Dependencies beyond the shared ctx (canvas) are a narrow host: resolve a mesh by id, the shared picker, and the
  * current camera. Scene3DManager keeps thin delegating methods so the public API and every caller are unchanged.
  */
@@ -16,6 +18,7 @@ import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import type { Camera3D } from '../../renderer/3d/camera-3d';
 import type { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
+import { claimPointerEvent } from '../../renderer/util/pointer-claims';
 import type { ManagerContext } from './manager-context';
 
 /** Triangle-area helpers for the world-space brush: 3D surface area and UV [0,1] area of a face. */
@@ -31,13 +34,243 @@ const SurfaceDensity = {
   },
 };
 
+/** A stroke's start info: the PointerEvent's pointerType (a finger gets the brush's touch smoothing cap — S1) and
+ *  its timeStamp (S8). */
+export interface SurfaceStrokeInfo { pointerType?: string; timestamp?: number }
+
 /** The UVPaintController stroke API a surface-paint session drives. `sizeScale` (local UV density ÷ mesh
- *  average) keeps a stroke a constant PHYSICAL size on the mesh despite unwrap stretch. */
+ *  average) keeps a stroke a constant PHYSICAL size on the mesh despite unwrap stretch. `timestamp` = the
+ *  sample's PointerEvent.timeStamp. */
 export interface SurfacePaintHandlers {
-  begin(u: number, v: number, pressure: number, sizeScale?: number): void;
-  move(u: number, v: number, pressure: number, sizeScale?: number): void;
-  end(): void;
+  begin(u: number, v: number, pressure: number, sizeScale?: number, info?: SurfaceStrokeInfo): void;
+  move(u: number, v: number, pressure: number, sizeScale?: number, timestamp?: number): void;
+  end(timestamp?: number): void;
+  /** Abandon the stroke and put its paint back (P1: a second finger turned it into a pinch). Absent → end(). */
+  cancel?(): void;
   hover?(uv: [number, number] | null): void;
+  /** Whether hover() has anyone to show the link cursor to right now (the UV pane is attached). False → the
+   *  per-move hover raycast is skipped (P2). Absent = always wanted. */
+  wantsHover?(): boolean;
+}
+
+/** A UV hit of the surface raycast (sizeScale only for the single-mesh path). */
+export type SurfaceUVHit = { u: number; v: number; sizeScale?: number };
+type ClientRect = { left: number; top: number; width: number; height: number };
+
+/** What {@link SurfacePaintGesture} needs from its canvas (DOM-free, so the state machine is unit tested). */
+export interface SurfaceGestureIO {
+  /** The canvas client rect (read once per gesture, P2). */
+  measure(): ClientRect;
+  /** Raycast a client point to the mesh UV, or null on a miss. */
+  uvAt(clientX: number, clientY: number, rect: ClientRect): SurfaceUVHit | null;
+  capture(pointerId: number): void;
+  release(pointerId: number): void;
+  /** requestAnimationFrame / cancelAnimationFrame (the touch first-dab delay). */
+  requestFrame(cb: () => void): number;
+  cancelFrame(id: number): void;
+}
+
+/** The PointerEvent fields the gesture reads (a real PointerEvent satisfies it). */
+type GesturePointer = Pick<PointerEvent, 'pointerId' | 'pointerType' | 'isPrimary' | 'button' | 'buttons' | 'altKey'
+  | 'clientX' | 'clientY' | 'pressure' | 'timeStamp' | 'stopImmediatePropagation' | 'preventDefault'>
+  & { getCoalescedEvents?: () => GesturePointer[] };
+
+/**
+ * P1 (mobile-parity 7.3b) — the surface-paint pointer state machine, shared by the single- and multi-mesh paths.
+ *
+ *  - MOUSE / PEN: unchanged — a left press on the mesh starts the stroke at once and is consumed
+ *    (stopImmediatePropagation), so orbit / select never see it.
+ *  - TOUCH: never consumed — the OrbitController must see every finger to pinch / two-finger orbit (in its
+ *    altOrbitOnly scheme one finger is a no-op for the camera). The stroke's first dab waits ~1 frame or
+ *    {@link TOUCH_START_PX} of movement, so a second finger landing right away makes a gesture with no paint at all.
+ *  - A SECOND TOUCH ends the stroke and puts its paint back (handlers.cancel), then nothing is consumed or painted
+ *    until every finger has lifted ('blocked'). `!isPrimary` pointers never start a stroke; one pointer owns a stroke.
+ *  - pointercancel / lostpointercapture / a move with no button held end the stroke — it can never stay stuck.
+ *  - Hover (no stroke) raycasts only when a consumer wants it (the UV pane's link cursor), never for a finger and
+ *    never while two fingers are down (P2). Coalesced samples are raycast too, at most {@link MAX_SAMPLES} per event.
+ */
+export class SurfacePaintGesture {
+  /** Finger movement (CSS px) that starts a touch stroke before its first frame. */
+  static readonly TOUCH_START_PX = 8;
+  /** Coalesced samples raycast per pointermove (evenly picked, the last always kept): each is a CPU raycast. */
+  static readonly MAX_SAMPLES = 4;
+
+  private mode: 'idle' | 'pending' | 'drawing' | 'blocked' = 'idle';
+  private readonly touches = new Set<number>();
+  private strokeId: number | null = null;
+  private rect: ClientRect | null = null;
+  private frame = 0;
+  /** The touch stroke waiting for its first dab: the press + any samples since. */
+  private pend: { x: number; y: number; pointerType: string; t: number; pressure: number; hit: SurfaceUVHit;
+                  queued: Array<{ hit: SurfaceUVHit; pressure: number; t: number }> } | null = null;
+
+  constructor(private readonly io: SurfaceGestureIO, private readonly handlers: () => SurfacePaintHandlers | undefined) {}
+
+  /** Diagnostics / tests. */
+  get state(): 'idle' | 'pending' | 'drawing' | 'blocked' { return this.mode; }
+  get touchCount(): number { return this.touches.size; }
+
+  down(e: GesturePointer): void {
+    const touch = e.pointerType === 'touch';
+    if (touch) {
+      // The primary finger starts a new contact sequence: any ids still tracked are stale (a missed up).
+      if (e.isPrimary && (this.mode === 'idle' || this.mode === 'blocked')) { this.touches.clear(); this.mode = 'idle'; }
+      this.touches.add(e.pointerId);
+      if (this.touches.size >= 2) { this.abortForGesture(); return; }   // pinch / orbit — never consumed
+    }
+    if (this.mode !== 'idle') return;          // blocked (fingers still down) or a stroke already owns a pointer
+    if (e.isPrimary === false) return;
+    const h = this.handlers();
+    if (e.button !== 0 || e.altKey || !h) return;   // alt = orbit
+    const rect = this.io.measure();
+    const hit = this.io.uvAt(e.clientX, e.clientY, rect);
+    if (!hit) return;                          // missed the mesh → let it through (orbit / select / pan)
+    this.rect = rect;
+    this.strokeId = e.pointerId;
+    e.preventDefault();
+    this.io.capture(e.pointerId);
+    const pressure = e.pressure || 1;
+    if (touch) {
+      claimPointerEvent(e);   // not stopped (the orbit controller must see the finger), but no other TOOL acts on it
+      this.mode = 'pending';
+      this.pend = { x: e.clientX, y: e.clientY, pointerType: e.pointerType, t: e.timeStamp, pressure, hit, queued: [] };
+      this.frame = this.io.requestFrame(() => { this.frame = 0; this.commitPending(); });
+      return;
+    }
+    e.stopImmediatePropagation();
+    this.mode = 'drawing';
+    h.begin(hit.u, hit.v, pressure, hit.sizeScale, { pointerType: e.pointerType, timestamp: e.timeStamp });
+  }
+
+  move(e: GesturePointer): void {
+    const touch = e.pointerType === 'touch';
+    if (this.mode === 'blocked' || this.touches.size >= 2) return;   // a gesture: no paint, no hover raycasts
+    const h = this.handlers();
+    if (!h) return;
+    if ((this.mode === 'drawing' || this.mode === 'pending') && e.pointerId === this.strokeId) {
+      if (!touch) e.stopImmediatePropagation();   // a finger's moves still reach the orbit controller (its tracking)
+      if (typeof e.buttons === 'number' && (e.buttons & 1) === 0) { this.up(e); return; }   // the up was missed
+      const rect = this.rect ?? this.io.measure();
+      let last: SurfaceUVHit | null = null;
+      for (const s of this.samplesOf(e)) {
+        const hit = this.io.uvAt(s.clientX, s.clientY, rect);
+        last = hit;
+        if (!hit) continue;                      // off-mesh → skip, keep the stroke alive
+        const pressure = s.pressure || 1;
+        if (this.mode === 'pending') this.pend!.queued.push({ hit, pressure, t: s.timeStamp });
+        else h.move(hit.u, hit.v, pressure, hit.sizeScale, s.timeStamp);
+      }
+      if (this.mode === 'pending') {
+        const p = this.pend!;
+        if (Math.hypot(e.clientX - p.x, e.clientY - p.y) >= SurfacePaintGesture.TOUCH_START_PX) this.commitPending();
+        return;
+      }
+      if (h.hover && (!h.wantsHover || h.wantsHover())) h.hover(last ? [last.u, last.v] : null);
+      return;
+    }
+    if (this.mode !== 'idle' || touch) return;   // another pointer during a stroke; a finger has no hover
+    // Hover → the link cursor ring on the UV pane — only when someone shows it (P2: no raycast otherwise).
+    if (!h.hover || (h.wantsHover && !h.wantsHover())) return;
+    const hit = this.io.uvAt(e.clientX, e.clientY, this.io.measure());
+    h.hover(hit ? [hit.u, hit.v] : null);
+  }
+
+  up(e: GesturePointer): void {
+    if (e.pointerType === 'touch') this.touches.delete(e.pointerId);
+    if (this.mode === 'blocked') { if (this.touches.size === 0) this.mode = 'idle'; return; }
+    if (e.pointerId !== this.strokeId) return;
+    if (this.mode === 'pending') this.commitPending();   // a quick tap still paints its dab
+    if (this.mode !== 'drawing') return;
+    this.finish();
+    this.handlers()?.end(e.timeStamp);
+  }
+
+  /** pointercancel: the pointer is gone. A live stroke ends (it never stays stuck); a pending one paints nothing. */
+  cancel(e: GesturePointer): void {
+    if (e.pointerType === 'touch') this.touches.delete(e.pointerId);
+    if (this.mode === 'blocked') { if (this.touches.size === 0) this.mode = 'idle'; return; }
+    if (e.pointerId !== this.strokeId) return;
+    this.endForLostPointer(e.timeStamp);
+  }
+
+  /** lostpointercapture: the stroke's pointer no longer reports to the canvas — end the stroke (after a normal up
+   *  it is already over: no-op). Touch tracking is left alone (the finger may still be down). */
+  lostCapture(e: GesturePointer): void {
+    if (e.pointerId !== this.strokeId || (this.mode !== 'drawing' && this.mode !== 'pending')) return;
+    this.endForLostPointer(e.timeStamp);
+  }
+
+  /** Session exit: a live stroke ends normally, a pending one is dropped, everything resets. */
+  reset(): void {
+    if (this.mode === 'drawing') { this.finish(); this.handlers()?.end(); }
+    else this.dropPending();
+    this.mode = 'idle';
+    this.touches.clear();
+    this.strokeId = null;
+    this.rect = null;
+  }
+
+  private endForLostPointer(t: number): void {
+    if (this.mode === 'pending') { this.dropPending(); this.finish(); return; }
+    if (this.mode !== 'drawing') return;
+    this.finish();
+    this.handlers()?.end(t);
+  }
+
+  /** The touch stroke's first dab: begin at the press, then the samples that arrived since. */
+  private commitPending(): void {
+    if (this.mode !== 'pending' || !this.pend) return;
+    if (this.frame) { this.io.cancelFrame(this.frame); this.frame = 0; }
+    const p = this.pend;
+    this.pend = null;
+    const h = this.handlers();
+    if (!h) { this.finish(); return; }
+    this.mode = 'drawing';
+    h.begin(p.hit.u, p.hit.v, p.pressure, p.hit.sizeScale, { pointerType: p.pointerType, timestamp: p.t });
+    for (const q of p.queued) h.move(q.hit.u, q.hit.v, q.pressure, q.hit.sizeScale, q.t);
+  }
+
+  /** A second finger: the stroke becomes a gesture — its paint is put back, nothing is painted until all lift. */
+  private abortForGesture(): void {
+    const h = this.handlers();
+    if (this.mode === 'pending') { this.dropPending(); this.release(); }
+    else if (this.mode === 'drawing') {
+      this.release();
+      if (h?.cancel) h.cancel(); else h?.end();
+    }
+    this.mode = 'blocked';
+    this.strokeId = null;
+    this.rect = null;
+    h?.hover?.(null);
+  }
+
+  private dropPending(): void {
+    if (this.frame) { this.io.cancelFrame(this.frame); this.frame = 0; }
+    this.pend = null;
+  }
+
+  private finish(): void {
+    this.release();
+    this.mode = 'idle';
+    this.rect = null;
+  }
+
+  private release(): void {
+    if (this.strokeId !== null) this.io.release(this.strokeId);
+    this.strokeId = null;
+  }
+
+  /** The event's coalesced samples (S2), at most MAX_SAMPLES of them — evenly picked, the newest always kept. */
+  private samplesOf(e: GesturePointer): GesturePointer[] {
+    let list: GesturePointer[] | null = null;
+    try { list = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null; } catch { list = null; }
+    if (!list || list.length === 0) return [e];
+    const n = list.length, max = SurfacePaintGesture.MAX_SAMPLES;
+    if (n <= max) return list;
+    const out: GesturePointer[] = [];
+    for (let k = 1; k <= max; k++) out.push(list[Math.round((k * n) / max) - 1]);
+    return out;
+  }
 }
 
 /** Narrow host surface — everything Scene3DSurfacePaint needs from the parent manager beyond the shared ctx. */
@@ -51,7 +284,8 @@ export class Scene3DSurfacePaint {
   private _meshId: string | null = null;
   private _handlers?: SurfacePaintHandlers;
   private _cleanup?: () => void;
-  private _drawing = false;
+  /** The live pointer state machine (P1) — null outside a session. */
+  private _gesture: SurfacePaintGesture | null = null;
 
   constructor(
     private readonly ctx: ManagerContext,
@@ -137,59 +371,56 @@ export class Scene3DSurfacePaint {
     const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
     if (!canvas) return;
 
-    const uvAt = (e: PointerEvent): { u: number; v: number; sizeScale: number } | null => {
+    this._bind(canvas, (clientX, clientY, rect) => {
       const mesh = this.host.getMesh(meshId);
       if (!mesh) return null;
-      const rect = canvas.getBoundingClientRect();
-      const px = (e.clientX - rect.left) * (canvas.width / rect.width);
-      const py = (e.clientY - rect.top) * (canvas.height / rect.height);
+      const px = (clientX - rect.left) * (canvas.width / rect.width);
+      const py = (clientY - rect.top) * (canvas.height / rect.height);
       return this._screenToMeshUV(px, py, canvas.width, canvas.height, mesh);
-    };
+    });
+  }
 
-    const onDown = (e: PointerEvent) => {
-      if (e.button !== 0 || e.altKey || !this._handlers) return; // alt = orbit
-      const uv = uvAt(e);
-      if (!uv) return; // missed the mesh → let it through (orbit / select / pan)
-      e.stopImmediatePropagation();
-      e.preventDefault();
-      canvas.setPointerCapture(e.pointerId);
-      this._drawing = true;
-      this._handlers.begin(uv.u, uv.v, e.pressure || 1, uv.sizeScale);
-    };
-    const onMove = (e: PointerEvent) => {
-      const h = this._handlers;
-      if (!h) return;
-      const uv = uvAt(e);
-      if (this._drawing) {
-        e.stopImmediatePropagation();
-        if (uv) h.move(uv.u, uv.v, e.pressure || 1, uv.sizeScale); // off-mesh → skip, keep stroke alive
-      }
-      // Always update the link cursor (ring on the UV pane), drawing or hovering.
-      h.hover?.(uv ? [uv.u, uv.v] : null);
-    };
-    const onUp = (e: PointerEvent) => {
-      if (!this._drawing) return;
-      this._drawing = false;
-      canvas.releasePointerCapture(e.pointerId);
-      this._handlers?.end();
-    };
+  /** Wire the canvas pointer events to a {@link SurfacePaintGesture} (P1) that raycasts with `uvAt`. Shared by the
+   *  single- and multi-mesh paths. */
+  private _bind(canvas: HTMLCanvasElement, uvAt: SurfaceGestureIO['uvAt']): void {
+    const raf = typeof requestAnimationFrame === 'function';
+    const gesture = new SurfacePaintGesture({
+      measure: () => canvas.getBoundingClientRect(),
+      uvAt,
+      capture: (id) => { try { canvas.setPointerCapture(id); } catch { /* pointer already gone */ } },
+      release: (id) => { try { if (canvas.hasPointerCapture?.(id)) canvas.releasePointerCapture(id); } catch { /* gone */ } },
+      requestFrame: (cb) => (raf ? requestAnimationFrame(cb) : (setTimeout(cb, 16) as unknown as number)),
+      cancelFrame: (id) => { if (raf) cancelAnimationFrame(id); else clearTimeout(id); },
+    }, () => this._handlers);
+    this._gesture = gesture;
+
+    const onDown = (e: PointerEvent) => gesture.down(e);
+    const onMove = (e: PointerEvent) => gesture.move(e);
+    const onUp = (e: PointerEvent) => gesture.up(e);
+    const onCancel = (e: PointerEvent) => gesture.cancel(e);
+    const onLost = (e: PointerEvent) => gesture.lostCapture(e);
     const onLeave = () => this._handlers?.hover?.(null);
 
-    addZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
-    addZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
-    addZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
+    addZonelessListener(canvas, 'pointerdown',   onDown,   { capture: true });
+    addZonelessListener(canvas, 'pointermove',   onMove,   { capture: true });
+    addZonelessListener(canvas, 'pointerup',     onUp,     { capture: true });
+    addZonelessListener(canvas, 'pointercancel', onCancel, { capture: true });
+    addZonelessListener(canvas, 'lostpointercapture', onLost, { capture: true });
     addZonelessListener(canvas, 'pointerleave', onLeave);
     this._cleanup = () => {
-      removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
-      removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
-      removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
+      removeZonelessListener(canvas, 'pointerdown',   onDown,   { capture: true });
+      removeZonelessListener(canvas, 'pointermove',   onMove,   { capture: true });
+      removeZonelessListener(canvas, 'pointerup',     onUp,     { capture: true });
+      removeZonelessListener(canvas, 'pointercancel', onCancel, { capture: true });
+      removeZonelessListener(canvas, 'lostpointercapture', onLost, { capture: true });
       removeZonelessListener(canvas, 'pointerleave', onLeave);
     };
   }
 
   /** Exit 3D surface-paint input. */
   exit(): void {
-    if (this._drawing) { this._handlers?.end(); this._drawing = false; }
+    this._gesture?.reset();   // a live stroke ends normally; a pending touch stroke is dropped
+    this._gesture = null;
     this._cleanup?.();
     this._cleanup = undefined;
     this._handlers = undefined;
@@ -226,52 +457,12 @@ export class Scene3DSurfacePaint {
     const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
     if (!canvas) return;
 
-    const uvAt = (e: PointerEvent): { u: number; v: number } | null => {
+    this._bind(canvas, (clientX, clientY, rect) => {
       const meshes = meshIds.map(id => this.host.getMesh(id)).filter((m): m is Mesh3D => !!m);
       if (!meshes.length) return null;
-      const rect = canvas.getBoundingClientRect();
-      const px = (e.clientX - rect.left) * (canvas.width / rect.width);
-      const py = (e.clientY - rect.top) * (canvas.height / rect.height);
+      const px = (clientX - rect.left) * (canvas.width / rect.width);
+      const py = (clientY - rect.top) * (canvas.height / rect.height);
       return this._screenToMeshesUV(px, py, canvas.width, canvas.height, meshes);
-    };
-
-    const onDown = (e: PointerEvent) => {
-      if (e.button !== 0 || e.altKey || !this._handlers) return; // alt = orbit
-      const uv = uvAt(e);
-      if (!uv) return; // missed the box → let it through (orbit / select / pan)
-      e.stopImmediatePropagation();
-      e.preventDefault();
-      canvas.setPointerCapture(e.pointerId);
-      this._drawing = true;
-      this._handlers.begin(uv.u, uv.v, e.pressure || 1);
-    };
-    const onMove = (e: PointerEvent) => {
-      const hnd = this._handlers;
-      if (!hnd) return;
-      const uv = uvAt(e);
-      if (this._drawing) {
-        e.stopImmediatePropagation();
-        if (uv) hnd.move(uv.u, uv.v, e.pressure || 1);
-      }
-      hnd.hover?.(uv ? [uv.u, uv.v] : null);
-    };
-    const onUp = (e: PointerEvent) => {
-      if (!this._drawing) return;
-      this._drawing = false;
-      canvas.releasePointerCapture(e.pointerId);
-      this._handlers?.end();
-    };
-    const onLeave = () => this._handlers?.hover?.(null);
-
-    addZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
-    addZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
-    addZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
-    addZonelessListener(canvas, 'pointerleave', onLeave);
-    this._cleanup = () => {
-      removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
-      removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
-      removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
-      removeZonelessListener(canvas, 'pointerleave', onLeave);
-    };
+    });
   }
 }

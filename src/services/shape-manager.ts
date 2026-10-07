@@ -8622,7 +8622,9 @@ class ShapeManager {
      * Call `renderer.draw(session, editMesh, texture?)` each time the canvas needs refresh.
      */
     public createUVCanvasRenderer(canvas: HTMLCanvasElement): UVCanvasRenderer {
-        return new UVCanvasRenderer(canvas);
+        const r = new UVCanvasRenderer(canvas);
+        r.maxDpr = this.webgpuRenderer?.getGpuCaps?.().maxDpr ?? Infinity;   // mobile tier: the pane's DPR is capped like the main canvas
+        return r;
     }
 
     /**

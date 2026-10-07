@@ -6,6 +6,7 @@ import { EventEmitter } from "../renderer/util/event-emitter";
 import { RasterPaintEngine } from "../renderer/raster/core/raster-paint-engine";
 import { PointerInput } from "../renderer/raster/brushes/brush-engine";
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
+import { isPointerEventClaimed } from '../renderer/util/pointer-claims';
 import { getStrokePrediction, predictionAppliesTo } from '../renderer/raster/brushes/brush-input-settings';
 
 /** Stroke prediction limits (BRUSH-4): a predicted sample more than this far ahead of the last real one (ms) is
@@ -306,6 +307,9 @@ export class RasterDrawingService {
 
   private async start(ev: PointerEvent) {
     if (!this.isEnabled || ev.button !== 0) return;
+    // 7.3b P1: a finger that 3D surface paint took (it can't stop a touch — the orbit controller needs it) never
+    // also starts a 2D stroke on the layer under the mesh.
+    if (isPointerEventClaimed(ev)) return;
     // BRUSH-3: one stroke at a time. A second pointer (resting palm, pinch finger) or a duplicate pointerdown
     // used to restart the stroke mid-way AND take another interactive lease that end() never returned.
     if (this.isDrawing) return;

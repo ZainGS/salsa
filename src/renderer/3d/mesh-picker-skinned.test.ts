@@ -5,7 +5,7 @@
  * the geometry so painting/selecting a POSED creature lands on the visible surface, not the rest silhouette.
  * This drives the real MeshPicker with an orthographic camera and asserts a posed vertex is where the ray hits.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 // Shape.id uses self.crypto.randomUUID (browser globals). Provide both before importing nodes.
 import { webcrypto } from 'node:crypto';
 const _g = globalThis as { self?: unknown; crypto?: unknown };
@@ -83,5 +83,38 @@ describe('MeshPicker — skin-aware pick', () => {
     const hit = picker.pickMesh(50, 50, 100, 100, cam, [mesh]);
     expect(hit).not.toBeNull();
     expect(Math.abs(hit!.hitPoint[0])).toBeLessThan(0.05);
+  });
+
+  it('mobile-parity 7.3b P2: a pose that holds still gets a BVH (same hits); a new pose re-skins in place and drops it', () => {
+    const now = { t: 1000 };
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => now.t);
+    try {
+      const picker = new MeshPicker();
+      const mesh = makeQuad();
+      const skel = makeSkeleton();
+      mesh.skeleton = skel; mesh.skeletonId = 'sk';
+      mesh.gpuDirty = false;
+      skel.setJointPosition(0, [0.5, 0, 0]);
+      type SkinEntry = { verts: Float32Array; bvh: unknown };
+      const cache = (picker as unknown as { _skinCache: Map<string, SkinEntry> })._skinCache;
+      const linear = picker.pickMesh(75, 50, 100, 100, cam, [mesh]);   // pick 1 at this pose: linear scan
+      expect(cache.get(mesh.id)!.bvh).toBeNull();
+      const verts0 = cache.get(mesh.id)!.verts;
+      now.t += 10; picker.pickMesh(75, 50, 100, 100, cam, [mesh]);
+      now.t += 100; const viaBvh = picker.pickMesh(75, 50, 100, 100, cam, [mesh]);   // pick 3, > 50 ms → BVH
+      expect(cache.get(mesh.id)!.bvh).not.toBeNull();
+      expect(viaBvh!.triangleIndex).toBe(linear!.triangleIndex);
+      expect(viaBvh!.hitPoint[0]).toBeCloseTo(linear!.hitPoint[0], 6);
+      expect(viaBvh!.baryU).toBeCloseTo(linear!.baryU, 6);
+      expect(picker.pickMesh(50, 50, 100, 100, cam, [mesh])).toBeNull();          // the BVH is the POSED surface
+
+      skel.setJointPosition(0, [-0.5, 0, 0]);                                     // a new pose
+      const moved = picker.pickMesh(25, 50, 100, 100, cam, [mesh]);
+      expect(moved).not.toBeNull();
+      expect(moved!.hitPoint[0]).toBeLessThan(-0.3);
+      expect(cache.get(mesh.id)!.verts).toBe(verts0);                               // re-skinned into the same array
+      expect(cache.get(mesh.id)!.bvh).toBeNull();                                   // the old pose's BVH is gone
+      expect(picker.pickMesh(75, 50, 100, 100, cam, [mesh])).toBeNull();
+    } finally { spy.mockRestore(); }
   });
 });

@@ -67,6 +67,64 @@ interface ActiveTarget {
  *  we break the stroke instead. Tuned for atlas-packed islands; may need adjusting. */
 const UV_SEAM_JUMP_SQ = 0.15 * 0.15;
 
+/** One queued stroke sample (S2, mobile-parity 7.3b): stamped with the rest of its frame in one dab batch. */
+interface UVStrokeSample { u: number; v: number; pressure: number; sizeScale: number; timestamp: number }
+
+/** Where the controller hooks its once-per-frame dab drain: the renderer's pre-render callbacks (so a frame's
+ *  samples are stamped right before the frame that shows them). Null = no frame loop → every sample drains at once. */
+export interface UVPaintFrameHooks {
+  add(cb: () => boolean): void;
+  remove(cb: () => boolean): void;
+}
+
+/** Start options of a stroke: the PointerEvent's pointerType (a finger gets the touch smoothing cap — BRUSH-4) and
+ *  its timeStamp. */
+export interface UVStrokeBeginOpts { pointerType?: string; timestamp?: number }
+
+/**
+ * S3 (mobile-parity 7.3b): when the UV pane's live readback may run. Pure (the clock is passed in) so it is unit
+ * tested. One read in flight at a time; requests while one runs coalesce into one follow-up. While a stroke is live
+ * reads start at most every {@link STROKE_INTERVAL_MS} (~9 Hz) and only cover the stroke's region ('rect'); a 'full'
+ * request (stroke end, enter, refresh) is never delayed and always reads the whole texture.
+ */
+export class PaneReadbackGate {
+  static readonly STROKE_INTERVAL_MS = 110;
+  private inFlight = false;
+  private wanted = false;
+  private wantedFull = false;
+  private lastStart = -Infinity;
+
+  /** Ask for a read (`full` = the whole texture, else the stroke region while drawing). */
+  want(full: boolean): void {
+    this.wanted = true;
+    if (full) this.wantedFull = true;
+  }
+
+  /** What to do now: start a read of `start` kind, wait `waitMs` before asking again, or nothing (null). */
+  poll(now: number, drawing: boolean): { start: 'full' | 'rect' } | { waitMs: number } | null {
+    if (!this.wanted || this.inFlight) return null;
+    const full = this.wantedFull || !drawing;
+    if (!full) {
+      const wait = this.lastStart + PaneReadbackGate.STROKE_INTERVAL_MS - now;
+      if (wait > 0) return { waitMs: Math.ceil(wait) };
+    }
+    this.wanted = false;
+    this.wantedFull = false;
+    this.inFlight = true;
+    this.lastStart = now;
+    return { start: full ? 'full' : 'rect' };
+  }
+
+  /** The started read finished (or failed). */
+  done(): void { this.inFlight = false; }
+
+  /** Drop the queued requests (session exit). A read still in flight stays tracked: the next session's first read
+   *  waits for it, so an old read can never land on the pane after a newer one. */
+  reset(): void { this.wanted = false; this.wantedFull = false; this.lastStart = -Infinity; }
+
+  get busy(): boolean { return this.inFlight; }
+}
+
 export class UVPaintController {
   private readonly engine: RasterPaintEngine;
   private target: ActiveTarget | null = null;
@@ -93,20 +151,38 @@ export class UVPaintController {
    *  default 0,0, which made endStroke draw a line to the corner). */
   private lastUV: [number, number] = [0, 0];
 
-  // Throttled readback → pane (single in-flight, coalesced).
+  // Throttled readback → pane (single in-flight, coalesced; ~9 Hz region reads mid-stroke — PaneReadbackGate).
   private readonly paneCanvas: HTMLCanvasElement;
-  private readbackInFlight = false;
-  private readbackPending = false;
+  private readonly readGate = new PaneReadbackGate();
+  private readTimer: ReturnType<typeof setTimeout> | null = null;
+  /** S5: the pane redraw (link-cursor ring, hover, readback) is coalesced to at most one per animation frame. */
+  private paneRaf = 0;
+
+  // S2: stroke samples queued for the next frame's dab batch (drained by a pre-render callback).
+  private pending: UVStrokeSample[] = [];
+  private drainHooked = false;
+  private readonly drainBound = (): boolean => { this.drainPending(); return false; };
+  /** Without a frame loop (or when it stalls) the queue drains at this size instead of growing. */
+  static readonly MAX_PENDING = 64;
+  /** S8: the stroke's last timestamp (samples are kept non-decreasing) and size scale. */
+  private lastTs = -Infinity;
+  private lastSizeScale = 1;
+  /** The live stroke's PointerEvent.pointerType (S1) — a seam-jump restart keeps it. */
+  private strokePointerType: string | undefined = undefined;
+  /** S8: the pane pointer that owns the current pane stroke (null = no pane stroke). */
+  private panePointerId: number | null = null;
 
   private readonly downBound = (e: PointerEvent) => this.onDown(e);
   private readonly moveBound = (e: PointerEvent) => this.onMove(e);
   private readonly upBound   = (e: PointerEvent) => this.onUp(e);
+  private readonly cancelBound = (e: PointerEvent) => this.onCancel(e);
   // Swallow left-clicks while active so the host's face-select never fires at the
   // end of a paint stroke. (auxclick/middle is a separate event, so pan is unaffected.)
   private readonly clickBound = (e: MouseEvent) => { if (this.target) e.stopImmediatePropagation(); };
   private readonly leaveBound = () => this.onLeave();
 
-  constructor(device: GPUDevice, private readonly scheduleRender: () => void) {
+  constructor(device: GPUDevice, private readonly scheduleRender: () => void,
+              private readonly frameHooks: UVPaintFrameHooks | null = null) {
     this.engine = new RasterPaintEngine(device, scheduleRender);
     // The brush library + active brush + color are copied from the 2D illustration
     // engine on enter (syncBrushFrom) so UV/mesh painting uses the SAME brushes. The
@@ -190,6 +266,10 @@ export class UVPaintController {
     if (this.drawing) this.strokeEndUV();
     this.detachPane();   // listeners + cursor ring + resize observer (no-op when no pane)
     this.target = null;
+    this.unhookDrain();
+    this.pending = [];
+    if (this.readTimer !== null) { clearTimeout(this.readTimer); this.readTimer = null; }
+    this.readGate.reset();
     this.onStrokeEnd = null;   // session-scoped — never carry a packaging sync into a character session
     this.onStrokeMove = null;  // session-scoped too (the throttled stack recomposite)
   }
@@ -198,6 +278,9 @@ export class UVPaintController {
     addZonelessListener(c, 'pointerdown', this.downBound, { capture: true });
     addZonelessListener(c, 'pointermove', this.moveBound, { capture: true });
     addZonelessListener(c, 'pointerup',   this.upBound,   { capture: true });
+    // S8: a cancelled pointer (OS gesture, palm rejection) or a lost capture ends the stroke — never left stuck.
+    addZonelessListener(c, 'pointercancel',      this.cancelBound, { capture: true });
+    addZonelessListener(c, 'lostpointercapture', this.cancelBound, { capture: true });
     c.addEventListener('click',       this.clickBound, { capture: true });
     addZonelessListener(c, 'pointerleave', this.leaveBound);
     c.style.cursor = 'crosshair';
@@ -207,6 +290,8 @@ export class UVPaintController {
     removeZonelessListener(c, 'pointerdown', this.downBound, { capture: true });
     removeZonelessListener(c, 'pointermove', this.moveBound, { capture: true });
     removeZonelessListener(c, 'pointerup',   this.upBound,   { capture: true });
+    removeZonelessListener(c, 'pointercancel',      this.cancelBound, { capture: true });
+    removeZonelessListener(c, 'lostpointercapture', this.cancelBound, { capture: true });
     c.removeEventListener('click',       this.clickBound, { capture: true });
     removeZonelessListener(c, 'pointerleave', this.leaveBound);
     c.style.cursor = '';
@@ -260,6 +345,8 @@ export class UVPaintController {
     const t = this.target;
     if (!t) return;
     if (t.canvas) this.unbindPane(t.canvas);
+    this.panePointerId = null;
+    if (this.paneRaf) { if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.paneRaf); this.paneRaf = 0; }
     if (t.uvRenderer) {
       t.uvRenderer.onLayoutResize = null;
       t.uvRenderer.autoBackingStore = false;   // disconnects the ResizeObserver (re-enabled on attach)
@@ -309,35 +396,73 @@ export class UVPaintController {
     if (!t || !t.canvas || !t.uvRenderer || e.button !== 0) return;
     e.stopImmediatePropagation();
     e.preventDefault();
-    t.canvas.setPointerCapture(e.pointerId);
+    // S8: one stroke at a time, owned by one pointer — a second finger / pen (or a 3D-surface stroke already
+    // running) never restarts it mid-way.
+    if (this.drawing || e.isPrimary === false) return;
+    try { t.canvas.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+    this.paneRect = t.canvas.getBoundingClientRect();   // one layout read per stroke (S8 / P2)
     const [px, py] = this.toCanvasPx(e);
     this.setCursorPx(px, py);
     const [u, v] = t.uvRenderer.canvasToUV(px, py, t.session);
-    this.strokeBeginUV(u, v, e.pressure || 1);
+    this.panePointerId = typeof e.pointerId === 'number' ? e.pointerId : null;
+    this.strokeBeginUV(u, v, e.pressure || 1, 1, { pointerType: e.pointerType, timestamp: e.timeStamp });
   }
 
   private onMove(e: PointerEvent): void {
     const t = this.target;
     if (!t || !t.canvas || !t.uvRenderer) return;
-    const [px, py] = this.toCanvasPx(e);
-    if (this.drawing) {
+    if (this.drawing && this.paneOwnsStroke(e)) {
       e.stopImmediatePropagation();
+      // The pointerup was missed (released outside / swallowed) → end here instead of drawing a hover line.
+      if (typeof e.buttons === 'number' && (e.buttons & 1) === 0) { this.endPaneStroke(e); return; }
+      // S2: every sample the browser coalesced into this event, each with its own timestamp — queued and
+      // stamped as one dab batch right before the next frame.
+      const list = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
+      const samples: PointerEvent[] = list && list.length ? list : [e];
+      let px = 0, py = 0;
+      for (const s of samples) {
+        [px, py] = this.toCanvasPx(s);
+        const [u, v] = t.uvRenderer.canvasToUV(px, py, t.session);
+        this.strokeMoveUV(u, v, s.pressure || 1, 1, s.timeStamp);
+      }
       this.setCursorPx(px, py);
-      const [u, v] = t.uvRenderer.canvasToUV(px, py, t.session);
-      this.strokeMoveUV(u, v, e.pressure || 1);
-    } else if (e.buttons === 0) {
+    } else if (!this.drawing && e.buttons === 0) {
       // Hover → brush ring at the cursor + cross-highlight the face under it.
       // Own the event so the host's hover handler never double-fires.
       e.stopImmediatePropagation();
+      this.paneRect = null;   // hover: a fresh rect (layout may have moved between strokes)
+      const [px, py] = this.toCanvasPx(e);
       this.setCursorPx(px, py);
       t.session.hoveredFaceIndex = t.mesh.editMesh
         ? t.uvRenderer.hitTestFace(px, py, t.session, t.mesh.editMesh)
         : null;
-      this.renderPane();
+      this.requestPaneRender();
       this.scheduleRender(); // 3D mesh face highlight
     }
     // A non-left drag (middle/right held) is left untouched so the host can still
     // pan/zoom the UV pane while paint mode is active.
+  }
+
+  /** The pane stroke's own pointer (S8) — events from any other pointer are ignored. */
+  private paneOwnsStroke(e: PointerEvent): boolean {
+    return this.panePointerId !== null && (e.pointerId === undefined || e.pointerId === this.panePointerId);
+  }
+
+  /** End the pane stroke for its pointer: release the capture and finish the stroke. */
+  private endPaneStroke(e: PointerEvent): void {
+    const id = this.panePointerId;
+    this.panePointerId = null;
+    this.paneRect = null;
+    if (id !== null) {
+      try { if (this.target?.canvas?.hasPointerCapture?.(id)) this.target.canvas.releasePointerCapture(id); } catch { /* gone */ }
+    }
+    if (this.drawing) this.strokeEndUV(e.timeStamp);
+  }
+
+  /** pointercancel / lostpointercapture on the pane: the stroke ends (never left stuck). */
+  private onCancel(e: PointerEvent): void {
+    if (!this.paneOwnsStroke(e)) return;
+    this.endPaneStroke(e);
   }
 
   /** Place the UV-pane brush ring at a canvas-pixel position, sized to the brush. */
@@ -348,7 +473,7 @@ export class UVPaintController {
   private onLeave(): void {
     if (!this.target) return;
     this.target.session.paintCursor = null;
-    this.renderPane();
+    this.requestPaneRender();
   }
 
   /** Show the UV-pane brush ring from a 3D-mesh hover (mapped to UV), or clear it.
@@ -361,34 +486,62 @@ export class UVPaintController {
       const [x, y] = t.uvRenderer.uvToCanvas(uv[0], uv[1], t.session);
       t.session.paintCursor = { x, y, r: this.ringScreenRadius() };
     } else {
+      if (!t.session.paintCursor) return;   // already cleared — nothing to redraw
       t.session.paintCursor = null;
     }
-    this.renderPane();
+    this.requestPaneRender();   // S5: at most one pane redraw per frame, however many moves arrive
   }
 
+  /** Whether a 3D-surface hover has anyone to show the link cursor to (the UV pane is attached). The surface input
+   *  skips its per-move hover raycast when this is false (P2). */
+  wantsLinkCursor(): boolean { return !!this.target?.uvRenderer; }
+
   private onUp(e: PointerEvent): void {
-    if (!this.drawing) return;
+    if (!this.drawing || !this.paneOwnsStroke(e)) return;
     e.stopImmediatePropagation(); // own the stroke-ending up so the host doesn't act on it
-    try { this.target?.canvas?.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
-    this.strokeEndUV();
+    this.endPaneStroke(e);
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
-  private toCanvasPx(e: PointerEvent): [number, number] {
+  /** The pane's client rect, cached for the length of a pane stroke (P2 / S8: no layout read per move). */
+  private paneRect: DOMRect | null = null;
+
+  private toCanvasPx(e: { clientX: number; clientY: number }): [number, number] {
     const c = this.target?.canvas;
     if (!c) return [0, 0];
-    const rect = c.getBoundingClientRect();
+    const rect = this.paneRect ?? c.getBoundingClientRect();
     return [
       (e.clientX - rect.left) * (c.width  / rect.width),
       (e.clientY - rect.top)  * (c.height / rect.height),
     ];
   }
 
-  /** UV [0,1] → brush PointerInput in texel space. */
-  private inputFromUV(u: number, v: number, pressure: number): PointerInput {
+  /** UV [0,1] → brush PointerInput in texel space. `timestamp`: the sample's (already kept non-decreasing). */
+  private inputFromUV(u: number, v: number, pressure: number, timestamp: number): PointerInput {
     const { w, h } = this.target!.texMgr.getTextureSize();
-    return { x: u * w, y: v * h, pressure, timestamp: Date.now(), tiltX: 0, tiltY: 0 };
+    return { x: u * w, y: v * h, pressure, timestamp, tiltX: 0, tiltY: 0 };
+  }
+
+  /** S8: the sample's own event time (`e.timeStamp`, not the handling time — queued and coalesced samples keep
+   *  their real spacing), kept non-decreasing within a stroke. */
+  private eventTime(t?: number): number {
+    let ts = (typeof t === 'number' && t > 0 && Number.isFinite(t)) ? t : performance.now();
+    if (ts < this.lastTs) ts = this.lastTs;
+    this.lastTs = ts;
+    return ts;
+  }
+
+  private hookDrain(): void {
+    if (this.drainHooked || !this.frameHooks) return;
+    this.frameHooks.add(this.drainBound);
+    this.drainHooked = true;
+  }
+
+  private unhookDrain(): void {
+    if (!this.drainHooked || !this.frameHooks) return;
+    this.frameHooks.remove(this.drainBound);
+    this.drainHooked = false;
   }
 
   // ── UV-coordinate stroke API ────────────────────────────────────────────────
@@ -399,9 +552,18 @@ export class UVPaintController {
 
   /** Begin a stroke at a UV [0,1] coordinate. The engine's current brush (the active
    *  preset + color + erase, set via the shared brush UI) defines the dab. */
-  strokeBeginUV(u: number, v: number, pressure = 1, sizeScale = 1): void {
+  strokeBeginUV(u: number, v: number, pressure = 1, sizeScale = 1, opts?: UVStrokeBeginOpts): void {
+    this.beginRun(u, v, pressure, sizeScale, opts, true);
+  }
+
+  /** Begin a stroke. `mirrorBrush` = run {@link beforeStroke} (the per-stroke 2D brush mirror, a preset JSON clone).
+   *  A seam-jump restart passes false: the brush cannot change in the middle of a drag (S7). */
+  private beginRun(u: number, v: number, pressure: number, sizeScale: number, opts: UVStrokeBeginOpts | undefined, mirrorBrush: boolean): void {
     if (!this.target) return;
+    if (this.drawing) this.strokeEndUV();   // never begin over a live stroke (its undo patch would be lost)
     this.engine.setSizeScale(sizeScale);   // 3D-surface paint passes local UV density so the stroke keeps a constant physical size
+    this.lastSizeScale = sizeScale;
+    this.strokePointerType = opts?.pointerType;
     // ★RE-RESOLVE the engine's write target from the texture manager on EVERY stroke start.
     // enter() captures texMgr.getTexture() once — but the manager can REALLOCATE its GPUTexture
     // after that (RasterLayerManager.setCanvasSize reallocates EVERY layer texture on a doc/canvas
@@ -410,29 +572,78 @@ export class UVPaintController {
     // Without this, every subsequent dab lands in an orphaned/destroyed texture: invisible on the
     // mesh, invisible in the pane, silently dropped from the save.
     this.syncActiveTexture();
-    this.beforeStroke?.(); // mirror the live 2D brush onto this engine before the dab
+    if (mirrorBrush) this.beforeStroke?.(); // mirror the live 2D brush onto this engine before the dab
     this.drawing = true;
     this.lastUV = [u, v];
-    this.engine.beginStroke(this.inputFromUV(u, v, pressure));
+    this.lastTs = -Infinity;
+    this.pending = [];
+    // pointerType: a finger stroke gets the touch smoothing cap (brush-input-settings.ts); pen / mouse don't (S1).
+    this.engine.beginStroke(this.inputFromUV(u, v, pressure, this.eventTime(opts?.timestamp)), { pointerType: opts?.pointerType });
+    this.hookDrain();
     this.scheduleRender();
     this.scheduleReadback();
   }
 
-  /** Add a point to the active stroke at a UV [0,1] coordinate. */
-  strokeMoveUV(u: number, v: number, pressure = 1, sizeScale = 1): void {
+  /** Add a point to the active stroke at a UV [0,1] coordinate. `timestamp`: the sample's event time (S8).
+   *  S2: the sample is QUEUED and stamped with the rest of its frame as one dab batch (see drainPending). */
+  strokeMoveUV(u: number, v: number, pressure = 1, sizeScale = 1, timestamp?: number): void {
     if (!this.target || !this.drawing) return;
-    this.engine.setSizeScale(sizeScale);
-    const du = u - this.lastUV[0], dv = v - this.lastUV[1];
-    if (du * du + dv * dv > UV_SEAM_JUMP_SQ) {
-      // UV discontinuity — the stroke crossed a seam / hopped to another island. A
-      // straight line in texture space between the two would streak across unrelated
-      // islands, so end this stroke and restart on the new island.
-      this.strokeEndUV();
-      this.strokeBeginUV(u, v, pressure, sizeScale);
-      return;
+    this.pending.push({ u, v, pressure, sizeScale, timestamp: this.eventTime(timestamp) });
+    // No frame loop to drain us (or rendering stalled) → stamp now rather than let the queue grow.
+    if (!this.drainHooked || this.pending.length >= UVPaintController.MAX_PENDING) this.drainPending();
+    else this.scheduleRender();
+  }
+
+  /**
+   * S2: stamp the queued samples as ONE dab batch (one GPU submit) — runs as a pre-render callback, so a frame's
+   * samples land right before the frame that shows them. The per-dab size scale can change between samples (3D
+   * surface: the local UV density of each hit triangle), so the batch is split into addStrokePoints runs of equal
+   * scale inside one outer batch. The seam-jump check runs per sample, exactly as when every sample was stamped on
+   * its own.
+   */
+  private drainPending(): void {
+    if (!this.target || !this.drawing || this.pending.length === 0) { this.pending.length = 0; return; }
+    const samples = this.pending;
+    this.pending = [];
+    const engine = this.engine;
+    let run: PointerInput[] = [];
+    const flushRun = () => { if (run.length) { engine.addStrokePoints(run); run = []; } };
+    engine.beginDabBatch();
+    let batchOpen = true;
+    try {
+      for (const s of samples) {
+        if (!this.drawing) break;   // (a restart below failed to begin — nothing left to paint into)
+        const du = s.u - this.lastUV[0], dv = s.v - this.lastUV[1];
+        if (du * du + dv * dv > UV_SEAM_JUMP_SQ) {
+          // UV discontinuity — the stroke crossed a seam / hopped to another island. A straight line in texture
+          // space between the two would streak across unrelated islands. S7: LIFT the brush inside the same stroke
+          // (no line, the stroke stays one undo step, no end/restart readbacks); a stroke-texture preset can't lift
+          // (its strip is one polyline), so that one still ends + restarts on the new island — without re-running
+          // the per-stroke brush mirror (the brush can't change mid-drag).
+          flushRun();
+          const runEnd = this.inputFromUV(this.lastUV[0], this.lastUV[1], 1, s.timestamp);   // what a stroke end used
+          const next = this.inputFromUV(s.u, s.v, s.pressure, s.timestamp);
+          if (engine.liftStroke(runEnd, next, s.sizeScale)) {
+            this.lastSizeScale = s.sizeScale;
+          } else {
+            engine.endDabBatch(); batchOpen = false;
+            this.strokeEndUV();
+            this.beginRun(s.u, s.v, s.pressure, s.sizeScale, { pointerType: this.strokePointerType, timestamp: s.timestamp }, false);
+            engine.beginDabBatch(); batchOpen = true;
+          }
+          this.lastUV = [s.u, s.v];
+          continue;
+        }
+        if (s.sizeScale !== this.lastSizeScale) { flushRun(); engine.setSizeScale(s.sizeScale); this.lastSizeScale = s.sizeScale; }
+        this.lastUV = [s.u, s.v];
+        run.push(this.inputFromUV(s.u, s.v, s.pressure, s.timestamp));
+      }
+      flushRun();
+    } catch (e) {
+      console.warn('[UVPaint] stroke points failed', e);
+    } finally {
+      if (batchOpen) engine.endDabBatch();
     }
-    this.lastUV = [u, v];
-    this.engine.addStrokePoint(this.inputFromUV(u, v, pressure));
     this.onStrokeMove?.();   // e.g. the throttled package-stack recomposite (box updates mid-stroke)
     this.scheduleRender();
     this.scheduleReadback();
@@ -440,41 +651,94 @@ export class UVPaintController {
 
   /** Finish the active stroke — ends at the last painted point (passing a default
    *  0,0 here made endStroke draw a line across to the texture corner). */
-  strokeEndUV(): void {
+  strokeEndUV(timestamp?: number): void {
     if (!this.target || !this.drawing) return;
+    this.drainPending();   // stamp whatever is still queued first
     this.drawing = false;
+    this.panePointerId = null;
+    this.unhookDrain();
     this.engine.setSizeScale(1);   // clear the 3D density scale so pane / 2D strokes aren't affected
-    void this.engine.endStroke(this.inputFromUV(this.lastUV[0], this.lastUV[1], 1));
+    this.lastSizeScale = 1;
+    void this.engine.endStroke(this.inputFromUV(this.lastUV[0], this.lastUV[1], 1, this.eventTime(timestamp)));
     // One stroke-end contract for BOTH input paths (pane pointer-up + 3D surface-input end):
     // refresh the live-texture link → the 3D mesh, then render. See the field docs.
     this.onStrokeEnd?.();
     this.scheduleRender();
-    this.scheduleReadback();
+    this.scheduleReadback(true);   // S3: the one full read at stroke end (mid-stroke reads cover only the stroke)
   }
+
+  /**
+   * Abandon the active stroke (P1: a second finger turned it into a pinch): queued samples are dropped and the
+   * texture goes back to its stroke-start pixels — no paint is left and no undo step is made. No-op when not drawing.
+   */
+  strokeCancelUV(): void {
+    if (!this.target || !this.drawing) return;
+    this.pending = [];
+    this.drawing = false;
+    this.panePointerId = null;
+    this.unhookDrain();
+    this.engine.setSizeScale(1);
+    this.lastSizeScale = 1;
+    this.engine.cancelStroke();
+    this.onStrokeEnd?.();   // the restored texels must reach the live-texture link / package composite too
+    this.scheduleRender();
+    this.scheduleReadback(true);
+  }
+
+  /** Whether a stroke is live (pane or 3D surface). */
+  isDrawing(): boolean { return this.drawing; }
 
   /** Force the UV pane to redraw with the current texture (e.g. after a session flag
    *  like `faceGuide` changes). No-op without a pane. */
-  refreshPane(): void { this.scheduleReadback(); }
+  refreshPane(): void { this.scheduleReadback(true); }
 
   // ── Throttled readback → UV pane ───────────────────────────────────────────
 
-  private scheduleReadback(): void {
+  /** `full`: read the whole texture (stroke end / enter / refresh). Otherwise, mid-stroke, a throttled read of the
+   *  stroke's region (S3). */
+  private scheduleReadback(full = false): void {
     if (!this.target?.uvRenderer) return; // no pane → nothing to read back into; mesh updates via the texture ref
-    if (this.readbackInFlight) { this.readbackPending = true; return; }
-    this.readbackInFlight = true;
-    void this.doReadback();
+    this.readGate.want(full);
+    this.pumpReadback();
   }
 
-  private async doReadback(): Promise<void> {
+  private pumpReadback(): void {
+    if (!this.target?.uvRenderer) return;
+    const r = this.readGate.poll(performance.now(), this.drawing);
+    if (!r) return;
+    if ('waitMs' in r) {
+      if (this.readTimer === null) this.readTimer = setTimeout(() => { this.readTimer = null; this.pumpReadback(); }, r.waitMs);
+      return;
+    }
+    void this.doReadback(r.start);
+  }
+
+  private async doReadback(kind: 'full' | 'rect'): Promise<void> {
     const t = this.target;
-    if (!t) { this.readbackInFlight = false; return; }
-    // Pane background source: the layer-stack COMPOSITE when provided (shows all layers), else
-    // the write target itself (the historical single-texture behaviour).
-    const src = t.readbackTexMgr?.() ?? t.texMgr;
-    await src.readToCanvas(this.paneCanvas);
-    this.renderPane();
-    this.readbackInFlight = false;
-    if (this.readbackPending) { this.readbackPending = false; this.scheduleReadback(); }
+    if (!t) { this.readGate.done(); return; }
+    try {
+      // Pane background source: the layer-stack COMPOSITE when provided (shows all layers), else
+      // the write target itself (the historical single-texture behaviour).
+      const src = t.readbackTexMgr?.() ?? t.texMgr;
+      // Mid-stroke: only the stroke's region so far (texel space — the composite is doc-sized like the write
+      // target). Everything else on the pane canvas is unchanged since the last full read.
+      const rect = kind === 'rect' ? this.engine.peekStrokeDirtyRect() : null;
+      if (kind === 'full' || rect) await src.readToCanvas(this.paneCanvas, rect);
+    } catch (e) {
+      console.warn('[UVPaint] pane readback failed', e);
+    } finally {
+      this.readGate.done();
+    }
+    this.requestPaneRender();
+    this.pumpReadback();   // a request that arrived meanwhile (or the next session's first read)
+  }
+
+  /** S5: redraw the pane on the next animation frame (coalesced — many hover / link-cursor moves, one draw). */
+  private requestPaneRender(): void {
+    if (!this.target?.uvRenderer) return;
+    if (typeof requestAnimationFrame !== 'function') { this.renderPane(); return; }
+    if (this.paneRaf) return;
+    this.paneRaf = requestAnimationFrame(() => { this.paneRaf = 0; this.renderPane(); });
   }
 
   private renderPane(): void {

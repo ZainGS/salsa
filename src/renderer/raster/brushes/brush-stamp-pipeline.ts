@@ -608,6 +608,39 @@ export class BrushStampPipeline {
     this.strokeActive = false;
   }
 
+  /**
+   * Abandon the live stroke (UV paint: a second finger turned the stroke into a pinch): put the stroke-start pixels
+   * back over everything the stroke wrote, then end it. The accum is cleared and base ⊕ (empty accum) is composited
+   * over the stroke's touched rect — the composite stores the base texel exactly where the accum is empty, so this
+   * is a byte-exact restore that uses only the stroke's own kinds of GPU work (no texture copy into the layer, no
+   * readback, no undo entry). Covers direct (erase / blend-mode) dab writes too: they are inside strokeTouched.
+   * Returns true when something was restored.
+   */
+  public abortStroke(): boolean {
+    this.settleProvisional();
+    this.flush();
+    const out = this.strokeTarget, base = this.strokeBaseTex, accum = this.strokeAccumTex;
+    const r = this.strokeTouched;
+    this.strokeTouched = null;
+    this.strokeAccumDirty = null;
+    this.strokeOutputDirty = null;
+    this.pendingComposite = null;
+    this.pendingCompositeFull = false;
+    this.pendingOutput = null;
+    const wasActive = this.strokeActive;
+    this.strokeActive = false;
+    if (!wasActive || !r || !out || !base || !accum || out.width !== this.strokeTexW || out.height !== this.strokeTexH) return false;
+    const x0 = Math.max(0, Math.floor(r.x0)), y0 = Math.max(0, Math.floor(r.y0));
+    const x1 = Math.min(out.width, Math.ceil(r.x1)), y1 = Math.min(out.height, Math.ceil(r.y1));
+    if (x1 <= x0 || y1 <= y0) return false;
+    this.reserveStaging(DAB_STAGING_BYTES);
+    const enc = this.encoder();
+    this.recordClear(enc, accum);
+    this.compositeRecord(enc, base, accum, out, { x0, y0, x1, y1 });
+    this.flush();
+    return true;
+  }
+
   /** The end-of-stroke flatten (see endStroke): one bounded composite of the accum into the stroke's output. */
   private compositeStrokeEnd(): void {
     const out = this.strokeTarget, base = this.strokeBaseTex, accum = this.strokeAccumTex;

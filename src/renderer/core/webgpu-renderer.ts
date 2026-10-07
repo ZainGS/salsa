@@ -1245,7 +1245,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     this._gpuCaps = c;
     const rc = Renderer3D.caps;
     rc.gpuDriven = c.gpuDriven; rc.shaderVariants = c.shaderVariants;
-    rc.shadows = c.shadows; rc.ssao = c.ssao; rc.ssr = c.ssr; rc.taa = c.taa;
+    rc.shadows = c.shadows; rc.ssao = c.ssao; rc.ssr = c.ssr; rc.taa = c.taa; rc.animatedFocusBg = c.animatedFocusBg !== false;
     TextEffectEngine.htmlInCanvasAllowed = c.htmlInCanvas;
     GPUPipelineCache.defaultMaxConcurrentWarm = Math.max(1, Math.floor(c.warmConcurrency));
     const pc = this.device ? GPUPipelineCache.peek(this.device) : null;
