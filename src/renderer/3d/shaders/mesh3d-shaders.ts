@@ -3042,6 +3042,13 @@ fn fs_main(
     }
     if (dbgM == 5u) { return vec4<f32>(u_instances[0].diffuseColor.rgb, 1.0); }
     if (dbgM == 6u) { return vec4<f32>(gouraudColor.rgb, 1.0); }
+    // 10 = the instance's material flag bits as a colour: RED = sparkle / star sparkle (bits 8 / 12), GREEN = rim
+    // (bit 7), on a dark-blue base. A plain cube is all dark blue; red only at some pixels = a per-pixel flags read
+    // going wrong, red everywhere = the sparkle bit really is set on the material.
+    if (dbgM == 10u) {
+      let dbgFb = inst.flags;
+      return vec4<f32>(select(0.0, 1.0, (dbgFb & 4352u) != 0u), select(0.0, 1.0, (dbgFb & 128u) != 0u), 0.3, 1.0);
+    }
     // 7 / 8 = solid grey / white (does the rainbow depend on the colour value?); 9 = the raw interpolated world normal
     // (one flat colour per cube face when healthy; through dbgFinal, so with dbgNanCheck on a NaN normal is green).
     if (dbgM == 7u) { return vec4<f32>(0.5, 0.5, 0.5, 1.0); }
@@ -3509,7 +3516,8 @@ fn fs_main(
 
   // Sparkle / glint — sparse twinkling micro-glints (the metal "glisten in the light"). Scintillates as the camera /
   // light move; twinkles over scene time (ps1Config2.z). Bright + light-tinted so it reads as a reflection.
-  if (sparkleOn || starSparkle) {
+  // RENDER DEBUG noSparkle (ibl.dbgFlags 32, uniform): skip the sparkle / glint term.
+  if ((sparkleOn || starSparkle) && (u32(ibl.dbgFlags) & 32u) == 0u) {
     var spk = 0.0;
     if (starSparkle) { spk = sparkleStar(worldPos, N, scene.ps1Config2.z, 45.0); }          // ✦ anime star bling
     else             { spk = sparkleGlint(worldPos, N, rdNormalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
@@ -3965,6 +3973,13 @@ fn fs_main(
     }
     if (dbgM == 5u) { return vec4<f32>(u_instances[0].diffuseColor.rgb, 1.0); }
     if (dbgM == 6u) { return vec4<f32>(gouraudColor.rgb, 1.0); }
+    // 10 = the instance's material flag bits as a colour: RED = sparkle / star sparkle (bits 8 / 12), GREEN = rim
+    // (bit 7), on a dark-blue base. A plain cube is all dark blue; red only at some pixels = a per-pixel flags read
+    // going wrong, red everywhere = the sparkle bit really is set on the material.
+    if (dbgM == 10u) {
+      let dbgFb = inst.flags;
+      return vec4<f32>(select(0.0, 1.0, (dbgFb & 4352u) != 0u), select(0.0, 1.0, (dbgFb & 128u) != 0u), 0.3, 1.0);
+    }
     // 7 / 8 = solid grey / white (does the rainbow depend on the colour value?); 9 = the raw interpolated world normal
     // (one flat colour per cube face when healthy; through dbgFinal, so with dbgNanCheck on a NaN normal is green).
     if (dbgM == 7u) { return vec4<f32>(0.5, 0.5, 0.5, 1.0); }
@@ -4342,7 +4357,8 @@ fn fs_main(
   lit = lit + scene.lightColor.rgb * waterGlint;
 
   // Sparkle / glint — sparse twinkling micro-glints (the metal "glisten in the light"). See the textured fragment.
-  if (sparkleOn || starSparkle) {
+  // RENDER DEBUG noSparkle (ibl.dbgFlags 32, uniform): skip the sparkle / glint term.
+  if ((sparkleOn || starSparkle) && (u32(ibl.dbgFlags) & 32u) == 0u) {
     var spk = 0.0;
     if (starSparkle) { spk = sparkleStar(worldPos, N, scene.ps1Config2.z, 45.0); }          // ✦ anime star bling
     else             { spk = sparkleGlint(worldPos, N, rdNormalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint

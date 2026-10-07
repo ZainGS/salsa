@@ -90,6 +90,10 @@ export type RenderDebugFlags = {
   /** Mesh fragment shader (shadow-receiving pipelines): output the raw shadow factor as grey; red = above 1,
    *  blue = below 0, green = NaN / Inf. */
   dbgShadowFactor: boolean;
+  /** Mesh fragment shader: skip the sparkle / glint term (sparse white light-scaled glints). */
+  noSparkle: boolean;
+  /** Mesh fragment shader: the material flag bits as a colour (red = sparkle, green = rim, on dark blue). */
+  dbgFlagBits: boolean;
   /** Every 3D pass that LOADS depth / stencil clears it instead (overlays lose depth occlusion). */
   clearDepthStencilLoads: boolean;
   /** Every 3D pass that LOADS colour clears it instead. Breaks the picture (an overlay pass wipes the scene); the point
@@ -117,6 +121,8 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'safeLightingMath', label: 'Safe lighting math' },
   { key: 'noShadowReceive', label: 'No shadow receive' },
   { key: 'dbgShadowFactor', label: 'Mesh colour = shadow factor' },
+  { key: 'noSparkle', label: 'No sparkle / glint' },
+  { key: 'dbgFlagBits', label: 'Mesh colour = material flags (red = sparkle)' },
   { key: 'noMeshEditOverlays', label: 'No mesh-edit / UV-paint overlays' },
   { key: 'noRearEdges', label: 'No mesh-edit rear edges' },
   { key: 'noBackground3D', label: 'No 3D background (focus bg)' },
@@ -199,23 +205,23 @@ export function getRenderDebug(): RenderDebugFlags { return { ...RD.f }; }
 
 /** The mesh fragment shader debug mode (IBLUniforms.dbgShade): 0 = off, 1 = unlit, 2 = constant colour, 3 = magenta,
  *  4 = instance index colour, 5 = instance 0's colour, 6 = vertex-stage colour, 7 = solid grey, 8 = solid white,
- *  9 = world normal colour. One mode at a time: the solid colours win, then the read tests, then unlit. */
+ *  9 = world normal colour, 10 = material flag bits (red = sparkle, green = rim). One mode at a time: the solid colours win, then the read tests, then unlit. */
 export function renderDebugShadeMode(): number {
   if (!RD.on) return 0;
   const f = RD.f;
   return f.solidMesh ? 3 : f.solidWhite ? 8 : f.solidGrey ? 7
-    : f.dbgInstanceIndex ? 4 : f.dbgInstanceZero ? 5 : f.dbgVertexColour ? 6 : f.dbgNormal ? 9
+    : f.dbgInstanceIndex ? 4 : f.dbgInstanceZero ? 5 : f.dbgVertexColour ? 6 : f.dbgFlagBits ? 10 : f.dbgNormal ? 9
     : f.noTextures ? 2 : f.noLighting ? 1 : 0;
 }
 
 /** The mesh fragment shader debug bits (IBLUniforms.dbgFlags): 1 = clamp the texture-array layer indices,
  *  2 = NaN / Inf highlight (dbgNanCheck), 4 = safe lighting maths (safeLightingMath), 8 = no shadow receive,
- *  16 = shadow factor as colour. */
+ *  16 = shadow factor as colour, 32 = no sparkle / glint. */
 export function renderDebugShaderBits(): number {
   if (!RD.on) return 0;
   const f = RD.f;
   return (f.clampTexLayers ? 1 : 0) | (f.dbgNanCheck ? 2 : 0) | (f.safeLightingMath ? 4 : 0)
-    | (f.noShadowReceive ? 8 : 0) | (f.dbgShadowFactor ? 16 : 0);
+    | (f.noShadowReceive ? 8 : 0) | (f.dbgShadowFactor ? 16 : 0) | (f.noSparkle ? 32 : 0);
 }
 
 /** The canvas context alpha mode: 'premultiplied' (the default), 'opaque' under forceOpaqueAlpha. */

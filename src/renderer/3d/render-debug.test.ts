@@ -137,6 +137,8 @@ describe('render debug flag set', () => {
         setRenderDebug({ clampTexLayers: true, dbgNanCheck: false }); expect(renderDebugShaderBits()).toBe(5);
         setRenderDebug({ reset: true, noShadowReceive: true }); expect(renderDebugShaderBits()).toBe(8);
         setRenderDebug({ dbgShadowFactor: true }); expect(renderDebugShaderBits()).toBe(24);
+        setRenderDebug({ reset: true, noSparkle: true }); expect(renderDebugShaderBits()).toBe(32);
+        setRenderDebug({ reset: true, dbgFlagBits: true }); expect(renderDebugShadeMode()).toBe(10);
         setRenderDebug({ reset: true });
         setRenderDebug({ clearColorLoads: true }); expect(rdColorLoad()).toBe('clear'); expect(rdDepthLoad()).toBe('load');
         setRenderDebug({ clearDepthStencilLoads: true }); expect(rdDepthLoad()).toBe('clear');
