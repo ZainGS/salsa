@@ -43,8 +43,8 @@ describe('foliage material flags — windSway (bit 19) + foliageShade (bit 20)',
     const everythingElse: Material3D = {
       ...DEFAULT_MATERIAL,
       hasTexture: true, hasNormalMap: true, renderStyle: 'cel-hd',
-      alphaCutout: true, hairSheen: true, rimEnabled: true, sparkleEnabled: true,
-      sparkleStar: true, leafCard: true, glassEnhance: true, patternMode: 'waves',
+      alphaCutout: true, hairSheen: true, rimEnabled: true,
+      leafCard: true, glassEnhance: true, patternMode: 'waves',
       texOverBase: true, boardShade: true, radialFade: true, groundShade: true,
     };
     expect(encodeMaterialFlags(everythingElse) & (WIND_BIT | FOLIAGE_BIT)).toBe(0);

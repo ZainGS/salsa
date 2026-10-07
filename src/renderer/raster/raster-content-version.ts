@@ -52,3 +52,27 @@ export function rasterTextureWrittenAt(tex: object): number {
   const own = writtenAt.get(tex) ?? 0;
   return own > unattributedAt ? own : unattributedAt;
 }
+
+const textureUids = new WeakMap<object, number>();
+let nextTextureUid = 0;
+
+/** A stable number for a texture OBJECT. A new texture (a resize, a device recovery, a new cel) gets a new one. */
+export function rasterTextureUid(tex: object): number {
+  let id = textureUids.get(tex);
+  if (id === undefined) { id = ++nextTextureUid; textureUids.set(tex, id); }
+  return id;
+}
+
+/**
+ * An opaque CONTENT VERSION of `tex` for a host's own copy of the pixels (Frogmarks' cloud upload, via
+ * `sm.getRasterContentVersions()`). It changes when the texture object changes or when a write to it — or a write
+ * with no known target — is reported. Two equal strings mean no reported write happened in between, so a copy taken
+ * when the first was read is still current. No texture = `'none'`.
+ *
+ * Read the version BEFORE you read the pixels: a write that lands in between makes the next comparison differ, so the
+ * copy is taken again (over-reporting is safe, under-reporting is not).
+ */
+export function rasterTextureVersion(tex: object | null | undefined): string {
+  if (!tex) return 'none';
+  return rasterTextureUid(tex) + ':' + rasterTextureWrittenAt(tex);
+}

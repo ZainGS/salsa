@@ -221,6 +221,8 @@ import {
 } from '../renderer/raster/brushes/brush-input-settings';
 import { runStrokePredictionSelfTest as _runStrokePredictionSelfTest, type StrokePredictionSelfTestReport } from '../renderer/raster/brushes/stroke-prediction-selftest';
 import { markRasterCompositeDirty as _markRasterCompositeDirty } from '../renderer/raster/core/raster-composite-dirty';
+import { rasterContentSeq as _rasterContentSeq } from '../renderer/raster/raster-content-version';
+import { vectorSceneObject as _vectorSceneObject } from './persistence/vector-scene-json';
 import {
     setRenderDebug as _setRenderDebug, getRenderDebug as _getRenderDebug, encodeRealFramePNG as _encodeRealFramePNG,
     RENDER_DEBUG_FLAGS, type RenderDebugFlags, type RealScreenshot,
@@ -8400,9 +8402,6 @@ class ShapeManager {
     /** Spawn a row of `count` belt-loop charms evenly around the waistband (auto-sized/placed). Returns their ids —
      *  pass two of them to a chain's `fromLoop`/`toLoop` to string a wallet chain between them. */
     public addBeltLoops3D(bodyMeshId: string, count = 5, params?: AttachmentParams): string[] { return this.scene3d.addBeltLoops(bodyMeshId, count, params); }
-    /** Toggle the SPARKLE / glint on all of a body's metal charms at once (the "make them glisten" checkbox). Twinkles
-     *  during any motion (orbit / idle / spring) and scintillates as the view moves. Per-charm: set `params.sparkle`. */
-    public setCharacterSparkle3D(bodyMeshId: string, on: boolean, style: 'glint' | 'star' = 'glint'): void { this.scene3d.setCharacterSparkle(bodyMeshId, on, style); }
     /** Enter "click a garment/body to drop a charm there" mode — each click surface-pins a new `type` charm (usually
      *  a `loop`) at the tapped point (it follows that body region). Stays active until `endAttachmentPlacePick3D`.
      *  Pin in the neutral/rest pose. `onPlaced(id)` fires per drop; `onHover(world|null)` tracks the cursor. */
@@ -12102,6 +12101,16 @@ class ShapeManager {
     }
 
     /**
+     * The VECTOR (2D) scene graph only: getSceneGraphJSON() without the 3D nodes (meshes, mesh groups / procedural
+     * markers, array groups, emitters, skeletons, grease pencil) and without the texture library. For a host that
+     * keeps the 3D scene elsewhere — Frogmarks' cloud save stores each mesh as its own blob. Loads with
+     * setSceneGraphJSON. Only the 2D nodes are serialized (no 3D geometry cost). See persistence/vector-scene-json.ts.
+     */
+    public getSceneGraphJSON2D(): string {
+        return JSON.stringify(_vectorSceneObject(this.sceneGraph.root));
+    }
+
+    /**
      * Lightweight mirror of getSceneGraphJSON for callers that only need the LAYER TREE shape per node —
      * `{ id, name, type, visible, locked, children }` — and not the full document. It walks the live nodes
      * and emits ONLY those fields, so it SKIPS the heavy per-mesh geometry + base64 skinning weights that
@@ -13071,9 +13080,34 @@ class ShapeManager {
      */
     public async exportRasterLayerToBlob(layerId: string, type: 'image/webp' | 'image/png' = 'image/webp'): Promise<Blob | null> {
         if (!this.rasterLayerManager) return null;
-        const blobs = await this.rasterLayerManager.exportLayersAsBlobs(type);
-        const match = blobs.find(b => b.id === layerId);
-        return match?.blob ?? null;
+        // Reads only this layer (it used to read back + encode EVERY layer and keep one: N read-backs per call).
+        return this.rasterLayerManager.exportLayerToBlob(layerId, type);
+    }
+
+    /**
+     * Export one animation CEL's pixels as a Blob — that cel's own texture, not the frame on screen
+     * (`exportRasterLayerToBlob` of an animated layer is not per cel). For a host's per-cel upload. Null for an
+     * unknown / blank cel.
+     */
+    public async exportRasterCelToBlob(celId: string, type: 'image/webp' | 'image/png' = 'image/webp'): Promise<Blob | null> {
+        return this.rasterLayerManager?.exportCelToBlob(celId, type) ?? null;
+    }
+
+    /**
+     * Per-layer / per-cel CONTENT VERSIONS for a host that keeps its own copy of the raster pixels (Frogmarks' cloud
+     * upload; docs/ui/document-persistence.md "Cloud"). Each value is an opaque string that changes when anything
+     * writes that layer's / cel's pixels — a stroke, fill, undo / redo, paste, transform, text stamp, move, clear,
+     * filter, merge, duplicate, import, load — or when its texture is replaced (resize, device recovery). Every pixel
+     * writer already reports through `markRasterCompositeDirty` / `bumpGpuPixelEpoch` (raster-content-version.ts); a
+     * write whose target is unknown changes EVERY version (fail safe). Paint layers only (no folders / vector layers /
+     * 3D divider). `seq` = the global write count: unchanged = nothing was written since.
+     *
+     * Compare with the version you read just BEFORE your last export of that layer / cel; a different string = upload
+     * again. Cheap (no GPU work): fine to call on every save.
+     */
+    public getRasterContentVersions(): { seq: number; layers: Record<string, string>; cels: Record<string, string> } {
+        const v = this.rasterLayerManager?.getContentVersions() ?? { layers: {}, cels: {} };
+        return { seq: _rasterContentSeq(), layers: v.layers, cels: v.cels };
     }
 
     /**

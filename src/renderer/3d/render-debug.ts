@@ -90,13 +90,14 @@ export type RenderDebugFlags = {
   /** Mesh fragment shader (shadow-receiving pipelines): output the raw shadow factor as grey; red = above 1,
    *  blue = below 0, green = NaN / Inf. */
   dbgShadowFactor: boolean;
-  /** Mesh fragment shader: skip the sparkle / glint term (sparse white light-scaled glints). */
-  noSparkle: boolean;
-  /** Mesh fragment shader: decide the sparkle term from a fresh read of the instance flags at its site, not the value
-   *  computed at the top of the shader (tests a mobile shader-compiler corruption of a long-lived value). */
-  lateSparkleFlags: boolean;
-  /** Mesh fragment shader: the material flag bits as a colour (red = sparkle, green = rim, on dark blue). */
+  /** Mesh fragment shader: the material flag bits as a colour (green = rim, on dark blue). */
   dbgFlagBits: boolean;
+  /** EVERY mesh / skinned-mesh fragment pipeline uses a ~15-line test shader (colour x simple lighting, same inputs)
+   *  instead of the uber shader. Read when pipelines are created: takes effect after a RELOAD. RENDER-1 test. */
+  tinyMeshFS: boolean;
+  /** Turn P21 shader variants on even where the GPU tier caps them off (mobile / safe): meshes use the smaller
+   *  specialised fragment shaders. Takes effect after a RELOAD. RENDER-1 test. */
+  forceShaderVariants: boolean;
   /** Every 3D pass that LOADS depth / stencil clears it instead (overlays lose depth occlusion). */
   clearDepthStencilLoads: boolean;
   /** Every 3D pass that LOADS colour clears it instead. Breaks the picture (an overlay pass wipes the scene); the point
@@ -124,9 +125,9 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'safeLightingMath', label: 'Safe lighting math' },
   { key: 'noShadowReceive', label: 'No shadow receive' },
   { key: 'dbgShadowFactor', label: 'Mesh colour = shadow factor' },
-  { key: 'noSparkle', label: 'No sparkle / glint' },
-  { key: 'lateSparkleFlags', label: 'Sparkle: re-read flag where used' },
-  { key: 'dbgFlagBits', label: 'Mesh colour = material flags (red = sparkle)' },
+  { key: 'dbgFlagBits', label: 'Mesh colour = material flags (green = rim)' },
+  { key: 'tinyMeshFS', label: 'Tiny mesh shader (test; reload)' },
+  { key: 'forceShaderVariants', label: 'Force shader variants (test; reload)' },
   { key: 'noMeshEditOverlays', label: 'No mesh-edit / UV-paint overlays' },
   { key: 'noRearEdges', label: 'No mesh-edit rear edges' },
   { key: 'noBackground3D', label: 'No 3D background (focus bg)' },
@@ -209,7 +210,7 @@ export function getRenderDebug(): RenderDebugFlags { return { ...RD.f }; }
 
 /** The mesh fragment shader debug mode (IBLUniforms.dbgShade): 0 = off, 1 = unlit, 2 = constant colour, 3 = magenta,
  *  4 = instance index colour, 5 = instance 0's colour, 6 = vertex-stage colour, 7 = solid grey, 8 = solid white,
- *  9 = world normal colour, 10 = material flag bits (red = sparkle, green = rim). One mode at a time: the solid colours win, then the read tests, then unlit. */
+ *  9 = world normal colour, 10 = material flag bits (green = rim). One mode at a time: the solid colours win, then the read tests, then unlit. */
 export function renderDebugShadeMode(): number {
   if (!RD.on) return 0;
   const f = RD.f;
@@ -220,16 +221,21 @@ export function renderDebugShadeMode(): number {
 
 /** The mesh fragment shader debug bits (IBLUniforms.dbgFlags): 1 = clamp the texture-array layer indices,
  *  2 = NaN / Inf highlight (dbgNanCheck), 4 = safe lighting maths (safeLightingMath), 8 = no shadow receive,
- *  16 = shadow factor as colour, 32 = no sparkle / glint, 64 = sparkle decided from a fresh flags read. */
+ *  16 = shadow factor as colour. 32 / 64 are free (they were the sparkle switches; sparkle removed 2026-10-07). */
 export function renderDebugShaderBits(): number {
   if (!RD.on) return 0;
   const f = RD.f;
   return (f.clampTexLayers ? 1 : 0) | (f.dbgNanCheck ? 2 : 0) | (f.safeLightingMath ? 4 : 0)
-    | (f.noShadowReceive ? 8 : 0) | (f.dbgShadowFactor ? 16 : 0) | (f.noSparkle ? 32 : 0)
-    | (f.lateSparkleFlags ? 64 : 0);
+    | (f.noShadowReceive ? 8 : 0) | (f.dbgShadowFactor ? 16 : 0);
 }
 
 /** The canvas context alpha mode: 'premultiplied' (the default), 'opaque' under forceOpaqueAlpha. */
+/** tinyMeshFS: the fragment shader code to compile for a mesh pipeline (the tiny test shader, or `code` unchanged). */
+export function rdMeshFragmentCode(code: string, tiny: string): string { return RD.on && RD.f.tinyMeshFS ? tiny : code; }
+
+/** forceShaderVariants: P21 variants on despite the GPU tier cap. */
+export function rdForceShaderVariants(): boolean { return RD.on && RD.f.forceShaderVariants; }
+
 export function rdCanvasAlphaMode(): GPUCanvasAlphaMode { return RD.on && RD.f.forceOpaqueAlpha ? 'opaque' : 'premultiplied'; }
 
 /** The colour loadOp for a pass that normally loads: 'clear' under clearColorLoads. */

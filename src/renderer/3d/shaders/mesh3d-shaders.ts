@@ -563,45 +563,6 @@ fn envSpecular(N: vec3<f32>, V: vec3<f32>, F0: vec3<f32>, roughness: f32, NdotV:
   return env * F_SchlickRoughness(NdotV, F0, roughness);
 }
 
-// Cheap GPU hash, vec3 cell -> vec3 in 0..1.
-fn hash33(p: vec3<f32>) -> vec3<f32> {
-  let q = vec3<f32>(dot(p, vec3<f32>(127.1, 311.7, 74.7)),
-                    dot(p, vec3<f32>(269.5, 183.3, 246.1)),
-                    dot(p, vec3<f32>(113.5, 271.9, 124.6)));
-  return fract(sin(q) * 43758.5453);
-}
-
-// Procedural SPARKLE / glint — tiny per-cell micro-facets on the surface that FLASH when they happen to align with
-// the light half-vector H. They scintillate as the camera / light move and twinkle slowly over time. Returns a
-// white glint intensity. density = sparkle grain (cells per world unit); higher = finer flecks.
-fn sparkleGlint(worldPos: vec3<f32>, N: vec3<f32>, H: vec3<f32>, time: f32, density: f32) -> f32 {
-  let cell = floor(worldPos * density) + floor(vec3<f32>(time * 1.3));   // step the cells over time -> twinkle
-  let jit  = hash33(cell) * 2.0 - 1.0;                                   // per-cell jitter in -1..1
-  let micro = normalize(N + jit * 0.7);                                  // a jittered micro-normal
-  let g = pow(max(dot(micro, H), 0.0), 220.0);                          // VERY tight -> a pinpoint glint
-  let sparsity = smoothstep(0.6, 0.95, hash33(cell + 4.7).x);           // only some cells fire -> sparse flecks
-  return g * sparsity;
-}
-
-// Anime STAR sparkle — bigger, sparser 4-point cross twinkles (the idol-bling look) vs the fine glint. Surface-
-// aligned (a frame derived from N) so the stars sit on the metal; each fades in/out over time. No view dependence,
-// so they pop on their own. Returns a white star intensity.
-fn sparkleStar(worldPos: vec3<f32>, N: vec3<f32>, time: f32, density: f32) -> f32 {
-  let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(N.y) > 0.9);
-  let tu = normalize(cross(N, up));
-  let tv = cross(N, tu);
-  let cell = floor(worldPos * density) + floor(vec3<f32>(time * 0.8));   // step cells over time -> twinkle
-  let r = hash33(cell);
-  let fire = step(0.86, r.x);                                            // sparse: only ~14 percent of cells
-  let lc = fract(worldPos * density) - vec3<f32>(0.5);
-  let x = dot(lc, tu); let y = dot(lc, tv);                             // surface-plane local coords within the cell
-  let rayX = max(0.0, 1.0 - abs(y) / 0.07) * max(0.0, 1.0 - abs(x) / 0.5);
-  let rayY = max(0.0, 1.0 - abs(x) / 0.07) * max(0.0, 1.0 - abs(y) / 0.5);
-  let star = max(rayX, rayY);                                            // a plus-shaped cross
-  let twinkle = 0.5 + 0.5 * sin(time * 5.0 + r.y * 6.2832);
-  return star * star * fire * twinkle;                                  // star^2 sharpens the rays
-}
-
 // Procedural geometric PATTERN mask (0..1) over the garment UV, ANALYTICALLY ANTIALIASED with fwidth so it stays
 // crisp up close and resolves to the correct average at distance (no shimmer/moire). mode: 1 stripes · 2 dots ·
 // 3 diamonds · 4 checker · 5 grid · 6 windows (handled by windowsPattern below) · 7 animated waves.
@@ -3009,8 +2970,6 @@ fn fs_main(
   let rimEnabled   = (flags & 128u) != 0u;
   let toonOn       = (flags & 1073741824u) != 0u;   // bit 30 — toon shadows (Cel styles)
   let skinToonOn   = (flags & 536870912u) != 0u;    // bit 29 — skin ramp → per-pixel in Cel styles
-  let sparkleOn    = (flags & 256u) != 0u;
-  let starSparkle  = (flags & 4096u) != 0u;
   let patMode      = (flags >> 9u) & 7u;
   let texOverBase  = (flags & 32768u) != 0u;
   let garpTex      = (flags & 16777216u) != 0u;   // bit 24: sample the dedicated GARP pool atlas, not diffuse
@@ -3042,12 +3001,10 @@ fn fs_main(
     }
     if (dbgM == 5u) { return vec4<f32>(u_instances[0].diffuseColor.rgb, 1.0); }
     if (dbgM == 6u) { return vec4<f32>(gouraudColor.rgb, 1.0); }
-    // 10 = the instance's material flag bits as a colour: RED = sparkle / star sparkle (bits 8 / 12), GREEN = rim
-    // (bit 7), on a dark-blue base. A plain cube is all dark blue; red only at some pixels = a per-pixel flags read
-    // going wrong, red everywhere = the sparkle bit really is set on the material.
+    // 10 = the instance's material flag bits as a colour: GREEN = rim (bit 7) on a dark-blue base. A plain cube is all
+    // dark blue; green only at some pixels = a per-pixel flags read going wrong.
     if (dbgM == 10u) {
-      let dbgFb = inst.flags;
-      return vec4<f32>(select(0.0, 1.0, (dbgFb & 4352u) != 0u), select(0.0, 1.0, (dbgFb & 128u) != 0u), 0.3, 1.0);
+      return vec4<f32>(0.0, select(0.0, 1.0, (inst.flags & 128u) != 0u), 0.3, 1.0);
     }
     // 7 / 8 = solid grey / white (does the rainbow depend on the colour value?); 9 = the raw interpolated world normal
     // (one flat colour per cube face when healthy; through dbgFinal, so with dbgNanCheck on a NaN normal is green).
@@ -3514,20 +3471,6 @@ fn fs_main(
   // not an albedo term, so it must not be multiplied by the diffuse response.
   lit = lit + scene.lightColor.rgb * waterGlint;
 
-  // Sparkle / glint — sparse twinkling micro-glints (the metal "glisten in the light"). Scintillates as the camera /
-  // light move; twinkles over scene time (ps1Config2.z). Bright + light-tinted so it reads as a reflection.
-  // RENDER DEBUG noSparkle (ibl.dbgFlags 32, uniform): skip the sparkle / glint term. dbgFlags 64 = decide it from a
-  // FRESH read of the instance flags here instead of the sparkleOn / starSparkle computed at the top (RENDER-1: tests a
-  // mobile-compiler corruption of a long-lived value; off = today's condition exactly).
-  let rdSpkLate = (u_instances[instanceIdx].flags & 4352u) != 0u;
-  let rdSpkOn = select(sparkleOn || starSparkle, rdSpkLate, (u32(ibl.dbgFlags) & 64u) != 0u);
-  if (rdSpkOn && (u32(ibl.dbgFlags) & 32u) == 0u) {
-    var spk = 0.0;
-    if (starSparkle) { spk = sparkleStar(worldPos, N, scene.ps1Config2.z, 45.0); }          // ✦ anime star bling
-    else             { spk = sparkleGlint(worldPos, N, rdNormalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
-    lit = lit + spk * scene.lightColor.rgb * scene.lightDirection.w * 3.5;
-  }
-
   // POINT LIGHTS (street lamps at night): additive lambert with a smooth radius falloff -- moving cars,
   // walkers and walls entering a lamp's radius pick up its warm pool. PBR / cel / cel-HD paths only.
   // (2026-09-29, city-quality L2/L9/L10) Collected into plPost and added AFTER the sun shadow (just below the
@@ -3945,8 +3888,6 @@ fn fs_main(
   let rimEnabled  = (flags & 128u) != 0u;
   let toonOn      = (flags & 1073741824u) != 0u;   // bit 30 — toon shadows (Cel styles)
   let skinToonOn  = (flags & 536870912u) != 0u;    // bit 29 — skin ramp → per-pixel in Cel styles
-  let sparkleOn   = (flags & 256u) != 0u;
-  let starSparkle = (flags & 4096u) != 0u;
   let leafCard    = (flags & 8192u) != 0u;
   let glassEnhance = (flags & 16384u) != 0u;
   let patMode     = (flags >> 9u) & 7u;
@@ -3977,12 +3918,10 @@ fn fs_main(
     }
     if (dbgM == 5u) { return vec4<f32>(u_instances[0].diffuseColor.rgb, 1.0); }
     if (dbgM == 6u) { return vec4<f32>(gouraudColor.rgb, 1.0); }
-    // 10 = the instance's material flag bits as a colour: RED = sparkle / star sparkle (bits 8 / 12), GREEN = rim
-    // (bit 7), on a dark-blue base. A plain cube is all dark blue; red only at some pixels = a per-pixel flags read
-    // going wrong, red everywhere = the sparkle bit really is set on the material.
+    // 10 = the instance's material flag bits as a colour: GREEN = rim (bit 7) on a dark-blue base. A plain cube is all
+    // dark blue; green only at some pixels = a per-pixel flags read going wrong.
     if (dbgM == 10u) {
-      let dbgFb = inst.flags;
-      return vec4<f32>(select(0.0, 1.0, (dbgFb & 4352u) != 0u), select(0.0, 1.0, (dbgFb & 128u) != 0u), 0.3, 1.0);
+      return vec4<f32>(0.0, select(0.0, 1.0, (inst.flags & 128u) != 0u), 0.3, 1.0);
     }
     // 7 / 8 = solid grey / white (does the rainbow depend on the colour value?); 9 = the raw interpolated world normal
     // (one flat colour per cube face when healthy; through dbgFinal, so with dbgNanCheck on a NaN normal is green).
@@ -4359,19 +4298,6 @@ fn fs_main(
   // WATER glitter is added AFTER lighting: it is a specular scintillation off the ripple normal,
   // not an albedo term, so it must not be multiplied by the diffuse response.
   lit = lit + scene.lightColor.rgb * waterGlint;
-
-  // Sparkle / glint — sparse twinkling micro-glints (the metal "glisten in the light"). See the textured fragment.
-  // RENDER DEBUG noSparkle (ibl.dbgFlags 32, uniform): skip the sparkle / glint term. dbgFlags 64 = decide it from a
-  // FRESH read of the instance flags here instead of the sparkleOn / starSparkle computed at the top (RENDER-1: tests a
-  // mobile-compiler corruption of a long-lived value; off = today's condition exactly).
-  let rdSpkLate = (u_instances[instanceIdx].flags & 4352u) != 0u;
-  let rdSpkOn = select(sparkleOn || starSparkle, rdSpkLate, (u32(ibl.dbgFlags) & 64u) != 0u);
-  if (rdSpkOn && (u32(ibl.dbgFlags) & 32u) == 0u) {
-    var spk = 0.0;
-    if (starSparkle) { spk = sparkleStar(worldPos, N, scene.ps1Config2.z, 45.0); }          // ✦ anime star bling
-    else             { spk = sparkleGlint(worldPos, N, rdNormalize(L + V), scene.ps1Config2.z, 150.0); }   // fine glint
-    lit = lit + spk * scene.lightColor.rgb * scene.lightDirection.w * 3.5;
-  }
 
   // POINT LIGHTS (street lamps at night): additive lambert with a smooth radius falloff — moving cars,
   // walkers and walls entering a lamp's radius pick up its warm pool. PBR / cel / cel-HD paths only.

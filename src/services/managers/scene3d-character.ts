@@ -51,7 +51,7 @@ import {
 } from './character-parts';
 import {
     AttachmentType, AttachmentParams, AttachmentPlacement, generateAttachment,
-    defaultAttachmentParams, defaultAttachmentPlacement, attachmentTypeNames, attachmentMaterial,
+    defaultAttachmentParams, defaultAttachmentPlacement, attachmentTypeNames, attachmentMaterial, dropRemovedAttachmentParams,
 } from './attachment-generator';
 import { resetSpringState } from '../../renderer/3d/spring-bone-solver';
 import { mat4, quat, vec3 } from 'gl-matrix';
@@ -1928,17 +1928,6 @@ export class Scene3DCharacter {
         return ids;
     }
 
-    setCharacterSparkle(bodyMeshId: string, on: boolean, style: 'glint' | 'star' = 'glint'): void {
-        const val: boolean | 'glint' | 'star' = on ? style : false;
-        for (const r of this._attachments.values()) {
-            if (r.bodyMeshId !== bodyMeshId || attachmentMaterial(r.params).metalness < 0.5) continue;
-            r.params = { ...r.params, sparkle: val };
-            const m = this.host.getMesh(r.attachmentMeshId);
-            if (m) { m.material.sparkleEnabled = on && style === 'glint'; m.material.sparkleStar = on && style === 'star'; }
-        }
-        this.ctx.scheduleRender();
-    }
-
     private _chainDrapeSurface(bodyMeshId: string): { verts: Float32Array } | undefined {
         const parts: Float32Array[] = [];
         for (const slot of ['bottom', 'top', 'shoes', 'socks'] as const) {
@@ -2024,9 +2013,6 @@ export class Scene3DCharacter {
         const col = hexToRgb01(rig.params.color); mesh.setDiffuseColor(col.r, col.g, col.b, 1);
         const mat = attachmentMaterial(rig.params);
         mesh.material.metalness = mat.metalness; mesh.material.roughness = mat.roughness;
-        const spk = rig.params.sparkle;
-        mesh.material.sparkleEnabled = spk === true || spk === 'glint';
-        mesh.material.sparkleStar = spk === 'star';
         this._inheritCharacterStyle(mesh, body);
         mesh.gpuDirty = true;
         this.ctx.sceneGraph.root.addChild(mesh);
@@ -2051,12 +2037,13 @@ export class Scene3DCharacter {
     }
 
     serializeAttachments(): { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] {
-        return [...this._attachments.values()].filter(r => !this._runtimeBodies.has(r.bodyMeshId)).map(r => ({ id: r.id, bodyMeshId: r.bodyMeshId, placement: r.placement, params: r.params }));
+        return [...this._attachments.values()].filter(r => !this._runtimeBodies.has(r.bodyMeshId)).map(r => ({ id: r.id, bodyMeshId: r.bodyMeshId, placement: r.placement, params: dropRemovedAttachmentParams(r.params) }));
     }
     restoreAttachments(states: { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] | undefined): void {
         if (!states?.length) return;
         for (const st of states) {
-            const rig: AttachmentRig = { id: st.id, bodyMeshId: st.bodyMeshId, attachmentMeshId: '', placement: st.placement, params: st.params };
+            // dropRemovedAttachmentParams: an old save's params.sparkle (sparkle removed 2026-10-07) is ignored.
+            const rig: AttachmentRig = { id: st.id, bodyMeshId: st.bodyMeshId, attachmentMeshId: '', placement: st.placement, params: dropRemovedAttachmentParams(st.params) };
             this._attachments.set(st.id, rig);
             try { this._buildAttachment(st.id); } catch (e) { console.warn('[Charm] restore failed', st.id, e); }
         }

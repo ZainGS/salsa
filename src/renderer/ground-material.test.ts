@@ -25,8 +25,8 @@ describe('procedural ground material — groundShade (bit 18, ashlar limestone)'
     const everythingElse: Material3D = {
       ...DEFAULT_MATERIAL,
       hasTexture: true, hasNormalMap: true, renderStyle: 'cel-hd',
-      alphaCutout: true, hairSheen: true, rimEnabled: true, sparkleEnabled: true,
-      sparkleStar: true, leafCard: true, glassEnhance: true, patternMode: 'waves',
+      alphaCutout: true, hairSheen: true, rimEnabled: true,
+      leafCard: true, glassEnhance: true, patternMode: 'waves',
       texOverBase: true, boardShade: true, radialFade: true,
     };
     // groundShade must not already be set by any other flag...

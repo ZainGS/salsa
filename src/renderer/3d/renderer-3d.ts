@@ -33,7 +33,7 @@ import { MAX_POINT_LIGHTS, packSceneUniforms, selectNearestPointLights, computeL
 import { ShadowRunTester, CasterSig, StaticLayerMembers, copyCascadeBox, cascadeBoxHolds, cascadeDepthMargin, cascadeRefresh, newCascadeCacheState, stepSunDirection, type CascadeCacheState } from './shadow-cache';
 import { DEFAULT_SHADOW_CASCADES, sanitizeShadowCascades, cascadeHalfExtents, cascadeBias, type ShadowCascadeSettings } from './shadow-cascades';
 import { ShadowMinMax } from './shadow-minmax';
-import { RD, renderDebugShadeMode, renderDebugShaderBits, rdColorLoad, rdDepthLoad } from './render-debug';
+import { RD, renderDebugShadeMode, renderDebugShaderBits, rdColorLoad, rdDepthLoad, rdForceShaderVariants } from './render-debug';
 import { shadowLodScreenThreshold, shadowLodThreshold, shadowTexel } from './shadow-lod';
 import { Mesh3D, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
@@ -861,7 +861,10 @@ export class Renderer3D {
   /** The GPU-driven path is on (the switch AND the device cap). */
   static get gpuDrivenActive(): boolean { return Renderer3D.gpuDriven && Renderer3D.caps.gpuDriven; }
   /** P21 shader variants are on (the switch AND the device cap). */
-  static get shaderVariantsActive(): boolean { return Renderer3D.shaderVariants && Renderer3D.caps.shaderVariants; }
+  static get shaderVariantsActive(): boolean {
+    // RENDER DEBUG forceShaderVariants (RENDER-1 test): variants on despite the tier cap.
+    return Renderer3D.shaderVariants && (Renderer3D.caps.shaderVariants || rdForceShaderVariants());
+  }
   /** LEAN: on a frame where no prepass / overlay reads the CPU's camera lists (outlines, SSAO / SSR, a planar mirror,
    *  hover / per-object outlines, the CPU occlusion cull, a verification), the draw-list loop skips the camera-pass
    *  tail (frustum, ranges, pushes) of GPU-culled records. false = the CPU still builds every list (A/B). */
@@ -1446,7 +1449,7 @@ export class Renderer3D {
   // reflections lost faces/interiors at working zoom).
   private _ssrReachWorld = 12.8;
   // ── World clock (UI System freezeWorld/setWorldSpeed): the shader scene time advances at _worldSpeed so
-  // time-driven effects (water/sparkle/neon/holograms) freeze or slow with the world. UI/hover shimmer uses
+  // time-driven effects (water/neon/holograms) freeze or slow with the world. UI/hover shimmer uses
   // its own wall clock and keeps running.
   private _worldSpeed = 1;
   private _worldTimeAccMs = 0;

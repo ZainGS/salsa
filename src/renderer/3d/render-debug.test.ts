@@ -137,8 +137,8 @@ describe('render debug flag set', () => {
         setRenderDebug({ clampTexLayers: true, dbgNanCheck: false }); expect(renderDebugShaderBits()).toBe(5);
         setRenderDebug({ reset: true, noShadowReceive: true }); expect(renderDebugShaderBits()).toBe(8);
         setRenderDebug({ dbgShadowFactor: true }); expect(renderDebugShaderBits()).toBe(24);
-        setRenderDebug({ reset: true, noSparkle: true }); expect(renderDebugShaderBits()).toBe(32);
-        setRenderDebug({ reset: true, lateSparkleFlags: true }); expect(renderDebugShaderBits()).toBe(64);
+        // The removed sparkle switches (noSparkle 32 / lateSparkleFlags 64, sparkle removed 2026-10-07) are unknown keys now.
+        setRenderDebug({ reset: true, noSparkle: true, lateSparkleFlags: true } as never); expect(renderDebugShaderBits()).toBe(0);
         setRenderDebug({ reset: true, dbgFlagBits: true }); expect(renderDebugShadeMode()).toBe(10);
         setRenderDebug({ reset: true });
         setRenderDebug({ clearColorLoads: true }); expect(rdColorLoad()).toBe('clear'); expect(rdDepthLoad()).toBe('load');
@@ -304,5 +304,30 @@ describe('render debug in the mesh fragment shaders', () => {
             expect(src, name).toMatch(/let texLayer {2}= select\(i32\(inst\.textureIndex\), min\(.*\), dbgClampL\);/);
             expect(src.includes('i32(inst.textureIndex));'), name).toBe(false);   // every sample uses the selected layer
         }
+    });
+});
+
+describe('render debug RENDER-1 shader-size tests', () => {
+    afterEach(() => { setRenderDebug({ reset: true }); });
+
+    it('tinyMeshFS swaps every mesh fragment module for the tiny shader; off = the code unchanged', async () => {
+        const { rdMeshFragmentCode, rdForceShaderVariants } = await import('./render-debug');
+        const { MESH3D_FS_TINY } = await import('./shaders/mesh3d-tiny-fs');
+        expect(rdMeshFragmentCode('UBER', MESH3D_FS_TINY)).toBe('UBER');
+        setRenderDebug({ tinyMeshFS: true });
+        expect(rdMeshFragmentCode('UBER', MESH3D_FS_TINY)).toBe(MESH3D_FS_TINY);
+        expect(rdForceShaderVariants()).toBe(false);
+        setRenderDebug({ reset: true, forceShaderVariants: true });
+        expect(rdForceShaderVariants()).toBe(true);
+        expect(rdMeshFragmentCode('UBER', MESH3D_FS_TINY)).toBe('UBER');
+    });
+
+    it('the tiny shader keeps the uber shader binding + location contract', async () => {
+        const { MESH3D_FS_TINY } = await import('./shaders/mesh3d-tiny-fs');
+        expect(MESH3D_FS_TINY).toContain('@group(0) @binding(0) var<storage, read> u_instances');
+        expect(MESH3D_FS_TINY).toContain('@group(0) @binding(1) var<uniform> scene');
+        expect(MESH3D_FS_TINY).toContain('@location(2) @interpolate(flat) instanceIdx: u32');
+        expect(MESH3D_FS_TINY).toContain('@location(4)                    worldNormal');
+        expect(MESH3D_FS_TINY.includes('`')).toBe(false);
     });
 });

@@ -26,8 +26,8 @@ describe('packaging panel material — texOverBase (dieline-over-kraft blend)', 
     const everythingElse: Material3D = {
       ...DEFAULT_MATERIAL,
       hasTexture: true, hasNormalMap: true, renderStyle: 'cel-hd',
-      alphaCutout: true, hairSheen: true, rimEnabled: true, sparkleEnabled: true,
-      sparkleStar: true, leafCard: true, glassEnhance: true, patternMode: 'waves',
+      alphaCutout: true, hairSheen: true, rimEnabled: true,
+      leafCard: true, glassEnhance: true, patternMode: 'waves',
     };
     expect(encodeMaterialFlags(everythingElse) & TEX_OVER_BASE_BIT).toBe(0);
     // And texOverBase on top preserves all of those bits (pure OR, no overwrite).

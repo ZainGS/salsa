@@ -159,7 +159,7 @@ export interface AttachmentParams {
     // silver = the colour). metalness 0 = dielectric … 1 = chrome; roughness 0 = mirror … 1 = matte.
     metalness?: number;
     roughness?: number;
-    sparkle?: boolean | 'glint' | 'star';    // twinkling: true/'glint' = fine micro-glints · 'star' = anime ✦ stars · false/'none' = off
+    // (sparkle — the charm glint / star twinkle — was REMOVED 2026-10-07; old saves may carry it: dropRemovedAttachmentParams.)
     cuffStyle?: 'rect' | 'round';            // headphones: 'rect' = boxy cups (default) · 'round' = rounded disc cups
 }
 
@@ -225,6 +225,14 @@ export function defaultAttachmentParams(type: AttachmentType): AttachmentParams 
         case 'tote':       base.color = '#8a7a5c'; base.metalness = 0;   base.roughness = 0.85; break;   // canvas tote
     }
     return base;
+}
+
+/** `p` itself, or a copy without the removed `sparkle` field (sparkle removed 2026-10-07: old saves and old hosts may
+ *  still pass it; it is ignored on load and never written). */
+export function dropRemovedAttachmentParams<T extends object>(p: T): T {
+    if (!p || !('sparkle' in p)) return p;
+    const { sparkle: _removed, ...rest } = p as T & { sparkle?: unknown };
+    return rest as T;
 }
 
 // ── minimal skinned-mesh builder (up to 4 bones/vertex; bone indices are BONE-LOCAL) ──────────

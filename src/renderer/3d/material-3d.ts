@@ -51,11 +51,8 @@ export interface Material3D {
   /** When true, add a Fresnel rim/back-light glow at the silhouette (a render-style-independent modifier;
    *  tinted by the scene light, stronger backlit). The "Enable Rim Light" toggle. */
   rimEnabled?: boolean;
-  /** When true, add procedural twinkling micro-glints (the metal "sparkle/glisten" effect). Light-tinted, scintillates
-   *  as the camera/light move + twinkles over time. A render-style-independent modifier (PBR styles). */
-  sparkleEnabled?: boolean;
-  /** Like sparkleEnabled but renders bigger, sparser ANIME ✦ STAR cross-twinkles instead of fine glints. */
-  sparkleStar?: boolean;
+  // (sparkleEnabled / sparkleStar — the procedural glint / star twinkle — were REMOVED 2026-10-07: see
+  //  REMOVED_MATERIAL_KEYS below. Old saves may still carry them; they are dropped on load and never written.)
   /** When true, this surface receives NO environment-specular reflection — a hard "ignore the sky" matte override for
    *  a metal you want powder-coated/matte despite its metalness (dielectrics already skip env specular). Independent of
    *  the scene-wide reflection intensity; per-object. See docs/specs/environment-and-reflections.md (P1b). */
@@ -490,9 +487,9 @@ export const DEFAULT_MATERIAL: Material3D = {
  * bit 5:    alphaCutout  (discard diffuse-texture alpha < 0.5 — alpha-card hair)
  * bit 6:    hairSheen    (anisotropic Kajiya-Kay highlight along the strands)
  * bit 7:    rimEnabled   (Fresnel rim / back-light silhouette glow)
- * bit 8:    sparkleEnabled (procedural twinkling micro-glints)
+ * bit 8:    FREE — was sparkleEnabled (procedural glints; removed 2026-10-07). Free for reuse.
  * bits 9-11: patternMode  (0 none · 1 stripes · 2 dots · 3 diamonds · 4 checker · 5 grid · 6 windows · 7 waves)
- * bit 12:   sparkleStar  (anime ✦ star twinkles instead of fine glints)
+ * bit 12:   FREE — was sparkleStar (anime star twinkles; removed 2026-10-07). Free for reuse.
  * bit 13:   leafCard     (procedural leaf-silhouette alpha cutout on a quad — foliage cards)
  * bit 14:   glassEnhance (stylized fresnel sky-reflection glass — gated by the global glass-quality toggle)
  * bit 15:   texOverBase  (diffuse texture composited OVER the base colour by tex alpha — decal-over-base;
@@ -604,6 +601,25 @@ export function fogCullClass(m: { fogClass: number; material: { noFog?: boolean 
   return m.material.noFog ? 0 : m.fogClass;
 }
 
+/** Material fields that no longer exist but may still be in saved documents: the sparkle / glint feature
+ *  (sparkleEnabled, sparkleStar) was removed 2026-10-07 — on an Android tablet its late shader branch fired on meshes
+ *  without the flag (white specks, mobile-parity §7.1). Loading ignores them (they set no flag bit) and
+ *  dropRemovedMaterialFields keeps them out of the live material and out of every save. */
+export const REMOVED_MATERIAL_KEYS: readonly string[] = ['sparkleEnabled', 'sparkleStar'];
+
+/** Remove REMOVED_MATERIAL_KEYS from `mat` IN PLACE and return it (no allocation when none are present). */
+export function dropRemovedMaterialFields<T extends object>(mat: T): T {
+  const r = mat as Record<string, unknown>;
+  for (const k of REMOVED_MATERIAL_KEYS) if (k in r) delete r[k];
+  return mat;
+}
+
+/** `mat` itself when it carries no REMOVED_MATERIAL_KEYS, else a shallow copy without them (for serialising). */
+export function withoutRemovedMaterialFields<T extends object>(mat: T): T {
+  for (const k of REMOVED_MATERIAL_KEYS) if (k in mat) return dropRemovedMaterialFields({ ...mat });
+  return mat;
+}
+
 const PATTERN_MAP: Record<NonNullable<Material3D['patternMode']>, number> =
   { none: 0, stripes: 1, dots: 2, diamonds: 3, checker: 4, grid: 5, windows: 6, waves: 7 };
 
@@ -616,9 +632,9 @@ export function encodeMaterialFlags(mat: Material3D): number {
   if (mat.alphaCutout)     flags |= 32;
   if (mat.hairSheen)       flags |= 64;
   if (mat.rimEnabled)      flags |= 128;
-  if (mat.sparkleEnabled)  flags |= 256;
+  // bit 8 (256) is free: it was sparkleEnabled (removed 2026-10-07).
   flags |= (PATTERN_MAP[mat.patternMode ?? 'none'] & 7) << 9;
-  if (mat.sparkleStar)     flags |= 4096;
+  // bit 12 (4096) is free: it was sparkleStar (removed 2026-10-07).
   if (mat.leafCard)        flags |= 8192;
   if (mat.glassEnhance)    flags |= 16384;
   if (mat.texOverBase)     flags |= 32768;

@@ -11,7 +11,7 @@
 
 import { Shape } from './base/shape';
 import { InteractionService } from '../../services/interaction-service';
-import { Material3D, DEFAULT_MATERIAL } from '../../renderer/3d/material-3d';
+import { Material3D, DEFAULT_MATERIAL, dropRemovedMaterialFields, withoutRemovedMaterialFields } from '../../renderer/3d/material-3d';
 import { MeshGeometry, FLOATS_PER_VERT, generateBox, generateSphere, generatePlane, generateCylinder, generateTorus, generateRevolve, generateTube, generateSprite, computeTangents } from '../../renderer/3d/mesh-generators';
 import { generateSdfMesh, type SdfBlob } from './sdf-mesh';
 import { Modifier, applyModifiers } from './modifiers';
@@ -516,7 +516,8 @@ export class Mesh3D extends Shape {
     this._name = 'Mesh3D';
     this._meshPrimitive = config.primitive ?? 'box';
     this._meshConfig = { ...config };
-    this._material = { ...DEFAULT_MATERIAL, ...config.material };
+    // dropRemovedMaterialFields: an old save's sparkleEnabled / sparkleStar (removed 2026-10-07) are ignored.
+    this._material = dropRemovedMaterialFields({ ...DEFAULT_MATERIAL, ...config.material });
     this.billboard = config.billboard ?? false;
 
     if (config.geometry) {
@@ -816,7 +817,7 @@ export class Mesh3D extends Shape {
 
   setMaterial(mat: Partial<Material3D>): void {
     this._pwGen = 0;   // re-classify for the pipeline prewarm
-    Object.assign(this._material, mat);
+    dropRemovedMaterialFields(Object.assign(this._material, mat));
     this.gpuDirty = true;
     this.stateDirty = true;
   }
@@ -1064,6 +1065,9 @@ export class Mesh3D extends Shape {
   toJSON(): any {
     // Serialize config — convert typed arrays to plain arrays for JSON safety
     const config: any = { ...this._meshConfig };
+    // Materials never write the removed sparkle keys (REMOVED_MATERIAL_KEYS, 2026-10-07): the construction-time
+    // config copy, the live material (Object.assign load paths can re-add them) and the submesh slots.
+    if (config.material) config.material = withoutRemovedMaterialFields(config.material);
     if (config.geometry) {
       config.geometry = {
         vertices: Array.from(this._meshConfig.geometry!.vertices),
@@ -1096,7 +1100,7 @@ export class Mesh3D extends Shape {
       scaleZ: this.scaleZ,
       primitive: this._meshPrimitive,
       config,
-      material: this._material,
+      material: withoutRemovedMaterialFields(this._material),
       name: this.name,
       keyframeTracks: this.keyframeTracks,
       textureLibraryId: this.textureLibraryId,
@@ -1105,7 +1109,10 @@ export class Mesh3D extends Shape {
       ...(this.outlineRings?.length ? { outlineRings: this.outlineRings } : {}),
       ...(this.cameraBlock !== 'auto' ? { cameraBlock: this.cameraBlock } : {}),
       // Multi-material slots (audit 2026-09-28 P8) — were never serialized, so per-slot materials reset on reload.
-      ...(this.submeshes.length > 0 ? { submeshes: this.submeshes } : {}),
+      ...(this.submeshes.length > 0 ? { submeshes: this.submeshes.map((s) => {
+        const mt = withoutRemovedMaterialFields(s.material);
+        return mt === s.material ? s : { ...s, material: mt };
+      }) } : {}),
       glbMeshIndex: this.glbMeshIndex ?? undefined,
       ...(this.modifiers.length > 0 ? { modifiers: this.modifiers } : {}),
       // ATTACHED DECALS (P6, 2026-09-15): a decal container rides as a CHILD of its target mesh,

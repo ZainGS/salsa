@@ -29,8 +29,8 @@ describe('shader variant keys', () => {
     expect(variantKeyOfMaterial(mat({ patternMode: 'windows', glassEnhance: true }))).toBe(encodeMaterialFlags(mat({ patternMode: 'windows', glassEnhance: true })));
     expect(variantKeyOfMaterial(mat({}))).toBe(encodeMaterialFlags(mat({})));
   });
-  it('unlisted families (textured, sparkle, normal maps, board, triplanar, combos) stay on the uber-shader', () => {
-    for (const p of [{ hasTexture: true }, { sparkleEnabled: true }, { hasNormalMap: true }, { boardShade: true }, { worldTriplanar: true },
+  it('unlisted families (textured, normal maps, board, triplanar, combos) stay on the uber-shader', () => {
+    for (const p of [{ hasTexture: true }, { hasNormalMap: true }, { boardShade: true }, { worldTriplanar: true },
       { groundShade: true, metalShade: true }, { patternMode: 'windows' as const, metalShade: true }, { planarReflector: true }, { garpTex: true, hasTexture: true }]) {
       expect(variantKeyOfMaterial(mat(p))).toBe(-1);
     }

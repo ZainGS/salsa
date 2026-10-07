@@ -5,8 +5,21 @@ import { DitherConfig } from '../renderer/raster/effects/dither-engine';
 import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation } from '../animation';
 import { EventEmitter } from '../renderer/util/event-emitter';
 import { bumpGpuPixelEpoch } from '../renderer/raster/gpu-pixel-epoch';
+import { rasterTextureVersion } from '../renderer/raster/raster-content-version';
 
 function makeId() { return 'r_' + Math.random().toString(36).slice(2,9); }
+
+/** Tightly packed RGBA8 → an image Blob (the same encode RasterTextureManager.exportToBlob does). */
+async function encodeRgbaToBlob(rgba: Uint8ClampedArray<ArrayBuffer>, w: number, h: number, type: 'image/webp' | 'image/png'): Promise<Blob> {
+  const canvas = typeof OffscreenCanvas !== 'undefined'
+    ? new OffscreenCanvas(w, h)
+    : Object.assign(document.createElement('canvas'), { width: w, height: h });
+  const ctx = (canvas as any).getContext('2d') as CanvasRenderingContext2D | null;
+  if (!ctx) throw new Error('2D context unavailable');
+  ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+  if ('convertToBlob' in canvas) return await (canvas as OffscreenCanvas).convertToBlob({ type });
+  return await new Promise<Blob>((res, rej) => (canvas as HTMLCanvasElement).toBlob(b => (b ? res(b) : rej(new Error('encode failed'))), type));
+}
 
 /** Discriminator for layer stack entry types. */
 export type LayerEntryType = 'layer' | 'folder' | '3d-scene' | 'reference' | 'ephemera' | 'vector';
@@ -681,7 +694,7 @@ export class RasterLayerManager {
   // Import a RasterCanvas into an existing layer by id
   public async importRasterCanvasToLayer(id: string, rasterCanvas: RasterCanvas) {
     const l = this.layers.find(x => x.id === id);
-    if (!l) return false;
+    if (!l?.manager) return false;   // no pixels to import into (folder / vector layer / 3D divider)
     // ensure manager texture matches raster size
     l.manager.ensureTexture(rasterCanvas.width, rasterCanvas.height);
     l.manager.uploadRasterCanvas(rasterCanvas as any);
@@ -756,27 +769,35 @@ export class RasterLayerManager {
   }
 
   // Per-layer snapshot/undo helpers
+  // Per-layer history lives in the layer's texture manager. Folders, vector / ephemera layers and the 3D divider have
+  // none (manager undefined): undo / redo / snapshot on them is a no-op returning false. A city document selects its
+  // 3D divider on load, and Ctrl+Z used to throw "Cannot read properties of undefined (reading 'undo')" here.
   public pushSnapshotForLayer(id: string) {
     const l = this.layers.find(x => x.id === id);
-    if (!l) return false;
+    if (!l?.manager) return false;
     void l.manager.pushSnapshot?.();
     return true;
   }
 
-  public async undoForLayer(id: string) {
+  public async undoForLayer(id: string): Promise<boolean> {
     const l = this.layers.find(x => x.id === id);
-    if (!l) return false;
-    const ok = await l.manager.undo?.();
+    if (!l?.manager) return false;
+    const ok = !!(await l.manager.undo?.());
     if (ok) this.notifyCompositionChanged();
     return ok;
   }
 
-  public async redoForLayer(id: string) {
+  public async redoForLayer(id: string): Promise<boolean> {
     const l = this.layers.find(x => x.id === id);
-    if (!l) return false;
-    const ok = await l.manager.redo?.();
+    if (!l?.manager) return false;
+    const ok = !!(await l.manager.redo?.());
     if (ok) this.notifyCompositionChanged();
     return ok;
+  }
+
+  /** True when `id` is a layer with its own pixel history (a paint layer), i.e. raster undo / redo can act on it. */
+  public hasRasterHistory(id: string): boolean {
+    return !!this.layers.find(x => x.id === id)?.manager;
   }
 
   private notifyCompositionChanged() {
@@ -1198,6 +1219,64 @@ export class RasterLayerManager {
       for (const cel of this.timeline.getCels(layer.id)) if (cel.texture) cels.push({ celId: cel.id, texture: cel.texture });
     }
     return { layers, cels };
+  }
+
+  /**
+   * Content versions (raster-content-version.ts) of every PAINT layer and every cel, for a host that keeps its own copy
+   * of the pixels (Frogmarks' cloud upload). A static layer's version covers both its current texture and its texture
+   * manager's texture (the one exportLayerToBlob reads) when they differ. An ANIMATED layer's current texture is the
+   * displayed cel (it changes with the frame), so its entry covers only the manager's texture; its pixels are versioned
+   * per cel. Folders, vector / ephemera layers and 3D dividers have no pixels and are not listed. A cel without a
+   * texture (blank) is `'none'`.
+   */
+  public getContentVersions(): { layers: Record<string, string>; cels: Record<string, string> } {
+    const layers: Record<string, string> = {};
+    const cels: Record<string, string> = {};
+    for (const l of this.layers) {
+      if ((l.type ?? 'layer') !== 'layer') continue;
+      const managed = l.manager?.getTexture?.() ?? null;
+      if (this.timeline.isLayerAnimated(l.id)) layers[l.id] = rasterTextureVersion(managed ?? l.texture);
+      else {
+        const own = rasterTextureVersion(l.texture);
+        layers[l.id] = managed && managed !== l.texture ? own + '|' + rasterTextureVersion(managed) : own;
+      }
+      for (const cel of this.timeline.getCels(l.id)) cels[cel.id] = rasterTextureVersion(cel.texture);
+    }
+    return { layers, cels };
+  }
+
+  /** One layer's pixels as an image Blob (what exportLayersAsBlobs gives for it, without reading every other layer).
+   *  Null for an unknown id, a layer without pixels (folder / vector / 3D divider) or a failed read. */
+  public async exportLayerToBlob(id: string, type: 'image/webp' | 'image/png' = 'image/webp'): Promise<Blob | null> {
+    const l = this.layers.find(x => x.id === id);
+    if (!l?.manager) return null;
+    try {
+      return await l.manager.exportToBlob(type);
+    } catch (e) {
+      console.warn('exportLayerToBlob failed for layer', id, e);
+      return null;
+    }
+  }
+
+  /** One animation cel's pixels as an image Blob (its own texture, not the displayed frame). Null for an unknown
+   *  cel, a cel without a texture or a failed read / encode. */
+  public async exportCelToBlob(celId: string, type: 'image/webp' | 'image/png' = 'image/webp'): Promise<Blob | null> {
+    for (const l of this.layers) {
+      if ((l.type ?? 'layer') !== 'layer') continue;
+      const cel = this.timeline.getCels(l.id).find(c => c.id === celId);
+      if (!cel) continue;
+      if (!cel.texture) return null;
+      try {
+        const w = cel.texture.width, h = cel.texture.height;
+        if (!w || !h) return null;
+        const pixels = await this.readTexturePixels(cel.texture);
+        return await encodeRgbaToBlob(new Uint8ClampedArray(pixels), w, h, type);
+      } catch (e) {
+        console.warn('exportCelToBlob failed for cel', celId, e);
+        return null;
+      }
+    }
+    return null;
   }
 
   /**

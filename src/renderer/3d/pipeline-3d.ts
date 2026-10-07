@@ -45,6 +45,11 @@ import { FLOATS_PER_VERT } from './mesh-generators';
 import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle, type PipelinePriority } from '../core/gpu-pipeline-cache';
 import { specialiseMeshFragment, VB_TEXTURED, VB_NOCULL, VB_PATTERNED, VB_SHADOW } from './shader-variants';
 import { noteTwinSource, packedTwin } from './vertex-pack';
+import { MESH3D_FS_TINY } from './shaders/mesh3d-tiny-fs';
+import { rdMeshFragmentCode } from './render-debug';
+
+/** RENDER DEBUG tinyMeshFS: every mesh / skinned-mesh fragment module goes through this (unchanged when off). */
+const meshFS = (code: string): string => rdMeshFragmentCode(code, MESH3D_FS_TINY);
 
 /** Background-compile priority of the specialised shader variants (step 8): after the common set, before the rare. */
 export const VARIANT_PRIORITY: PipelinePriority = PIPELINE_PRIORITY.COMMON + 0.5;
@@ -262,7 +267,7 @@ export class Pipeline3D {
       const desc = (): GPURenderPipelineDescriptor => ({
         label, layout,
         vertex: { module: this._vsModule, entryPoint: 'vs_main', buffers: [this._vbLayout] },
-        fragment: { module: this.device.createShaderModule({ code: specialiseMeshFragment(src, key, fastPaths), label }), entryPoint: 'fs_main', targets: [this._opaqueTarget] },
+        fragment: { module: this.device.createShaderModule({ code: meshFS(specialiseMeshFragment(src, key, fastPaths)), label }), entryPoint: 'fs_main', targets: [this._opaqueTarget] },
         primitive: { topology: 'triangle-list', cullMode: nc ? 'none' : 'back', frontFace: 'ccw' },
         depthStencil: this._opaqueDS,
       });
@@ -545,15 +550,15 @@ export class Pipeline3D {
 
   private createPipelines(): void {
     const vertexModule          = this.device.createShaderModule({ code: MESH3D_VERTEX_SHADER });
-    const fragTexturedModule    = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER });
-    const fragUntexturedModule  = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED });
+    const fragTexturedModule    = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER) });
+    const fragUntexturedModule  = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_UNTEXTURED) });
     const shadowPassVertModule  = this.device.createShaderModule({ code: SHADOW_VERTEX_SHADER });
     // Shadow-RECEIVING pipelines use the MODERN fragment shaders (patterns/interiors/relief/point lights/PBR)
     // with shadow sampling substituted in — the legacy gouraud shadow FS predates the whole pattern system and
     // silently downgraded anything that received shadows. The modern VS pairs with them (lightSpacePos is
     // computed in-fragment from worldPos, so no dedicated shadow VS is needed).
-    const shadowFragTexModule   = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_SHADOW_MODERN });
-    const shadowFragUntexModule = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN });
+    const shadowFragTexModule   = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_SHADOW_MODERN) });
+    const shadowFragUntexModule = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN) });
 
     // 3D vertex buffer layout: position(vec3) + normal(vec3) + uv(vec2) + tangent(vec4)
     const vertexBufferLayout: GPUVertexBufferLayout = {
@@ -936,8 +941,8 @@ export class Pipeline3D {
 
     const skinnedTexVertModule   = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_TEXTURED });
     const skinnedUntexVertModule = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED });
-    const skinnedTexFragModule   = this.device.createShaderModule({ code: SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED });
-    const skinnedUntexFragModule = this.device.createShaderModule({ code: SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED });
+    const skinnedTexFragModule   = this.device.createShaderModule({ code: meshFS(SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED) });
+    const skinnedUntexFragModule = this.device.createShaderModule({ code: meshFS(SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED) });
 
     // Skinned opaque + textured — layout: [mesh(0), texture(1), skin(2)]
     this._skinnedOpaqueTextured = this._reg({
@@ -1017,10 +1022,10 @@ export class Pipeline3D {
     // pattern/window/ground/shade/normal-map here; output is identical to the full shader for those meshes.
     //
     // Registered like everything else — a plain mesh's first draw compiles only the plain variant(s) it uses.
-    const plainFragTex         = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_PLAIN,                        label: 'PlainTex' });
-    const plainFragUntex       = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN,            label: 'PlainUntex' });
-    const plainShadowFragTex   = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN,         label: 'PlainTexShadow' });
-    const plainShadowFragUntex = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN, label: 'PlainUntexShadow' });
+    const plainFragTex         = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_PLAIN),                label: 'PlainTex' });
+    const plainFragUntex       = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN),    label: 'PlainUntex' });
+    const plainShadowFragTex   = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN), label: 'PlainTexShadow' });
+    const plainShadowFragUntex = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN), label: 'PlainUntexShadow' });
     const opaquePlainDesc = (layout: GPUPipelineLayout, frag: GPUShaderModule, cull: GPUCullMode): GPURenderPipelineDescriptor => ({
       layout,
       vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
@@ -1028,8 +1033,8 @@ export class Pipeline3D {
       primitive: { topology: 'triangle-list', cullMode: cull, frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
     });
-    const plainSkinnedFragTex   = this.device.createShaderModule({ code: SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED_PLAIN,   label: 'PlainSkinnedTex' });
-    const plainSkinnedFragUntex = this.device.createShaderModule({ code: SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN, label: 'PlainSkinnedUntex' });
+    const plainSkinnedFragTex   = this.device.createShaderModule({ code: meshFS(SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED_PLAIN),   label: 'PlainSkinnedTex' });
+    const plainSkinnedFragUntex = this.device.createShaderModule({ code: meshFS(SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN), label: 'PlainSkinnedUntex' });
     const skinnedPlainDesc = (layout: GPUPipelineLayout, vs: GPUShaderModule, frag: GPUShaderModule): GPURenderPipelineDescriptor => ({
       // Double-sided; skinned meshes have no separate shadow-receiving pipeline.
       layout,

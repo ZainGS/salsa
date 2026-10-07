@@ -847,7 +847,7 @@ export class Scene3DManager {
         // Same for a persistent per-object outline that SCROLLS (patternMode + speed): its phase reads scene time,
         // so keep frames flowing while any assigned outline animates.
         this.ctx.webgpuRenderer.addPreRenderCallback(() => this.renderer3D.hasAnimatedOutline, 'animatedOutline');
-        // ★ Keep the loop alive while a TIME-ANIMATED material (water / neon / sparkle) is visible. Their shader
+        // ★ Keep the loop alive while a TIME-ANIMATED material (water / neon) is visible. Their shader
         // phase advances with scene time, so with no other driver (e.g. no city traffic) they'd freeze until a
         // mouse-move. Throttled scan (≤5×/sec, cached between) so it's cheap even in a large scene.
         this.ctx.webgpuRenderer.addPreRenderCallback(() => this._animatedMaterialVisible(), 'animatedMaterial');
@@ -939,7 +939,7 @@ export class Scene3DManager {
             this._animMatLastScan = now;
             this._animMatCache = this.getAllMeshes().some(m => {
                 const mt = m.material as Partial<Material3D> | undefined;
-                return !!(mt?.waterShade || mt?.neonShade || mt?.sparkleEnabled || mt?.sparkleStar);
+                return !!(mt?.waterShade || mt?.neonShade);
             });
         }
         return this._animMatCache;
@@ -6783,7 +6783,6 @@ export class Scene3DManager {
     removeAttachment(id: string): void { this._character.removeAttachment(id); }
     getAttachmentMeshId(id: string): string | null { return this._character.getAttachmentMeshId(id); }
     addBeltLoops(bodyMeshId: string, count = 5, params?: AttachmentParams): string[] { return this._character.addBeltLoops(bodyMeshId, count, params); }
-    setCharacterSparkle(bodyMeshId: string, on: boolean, style: 'glint' | 'star' = 'glint'): void { this._character.setCharacterSparkle(bodyMeshId, on, style); }
     serializeAttachments(): { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] { return this._character.serializeAttachments(); }
     restoreAttachments(states: { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] | undefined): void { this._character.restoreAttachments(states); }
 
@@ -9192,7 +9191,7 @@ export class Scene3DManager {
     setSSRDeferred3D(on: boolean): void { this.renderer3D.setSSRDeferred(on); this.ctx.scheduleRender(); }
 
     /** UI System world control: scale WORLD time (1 = normal, 0 = frozen, 0.5 = slow-mo). Freezes/slows the
-     *  shader scene clock (water/sparkle/neon/holograms) AND every AnimationPlayer3D (clips + NLA). */
+     *  shader scene clock (water/neon/holograms) AND every AnimationPlayer3D (clips + NLA). */
     uiSetWorldSpeed3D(speed: number): void {
         this.renderer3D.setWorldSpeed(speed);
         AnimationPlayer3D.worldSpeed = Math.max(0, speed);
