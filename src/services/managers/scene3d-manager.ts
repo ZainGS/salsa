@@ -1953,6 +1953,31 @@ export class Scene3DManager {
         this.exitPlayMode3D();
     }
 
+    /** Back to the DEFAULT view for a host screen that is not the 3D editor (ShapeManager.resetTo2DEditingView,
+     *  mobile-parity 7.3c). Ends Play, the armature overlay, any mesh / group orbit claim and camera look-through /
+     *  preview; drops the 3D pointer controllers (select + gizmo), the hover and the selection; then sets the view
+     *  state to illustration × ortho2D with no remembered poses — which releases the orbit controller, the nav gizmo
+     *  and fly, clears the 3D workspace backdrop and hands pan / zoom back to the 2D view (cameraOwnsView false).
+     *  The engine outlives every route: without this a free3D camera left on by the illustration editor re-attached
+     *  its orbit controller to the NEXT screen's canvas (a board) and owned its pan / zoom. Idempotent. */
+    resetToDefaultView3D(): void {
+        this.exitPlayMode3D();                                   // (no-op when not playing)
+        if (this._armature.isBoneOverlayActive()) this.showBoneOverlay3D(null);
+        if (this._previewThroughCameras) this.setPreviewThroughCameras3D(false);
+        if (this._lookThroughCamId !== null) this.lookThroughCamera3D(null);
+        this._armature.exitMeshOrbit3D();                        // surface-paint / group / creator orbit: hands back its cameraOwnsView claim
+        this.disableTransformControls();
+        this.setHoveredMesh(null);
+        this.clearSelection();
+        this._viewChangedInPlay = false;
+        this._flyLookHeld = false;
+        this._viewState = { ...DEFAULT_VIEW_STATE };
+        this._applyViewState();                                  // ortho2D: orbit + gizmo off, cameraOwnsView = false, 2D composite back
+        this.onViewStateChanged.emit();
+        this.ctx.scheduleRender();
+        void this._refreshArtboardTexture();
+    }
+
     /** Snapshot the CURRENT mode's camera vantage into `_viewState` (free3D orbit vantage → `freeCam`;
      *  2D pan/zoom → `flatCam`) so switching modes — and reloading a saved document — returns you to where
      *  you were instead of reframing. Call BEFORE mutating the mode; also called at serialize time so a save
@@ -5623,6 +5648,13 @@ export class Scene3DManager {
                 format: '12float' as const,
             };
             mesh = this.createCustomMesh(state.x, state.y, state.z, geom, state.material);
+            // The saved EDIT topology (edit-mesh-topology.md §5): rebuild it and recompile, so the mesh comes back
+            // welded with its quads / seams and its vertex-colour render path, exactly as saved. (A save without it —
+            // older documents — rebuilds the topology from the geometry when it next enters Edit Mesh.)
+            if (state.editMesh && mesh && !(mesh instanceof SkinnedMesh3D)) {
+                try { mesh.editMesh = EditMesh.fromJSON(state.editMesh); mesh.syncFromEditMesh(); }
+                catch { mesh.editMesh = null; }
+            }
         } else if (state.primitive && state.primitive !== 'custom') {
             // Rebuild from the FULL saved config so PARAMS-ONLY primitives survive reload: metaball
             // (blobs/resolution), revolve (profile), tube (path/radii), plus box/cylinder/etc. dimensions.

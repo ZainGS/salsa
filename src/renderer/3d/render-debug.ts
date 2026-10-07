@@ -98,11 +98,12 @@ export type RenderDebugFlags = {
   /** Turn P21 shader variants on even where the GPU tier caps them off (mobile / safe): meshes use the smaller
    *  specialised fragment shaders. Takes effect after a RELOAD. RENDER-1 test. */
   forceShaderVariants: boolean;
-  /** SHADER SPLIT phases 1-2 (docs/specs/shader-split.md): meshes whose features the split covers draw with small
-   *  generated fragment shaders (only their features compiled in) instead of the uber-shader; the same pixels. The
-   *  same switch as localStorage salsa.shaderSplit = 'on' / sm.setShaderSplit3D. Reload for the full effect (the
-   *  boot warm-up then skips the uber pipelines the split replaces). RENDER-1 test. */
-  forceShaderSplit: boolean;
+  /** SHADER SPLIT ROLLBACK (docs/specs/shader-split.md §13, phase 3): the split is ON by default on every tier (meshes
+   *  draw with small generated fragment shaders, only their features compiled in; the same pixels). This switch forces
+   *  it OFF: every mesh back on the uber-shader, whatever localStorage salsa.shaderSplit says (the same effect as
+   *  salsa.shaderSplit = 'off' / sm.setShaderSplit3D({ mode: 'off' })). Draws switch at once; RELOAD so the boot
+   *  warm-up compiles the uber pipelines again. (Replaces the phase 1-2 opt-in `forceShaderSplit`, now the default.) */
+  noShaderSplit: boolean;
   /** Every 3D pass that LOADS depth / stencil clears it instead (overlays lose depth occlusion). */
   clearDepthStencilLoads: boolean;
   /** Every 3D pass that LOADS colour clears it instead. Breaks the picture (an overlay pass wipes the scene); the point
@@ -133,7 +134,7 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'dbgFlagBits', label: 'Mesh colour = material flags (green = rim)' },
   { key: 'tinyMeshFS', label: 'Tiny mesh shader (test; reload)' },
   { key: 'forceShaderVariants', label: 'Force shader variants (test; reload)' },
-  { key: 'forceShaderSplit', label: 'Shader split (phase 2; reload)' },
+  { key: 'noShaderSplit', label: 'Shader split OFF (rollback; reload)' },
   { key: 'noMeshEditOverlays', label: 'No mesh-edit / UV-paint overlays' },
   { key: 'noRearEdges', label: 'No mesh-edit rear edges' },
   { key: 'noBackground3D', label: 'No 3D background (focus bg)' },
@@ -242,8 +243,8 @@ export function rdMeshFragmentCode(code: string, tiny: string): string { return 
 /** forceShaderVariants: P21 variants on despite the GPU tier cap. */
 export function rdForceShaderVariants(): boolean { return RD.on && RD.f.forceShaderVariants; }
 
-/** forceShaderSplit: the shader split (mesh-fs-pipelines.ts) on, whatever salsa.shaderSplit says. */
-export function rdForceShaderSplit(): boolean { return RD.on && RD.f.forceShaderSplit; }
+/** noShaderSplit: the shader split (mesh-fs-pipelines.ts) OFF (the rollback), whatever salsa.shaderSplit says. */
+export function rdNoShaderSplit(): boolean { return RD.on && RD.f.noShaderSplit; }
 
 export function rdCanvasAlphaMode(): GPUCanvasAlphaMode { return RD.on && RD.f.forceOpaqueAlpha ? 'opaque' : 'premultiplied'; }
 

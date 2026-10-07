@@ -7492,6 +7492,9 @@ class ShapeManager {
     // (phase 2: also `noStandIn` (shadow stand-in off), `maxKeys` (key cap, session), `exclude` (families on today's
     // pipelines, per machine: 'patterns' | 'windows' | 'adScreens' | 'ground' | 'water' | 'leaf' | 'triplanar' | 'phase2'),
     // `clearJournal`; the result adds standIn / widened / exactKeys / maxKeys / journal / exclude.)
+    // (phase 3, 2026-10-07: ON BY DEFAULT on every tier; 'auto' = on. The ROLLBACK is `{ mode: 'off' }` (or
+    // `{ enabled: false }`, or render debug noShaderSplit), then reload; `{ mode: 'auto' }` undoes it. The result adds
+    // uberModules / uberPipelines: uber-shader modules created / replaced uber pipelines compiled, 0 while split.)
     public setShaderSplit3D(o: Parameters<Renderer3D['setShaderSplit']>[0] = {}): ReturnType<Renderer3D['setShaderSplit']> { const r = this.renderer3D.setShaderSplit(o); this.scheduleRender(); return r; }
     public getShaderSplit3D(): ReturnType<Renderer3D['setShaderSplit']> { return this.renderer3D.setShaderSplit({}); }
     /** P15 diagnostics: records / draw order / buckets, the GPU-reported counters (one frame late, `age`), rebuilds,
@@ -8942,6 +8945,17 @@ class ShapeManager {
     /** Weld all vertices within `threshold` distance. Returns the number removed. */
     public mergeByDistance3D(meshId: string, threshold: number): number {
         return this.meshEdit.mergeByDistance(meshId, threshold);
+    }
+
+    /** Shade faces smooth / flat (Blender's Shade Smooth / Flat). Omit fIdxSet → the face selection, or every face
+     *  when none is selected. Undoable. See docs/specs/edit-mesh-topology.md. */
+    public setFacesSmooth3D(meshId: string, fIdxSet: Set<number> | null, smooth: boolean): boolean {
+        return this.meshEdit.setFacesSmooth(meshId, fIdxSet, smooth);
+    }
+
+    /** Mark / clear sharp (hard) edges by half-edge index — smooth shading never blends across them. Undoable. */
+    public setSharpEdges3D(meshId: string, halfEdgeIndices: number[], sharp: boolean): boolean {
+        return this.meshEdit.setSharpEdges(meshId, halfEdgeIndices, sharp);
     }
 
     /** Subdivide face `fIdx` into quads by inserting a center vertex and per-edge midpoints. */
@@ -13972,6 +13986,42 @@ class ShapeManager {
         }));
         this.interactionService?.clearSelectedNodes();
         this.scene3d?.clearSelection();
+        this.scheduleRender();
+    }
+
+    /**
+     * Put the shared engine back into the plain 2D editing VIEW (mobile-parity 7.3c). The ShapeManager outlives every
+     * route, so a 3D camera mode or edit mode the illustration editor left on carried into the next screen: a free3D
+     * camera re-attached its orbit controller to a BOARD's canvas and owned its pan / zoom (cameraOwnsView blocked the
+     * 2D wheel / drag / pinch), the 3D workspace backdrop replaced the board's background, Play kept running and
+     * Edit Mesh kept suppressing box-select. A host that boots the engine for a non-3D screen (board, package editor,
+     * cart player) calls this on entry; an editor calls it when it is left.
+     *
+     * Exits Play, the UI player mode, Edit Mesh (+ its pointer handlers), every UV editor / UV paint, the creator / CD
+     * stage, bone placement / weight paint / Grease Pencil draw / decal placement, the armature overlay, any mesh /
+     * group orbit and camera look-through / preview; drops the 3D pointer controllers, the hover and the selection;
+     * then sets the view to the default (illustration × ortho2D, no remembered poses), which releases the orbit
+     * controller, the nav gizmo and fly and hands pan / zoom back to the 2D view. No document content changes beyond
+     * what those exits restore (Play's pre-Play transforms, a stage's saved rotation); nothing is saved. Idempotent.
+     */
+    public resetTo2DEditingView(): void {
+        const step = (what: string, fn: () => void): void => {
+            try { fn(); } catch (e) { console.warn('[resetTo2DEditingView] ' + what + ' failed', e); }
+        };
+        const s3 = this.scene3d;
+        step('Play', () => { if (s3?.isPlaying3D) this.exitPlayMode3D(); });
+        step('UI player', () => { if (this._uiPlayerMode) this.exitUIPlayerMode(); });
+        step('Edit Mesh', () => { this.detachMeshEditPointerHandlers(); if (this.isMeshEditMode3D) this.exitMeshEditMode3D(); });
+        step('UV editor', () => { if (this._uvSessions.size > 0 || this.uvPaint.isActive()) this.closeAllUVEditors3D(); });
+        step('creator stage', () => this.exitCreatorStage3D());
+        step('CD designer', () => this.exitCDDesigner3D());
+        if (s3) {
+            step('bone placement', () => { if (s3.isBonePlacementModeActive3D()) s3.exitBonePlacementMode3D(); });
+            step('weight paint', () => s3.exitWeightPaintMode3D());
+            step('Grease Pencil', () => { s3.exitGpDrawMode(); s3.exitGpFaceSelectMode(); });
+            step('decal placement', () => this.exitDecalPlaceMode3D());
+            step('3D view', () => s3.resetToDefaultView3D());
+        }
         this.scheduleRender();
     }
 

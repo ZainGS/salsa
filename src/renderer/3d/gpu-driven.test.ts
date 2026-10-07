@@ -1139,6 +1139,7 @@ describe('P15 sub-bundles: omitted draws are zero draws, the replay set = the fu
     const R3 = Renderer3D as unknown as { gpuDriven: boolean; gpuDrivenLean: boolean; rangeCulling: boolean; shaderVariants: boolean };
     const prev = { g: R3.gpuDriven, l: R3.gpuDrivenLean, rc: R3.rangeCulling, sv: R3.shaderVariants };
     R3.gpuDriven = true; R3.gpuDrivenLean = false; R3.rangeCulling = false; R3.shaderVariants = true;
+    r.setShaderSplit({ mode: 'off' });   // P21 variants only apply on the uber path: the split rolled back (it is on by default since phase 3)
     try {
       // three families interleaved in the geometry-key order: plain, painted metal, procedural ground
       meshes.forEach((m, i) => { if (/^m\d+$/.test(m.name)) { if (i % 3 === 1) m.material.metalShade = true; else if (i % 3 === 2) m.material.groundShade = true; m.materialDirty = true; } });
@@ -1181,7 +1182,7 @@ describe('P15 sub-bundles: omitted draws are zero draws, the replay set = the fu
       const st = r.setShaderVariants({});
       expect(st.enabled).toBe(false);
       expect(st.keys).toBeGreaterThanOrEqual(3);
-    } finally { R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; R3.shaderVariants = prev.sv; }
+    } finally { r.setShaderSplit({ mode: 'auto' }); R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; R3.shaderVariants = prev.sv; }
   });
 });
 
@@ -1201,7 +1202,7 @@ describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
         else if (i % 5 === 4) m.material.patternMode = 'stripes';
         m.materialDirty = true;
       });
-      expect(r.setShaderSplit({ enabled: true }).active).toBe(true);
+      expect(r.setShaderSplit({}).active, 'phase 3: on by default (no stored mode)').toBe(true);
       const em = emulator(r, dev.mem);
       dev.onEncode.push(em.run);
       cam.setPosition(0, 40, 90); cam.setTarget(0, 0, 0);
@@ -1235,13 +1236,15 @@ describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
       // uncovered vertex-coloured mesh, as today)
       const st = r.setShaderSplit({});
       expect(st.pipelines).toBeGreaterThanOrEqual(3);
+      expect(st.uberPipelines, 'no replaced uber pipeline compiled').toBe(0);
+      expect(st.uberModules, 'no uber fragment module created').toBe(0);
       expect(st.list.every((e: { key: string }) => e.key.startsWith('U|') || e.key.startsWith('T|'))).toBe(true);
       for (const n of ['opaqueUntexturedPlainPipeline', 'opaqueUntexturedNoCullPlainPipeline', 'transparentUntexturedPipeline', 'opaqueUntexturedPipeline', 'opaqueUntexturedNoCullPipeline']) {
         expect(r.pipeline.handleOf(n).ready, n).toBe(false);
       }
-      // switching the split off keeps the draw order and drops the split ids
+      // switching the split off (the phase-3 rollback) keeps the draw order and drops the split ids
       const order0 = (r._drawOrder.orderedMeshes() as typeof meshes).map((m) => m.id).join(',');
-      r.setShaderSplit({ mode: 'auto' });
+      expect(r.setShaderSplit({ mode: 'off' }).active).toBe(false);
       for (let f = 0; f < 6; f++) { await Promise.resolve(); r.drawMeshes(recordingPass(em.args).pass, meshes, 1300, 850); }
       expect((r._drawOrder.orderedMeshes() as typeof meshes).map((m) => m.id).join(',')).toBe(order0);
       for (let p = 0; p < gd._nOrder; p++) expect(((gd._code[gd._order[p]] >> 5) & R3.SPLIT_ID_FLAG) !== 0).toBe(false);

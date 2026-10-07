@@ -1065,6 +1065,10 @@ export class Mesh3D extends Shape {
 
   // ── Serialization ──────────────────────────────────────────────
 
+  /** Whether toJSON writes the EditMesh topology (a skinned body's edit mesh is a 1:1 UV-editing view of its
+   *  geometry — rebuilt on demand, never saved). */
+  protected persistsEditMesh(): boolean { return true; }
+
   toJSON(): any {
     // Serialize config — convert typed arrays to plain arrays for JSON safety
     const config: any = { ...this._meshConfig };
@@ -1117,6 +1121,10 @@ export class Mesh3D extends Shape {
         return mt === s.material ? s : { ...s, material: mt };
       }) } : {}),
       glbMeshIndex: this.glbMeshIndex ?? undefined,
+      // The EDIT topology (docs/specs/edit-mesh-topology.md §5): welded vertices, quads / n-gons, corner UVs, smooth /
+      // sharp / seam flags. The saved geometry above is only its render mesh — re-deriving the topology from it on
+      // reload would lose the n-gons and the seams. restoreMeshState rebuilds the EditMesh from this.
+      ...(this.editMesh && this.persistsEditMesh() ? { editMesh: this.editMesh.toJSON() } : {}),
       ...(this.modifiers.length > 0 ? { modifiers: this.modifiers } : {}),
       // ATTACHED DECALS (P6, 2026-09-15): a decal container rides as a CHILD of its target mesh,
       // but Mesh3D.toJSON historically emitted no children at all — so attached decals never

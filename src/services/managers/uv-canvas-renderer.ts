@@ -502,16 +502,23 @@ export class UVCanvasRenderer {
     uv:       (u: number, v: number) => [number, number],
   ): void {
     const { ctx } = this;
-    const { halfEdges, vertices } = editMesh;
+    const { halfEdges } = editMesh;
 
     for (let hi = 0; hi < halfEdges.length; hi++) {
       const he = halfEdges[hi];
-      // Only draw the canonical half of each edge (skip the twin)
-      if (he.twin >= 0 && he.twin < hi) continue;
-
-      const uvTo   = vertices[he.vertex].uv;
-      const uvFrom = vertices[halfEdges[he.prev].vertex].uv;
+      // UVs are per face corner: this half-edge runs from its face's corner at the origin (he.prev) to the corner at
+      // its destination (he). Draw the canonical half of each edge — and BOTH halves where the two faces' UVs differ
+      // (a seam on a welded mesh: the edge sits in two places in UV space).
+      const uvTo   = editMesh.cornerUV(hi);
+      const uvFrom = editMesh.cornerUV(he.prev);
       if (!uvTo || !uvFrom) continue;
+      let continuous = false;
+      if (he.twin >= 0) {
+        const tw = halfEdges[he.twin];
+        const tTo = editMesh.cornerUV(he.twin), tFrom = editMesh.cornerUV(tw.prev);
+        continuous = !!tTo && !!tFrom && tTo[0] === uvFrom[0] && tTo[1] === uvFrom[1] && tFrom[0] === uvTo[0] && tFrom[1] === uvTo[1];
+        if (continuous && he.twin < hi) continue;
+      }
 
       const [x0, y0] = uv(uvFrom[0], uvFrom[1]);
       const [x1, y1] = uv(uvTo[0],   uvTo[1]);
@@ -519,11 +526,10 @@ export class UVCanvasRenderer {
       const isSel = session.selection.mode === 'edge' && session.selection.edges.has(hi);
 
       // Hide triangulation diagonals (interior edges between coplanar faces) so a
-      // flat face reads as one polygon, not two triangles. Primitives become
-      // triangle meshes when made editable, which is why a cube face otherwise
-      // shows a diagonal. Seams / explicitly-selected edges are always drawn.
-      // See EditMesh.isCoplanarInteriorEdge().
-      if (!isSel && !he.isSeam && editMesh.isCoplanarInteriorEdge(hi)) continue;
+      // flat face reads as one polygon, not two triangles (meshes whose triangle
+      // pairs did not merge into quads on entering Edit Mesh). Seams, UV cuts and
+      // explicitly-selected edges are always drawn. See EditMesh.isCoplanarInteriorEdge().
+      if (!isSel && !he.isSeam && continuous && editMesh.isCoplanarInteriorEdge(hi)) continue;
 
       ctx.beginPath();
       ctx.moveTo(x0, y0);
@@ -565,34 +571,50 @@ export class UVCanvasRenderer {
       }
     }
 
+    // One dot per distinct UV of each vertex (a vertex on a seam shows in every island it belongs to).
+    const vertexUVs = (): Map<number, Array<[number, number]>> => {
+      const m = new Map<number, Array<[number, number]>>();
+      editMesh.halfEdges.forEach((he, hi) => {
+        if (he.face < 0) return;
+        const c = editMesh.cornerUV(hi);
+        if (!c) return;
+        let l = m.get(he.vertex);
+        if (!l) m.set(he.vertex, (l = []));
+        if (!l.some(p => p[0] === c[0] && p[1] === c[1])) l.push(c);
+      });
+      return m;
+    };
+    const needDots = selection.mode === 'vertex' || session.pinnedVertices.size > 0;
+    const dots = needDots ? vertexUVs() : null;
+
     // Vertex dots — all shown in vertex mode, selected are larger/brighter
-    if (selection.mode === 'vertex') {
-      for (let vi = 0; vi < editMesh.vertices.length; vi++) {
-        const uvCoord = editMesh.vertices[vi].uv;
-        if (!uvCoord) continue;
-        const [cx, cy] = uv(uvCoord[0], uvCoord[1]);
+    if (selection.mode === 'vertex' && dots) {
+      for (const [vi, list] of dots) {
         const isSel = selection.vertices.has(vi);
-        ctx.beginPath();
-        ctx.arc(cx, cy, isSel ? 5 : 3, 0, Math.PI * 2);
-        ctx.fillStyle = isSel ? 'rgba(255,160,30,1.0)' : 'rgba(255,180,80,0.7)';
-        ctx.fill();
+        for (const uvCoord of list) {
+          const [cx, cy] = uv(uvCoord[0], uvCoord[1]);
+          ctx.beginPath();
+          ctx.arc(cx, cy, isSel ? 5 : 3, 0, Math.PI * 2);
+          ctx.fillStyle = isSel ? 'rgba(255,160,30,1.0)' : 'rgba(255,180,80,0.7)';
+          ctx.fill();
+        }
       }
     }
 
     // Pinned vertices — blue diamond
     for (const vi of session.pinnedVertices) {
-      const uvCoord = editMesh.vertices[vi]?.uv;
-      if (!uvCoord) continue;
-      const [cx, cy] = uv(uvCoord[0], uvCoord[1]);
-      const s = 4;
-      ctx.beginPath();
-      ctx.moveTo(cx,     cy - s);
-      ctx.lineTo(cx + s, cy    );
-      ctx.lineTo(cx,     cy + s);
-      ctx.lineTo(cx - s, cy    );
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(80,180,255,1.0)';
-      ctx.fill();
+      for (const uvCoord of dots?.get(vi) ?? []) {
+        const [cx, cy] = uv(uvCoord[0], uvCoord[1]);
+        const s = 4;
+        ctx.beginPath();
+        ctx.moveTo(cx,     cy - s);
+        ctx.lineTo(cx + s, cy    );
+        ctx.lineTo(cx,     cy + s);
+        ctx.lineTo(cx - s, cy    );
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(80,180,255,1.0)';
+        ctx.fill();
+      }
     }
   }
 
@@ -627,9 +649,9 @@ export class UVCanvasRenderer {
 
   // ── Private: data extraction ──────────────────────────────────────────────
 
-  /** UV coordinates of each vertex of face `fi`, in face-winding order. */
+  /** UV coordinates of each corner of face `fi`, in face-winding order. */
   private _getFaceUVVerts(fi: number, editMesh: EditMesh): [number, number][] {
-    const { faces, halfEdges, vertices } = editMesh;
+    const { faces, halfEdges } = editMesh;
     const face = faces[fi];
     if (!face) return [];
     const result: [number, number][] = [];
@@ -637,7 +659,7 @@ export class UVCanvasRenderer {
     const start = hi;
     let guard = 0;
     do {
-      const uvCoord = vertices[halfEdges[hi].vertex].uv;
+      const uvCoord = editMesh.cornerUV(hi);
       result.push(uvCoord ?? [0, 0]);
       hi = halfEdges[hi].next;
       if (++guard > 64) break;

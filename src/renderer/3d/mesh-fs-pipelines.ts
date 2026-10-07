@@ -1,5 +1,6 @@
 /**
- * SPECIALISED MESH FRAGMENT PIPELINES (docs/specs/shader-split.md §5; phases 1-2 of the shader split).
+ * SPECIALISED MESH FRAGMENT PIPELINES (docs/specs/shader-split.md §5; phases 1-3 of the shader split: ON by default
+ * on every tier since phase 3, 2026-10-07; the rollback is SHADER_SPLIT mode 'off' / render debug noShaderSplit).
  *
  * One registry of (axis x key) render pipelines. The axis supplies everything but the fragment module (vertex module
  * and buffers, layout, blend, depth, cull: Pipeline3D's describe callback); the key's fragment module is generated
@@ -38,17 +39,20 @@
 
 import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle, type PipelinePriority } from '../core/gpu-pipeline-cache';
 import { noteTwinSource } from './vertex-pack';
-import { rdForceShaderSplit } from './render-debug';
+import { rdNoShaderSplit } from './render-debug';
 import { generateMeshFs, meshFsSize } from './shaders/mesh-fs-generate';
 import { MESH_FS_FAMILIES, meshFsCoverageExcluding, setMeshFsCoverage, type MeshFsFamily, MESH_FS_G_DEBUG, MESH_FS_G_SHADOW, MESH_FS_G_SSR_INLINE, meshFsBaseKey, meshFsBisectKey, meshFsKeyCovers, meshFsKeyOfNum, meshFsKeyParse, meshFsKeyString, meshFsWidenKey, type MeshFsBisect, type MeshFsKey } from './shaders/mesh-fs-key';
 
 // ── The switch (spec §7.1) ─────────────────────────────────────────────────────────────────────────────────────────
 
-/** Per-machine preference: 'on' | 'off' | 'auto' (= the phase default: OFF in phase 1). Read once at load. */
+/** Per-machine preference: 'on' | 'off' | 'auto' (= the phase default: ON since phase 3). Read once at load. 'off' is
+ *  the ROLLBACK (every mesh on the uber-shader, as before the split); a stored 'on' (the phase 1-2 tablet opt-in)
+ *  still means on. */
 export const SHADER_SPLIT_STORAGE_KEY = 'salsa.shaderSplit';
 export type ShaderSplitMode = 'on' | 'off' | 'auto';
-/** Phase 1 default: off everywhere. */
-const SHADER_SPLIT_DEFAULT = false;
+/** The phase default ('auto' / no stored value). Phase 3 (shader-split.md §13): ON on every tier: desktop, mobile and
+ *  safe mode (§9 decision 8: the smaller shaders are the safer path). */
+export const SHADER_SPLIT_DEFAULT = true;
 
 function readMode(): ShaderSplitMode {
   try {
@@ -60,9 +64,11 @@ function readMode(): ShaderSplitMode {
 /** The live switch state (Renderer3D reads shaderSplitActive() at draw time; Pipeline3D at its boot warm). */
 export const SHADER_SPLIT: { mode: ShaderSplitMode } = { mode: readMode() };
 
-/** The split is on: the stored mode (auto = the phase default) or the render-debug forceShaderSplit switch. */
+/** The split is on: the stored mode (auto = the phase default, ON), unless the render-debug rollback switch
+ *  noShaderSplit forces it off. */
 export function shaderSplitActive(): boolean {
-  return (SHADER_SPLIT.mode === 'on' || (SHADER_SPLIT.mode === 'auto' && SHADER_SPLIT_DEFAULT)) || rdForceShaderSplit();
+  if (rdNoShaderSplit()) return false;
+  return SHADER_SPLIT.mode === 'on' || (SHADER_SPLIT.mode === 'auto' && SHADER_SPLIT_DEFAULT);
 }
 
 /** Set (and persist) the mode. 'auto' removes the stored value. */
@@ -74,7 +80,7 @@ export function setShaderSplitMode(mode: ShaderSplitMode): void {
   } catch { /* storage blocked: this session only */ }
 }
 
-if (SHADER_SPLIT.mode === 'on') console.warn(`[Salsa][shader-split] ON from localStorage (${SHADER_SPLIT_STORAGE_KEY}). sm.setShaderSplit3D({ mode: 'auto' }) clears it.`);
+if (SHADER_SPLIT.mode === 'off') console.warn(`[Salsa][shader-split] OFF (rollback) from localStorage (${SHADER_SPLIT_STORAGE_KEY}): every mesh on the uber-shader. sm.setShaderSplit3D({ mode: 'auto' }) clears it.`);
 
 /** Per-machine family exclusions (a JSON array of MeshFsFamily): the safety valve for a device where a phase-2 family
  *  looks wrong (for example a driver that compiles the window-facade hash differently, shader-split.md §11.6):

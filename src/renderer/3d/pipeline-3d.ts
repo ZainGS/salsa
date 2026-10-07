@@ -53,6 +53,10 @@ import { meshFsBaseKey, type MeshFsKey } from './shaders/mesh-fs-key';
 /** RENDER DEBUG tinyMeshFS: every mesh / skinned-mesh fragment module goes through this (unchanged when off). */
 const meshFS = (code: string): string => rdMeshFragmentCode(code, MESH3D_FS_TINY);
 
+/** SHADER SPLIT phase 3: the marker of a LAZY uber fragment module (see Pipeline3D._uberFs). */
+const LAZY_FS = Symbol('lazyUberFs');
+type LazyFs = { [LAZY_FS]: { code: string; label?: string } };
+
 /** Background-compile priority of the specialised shader variants (step 8): after the common set, before the rare. */
 export const VARIANT_PRIORITY: PipelinePriority = PIPELINE_PRIORITY.COMMON + 0.5;
 
@@ -303,6 +307,16 @@ export class Pipeline3D {
    *  x shadow, transparent, skinned): left out of the boot warm while the split is on (they still compile on demand
    *  for the meshes the split does not cover). */
   private readonly _splitReplaced = new Set<PipelineHandle<GPURenderPipeline>>();
+  /** SHADER SPLIT phase 3: the uber-shader fragment modules (~120 KB of WGSL each) created so far. They are created
+   *  on FIRST USE (the first compile of a pipeline that uses one), not at construction: with the split on (the
+   *  default) nothing draws with them unless rolled back or uncovered, so the driver never even parses them. */
+  private readonly _uberFsModules = new Map<LazyFs, GPUShaderModule>();
+
+  /** Diagnostics: how many uber-shader fragment modules exist (0 with the split on and every mesh covered). */
+  get uberFragmentModules(): number { return this._uberFsModules.size; }
+  /** Diagnostics: how many of the uber pipelines the split replaces are compiled (0 with the split on and every
+   *  mesh covered; all of them warmed at boot with the split off). */
+  get uberPipelinesCompiled(): number { let n = 0; for (const h of this._splitReplaced) if (h.ready) n++; return n; }
 
   /** The specialised (axis x key) mesh pipelines (shader split). */
   get meshFs(): MeshFsPipelines { return this._meshFs; }
@@ -548,13 +562,32 @@ export class Pipeline3D {
   /** Register a pipeline for GRANULAR lazy, NON-BLOCKING compilation and return its accessor (see PipeAccessor).
    *  `priority` orders the background warm (COMMON = every 3D scene soon needs it; RARE = tools / debug / niche). */
   private _reg(descriptor: GPURenderPipelineDescriptor, priority: PipelinePriority = PIPELINE_PRIORITY.COMMON): PipeAccessor {
-    const h = this._cache.render(descriptor, descriptor.label ?? `Pipeline3D#${this._pipeEntries.length + 1}`);
+    // a LAZY uber fragment module (_uberFs): the descriptor becomes a factory that creates the module on first compile
+    const frag = descriptor.fragment;
+    const lazy = frag && (frag.module as unknown as Partial<LazyFs>)[LAZY_FS] ? frag.module as unknown as LazyFs : null;
+    const src = lazy && frag ? (): GPURenderPipelineDescriptor => ({ ...descriptor, fragment: { ...frag, module: this._uberFsModule(lazy) } }) : descriptor;
+    const h = this._cache.render(src, descriptor.label ?? `Pipeline3D#${this._pipeEntries.length + 1}`);
     this._pipeEntries.push({ handle: h, priority });
     // P22: the compiled pipeline is noted with its descriptor, so the renderer can ask for its packed twin (vertex-pack.ts)
     let noted: GPURenderPipeline | null = null;
-    const acc = (() => { const p = h.get(); if (p !== null && p !== noted) { noteTwinSource(p, descriptor); noted = p; } return p; }) as PipeAccessor;
+    const acc = (() => { const p = h.get(); if (p !== null && p !== noted) { noteTwinSource(p, h.descriptor()); noted = p; } return p; }) as PipeAccessor;
     acc.handle = h;
     return acc;
+  }
+
+  /** SHADER SPLIT phase 3: a placeholder for an uber fragment module, resolved by _reg on the pipeline's first compile
+   *  (one real module per placeholder, shared by every pipeline that uses it, as before). */
+  private _uberFs(code: string, label?: string): GPUShaderModule {
+    return { [LAZY_FS]: { code: meshFS(code), label } } as unknown as GPUShaderModule;
+  }
+  private _uberFsModule(lz: LazyFs): GPUShaderModule {
+    let m = this._uberFsModules.get(lz);
+    if (!m) {
+      const { code, label } = lz[LAZY_FS];
+      m = this.device.createShaderModule(label ? { code, label } : { code });
+      this._uberFsModules.set(lz, m);
+    }
+    return m;
   }
 
   /** P22: start compiling the packed twin of every compiled pool pipeline (the base set and the shader variants), so
@@ -589,8 +622,10 @@ export class Pipeline3D {
    *  stuck behind the warm. Idempotent + memoized; resolves when all have settled; never rejects. */
   async warmAllAsync(): Promise<void> {
     return this._warmPromise ??= (async () => {
-      // SHADER SPLIT on: the uber pipelines it replaces are not warmed (they compile on demand for uncovered meshes);
-      // the U / T BASE fallbacks of the opaque axes are warmed instead (spec §5.3: never *-ALL).
+      // SHADER SPLIT on (the default since phase 3; shader-split.md §13): the uber pipelines it replaces are not warmed
+      // (they compile on demand only for a mesh the split does not cover, and their ~120 KB fragment modules are not
+      // even created until then: _uberFs); the U / T BASE fallbacks of the opaque axes are warmed instead (spec §5.3:
+      // never *-ALL). Rolled back (mode 'off' / render debug noShaderSplit): today's full uber warm.
       const split = shaderSplitActive();
       if (split) {
         for (const axis of ['opaqueNoCull', 'opaque'] as const) for (const tex of [false, true]) this._meshFs.warm(axis, meshFsBaseKey(tex, false, false, false), PIPELINE_PRIORITY.COMMON);
@@ -600,7 +635,8 @@ export class Pipeline3D {
       }
       const pending = this._pipeEntries.filter(e => !e.handle.ready && !(split && this._splitReplaced.has(e.handle)));
       const t0 = performance.now();
-      console.log(`[Salsa][warm] warming ${pending.length} pipelines in background (${this._pipeEntries.length - pending.length} already compiled)…`);
+      const skipped = split ? this._pipeEntries.filter(e => !e.handle.ready && this._splitReplaced.has(e.handle)).length : 0;
+      console.log(`[Salsa][warm] warming ${pending.length} pipelines in background (${this._pipeEntries.length - pending.length - skipped} already compiled${split ? `; ${skipped} uber pipelines skipped: shader split on` : ''})…`);
       try {
         await Promise.all(pending.map(e => e.handle.warm(e.priority)));
         console.log(`[Salsa][warm] pipeline warm complete: ${pending.length} compiled in ${Math.round(performance.now() - t0)}ms`);
@@ -610,15 +646,15 @@ export class Pipeline3D {
 
   private createPipelines(): void {
     const vertexModule          = this.device.createShaderModule({ code: MESH3D_VERTEX_SHADER });
-    const fragTexturedModule    = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER) });
-    const fragUntexturedModule  = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_UNTEXTURED) });
+    const fragTexturedModule    = this._uberFs(MESH3D_FRAGMENT_SHADER);   // (lazy: see _uberFs; the same for every uber FS below)
+    const fragUntexturedModule  = this._uberFs(MESH3D_FRAGMENT_SHADER_UNTEXTURED);
     const shadowPassVertModule  = this.device.createShaderModule({ code: SHADOW_VERTEX_SHADER });
     // Shadow-RECEIVING pipelines use the MODERN fragment shaders (patterns/interiors/relief/point lights/PBR)
     // with shadow sampling substituted in — the legacy gouraud shadow FS predates the whole pattern system and
     // silently downgraded anything that received shadows. The modern VS pairs with them (lightSpacePos is
     // computed in-fragment from worldPos, so no dedicated shadow VS is needed).
-    const shadowFragTexModule   = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_SHADOW_MODERN) });
-    const shadowFragUntexModule = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN) });
+    const shadowFragTexModule   = this._uberFs(MESH3D_FRAGMENT_SHADER_SHADOW_MODERN);
+    const shadowFragUntexModule = this._uberFs(MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN);
 
     // 3D vertex buffer layout: position(vec3) + normal(vec3) + uv(vec2) + tangent(vec4)
     const vertexBufferLayout: GPUVertexBufferLayout = {
@@ -1004,8 +1040,8 @@ export class Pipeline3D {
     const skinnedTexVertModule   = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_TEXTURED });
     const skinnedUntexVertModule = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED });
     this._skinnedVbLayout = skinnedVertexBufferLayout; this._skinnedTexVS = skinnedTexVertModule; this._skinnedUntexVS = skinnedUntexVertModule;   // shader split
-    const skinnedTexFragModule   = this.device.createShaderModule({ code: meshFS(SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED) });
-    const skinnedUntexFragModule = this.device.createShaderModule({ code: meshFS(SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED) });
+    const skinnedTexFragModule   = this._uberFs(SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED);
+    const skinnedUntexFragModule = this._uberFs(SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED);
 
     // Skinned opaque + textured — layout: [mesh(0), texture(1), skin(2)]
     this._skinnedOpaqueTextured = this._reg({
@@ -1085,10 +1121,10 @@ export class Pipeline3D {
     // pattern/window/ground/shade/normal-map here; output is identical to the full shader for those meshes.
     //
     // Registered like everything else — a plain mesh's first draw compiles only the plain variant(s) it uses.
-    const plainFragTex         = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_PLAIN),                label: 'PlainTex' });
-    const plainFragUntex       = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN),    label: 'PlainUntex' });
-    const plainShadowFragTex   = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN), label: 'PlainTexShadow' });
-    const plainShadowFragUntex = this.device.createShaderModule({ code: meshFS(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN), label: 'PlainUntexShadow' });
+    const plainFragTex         = this._uberFs(MESH3D_FRAGMENT_SHADER_PLAIN,                       'PlainTex');
+    const plainFragUntex       = this._uberFs(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN,            'PlainUntex');
+    const plainShadowFragTex   = this._uberFs(MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN,         'PlainTexShadow');
+    const plainShadowFragUntex = this._uberFs(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN, 'PlainUntexShadow');
     const opaquePlainDesc = (layout: GPUPipelineLayout, frag: GPUShaderModule, cull: GPUCullMode): GPURenderPipelineDescriptor => ({
       layout,
       vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
@@ -1096,8 +1132,8 @@ export class Pipeline3D {
       primitive: { topology: 'triangle-list', cullMode: cull, frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
     });
-    const plainSkinnedFragTex   = this.device.createShaderModule({ code: meshFS(SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED_PLAIN),   label: 'PlainSkinnedTex' });
-    const plainSkinnedFragUntex = this.device.createShaderModule({ code: meshFS(SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN), label: 'PlainSkinnedUntex' });
+    const plainSkinnedFragTex   = this._uberFs(SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED_PLAIN,   'PlainSkinnedTex');
+    const plainSkinnedFragUntex = this._uberFs(SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN, 'PlainSkinnedUntex');
     const skinnedPlainDesc = (layout: GPUPipelineLayout, vs: GPUShaderModule, frag: GPUShaderModule): GPURenderPipelineDescriptor => ({
       // Double-sided; skinned meshes have no separate shadow-receiving pipeline.
       layout,
@@ -1140,6 +1176,7 @@ export class Pipeline3D {
       this._transparentTextured, this._transparentUntextured, this._transparentTexturedNoCull, this._transparentUntexturedNoCull,
       this._skinnedOpaqueTextured, this._skinnedOpaqueUntextured, this._skinnedOpaqueTexturedPlain, this._skinnedOpaqueUntexturedPlain,
       this._opaqueVertexColor, this._postOverlayTextured, this._skinnedFaceMultiply,   // (phase 2 axes)
+      this._overlayTextured,   // (phase 3: the always-on-top card has no draw site; it only compiled the FULL textured uber FS at boot)
     ]) this._splitReplaced.add(a.handle);
   }
 

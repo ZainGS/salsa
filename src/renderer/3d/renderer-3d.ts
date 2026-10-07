@@ -6343,7 +6343,8 @@ export class Renderer3D {
     return { enabled: Renderer3D.shaderVariants, capped: !Renderer3D.caps.shaderVariants, keys: this._svIds.size, max: this._svIds.max, ...this.pipeline.variantStats() };
   }
   // ── SHADER SPLIT phase 1 (mesh-fs-pipelines.ts; docs/specs/shader-split.md) ─────────────────────────────────────
-  /** The split is on (localStorage salsa.shaderSplit / sm.setShaderSplit3D / render debug forceShaderSplit). */
+  /** The split is on: the default on every tier since phase 3 (shader-split.md §13); off only when rolled back
+   *  (localStorage salsa.shaderSplit = 'off' / sm.setShaderSplit3D({ mode: 'off' }) / render debug noShaderSplit). */
   static get shaderSplitActive(): boolean { return shaderSplitActive(); }
   /** GPU-driven state codes: bit 14 of the variant-id field marks a split key id (P21 ids stay below 0x4000). */
   static readonly SPLIT_ID_FLAG = 0x4000;
@@ -6451,9 +6452,13 @@ export class Renderer3D {
   private _splitFallback(num: number, axis: MeshFsAxis, shadow: boolean): GPURenderPipeline | null {
     return this.pipeline.meshFs.fallbackPipe(axis, num, this._splitG(shadow));
   }
-  /** SHADER SPLIT switch + diagnostics. `mode` / `enabled` persist per machine (localStorage salsa.shaderSplit);
-   *  `bisect` (spec §7 phase-1 risk) and the test knobs (forceFallback, noFallback, slowCompileMs) are session-only. */
-  setShaderSplit(o: { enabled?: boolean; mode?: ShaderSplitMode; bisect?: MeshFsBisect; forceFallback?: boolean; noFallback?: boolean; noStandIn?: boolean; slowCompileMs?: number; maxKeys?: number; exclude?: MeshFsFamily[]; clearJournal?: boolean; resetCounters?: boolean } = {}): { active: boolean; mode: ShaderSplitMode; bisect: MeshFsBisect; forceFallback: boolean; noFallback: boolean; noStandIn: boolean; slowCompileMs: number; exclude: readonly MeshFsFamily[]; journal: number } & MeshFsSplitStats {
+  /** SHADER SPLIT switch + diagnostics. `mode` / `enabled` persist per machine (localStorage salsa.shaderSplit):
+   *  'auto' (no stored value) = the phase default, ON since phase 3; `{ mode: 'off' }` / `{ enabled: false }` = the
+   *  ROLLBACK (reload so the boot warm-up compiles the uber pipelines again); `{ enabled: true }` stores 'on'.
+   *  `bisect` (spec §7 phase-1 risk) and the test knobs (forceFallback, noFallback, slowCompileMs) are session-only.
+   *  The result adds `uberModules` / `uberPipelines`: the uber-shader fragment modules created and the uber pipelines
+   *  the split replaces that are compiled (both 0 with the split on and every mesh covered). */
+  setShaderSplit(o: { enabled?: boolean; mode?: ShaderSplitMode; bisect?: MeshFsBisect; forceFallback?: boolean; noFallback?: boolean; noStandIn?: boolean; slowCompileMs?: number; maxKeys?: number; exclude?: MeshFsFamily[]; clearJournal?: boolean; resetCounters?: boolean } = {}): { active: boolean; mode: ShaderSplitMode; bisect: MeshFsBisect; forceFallback: boolean; noFallback: boolean; noStandIn: boolean; slowCompileMs: number; exclude: readonly MeshFsFamily[]; journal: number; uberModules: number; uberPipelines: number } & MeshFsSplitStats {
     const was = shaderSplitActive();
     if (o.mode !== undefined) setShaderSplitMode(o.mode);
     else if (o.enabled !== undefined) setShaderSplitMode(o.enabled ? 'on' : 'off');
@@ -6473,7 +6478,8 @@ export class Renderer3D {
     if (o.clearJournal) reg.clearJournal();
     if (o.resetCounters) reg.resetCounters();
     if (shaderSplitActive() !== was) { this._prewarmSeen.opaque = -1; this._prewarmSeen.skinned = -1; }   // (the GPU-driven re-code: _gdBegin)
-    return { active: shaderSplitActive(), mode: SHADER_SPLIT.mode, bisect: opts.bisect, forceFallback: opts.forceFallback, noFallback: opts.noFallback, noStandIn: opts.noStandIn, slowCompileMs: opts.slowCompileMs, exclude: shaderSplitExcluded(), journal: reg.journal().length, ...reg.stats() };
+    return { active: shaderSplitActive(), mode: SHADER_SPLIT.mode, bisect: opts.bisect, forceFallback: opts.forceFallback, noFallback: opts.noFallback, noStandIn: opts.noStandIn, slowCompileMs: opts.slowCompileMs, exclude: shaderSplitExcluded(), journal: reg.journal().length,
+      uberModules: this.pipeline.uberFragmentModules, uberPipelines: this.pipeline.uberPipelinesCompiled, ...reg.stats() };
   }
   /** FOG HORIZON silhouette fast path (fog-horizon.ts FOG_HORIZON_FAST): fogged pixels return the fog colour early
    *  while Hard edge + linear fog are on. Pixel-identical; false = the full shading path (A/B). */

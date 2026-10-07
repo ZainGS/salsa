@@ -92,6 +92,9 @@ export class SkinnedMesh3D extends Mesh3D {
   /** Never in place for a skinned mesh: its GPU copy is the skinned vertex buffer, not the pool (always recompile). */
   override patchFromEditMesh(): number[] | null { return null; }
 
+  /** A skinned body's edit mesh is a 1:1 view of its geometry for UV editing — not saved (see Mesh3D.toJSON). */
+  protected override persistsEditMesh(): boolean { return false; }
+
   /** Rebuild jointIndices/jointWeights for the recompiled geometry via editMesh's source map. */
   private _remapSkinToCompiledGeometry(): void {
     const src = this.editMesh?.lastCompileSourceVerts;

@@ -7,11 +7,14 @@
  * All mutating ops snapshot UV and seam state before/after and push
  * a command onto the 3D undo stack. Pin ops are session-only (no undo).
  *
- * UV coordinates live on `EditVertex.uv?: [number, number]` — one per vertex.
- * Operations work on whichever vertices the session selection implies:
- *   vertex mode  → selected vertex indices
- *   face mode    → all vertices of selected faces
- *   edge mode    → both endpoints of each selected half-edge
+ * UV coordinates live per FACE CORNER (`EditMesh.cornerUV(hi)`: the half-edge's own `uv`, else its vertex's —
+ * docs/specs/edit-mesh-topology.md). Operations work on whichever corners the session selection implies:
+ *   vertex mode  → every corner of the selected vertices
+ *   face mode    → the corners of the selected faces
+ *   edge mode    → the selected half-edge's two corners (in its face)
+ * plus, "sticky" (Blender's shared-location default), every other corner of the same vertex that shows the same
+ * UV — so a UV island moves as one piece while a seam (a vertex whose corners differ) stays cut. On a mesh with
+ * per-vertex UVs only that is exactly the old per-vertex behaviour.
  */
 
 import type { ManagerContext } from './manager-context';
@@ -22,8 +25,8 @@ import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 
 // ── Snapshot types ────────────────────────────────────────────────────────────
 
-/** UV snapshot: index → [u, v] | undefined. Sparse — only stores assigned UVs. */
-type UVSnapshot  = Map<number, [number, number]>;
+/** UV snapshot: per-vertex fallback UVs + per-corner (half-edge) UVs, undefined = none. */
+type UVSnapshot  = { v: Array<[number, number] | undefined>; h: Array<[number, number] | undefined> };
 /** Seam snapshot: half-edge index → isSeam value. */
 type SeamSnapshot = boolean[];
 
@@ -42,14 +45,11 @@ export class UVEditManager {
   moveSelected(meshId: string, du: number, dv: number): boolean {
     const { mesh, em, session } = this._get(meshId);
     if (!mesh || !em || !session) return false;
-    const verts = _selectedVerts(session, em);
-    if (verts.size === 0) return false;
+    const corners = _selectedCorners(session, em);
+    if (corners.length === 0) return false;
 
     const before = _snapUVs(em);
-    for (const vi of verts) {
-      const uv = em.vertices[vi].uv;
-      if (uv) em.vertices[vi].uv = [uv[0] + du, uv[1] + dv];
-    }
+    _mapCorners(em, corners, (u, v) => [u + du, v + dv]);
     const after = _snapUVs(em);
     mesh.syncFromEditMesh();
 
@@ -65,15 +65,12 @@ export class UVEditManager {
   scaleSelected(meshId: string, su: number, sv: number): boolean {
     const { mesh, em, session } = this._get(meshId);
     if (!mesh || !em || !session) return false;
-    const verts = _selectedVerts(session, em);
-    if (verts.size === 0) return false;
+    const corners = _selectedCorners(session, em);
+    if (corners.length === 0) return false;
 
-    const [cu, cv] = _bboxCenter(verts, em);
+    const [cu, cv] = _bboxCenter(corners, em);
     const before = _snapUVs(em);
-    for (const vi of verts) {
-      const uv = em.vertices[vi].uv;
-      if (uv) em.vertices[vi].uv = [cu + (uv[0] - cu) * su, cv + (uv[1] - cv) * sv];
-    }
+    _mapCorners(em, corners, (u, v) => [cu + (u - cu) * su, cv + (v - cv) * sv]);
     const after = _snapUVs(em);
     mesh.syncFromEditMesh();
 
@@ -89,19 +86,17 @@ export class UVEditManager {
   rotateSelected(meshId: string, angleRad: number): boolean {
     const { mesh, em, session } = this._get(meshId);
     if (!mesh || !em || !session) return false;
-    const verts = _selectedVerts(session, em);
-    if (verts.size === 0) return false;
+    const corners = _selectedCorners(session, em);
+    if (corners.length === 0) return false;
 
-    const [cu, cv] = _bboxCenter(verts, em);
+    const [cu, cv] = _bboxCenter(corners, em);
     const cos = Math.cos(angleRad);
     const sin = Math.sin(angleRad);
     const before = _snapUVs(em);
-    for (const vi of verts) {
-      const uv = em.vertices[vi].uv;
-      if (!uv) continue;
-      const du = uv[0] - cu, dv = uv[1] - cv;
-      em.vertices[vi].uv = [cu + du * cos - dv * sin, cv + du * sin + dv * cos];
-    }
+    _mapCorners(em, corners, (u, v) => {
+      const du = u - cu, dv = v - cv;
+      return [cu + du * cos - dv * sin, cv + du * sin + dv * cos];
+    });
     const after = _snapUVs(em);
     mesh.syncFromEditMesh();
 
@@ -120,18 +115,12 @@ export class UVEditManager {
   mirrorSelected(meshId: string, axis: 'u' | 'v'): boolean {
     const { mesh, em, session } = this._get(meshId);
     if (!mesh || !em || !session) return false;
-    const verts = _selectedVerts(session, em);
-    if (verts.size === 0) return false;
+    const corners = _selectedCorners(session, em);
+    if (corners.length === 0) return false;
 
-    const [cu, cv] = _bboxCenter(verts, em);
+    const [cu, cv] = _bboxCenter(corners, em);
     const before = _snapUVs(em);
-    for (const vi of verts) {
-      const uv = em.vertices[vi].uv;
-      if (!uv) continue;
-      em.vertices[vi].uv = axis === 'u'
-        ? [2 * cu - uv[0], uv[1]]
-        : [uv[0], 2 * cv - uv[1]];
-    }
+    _mapCorners(em, corners, (u, v) => (axis === 'u' ? [2 * cu - u, v] : [u, 2 * cv - v]));
     const after = _snapUVs(em);
     mesh.syncFromEditMesh();
 
@@ -153,31 +142,30 @@ export class UVEditManager {
   weldSelected(meshId: string, threshold = 0.001): boolean {
     const { mesh, em, session } = this._get(meshId);
     if (!mesh || !em || !session) return false;
-    const verts = _selectedVerts(session, em);
-    if (verts.size === 0) return false;
+    const corners = _selectedCorners(session, em);
+    if (corners.length === 0) return false;
 
     const uvBefore   = _snapUVs(em);
     const seamBefore = _snapSeams(em);
 
-    const vertArr = [...verts];
     const thresh2 = threshold * threshold;
-    for (let i = 0; i < vertArr.length; i++) {
-      const vi = vertArr[i];
-      const uvI = em.vertices[vi].uv;
+    const cur = corners.map(hi => em.cornerUV(hi));
+    for (let i = 0; i < corners.length; i++) {
+      const uvI = cur[i];
       if (!uvI) continue;
-      for (let j = i + 1; j < vertArr.length; j++) {
-        const vj = vertArr[j];
-        const uvJ = em.vertices[vj].uv;
+      for (let j = i + 1; j < corners.length; j++) {
+        const uvJ = cur[j];
         if (!uvJ) continue;
         const du = uvI[0] - uvJ[0], dv = uvI[1] - uvJ[1];
         if (du * du + dv * dv <= thresh2) {
           const mid: [number, number] = [(uvI[0] + uvJ[0]) * 0.5, (uvI[1] + uvJ[1]) * 0.5];
-          em.vertices[vi].uv = mid;
-          em.vertices[vj].uv = [...mid];
-          _clearEdgeBetween(em, vi, vj);
+          cur[i] = mid; cur[j] = [mid[0], mid[1]];
+          const vi = em.halfEdges[corners[i]].vertex, vj = em.halfEdges[corners[j]].vertex;
+          if (vi !== vj) _clearEdgeBetween(em, vi, vj);
         }
       }
     }
+    corners.forEach((hi, i) => { const uv = cur[i]; if (uv) em.setCornerUV(hi, uv); });
 
     const uvAfter   = _snapUVs(em);
     const seamAfter = _snapSeams(em);
@@ -287,14 +275,14 @@ export class UVEditManager {
   pinSelected(meshId: string): void {
     const { em, session } = this._get(meshId);
     if (!em || !session) return;
-    for (const vi of _selectedVerts(session, em)) session.pinnedVertices.add(vi);
+    for (const hi of _selectedCorners(session, em)) session.pinnedVertices.add(em.halfEdges[hi].vertex);
   }
 
   /** Unpin selected vertices. */
   unpinSelected(meshId: string): void {
     const { em, session } = this._get(meshId);
     if (!em || !session) return;
-    for (const vi of _selectedVerts(session, em)) session.pinnedVertices.delete(vi);
+    for (const hi of _selectedCorners(session, em)) session.pinnedVertices.delete(em.halfEdges[hi].vertex);
   }
 
   /** Remove all pins. */
@@ -314,41 +302,69 @@ export class UVEditManager {
 
 // ── Module-private helpers ────────────────────────────────────────────────────
 
-/** Build the set of vertex indices implied by the current selection. */
-function _selectedVerts(session: UVEditorSession, em: EditMesh): Set<number> {
-  const result = new Set<number>();
+/** The face corners (half-edge indices) the current selection implies, plus the sticky ones: every other corner of
+ *  the same vertex showing the same UV as a selected corner. */
+function _selectedCorners(session: UVEditorSession, em: EditMesh): number[] {
+  const H = em.halfEdges;
+  const base = new Set<number>();
   if (session.selection.mode === 'vertex') {
-    for (const vi of session.selection.vertices) result.add(vi);
-  } else if (session.selection.mode === 'face') {
+    const vs = session.selection.vertices;
+    H.forEach((he, hi) => { if (he.face >= 0 && vs.has(he.vertex)) base.add(hi); });
+    return [...base];
+  }
+  if (session.selection.mode === 'face') {
     for (const fi of session.selection.faces) {
       let hi = em.faces[fi]?.halfEdge ?? -1;
       const start = hi;
       let guard = 0;
       do {
         if (hi < 0) break;
-        result.add(em.halfEdges[hi].vertex);
-        hi = em.halfEdges[hi].next;
-        if (++guard > 64) break;
+        base.add(hi);
+        hi = H[hi].next;
+        if (++guard > 1000) break;
       } while (hi !== start);
     }
   } else {
-    // edge mode: both endpoints of each selected half-edge
+    // edge mode: the half-edge's two corners (its destination = he, its origin = he.prev)
     for (const hi of session.selection.edges) {
-      const he = em.halfEdges[hi];
+      const he = H[hi];
       if (!he) continue;
-      result.add(he.vertex);
-      result.add(em.halfEdges[he.prev].vertex);
+      base.add(hi);
+      base.add(he.prev);
     }
   }
-  return result;
+  if (base.size === 0) return [];
+  const byVert = new Map<number, number[]>();
+  H.forEach((he, hi) => {
+    if (he.face < 0) return;
+    const l = byVert.get(he.vertex);
+    if (l) l.push(hi); else byVert.set(he.vertex, [hi]);
+  });
+  const out = new Set(base);
+  for (const hi of base) {
+    const uv = em.cornerUV(hi);
+    for (const c of byVert.get(H[hi].vertex) ?? []) if (!out.has(c) && _sameUV(uv, em.cornerUV(c))) out.add(c);
+  }
+  return [...out];
 }
 
-/** Bounding-box centre of the UV coordinates of the given vertex set. */
-function _bboxCenter(verts: Set<number>, em: EditMesh): [number, number] {
+function _sameUV(a: [number, number] | undefined, b: [number, number] | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  return Math.abs(a[0] - b[0]) <= 1e-6 && Math.abs(a[1] - b[1]) <= 1e-6;
+}
+
+/** Map the UV of every listed corner through `fn` (all read first, so corners sharing a vertex UV map once). */
+function _mapCorners(em: EditMesh, corners: number[], fn: (u: number, v: number) => [number, number]): void {
+  const cur = corners.map(hi => em.cornerUV(hi));
+  corners.forEach((hi, i) => { const uv = cur[i]; if (uv) em.setCornerUV(hi, fn(uv[0], uv[1])); });
+}
+
+/** Bounding-box centre of the UV coordinates of the given corners. */
+function _bboxCenter(corners: number[], em: EditMesh): [number, number] {
   let uMin = Infinity, vMin = Infinity, uMax = -Infinity, vMax = -Infinity;
   let any = false;
-  for (const vi of verts) {
-    const uv = em.vertices[vi].uv;
+  for (const hi of corners) {
+    const uv = em.cornerUV(hi);
     if (!uv) continue;
     any = true;
     if (uv[0] < uMin) uMin = uv[0];
@@ -359,18 +375,22 @@ function _bboxCenter(verts: Set<number>, em: EditMesh): [number, number] {
   return any ? [(uMin + uMax) * 0.5, (vMin + vMax) * 0.5] : [0.5, 0.5];
 }
 
+/** Every UV the mesh holds: vertex fallbacks and corner UVs. */
 function _snapUVs(em: EditMesh): UVSnapshot {
-  const snap: UVSnapshot = new Map();
-  for (let i = 0; i < em.vertices.length; i++) {
-    const uv = em.vertices[i].uv;
-    if (uv) snap.set(i, [uv[0], uv[1]]);
-  }
-  return snap;
+  return {
+    v: em.vertices.map(v => (v.uv ? [v.uv[0], v.uv[1]] as [number, number] : undefined)),
+    h: em.halfEdges.map(he => (he.uv ? [he.uv[0], he.uv[1]] as [number, number] : undefined)),
+  };
 }
 
 function _restoreUVs(em: EditMesh, snap: UVSnapshot): void {
   for (let i = 0; i < em.vertices.length; i++) {
-    em.vertices[i].uv = snap.get(i);
+    const uv = snap.v[i];
+    em.vertices[i].uv = uv ? [uv[0], uv[1]] : undefined;
+  }
+  for (let i = 0; i < em.halfEdges.length; i++) {
+    const uv = snap.h[i];
+    em.halfEdges[i].uv = uv ? [uv[0], uv[1]] : undefined;
   }
 }
 

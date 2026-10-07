@@ -7,8 +7,8 @@
  * Simple and correct; mesh sizes are small enough (hundreds of polys) that JSON round-trips
  * are fast.
  *
- * `makeEditable()` replaces the mesh's compiled geometry with an EditMesh built from the
- * same primitive type, then calls syncFromEditMesh() to push the compiled result back.
+ * `makeEditable()` builds the EditMesh from the geometry the mesh renders (welded topology + quads,
+ * EditMesh.fromGeometry), then calls syncFromEditMesh() to push the compiled result back.
  *
  * Phase 2: makeEditable, vertex drag, extrude, inset, delete, weld, vertex colors,
  * MirrorModifier, SubdivisionModifier, selection queries.
@@ -20,7 +20,7 @@ import type { ManagerContext } from './manager-context';
 import type { Command3D } from './undo-manager-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
-import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier } from '../../scene-graph/shapes/edit-mesh';
+import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier, faceList, type FaceList } from '../../scene-graph/shapes/edit-mesh';
 import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
 export interface EditSelection {
@@ -69,10 +69,13 @@ export class MeshEditManager {
   }
 
   /**
-   * Convert the mesh's current primitive to an EditMesh. The EditMesh is built
-   * to match the geometry as closely as possible using the primitive type.
-   * After this call, mesh.editMesh is set and mesh.syncFromEditMesh() is called
-   * so the GPU geometry remains unchanged.
+   * Build the mesh's EditMesh from the geometry it renders (docs/specs/edit-mesh-topology.md §2): coincident vertices
+   * WELDED (a cube = 8 vertices, so dragging a corner moves all 3 faces), triangle pairs merged into quads (a cube = 6
+   * quads), per-corner UVs + smooth / sharp shading kept — EditMesh.fromGeometry. Primitives, imports and reloaded
+   * triangle-soup saves all take this path, so the EditMesh always matches what is on screen (the old fromSphere /
+   * fromCylinder rebuilt the primitive at a different resolution and without its UVs). A skinned body stays 1:1 with
+   * its geometry (its rest weights / weight paint index the geometry's vertices). After this call mesh.editMesh is set
+   * and mesh.syncFromEditMesh() is called — an unedited mesh compiles back to the same render geometry.
    *
    * Returns false if the mesh is not found or is already editable.
    */
@@ -82,18 +85,17 @@ export class MeshEditManager {
     if (mesh.editMesh) return true;  // already editable
 
     const prim = mesh.meshPrimitive;
-    const cfg = (mesh as any)._meshConfig ?? {};
-
+    const geom = mesh.geometry;
     let em: EditMesh;
-    if (prim === 'box') {
-      em = EditMesh.fromBox(cfg.width ?? 1, cfg.height ?? 1, cfg.depth ?? 1);
-    } else if (prim === 'sphere') {
-      em = EditMesh.fromSphere(cfg.radius ?? 0.5, cfg.widthSegments ?? 8);
-    } else if (prim === 'cylinder') {
-      em = EditMesh.fromCylinder(cfg.radius ?? 0.5, cfg.height ?? 1, cfg.radialSegments ?? 8);
+    if (!geom || !geom.vertices || geom.vertices.length < FLOATS_PER_VERT * 3) {
+      em = EditMesh.fromBox(1, 1, 1);
+    } else if (mesh instanceof SkinnedMesh3D) {
+      em = EditMesh.fromGeometry(geom, { weld: false });
     } else {
-      // For custom/imported meshes: build a rough EditMesh from the triangles
-      em = this._editMeshFromGeometry(mesh);
+      // box / sphere / cylinder: the UV editor auto-unwraps them on first open (they had no UVs as EditMeshes
+      // before), so their vertex-UV fallback stays empty — the corners still carry the generator UVs for rendering.
+      const primitiveUVs = prim === 'box' || prim === 'sphere' || prim === 'cylinder';
+      em = EditMesh.fromGeometry(geom, { vertexUVs: !primitiveUVs });
     }
 
     mesh.editMesh = em;
@@ -434,13 +436,14 @@ export class MeshEditManager {
     if (!mesh?.editMesh) return false;
 
     const run = (em: EditMesh) => {
+      // Islands = existing UV cuts (corners whose UVs differ — an import's authored seams) + these seams.
       em.suggestSeams(45);   // hard edges (> 45°) → seams → separate islands
-      em.splitSeams();       // duplicate shared boundary verts so islands CAN separate
+      em.splitSeams();       // every corner gets its own UV so islands CAN separate (topology stays welded)
       em.unwrapIslands();    // project each island independently
       em.packUVIslands();    // pack islands into [0,1] with no overlap
       // Flip V so the 2D UV layout matches the 3D viewport orientation — painting
       // the bottom of the mesh shows at the bottom of the UV pane (not the top).
-      for (const vtx of em.vertices) if (vtx.uv) vtx.uv = [vtx.uv[0], 1 - vtx.uv[1]];
+      em.mapUVs((u, v) => [u, 1 - v]);
     };
 
     const before = mesh.editMesh.toJSON();
@@ -615,6 +618,41 @@ export class MeshEditManager {
     return true;
   }
 
+  /** Shade a set of faces smooth or flat (Blender's Shade Smooth / Flat). Omit the set → the face selection; an
+   *  empty selection → every face. Undoable. */
+  setFacesSmooth(meshId: string, fIdxSet: Set<number> | null, smooth: boolean): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    let set = fIdxSet ?? this._selection?.faces ?? new Set<number>();
+    if (set.size === 0) set = new Set(mesh.editMesh.faces.map((_, i) => i));
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.setFacesSmooth(set, smooth);
+    mesh.syncFromEditMesh();
+    const after = mesh.editMesh.toJSON();
+    this.pushCommand({
+      description: smooth ? 'Shade smooth' : 'Shade flat',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh = EditMesh.fromJSON(after); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /** Mark / clear half-edges (and their twins) as sharp — smooth shading never blends across them. Undoable. */
+  setSharpEdges(meshId: string, halfEdgeIndices: number[], sharp: boolean): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh || halfEdgeIndices.length === 0) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.setSharpEdges(halfEdgeIndices, sharp);
+    mesh.syncFromEditMesh();
+    const after = mesh.editMesh.toJSON();
+    this.pushCommand({
+      description: sharp ? 'Mark sharp' : 'Clear sharp',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh = EditMesh.fromJSON(after); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
   /** Weld all vertices within `threshold` distance. Returns the number removed. */
   mergeByDistance(meshId: string, threshold: number): number {
     const mesh = this._getMesh(meshId);
@@ -675,7 +713,7 @@ export class MeshEditManager {
     if (set.size === 0) return null;
 
     const em = mesh.editMesh;
-    const allFaceLists = em['_getAllFaceLists']() as number[][];
+    const allFaceLists = em['_getAllFaceLists']() as FaceList[];
 
     // Gather unique vertex indices from selected faces
     const usedVerts = new Set<number>();
@@ -693,18 +731,19 @@ export class MeshEditManager {
       newVerts.push({ ...em.vertices[vi] });
     }
 
-    // Build remapped face lists
-    const newFaceLists: number[][] = [];
+    // Build remapped face lists (corner UVs + shading travel with their faces)
+    const newFaceLists: FaceList[] = [];
     for (const fi of set) {
       if (fi >= 0 && fi < allFaceLists.length) {
-        newFaceLists.push(allFaceLists[fi].map(vi => oldToNew.get(vi)!));
+        const f = allFaceLists[fi];
+        newFaceLists.push(faceList(f.map(vi => oldToNew.get(vi)!), f.uvs, f.smooth));
       }
     }
 
     // Create new EditMesh
     const newEm = new EditMesh();
     newEm.vertices = newVerts;
-    newEm['_buildTopology'](newFaceLists);
+    newEm._buildTopology(newFaceLists, { keepFlags: false });
 
     // Create new Mesh3D at source's position
     const newMesh = new Mesh3D(this.ctx.interactionService, mesh.x, mesh.y, mesh.z, { primitive: 'custom', geometry: newEm.compile() });
@@ -882,39 +921,4 @@ export class MeshEditManager {
     this._selection.faces = new Set();
   }
 
-  /**
-   * Build a rough EditMesh from a Mesh3D's existing geometry (for custom/imported meshes).
-   * Reads the flat vertex buffer and produces one EditMesh triangle per GPU triangle.
-   * No topology welding — vertices shared in the GPU buffer are not shared in the EditMesh.
-   * Suitable for inspection/painting; heavy topology editing on unoptimized meshes will be slow.
-   */
-  private _editMeshFromGeometry(mesh: Mesh3D): EditMesh {
-    const em = new EditMesh();
-    const geom = mesh.geometry;
-    if (!geom) return EditMesh.fromBox(1, 1, 1);
-
-    const stride = FLOATS_PER_VERT;
-    const verts = geom.vertices;
-    const idxs = geom.indices;
-
-    const nVerts = verts.length / stride;
-    for (let i = 0; i < nVerts; i++) {
-      const o = i * stride;
-      // UV lives at offset 6–7 in both 8-float and 12-float vertex layouts.
-      const u = verts[o + 6] ?? 0, v = verts[o + 7] ?? 0;
-      em.vertices.push({
-        x: verts[o], y: verts[o + 1], z: verts[o + 2],
-        color: [0.8, 0.8, 0.8, 1],
-        halfEdge: -1,
-        uv: [u, v],
-      });
-    }
-
-    const faceLists: number[][] = [];
-    for (let i = 0; i < idxs.length; i += 3) {
-      faceLists.push([idxs[i], idxs[i + 1], idxs[i + 2]]);
-    }
-    em._buildTopology(faceLists);
-    return em;
-  }
 }
