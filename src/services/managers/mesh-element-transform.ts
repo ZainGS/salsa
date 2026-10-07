@@ -10,6 +10,9 @@
  *    (with an axis, as for objects), Apply (left click / Enter / the pill) or Cancel (right click / Esc / the pill).
  *  - 'gizmo' — a drag on a handle of the transform gizmo drawn at the selection's centroid (the pointer controller's
  *    hit-test): the same handle semantics as the object gizmo; the release applies.
+ *  - 'drag' — a one-finger / mouse drag that started on an already-selected element (UI review §4 "drag the selection"):
+ *    a grab on the camera-facing plane through the pivot (X / Y / Z still constrain it), the release applies, a 2nd
+ *    finger / right click / Esc / pointercancel cancels.
  *
  * Pivot = the selection's centroid (median point — Blender's default), fixed for the session. Grab = the pointer's
  * movement on a plane through the pivot (camera-facing; with an axis: the plane holding the axis that faces the camera,
@@ -34,7 +37,9 @@ import type { MeshEditManager } from './mesh-edit-manager';
 import type { Command3D } from './undo-manager-3d';
 
 export type ElementTransformMode = 'grab' | 'rotate' | 'scale';
-export type ElementTransformSource = 'modal' | 'gizmo';
+/** 'modal' = G / R / S (keyboard / pill); 'gizmo' = a handle drag of the selection gizmo; 'drag' = a one-finger / mouse
+ *  drag that started ON the selection (setMeshEditDragMovesSelection3D) — a grab on the view plane, applied on release. */
+export type ElementTransformSource = 'modal' | 'gizmo' | 'drag';
 type Axis1 = 'x' | 'y' | 'z';
 
 /** The session as the host shows it (HUD readout, touch pill, tests). */
@@ -600,6 +605,9 @@ export interface ElementTransformRouter {
   isActive(): boolean;
   /** A MODAL session runs (the keyboard / pill transform — the HUD's "shortcut"). */
   isModal(): boolean;
+  /** X / Y / Z (constrainAxis3D) apply to the running session though it is not modal — a one-finger / mouse drag on
+   *  the selection (the pill's axis buttons). Absent = modal only. */
+  acceptsAxis?(): boolean;
   mode(): ElementTransformMode | null;
   axis(): Axis1 | null;
   numeric(): string;

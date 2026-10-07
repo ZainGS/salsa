@@ -25,7 +25,9 @@ import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { buildRenderMesh, patchRenderMesh, type RenderGeometry, type RenderState } from './edit-mesh-render';
 import { weldGeometry, type WeldOptions } from './edit-mesh-weld';
 import { buildBevel, bevelLimit, bevelGuides, type BevelSpec, type BevelGuide } from './edit-mesh-bevel';
+import { buildKnifeCut, type KnifePoint, type KnifeOptions } from './edit-mesh-knife';
 export type { BevelSpec, BevelGuide } from './edit-mesh-bevel';
+export type { KnifePoint, KnifeOptions } from './edit-mesh-knife';
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -1319,6 +1321,181 @@ export class EditMesh {
     this._buildTopology(newFaceLists.map(f => this._insertEdgePoints(f, points)));
   }
 
+  /**
+   * KNIFE along a polyline of surface points (the Edit Mesh Knife tool — edit-mesh-knife.ts): between consecutive
+   * points the cut follows the surface on the plane through both points and the eye / view direction (`opts`), splitting
+   * every face it crosses edge to edge (tapped points inside a face become vertices on the split). The faces beside a
+   * cut edge take its new vertex (closed stays closed); a cut edge's seam / sharp flag passes to both pieces. Returns the
+   * number of faces split (0 = nothing cut, the mesh untouched).
+   */
+  knifeCutPath(points: KnifePoint[], opts: KnifeOptions = {}): number {
+    const b = buildKnifeCut(this.vertices, this._getAllFaceLists(), points, opts);
+    if (!b) return 0;
+    const seam = new Set(this._flagPairs('isSeam').map(([a, c]) => edgeKey(a, c)));
+    const sharp = new Set(this._flagPairs('isSharp').map(([a, c]) => edgeKey(a, c)));
+    for (const v of b.vertices) {
+      this.vertices.push({ x: v.x, y: v.y, z: v.z, color: [v.color[0], v.color[1], v.color[2], v.color[3]], halfEdge: -1, uv: v.uv ? [v.uv[0], v.uv[1]] : undefined });
+    }
+    this._buildTopology(b.faces.map(f => this._insertEdgePoints(f, b.points)));
+    const addSeam: Array<[number, number]> = [], addSharp: Array<[number, number]> = [];
+    for (const [a, c, m] of b.splitEdges) {
+      const k = edgeKey(a, c);
+      if (seam.has(k)) addSeam.push([a, m], [m, c]);
+      if (sharp.has(k)) addSharp.push([a, m], [m, c]);
+    }
+    this._markPairs(addSeam, 'isSeam');
+    this._markPairs(addSharp, 'isSharp');
+    return b.splitFaces;
+  }
+
+  // ── Loop cut with several cuts + a position (the Loop Cut tool) ───────────
+
+  /**
+   * The quad ring a loop cut through half-edge `halfEdgeIdx` crosses (both directions, stopping at a non-quad / a
+   * boundary / the start face), each quad with the edge it is entered through (`a`) and left through (`b`), both as
+   * [side, other] — `side` is on the same side of the loop for every edge, so a fraction "from side" lines up across the
+   * ring. Empty when the start edge has no quad.
+   */
+  loopRing(halfEdgeIdx: number): Array<{ face: number; a: [number, number]; b: [number, number] }> {
+    const H = this.halfEdges;
+    if (!(halfEdgeIdx >= 0 && halfEdgeIdx < H.length)) return [];
+    const out: Array<{ face: number; a: [number, number]; b: [number, number] }> = [];
+    const visited = new Set<number>();
+    const traverse = (start: number, flip: boolean): void => {
+      let he = start;
+      for (let guard = 0; guard < 100000; guard++) {
+        const h = H[he];
+        const f = h.face;
+        if (f < 0 || f >= this.faces.length || visited.has(f) || this.faces[f].vertexCount !== 4) break;
+        visited.add(f);
+        const from = H[h.prev].vertex, to = h.vertex;
+        const opp = H[h.next].next, oFrom = H[H[opp].prev].vertex, oTo = H[opp].vertex;
+        out.push({ face: f, a: flip ? [to, from] : [from, to], b: flip ? [oFrom, oTo] : [oTo, oFrom] });
+        const tw = H[opp].twin;
+        if (tw < 0) break;
+        he = tw;
+      }
+    };
+    traverse(halfEdgeIdx, false);
+    const tw = H[halfEdgeIdx].twin;
+    if (tw >= 0) traverse(tw, true);
+    return out;
+  }
+
+  /** The cut fractions (from the ring's side) of a loop cut with `count` evenly spaced cuts whose CENTRE sits at
+   *  `position` (0–1; 0.5 = centred — Blender's slide): t_i = (i + 1) / (count + 1) + shift, the shift clamped so every
+   *  cut stays inside the edge (one cut: t = position). */
+  static loopCutFractions(count: number, position = 0.5): number[] {
+    const n = Math.max(1, Math.min(64, Math.round(Number.isFinite(count) ? count : 1)));
+    const p = Number.isFinite(position) ? position : 0.5;
+    const max = 1 / (n + 1) - 0.001;
+    const shift = Math.max(-max, Math.min(max, p - 0.5));
+    return Array.from({ length: n }, (_, i) => (i + 1) / (n + 1) + shift);
+  }
+
+  /** Object-space preview segments of {@link loopCuts} (xyz, xyz per segment) — what the cut would add. */
+  loopCutPreview(halfEdgeIdx: number, count = 1, position = 0.5): number[] {
+    const ts = EditMesh.loopCutFractions(count, position);
+    const V = this.vertices, out: number[] = [];
+    const at = (e: [number, number], t: number): number[] => {
+      const a = V[e[0]], b = V[e[1]];
+      return [a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t];
+    };
+    for (const q of this.loopRing(halfEdgeIdx)) for (const t of ts) out.push(...at(q.a, t), ...at(q.b, t));
+    return out;
+  }
+
+  /**
+   * LOOP CUT with `count` parallel cuts at `position` (Blender's Loop Cut "Number of Cuts" + the slide): every quad of
+   * the ring through `halfEdgeIdx` is split into count + 1 quads; a face the ring stops at (a triangle / n-gon) gains the
+   * new vertices on its edge (no crack). Corner UVs / colours interpolate along the cut edges; a cut edge's seam / sharp
+   * flag passes to its pieces. Returns false (mesh untouched) when there is no quad ring there.
+   */
+  loopCuts(halfEdgeIdx: number, count = 1, position = 0.5): boolean {
+    const ring = this.loopRing(halfEdgeIdx);
+    if (ring.length === 0) return false;
+    const ts = EditMesh.loopCutFractions(count, position);
+    const V = this.vertices;
+    // every ring edge: its new vertices, ordered from its side vertex
+    const edges = new Map<string, { side: number; other: number; idx: number[] }>();
+    const addEdge = (e: [number, number]): void => {
+      const k = edgeKey(e[0], e[1]);
+      if (edges.has(k)) return;
+      const a = V[e[0]], b = V[e[1]];
+      const idx = ts.map(t => {
+        V.push({
+          x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t,
+          color: lerpCol(a.color, b.color, t), halfEdge: -1, uv: a.uv && b.uv ? lerpUV(a.uv, b.uv, t) : undefined,
+        });
+        return V.length - 1;
+      });
+      edges.set(k, { side: e[0], other: e[1], idx });
+    };
+    for (const q of ring) { addEdge(q.a); addEdge(q.b); }
+    /** The new vertices on edge (from → to) in order from `from`, with their fractions from `from`. */
+    const along = (from: number, to: number): { idx: number[]; s: number[] } | null => {
+      const e = edges.get(edgeKey(from, to));
+      if (!e) return null;
+      return e.side === from ? { idx: e.idx, s: ts } : { idx: [...e.idx].reverse(), s: ts.map(t => 1 - t).reverse() };
+    };
+    const ringFaces = new Map(ring.map(q => [q.face, q]));
+    const faceLists = this._getAllFaceLists();
+    const out: FaceList[] = [];
+    for (let fi = 0; fi < faceLists.length; fi++) {
+      const f = faceLists[fi];
+      const q = ringFaces.get(fi);
+      if (!q || f.length !== 4) {
+        // a face the ring stops at: the new vertices on its ring edges (in order) — no T-junction
+        const verts: number[] = [], uvs: Array<UV | undefined> = [], cols: RGBA[] = [];
+        let changed = false;
+        for (let k = 0; k < f.length; k++) {
+          const a = f[k], b = f[(k + 1) % f.length];
+          verts.push(a); uvs.push(this._fuv(f, k)); cols.push(this._fcol(f, k));
+          const e = along(a, b);
+          if (!e) continue;
+          changed = true;
+          e.idx.forEach((vi, i) => {
+            verts.push(vi);
+            uvs.push(lerpUV(this._fuv(f, k), this._fuv(f, (k + 1) % f.length), e.s[i]));
+            cols.push(lerpCol(this._fcol(f, k), this._fcol(f, (k + 1) % f.length), e.s[i]));
+          });
+        }
+        out.push(changed ? faceList(verts, f.uvs ? uvs : null, f.smooth, f.cols ? cols : null) : f);
+        continue;
+      }
+      // rotate so the entry edge is corners 0 → 1 (the exit edge is then 2 → 3)
+      const r = [0, 1, 2, 3].find(k => edgeKey(f[k], f[(k + 1) % 4]) === edgeKey(q.a[0], q.a[1]))!;
+      const g = [0, 1, 2, 3].map(k => (k + r) % 4);
+      const p = g.map(k => f[k]);
+      const U = g.map(k => this._fuv(f, k)), C = g.map(k => this._fcol(f, k));
+      const A = along(p[0], p[1]), D = along(p[3], p[2]);
+      if (!A || !D) { out.push(f); continue; }
+      const n = ts.length;
+      const AU = A.s.map(s => lerpUV(U[0], U[1], s)), AC = A.s.map(s => lerpCol(C[0], C[1], s));
+      const DU = D.s.map(s => lerpUV(U[3], U[2], s)), DC = D.s.map(s => lerpCol(C[3], C[2], s));
+      const mk = (vs: number[], us: Array<UV | undefined>, cs: RGBA[]) => faceList(vs, f.uvs ? us : null, f.smooth, f.cols ? cs : null);
+      out.push(mk([p[0], A.idx[0], D.idx[0], p[3]], [U[0], AU[0], DU[0], U[3]], [C[0], AC[0], DC[0], C[3]]));
+      for (let i = 0; i + 1 < n; i++) {
+        out.push(mk([A.idx[i], A.idx[i + 1], D.idx[i + 1], D.idx[i]], [AU[i], AU[i + 1], DU[i + 1], DU[i]], [AC[i], AC[i + 1], DC[i + 1], DC[i]]));
+      }
+      out.push(mk([A.idx[n - 1], p[1], p[2], D.idx[n - 1]], [AU[n - 1], U[1], U[2], DU[n - 1]], [AC[n - 1], C[1], C[2], DC[n - 1]]));
+    }
+    const seam = new Set(this._flagPairs('isSeam').map(([a, c]) => edgeKey(a, c)));
+    const sharp = new Set(this._flagPairs('isSharp').map(([a, c]) => edgeKey(a, c)));
+    this._buildTopology(out);
+    const addSeam: Array<[number, number]> = [], addSharp: Array<[number, number]> = [];
+    for (const [k, e] of edges) {
+      const chain = [e.side, ...e.idx, e.other];
+      for (let i = 0; i + 1 < chain.length; i++) {
+        if (seam.has(k)) addSeam.push([chain[i], chain[i + 1]]);
+        if (sharp.has(k)) addSharp.push([chain[i], chain[i + 1]]);
+      }
+    }
+    this._markPairs(addSeam, 'isSeam');
+    this._markPairs(addSharp, 'isSharp');
+    return true;
+  }
+
   // ── UV unwrap ──────────────────────────────────────────────────────────────
 
   /**
@@ -2003,6 +2180,30 @@ export class EditMesh {
     }
     this._buildTopology(faceLists);
     return sel;
+  }
+
+  /**
+   * Move each edge-connected group of the given faces along its area-weighted normal by `distance` (the Inset tool's
+   * DEPTH, Blender's Inset "Depth"): every vertex of the group moves once, so the faces around the group (an inset's
+   * border) slant with it. Custom normals around the moved vertices are recomputed. Returns whether anything moved.
+   */
+  offsetRegion(fIdxSet: Iterable<number>, distance: number): boolean {
+    if (!Number.isFinite(distance) || distance === 0) return false;
+    const faceLists = this._getAllFaceLists();
+    const sel = this._validFaces(fIdxSet, faceLists.length);
+    if (sel.length === 0) return false;
+    const { regions } = this._regionInfo(faceLists, sel);
+    const moved: number[] = [];
+    for (const region of regions) {
+      const n = this._regionNormal(faceLists, region);
+      for (const vi of new Set(region.flatMap(fi => [...faceLists[fi]]))) {
+        const v = this.vertices[vi];
+        v.x += n[0] * distance; v.y += n[1] * distance; v.z += n[2] * distance;
+        moved.push(vi);
+      }
+    }
+    if (moved.length) this.clearCustomNormalsAround(moved);
+    return moved.length > 0;
   }
 
   /**

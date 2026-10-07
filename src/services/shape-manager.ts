@@ -208,7 +208,7 @@ import { KIT_SCHEMA, KIT_KIND_LABELS, KIT_COLOR_TOKENS, KIT_ANCHORS, KIT_INTROS 
 import { UI_KIT_TRANSITIONS, UI_KIT_CLIPS, type UIKitWidget, type UIKitKind, type UIKitClip, type UIKitTransitionType, type UIKitPropSpec } from '../ui/kit/kit-types';
 import { UISoundPlayer } from '../ui/ui-sound';
 import type { UIStateMachine, UILayerData, UIEvent, UIValue, ShapeInteractionProps, TransitionAnimation, HtmlFormElement } from '../ui/ui-types';
-import { MeshEditPointerController, type MeshEditSelectionMode } from './managers/mesh-edit-pointer-controller';
+import { MeshEditPointerController, type MeshEditSelectionMode, type MeshEditTool, type MeshEditElementHit } from './managers/mesh-edit-pointer-controller';
 import { isPointerEventClaimed } from '../renderer/util/pointer-claims';
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
@@ -898,7 +898,11 @@ class ShapeManager {
         });
 
         this.meshPaint = new MeshPaintManager(ctx);
-        this.meshEdit = new MeshEditManager(ctx, (cmd) => this.scene3d.pushCommand3D(cmd));
+        this.meshEdit = new MeshEditManager(ctx, (cmd) => this.scene3d.pushCommand3D(cmd), {
+            // "adjust last operation" (redoMeshEditLastOp3D) replaces the op's own undo step
+            peek: () => this.scene3d.peekUndoCommand3D(),
+            discardTop: () => this.scene3d.discardUndoTop3D(),
+        });
         this._uvEdit  = new UVEditManager(ctx, (cmd) => this.scene3d.pushCommand3D(cmd), (id) => this._uvSessions.get(id) ?? null);
         this._liveTexture = new LiveTextureMode(ctx.sceneGraph, () => ctx.rasterLayerManager ?? null);
         // A sync that RE-POINTS a mesh at a different GPUTexture also evicts the 3D renderer's
@@ -956,7 +960,8 @@ class ShapeManager {
                     // edges (you need them to select verts/edges while mesh-editing).
                     showWireframe: uvSession?.showWireframe ?? true,
                     // the Chamfer / Bevel tool's dashed guide lines (null when it shows none)
-                    guides: this._meshEditPointerController.bevel.guideLines(),
+                    // + the Knife path and the Loop Cut preview (the tool strip's tools)
+                    guides: this._meshEditPointerController.guideLines(),
                     // the transform gizmo on the selection's centroid (null when hidden)
                     gizmo: this._meshEditPointerController.gizmoDrawData(),
                 };
@@ -4845,6 +4850,47 @@ class ShapeManager {
         this.scene3d.selectJoint(jointIndex);
     }
 
+    // ── Armature tool strip + tap-select (UI review 2026-10-07 §4; docs/reviews/section4-engine-api.md) ──────────
+
+    /** Select a joint of the overlay skeleton (tap-select). additive = toggle it in a multi-selection (an added joint
+     *  becomes the primary, the gizmo's). Non-additive = selectJoint3D. False when the skeleton isn't the overlay's. */
+    public selectArmatureJoint3D(skeletonId: string, jointIndex: number, additive = false): boolean {
+        return this.scene3d.selectArmatureJoint3D(skeletonId, jointIndex, additive);
+    }
+    /** The selected joints (primary first). getSelectedJoint3D is the primary alone. */
+    public getSelectedArmatureJoints3D(): { skeletonId: string; jointIndex: number }[] { return this.scene3d.getSelectedArmatureJoints3D(); }
+    /** Subscribe to joint-selection changes (taps, the panel, programmatic, a removed bone). Returns the unsubscribe. */
+    public onArmatureJointSelectionChanged(cb: (sel: { skeletonId: string; jointIndex: number }[]) => void): () => void {
+        return this.scene3d.onArmatureJointSelectionChanged(cb);
+    }
+    /** The overlay skeleton's joint nearest a client (CSS) point on screen within ~24 CSS px (only in Armature mode,
+     *  i.e. while a bone overlay is shown), or null. */
+    public pickArmatureJointAt3D(clientX: number, clientY: number): { skeletonId: string; jointIndex: number; jointName: string } | null {
+        return this.scene3d.pickArmatureJointAt3D(clientX, clientY);
+    }
+    /** The armature tool strip: select | rotate | move (= setArmatureToolMode3D) | addbone (placement stays on: each
+     *  tap on the mesh adds a bone from the selected joint) | ik (taps select; setArmatureIK3D configures) | weight
+     *  (weight paint of the overlay skeleton's skinned mesh on the selected joint). False when it can't apply. */
+    public setArmatureActiveTool3D(tool: 'select' | 'rotate' | 'move' | 'addbone' | 'ik' | 'weight'): boolean {
+        const ok = this.scene3d.setArmatureActiveTool3D(tool);
+        this.scheduleRender();
+        return ok;
+    }
+    public getArmatureActiveTool3D(): 'select' | 'rotate' | 'move' | 'addbone' | 'ik' | 'weight' { return this.scene3d.getArmatureActiveTool3D(); }
+    /** Add a child joint (head at the parent's tail, continuing its bone; -1 = a new root). Selects it. ONE undo step.
+     *  Returns the new joint index, or -1. */
+    public addArmatureChildJoint3D(skeletonId: string, parentJointIndex: number, name?: string): number {
+        return this.scene3d.addArmatureChildJoint3D(skeletonId, parentJointIndex, name);
+    }
+    /** IK on the chain ending at `jointIndex` (created when missing): chain length (≥ 2), enabled, and the pole —
+     *  a joint (the pole target goes to its current world position), null = none, undefined = unchanged. Returns the
+     *  chain id or null. */
+    public setArmatureIK3D(skeletonId: string, jointIndex: number, opts: { chainLength: number; poleJointIndex?: number | null; enabled: boolean }): string | null {
+        return this.scene3d.setArmatureIK3D(skeletonId, jointIndex, opts);
+    }
+    /** The IK chain ending at `jointIndex`: { chainId, chainLength, poleJointIndex, enabled, target, poleTarget }, or null. */
+    public getArmatureIK3D(skeletonId: string, jointIndex: number) { return this.scene3d.getArmatureIK3D(skeletonId, jointIndex); }
+
     /**
      * Project all joint world positions into 2D screen coordinates.
      * Use this each frame to position name-label DOM elements over the canvas.
@@ -8093,6 +8139,87 @@ class ShapeManager {
         if (steps.scale !== undefined && steps.scale > 0) t.snapScale = steps.scale;
     }
 
+    // ── Edit Mesh redesign — engine side (UI review 2026-10-07 §4; docs/reviews/section4-engine-api.md) ──────────
+
+    /** A one-finger / mouse drag that STARTS on an already-selected vertex / edge / face moves the whole selection on
+     *  the view plane (live; one undo step on release; a 2nd finger / right click / Esc / pointercancel cancels;
+     *  constrainAxis3D X / Y / Z apply while it runs). Elsewhere a drag keeps its old meaning. Default ON. */
+    public setMeshEditDragMovesSelection3D(on: boolean): void { this._meshEditPointerController.dragMovesSelection = !!on; }
+    public getMeshEditDragMovesSelection3D(): boolean { return this._meshEditPointerController.dragMovesSelection; }
+
+    /** The vertex / edge / face (the current selection mode) under a client (CSS) point in Edit Mesh, and whether it is
+     *  selected — null when nothing is in reach or no mesh is in Edit Mesh. Edges are half-edge indices (what
+     *  selectEdge3D / loopCut3D / setSharpEdges3D take). `touch` = the finger's ×2 pick radius. */
+    public pickMeshEditElementAt3D(clientX: number, clientY: number, touch = false): MeshEditElementHit | null {
+        return this._meshEditPointerController.pickElementAt(clientX, clientY, touch);
+    }
+
+    /** The Edit Mesh tool strip's tool: select (taps select, no gizmo) | move / rotate / scale (the selection gizmo in
+     *  that mode — the same as setMeshEditGizmoMode3D) | extrude / inset / bevel (the host runs the op; selection as
+     *  select) | loopcut (hover / touch an edge to preview the loop, release / click cuts with the Loop Cut options) |
+     *  knife (taps on the surface place cut points; applyMeshEditKnife3D cuts). False for an unknown tool. */
+    public setMeshEditActiveTool3D(tool: MeshEditTool): boolean {
+        const ok = this._meshEditPointerController.setTool(tool);
+        this.scheduleRender();
+        return ok;
+    }
+    public getMeshEditActiveTool3D(): MeshEditTool { return this._meshEditPointerController.tool; }
+
+    /** The Loop Cut tool's next cut: `count` parallel cuts (1–64) at `position` (0–1; 0.5 = evenly spaced). */
+    public setMeshEditLoopCutOptions3D(opts: { count?: number; position?: number }): void {
+        const c = this._meshEditPointerController;
+        if (opts.count !== undefined && Number.isFinite(opts.count)) c.loopCutCount = Math.max(1, Math.min(64, Math.round(opts.count)));
+        if (opts.position !== undefined && Number.isFinite(opts.position)) c.loopCutPosition = Math.max(0, Math.min(1, opts.position));
+        this.scheduleRender();
+    }
+    public getMeshEditLoopCutOptions3D(): { count: number; position: number } {
+        return { count: this._meshEditPointerController.loopCutCount, position: this._meshEditPointerController.loopCutPosition };
+    }
+
+    /** Loop cut with several cuts + a position (the Loop Cut tool's op; the selection is cleared). One undo step; the
+     *  last op (getMeshEditLastOp3D). */
+    public loopCuts3D(meshId: string, halfEdgeIdx: number, count = 1, position = 0.5): boolean {
+        return this._redrawIf(this.meshEdit.loopCuts(meshId, halfEdgeIdx, count, position));
+    }
+
+    /** Knife: cut along the points tapped so far (straight on screen between them, across the faces) — ONE undo step.
+     *  Returns the number of faces split (0 = nothing cut). The points are dropped either way. */
+    public applyMeshEditKnife3D(): number {
+        const n = this._meshEditPointerController.knifeApply();
+        this.scheduleRender();
+        return n;
+    }
+    /** Knife: drop the tapped points (Esc). */
+    public cancelMeshEditKnife3D(): void { this._meshEditPointerController.knifeCancel(); this.scheduleRender(); }
+    /** Knife: how many points are placed (≥ 2 can be applied). */
+    public getMeshEditKnifePointCount3D(): number { return this._meshEditPointerController.knifePointCount; }
+
+    /** "Adjust last operation" (Blender's F9): the last parametric op — extrudeRegion {distance}, insetRegion {amount,
+     *  depth}, bevel {amount, segments}, loopCut {count, position}, subdivide {levels} — while nothing else edited the
+     *  mesh since (any other edit / undo / redo / leaving Edit Mesh forgets it). Null otherwise. */
+    public getMeshEditLastOp3D(): { op: string; params: Record<string, number | boolean | string> } | null {
+        return this.meshEdit.getLastOp();
+    }
+
+    /** Re-run the last parametric op with these params (merged over its own; unknown keys ignored) from the same mesh +
+     *  selection: its undo step is replaced, so the stack stays ONE step net. Cheap enough to call per pill-scrub change
+     *  (one EditMesh copy + the op + one compile; no undo replay). False when there is no valid last op, or a Chamfer /
+     *  element transform is running. */
+    public redoMeshEditLastOp3D(params: Record<string, number | boolean | string>): boolean {
+        const c = this._meshEditPointerController;
+        if (c.bevel.active || c.transform.active) return false;
+        const ok = this.meshEdit.redoLastOp(params);
+        if (ok) {
+            const last = this.meshEdit.getLastOp();
+            if (last?.op === 'loopCut') {   // the Loop Cut tool's next cut uses the adjusted values
+                if (typeof last.params.count === 'number') c.loopCutCount = last.params.count;
+                if (typeof last.params.position === 'number') c.loopCutPosition = last.params.position;
+            }
+            this.scheduleRender();
+        }
+        return ok;
+    }
+
     /**
      * Run a smart-project (box/triplanar) UV unwrap on the mesh.
      * Assigns UV coordinates to every vertex by projecting along the dominant
@@ -9092,13 +9219,13 @@ class ShapeManager {
 
     /** REGION inset: one border around each connected group of the set (null = the selection); a lone face insets as
      *  {@link insetFace3D}. The inner faces stay selected. */
-    public insetRegion3D(meshId: string, fIdxSet: Iterable<number> | null, amount: number): boolean {
-        return this._redrawIf(this.meshEdit.insetRegion(meshId, fIdxSet, amount));
+    public insetRegion3D(meshId: string, fIdxSet: Iterable<number> | null, amount: number, depth = 0): boolean {
+        return this._redrawIf(this.meshEdit.insetRegion(meshId, fIdxSet, amount, depth));
     }
 
     /** Subdivide every face of the set (null = the selection) at once, edge midpoints shared. Clears the selection. */
-    public subdivideFaces3D(meshId: string, fIdxSet: Iterable<number> | null): boolean {
-        return this._redrawIf(this.meshEdit.subdivideFaces(meshId, fIdxSet));
+    public subdivideFaces3D(meshId: string, fIdxSet: Iterable<number> | null, levels = 1): boolean {
+        return this._redrawIf(this.meshEdit.subdivideFaces(meshId, fIdxSet, levels));
     }
 
     /** Cap every hole — or, when selected vertices / edges lie on holes, only those. Returns the number filled. */

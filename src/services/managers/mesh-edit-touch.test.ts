@@ -90,9 +90,12 @@ describe('MeshEditPointerController — mouse (unchanged)', () => {
     // Another face (the pick resolves to the face centre nearest the hit point — force a different one via the latch).
     t.meshEdit.selectFace('m', (first + 1) % 6, true);
     expect(t.sel().faces.size).toBe(2);
-    t.fire('pointerdown', { clientX: 400, clientY: 300 });       // plain press replaces
+    // plain press on a SELECTED face: it waits (a drag would move the whole selection — UI review §4); the click
+    // (release without a drag) replaces the selection
+    t.fire('pointerdown', { clientX: 400, clientY: 300 });
+    expect(t.sel().faces.size).toBe(2);
+    t.fire('pointerup', { clientX: 400, clientY: 300 });
     expect(t.sel().faces.size).toBe(1);
-    t.fire('pointerup', {});
     t.meshEdit.selectFace('m', (first + 1) % 6, true);
     t.setAdditive(true);
     t.fire('pointerdown', { clientX: 400, clientY: 300 });       // latch: adds (keeps the other face)

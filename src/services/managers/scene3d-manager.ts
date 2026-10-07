@@ -1129,6 +1129,10 @@ export class Scene3DManager {
 
     clearUndo3D(): void { this._undoManager.clear(); }
     pushCommand3D(cmd: import('./undo-manager-3d').Command3D): void { this._undoManager.push(cmd); }
+    /** The 3D undo step that undo3D would revert next (null when none). */
+    peekUndoCommand3D(): import('./undo-manager-3d').Command3D | null { return this._undoManager.peekUndo(); }
+    /** Drop the top 3D undo step without running its undo (the caller restored the state) — UndoManager3D.discardUndoTop. */
+    discardUndoTop3D(): boolean { return this._undoManager.discardUndoTop(); }
 
     // ── Shadow mapping ───────────────────────────────────────────────
 
@@ -8221,6 +8225,17 @@ export class Scene3DManager {
     /** Clear the active joint selection without clearing the bone overlay. */
     clearJointSelection(): void { return this._armature.clearJointSelection(); }
 
+    // ── Armature tool strip + tap-select (UI review 2026-10-07 §4; Scene3DArmature) ──
+    selectArmatureJoint3D(skeletonId: string, jointIndex: number, additive = false): boolean { return this._armature.selectArmatureJoint(skeletonId, jointIndex, additive); }
+    getSelectedArmatureJoints3D(): { skeletonId: string; jointIndex: number }[] { return this._armature.getSelectedArmatureJoints(); }
+    onArmatureJointSelectionChanged(cb: (sel: { skeletonId: string; jointIndex: number }[]) => void): () => void { return this._armature.onJointSelectionChanged(cb); }
+    pickArmatureJointAt3D(clientX: number, clientY: number, radiusCss?: number): { skeletonId: string; jointIndex: number; jointName: string } | null { return this._armature.pickArmatureJointAt(clientX, clientY, radiusCss); }
+    setArmatureActiveTool3D(tool: import('./scene3d-armature').ArmatureTool): boolean { return this._armature.setArmatureActiveTool(tool); }
+    getArmatureActiveTool3D(): import('./scene3d-armature').ArmatureTool { return this._armature.getArmatureActiveTool(); }
+    addArmatureChildJoint3D(skeletonId: string, parentJointIndex: number, name?: string): number { return this._armature.addArmatureChildJoint(skeletonId, parentJointIndex, name); }
+    setArmatureIK3D(skeletonId: string, jointIndex: number, opts: { chainLength: number; poleJointIndex?: number | null; enabled: boolean }): string | null { return this._armature.setArmatureIK(skeletonId, jointIndex, opts); }
+    getArmatureIK3D(skeletonId: string, jointIndex: number) { return this._armature.getArmatureIK(skeletonId, jointIndex); }
+
     // ── Extrude bone (deprecated) ─────────────────────────────────────
 
     /**
@@ -9881,7 +9896,7 @@ export class Scene3DManager {
     constrainAxis3D(axis: 'x' | 'y' | 'z'): void {
         if (this._playing) return;
         const r = this._xfRouted();
-        if (r) { if (r.isModal()) r.constrainAxis(axis); return; }
+        if (r) { if (r.isModal() || r.acceptsAxis?.()) r.constrainAxis(axis); return; }   // (+ a drag on the selection)
         this._armature.getTransformController()?.constrainAxis3D(axis);
     }
 

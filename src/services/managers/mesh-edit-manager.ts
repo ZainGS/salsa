@@ -20,7 +20,7 @@ import type { ManagerContext } from './manager-context';
 import type { Command3D } from './undo-manager-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
-import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier, remapFace, type FaceList, type BevelSpec } from '../../scene-graph/shapes/edit-mesh';
+import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier, remapFace, type FaceList, type BevelSpec, type KnifePoint, type KnifeOptions } from '../../scene-graph/shapes/edit-mesh';
 import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
 export interface EditSelection {
@@ -30,16 +30,56 @@ export interface EditSelection {
   faces: Set<number>;
 }
 
+/** The parametric ops "adjust last operation" can re-run (getMeshEditLastOp3D / redoMeshEditLastOp3D). */
+export type MeshEditLastOpName = 'extrudeRegion' | 'insetRegion' | 'bevel' | 'loopCut' | 'subdivide';
+
+/** The last parametric op as the host shows it (the operation pill / Blender's F9 panel). */
+export interface MeshEditLastOp {
+  op: MeshEditLastOpName;
+  params: Record<string, number | boolean | string>;
+}
+
+/** Hooks into the 3D undo stack ("adjust last operation" replaces the op's own step). */
+export interface MeshEditUndoHooks {
+  /** The step undo3D would revert next. */
+  peek(): Command3D | null;
+  /** Drop that step without running its undo. */
+  discardTop(): boolean;
+}
+
+/** What a re-run needs: the mesh before the op, the selection before it, the op's target, and the step it pushed. */
+interface LastOpRecord extends MeshEditLastOp {
+  meshId: string;
+  before: object;
+  sel: { vertices: number[]; edges: number[]; faces: number[] } | null;
+  /** The op's target in the BEFORE mesh: faces / a half-edge / a bevel spec (without amount / segments). */
+  target: { faces?: number[]; halfEdge?: number; vertices?: number[]; edges?: Array<[number, number]> };
+  /** The step the op pushed (null = the last re-run changed nothing: no step, the mesh is `before`). */
+  cmd: Command3D | null;
+  /** The step below it (what must be on top while `cmd` is null). */
+  below: Command3D | null;
+  /** The EditMesh the op left (another object / attribute version = something else edited the mesh since). */
+  em: EditMesh;
+  attr: number;
+}
+
 export class MeshEditManager {
   private ctx: ManagerContext;
   private pushCommand: (cmd: Command3D) => void;
+  private readonly _undo: MeshEditUndoHooks | null;
 
   private _editMeshId: string | null = null;
   private _selection: EditSelection | null = null;
+  /** The last command this manager pushed (an op's own step). */
+  private _lastPushed: Command3D | null = null;
+  /** The EditMesh JSON _topologyEdit took before its op (reused by the last-op record). */
+  private _lastBefore: object | null = null;
+  private _lastOp: LastOpRecord | null = null;
 
-  constructor(ctx: ManagerContext, pushCommand: (cmd: Command3D) => void) {
+  constructor(ctx: ManagerContext, pushCommand: (cmd: Command3D) => void, undo?: MeshEditUndoHooks) {
     this.ctx = ctx;
-    this.pushCommand = pushCommand;
+    this.pushCommand = (cmd) => { this._lastPushed = cmd; pushCommand(cmd); };
+    this._undo = undo ?? null;
   }
 
   // ── Edit mode ─────────────────────────────────────────────────────────────
@@ -64,6 +104,7 @@ export class MeshEditManager {
   }
 
   exitEditMode(): void {
+    this._lastOp = null;
     this._editMeshId = null;
     this._selection = null;
   }
@@ -404,10 +445,11 @@ export class MeshEditManager {
    * (`spec.edges`, vertex pairs) by `spec.amount` (distance along the edges, clamped) with `spec.segments`. One undo
    * step; the selection is dropped (the indices change). Returns the amount used, or null when nothing was beveled.
    */
-  bevel(meshId: string, spec: BevelSpec): number | null {
+  bevel(meshId: string, spec: BevelSpec, _before?: object, _sel?: LastOpRecord['sel']): number | null {
     const mesh = this._getMesh(meshId);
     if (!mesh?.editMesh) return null;
-    const before = mesh.editMesh.toJSON();
+    const sel = _sel !== undefined ? _sel : this.snapshotSelection(meshId);
+    const before = _before ?? mesh.editMesh.toJSON();
     const r = mesh.editMesh.bevel(spec);
     if (!r) return null;
     mesh.syncFromEditMesh();
@@ -418,6 +460,9 @@ export class MeshEditManager {
       undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
       redo: () => { mesh.editMesh = EditMesh.fromJSON(after); mesh.syncFromEditMesh(); },
     });
+    this._lastBefore = before;
+    this._recordOp(meshId, 'bevel', { amount: r.amount, segments: spec.segments ?? 1 },
+      spec.vertices?.length ? { vertices: [...spec.vertices] } : { edges: (spec.edges ?? []).map(e => [e[0], e[1]] as [number, number]) }, sel);
     return r.amount;
   }
 
@@ -616,10 +661,11 @@ export class MeshEditManager {
   // ── Region ops (UI review 2026-10-07): one undo step each, the selection as the default target ──
 
   /** One undoable topology edit: snapshot, run `op` (false = it changed nothing → no command), recompile, push. */
-  private _topologyEdit(meshId: string, description: string, op: (mesh: Mesh3D) => boolean): boolean {
+  private _topologyEdit(meshId: string, description: string, op: (mesh: Mesh3D) => boolean, beforeJSON?: object): boolean {
     const mesh = this._getMesh(meshId);
     if (!mesh?.editMesh) return false;
-    const before = mesh.editMesh.toJSON();
+    const before = beforeJSON ?? mesh.editMesh.toJSON();
+    this._lastBefore = before;
     if (!op(mesh)) return false;   // the region ops bail out before touching the mesh
     mesh.syncFromEditMesh();
     const after = mesh.editMesh!.toJSON();
@@ -638,30 +684,176 @@ export class MeshEditManager {
 
   /** REGION extrude (EditMesh.extrudeRegion): connected selected faces move as one piece with one ring of walls. The
    *  extruded faces stay selected (they keep their indices), ready for the next extrude / G. */
-  extrudeRegion(meshId: string, fIdxSet: Iterable<number> | null, distance: number): boolean {
+  extrudeRegion(meshId: string, fIdxSet: Iterable<number> | null, distance: number, _before?: object): boolean {
     const set = this._facesOrSelection(fIdxSet);
     if (set.size === 0) return false;
-    const ok = this._topologyEdit(meshId, set.size > 1 ? 'Extrude region' : 'Extrude face', m => m.editMesh!.extrudeRegion(set, distance).length > 0);
-    if (ok) this._reselectFaces(meshId, set);
+    const sel = this.snapshotSelection(meshId);
+    const ok = this._topologyEdit(meshId, set.size > 1 ? 'Extrude region' : 'Extrude face', m => m.editMesh!.extrudeRegion(set, distance).length > 0, _before);
+    if (ok) {
+      this._reselectFaces(meshId, set);
+      this._recordOp(meshId, 'extrudeRegion', { distance }, { faces: [...set] }, sel);
+    }
     return ok;
   }
 
-  /** REGION inset (EditMesh.insetRegion): one border around each connected group. The inner faces stay selected. */
-  insetRegion(meshId: string, fIdxSet: Iterable<number> | null, amount: number): boolean {
+  /** REGION inset (EditMesh.insetRegion): one border around each connected group. The inner faces stay selected.
+   *  `depth` (Blender's Inset "Depth") then moves the inner faces along their normal. */
+  insetRegion(meshId: string, fIdxSet: Iterable<number> | null, amount: number, depth = 0, _before?: object): boolean {
     const set = this._facesOrSelection(fIdxSet);
     if (set.size === 0) return false;
-    const ok = this._topologyEdit(meshId, set.size > 1 ? 'Inset region' : 'Inset face', m => m.editMesh!.insetRegion(set, amount).length > 0);
-    if (ok) this._reselectFaces(meshId, set);
+    const sel = this.snapshotSelection(meshId);
+    const d = Number.isFinite(depth) ? depth : 0;
+    const ok = this._topologyEdit(meshId, set.size > 1 ? 'Inset region' : 'Inset face', m => {
+      const em = m.editMesh!;
+      const inset = amount > 0 && em.insetRegion(set, amount).length > 0;
+      const moved = d !== 0 && em.offsetRegion(set, d);
+      return inset || moved;
+    }, _before);
+    if (ok) {
+      this._reselectFaces(meshId, set);
+      this._recordOp(meshId, 'insetRegion', { amount, depth: d }, { faces: [...set] }, sel);
+    }
     return ok;
   }
 
-  /** Subdivide every selected face at once (shared edge midpoints). The selection is cleared (faces renumbered). */
-  subdivideFaces(meshId: string, fIdxSet: Iterable<number> | null): boolean {
+  /** Subdivide every selected face at once (shared edge midpoints). The selection is cleared (faces renumbered).
+   *  `levels` > 1 subdivides the new faces again (each level splits every face edge in two: 2^levels pieces per edge). */
+  subdivideFaces(meshId: string, fIdxSet: Iterable<number> | null, levels = 1, _before?: object): boolean {
     const set = this._facesOrSelection(fIdxSet);
     if (set.size === 0) return false;
-    const ok = this._topologyEdit(meshId, 'Subdivide faces', m => { const n = m.editMesh!.faces.length; m.editMesh!.subdivideFaces(set); return m.editMesh!.faces.length !== n; });
+    const sel = this.snapshotSelection(meshId);
+    const lv = Math.max(1, Math.min(4, Math.round(Number.isFinite(levels) ? levels : 1)));
+    const ok = this._topologyEdit(meshId, 'Subdivide faces', m => {
+      const em = m.editMesh!;
+      const n0 = em.faces.length;
+      let cur = [...set].filter(fi => fi >= 0 && fi < em.faces.length && em.faces[fi].vertexCount >= 3);
+      for (let l = 0; l < lv && cur.length > 0; l++) {
+        const made = cur.reduce((acc, fi) => acc + em.faces[fi].vertexCount, 0);
+        em.subdivideFaces(cur);
+        // subdivideFaces keeps the other faces first and appends the new quads
+        cur = Array.from({ length: made }, (_, i) => em.faces.length - made + i);
+      }
+      return em.faces.length !== n0;
+    }, _before);
+    if (ok) {
+      this._clearSelectionGeometry(meshId);
+      this._recordOp(meshId, 'subdivide', { levels: lv }, { faces: [...set] }, sel);
+    }
+    return ok;
+  }
+
+  /**
+   * LOOP CUT with `count` parallel cuts at `position` (0–1, 0.5 = evenly spaced) through the quad ring of half-edge
+   * `halfEdgeIdx` (EditMesh.loopCuts). One undo step; the selection is cleared (vertices renumbered). Recorded as the
+   * last op (adjust count / position afterwards).
+   */
+  loopCuts(meshId: string, halfEdgeIdx: number, count = 1, position = 0.5, _before?: object): boolean {
+    const sel = this.snapshotSelection(meshId);
+    const n = Math.max(1, Math.min(64, Math.round(Number.isFinite(count) ? count : 1)));
+    const p = Math.max(0, Math.min(1, Number.isFinite(position) ? position : 0.5));
+    const ok = this._topologyEdit(meshId, n > 1 ? `Loop cut (${n})` : 'Loop cut', m => m.editMesh!.loopCuts(halfEdgeIdx, n, p), _before);
+    if (ok) {
+      this._clearSelectionGeometry(meshId);
+      this._recordOp(meshId, 'loopCut', { count: n, position: p }, { halfEdge: halfEdgeIdx }, sel);
+    }
+    return ok;
+  }
+
+  /**
+   * KNIFE along tapped surface points (EditMesh.knifeCutPath — the Knife tool). One undo step; the selection is cleared.
+   * Returns the number of faces split (0 = nothing cut, no step).
+   */
+  knifePath(meshId: string, points: KnifePoint[], opts: KnifeOptions = {}): number {
+    let split = 0;
+    const ok = this._topologyEdit(meshId, 'Knife', m => (split = m.editMesh!.knifeCutPath(points, opts)) > 0);
     if (ok) this._clearSelectionGeometry(meshId);
-    return ok;
+    return ok ? split : 0;
+  }
+
+  // ── Adjust last operation (Blender's F9) ──────────────────────────────────
+
+  /** Record `op` (just applied; its step = the last one pushed) as the last parametric op. */
+  private _recordOp(meshId: string, op: MeshEditLastOpName, params: LastOpRecord['params'], target: LastOpRecord['target'],
+    sel: LastOpRecord['sel']): void {
+    if (!this._lastBefore || !this._lastPushed) return;
+    this.recordLastOp({ meshId, op, params, target, sel, before: this._lastBefore, cmd: this._lastPushed });
+  }
+
+  /**
+   * Record a parametric op applied OUTSIDE this manager (the interactive Chamfer tool pushes its own step): `before` =
+   * the EditMesh JSON before it, `cmd` = the step it pushed, `sel` = the selection before it.
+   */
+  recordLastOp(r: { meshId: string; op: MeshEditLastOpName; params: LastOpRecord['params']; target: LastOpRecord['target'];
+    sel: LastOpRecord['sel']; before: object; cmd: Command3D }): void {
+    const mesh = this._getMesh(r.meshId);
+    if (!mesh?.editMesh) { this._lastOp = null; return; }
+    this._lastOp = { ...r, params: { ...r.params }, below: null, em: mesh.editMesh, attr: mesh.editMesh.attrVersion };
+  }
+
+  /** The last parametric op while nothing else has edited since (else null — and forgotten). */
+  getLastOp(): MeshEditLastOp | null {
+    const r = this._validLastOp();
+    return r ? { op: r.op, params: { ...r.params } } : null;
+  }
+
+  private _validLastOp(): LastOpRecord | null {
+    const r = this._lastOp;
+    if (!r) return null;
+    const mesh = this._getMesh(r.meshId);
+    const top = this._undo ? this._undo.peek() : r.cmd;
+    const ok = !!mesh && mesh.editMesh === r.em && r.em.attrVersion === r.attr && this._editMeshId === r.meshId
+      && (r.cmd ? top === r.cmd : top === r.below);
+    if (!ok) this._lastOp = null;
+    return ok ? r : null;
+  }
+
+  /** Forget the last op. */
+  clearLastOp(): void { this._lastOp = null; }
+
+  /**
+   * Re-run the last parametric op with `params` merged over its current ones (unknown keys ignored), from the same mesh
+   * + selection: its own undo step is DROPPED (not undone — the BEFORE mesh is put back directly) and the re-run pushes
+   * one, so the stack stays ONE step net. A re-run that changes nothing (e.g. distance 0) leaves the mesh as before the
+   * op with no step; a later call can still bring it back. False when there is no valid last op (another edit happened
+   * since, undo / redo, Edit Mesh left). Cost per call: one EditMesh.fromJSON + the op + one compile (no undo replay).
+   */
+  redoLastOp(params: Record<string, number | boolean | string>): boolean {
+    const r = this._validLastOp();
+    if (!r) return false;
+    const mesh = this._getMesh(r.meshId)!;
+    if (r.cmd && !(this._undo?.discardTop() ?? false)) { this._lastOp = null; return false; }
+    const below = this._undo?.peek() ?? null;
+    const p: LastOpRecord['params'] = { ...r.params };
+    for (const [k, v] of Object.entries(params ?? {})) {
+      if (!(k in p)) continue;
+      if (typeof p[k] === 'number') { const n = Number(v); if (Number.isFinite(n)) p[k] = n; }
+      else if (typeof p[k] === typeof v) p[k] = v;
+    }
+    mesh.editMesh = EditMesh.fromJSON(r.before);
+    this.restoreSelection(r.meshId, r.sel);
+    const num = (k: string, d: number): number => (typeof p[k] === 'number' ? p[k] as number : d);
+    this._lastOp = null;
+    let ok = false;
+    switch (r.op) {
+      case 'extrudeRegion': ok = this.extrudeRegion(r.meshId, r.target.faces ?? [], num('distance', 0), r.before); break;
+      case 'insetRegion': ok = this.insetRegion(r.meshId, r.target.faces ?? [], num('amount', 0), num('depth', 0), r.before); break;
+      case 'subdivide': ok = this.subdivideFaces(r.meshId, r.target.faces ?? [], num('levels', 1), r.before); break;
+      case 'loopCut': ok = this.loopCuts(r.meshId, r.target.halfEdge ?? -1, num('count', 1), num('position', 0.5), r.before); break;
+      case 'bevel': {
+        const amount = num('amount', 0), segments = num('segments', 1);
+        const spec: BevelSpec = r.target.vertices?.length
+          ? { vertices: r.target.vertices, amount, segments } : { edges: r.target.edges ?? [], amount, segments };
+        ok = amount > 0 && this.bevel(r.meshId, spec, r.before, r.sel) !== null;
+        break;
+      }
+    }
+    if (!ok) {
+      // nothing changed: the mesh stays as before the op (no step); keep the record so the pill can scrub back
+      mesh.syncFromEditMesh();
+      this.restoreSelection(r.meshId, r.sel);
+      this._lastOp = { ...r, params: p, cmd: null, below, em: mesh.editMesh!, attr: mesh.editMesh!.attrVersion };
+    }
+    return true;
   }
 
   /** Cap every hole (or, when vertices / edges on a hole are selected, just those holes) — one undo step. Returns the

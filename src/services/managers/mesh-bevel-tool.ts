@@ -249,12 +249,19 @@ export class MeshBevelTool {
     if (this._phase !== 'adjust' || !(this._amount > 0) || !mesh?.editMesh || mesh.editMesh === this._orig) { this.cancel(); return false; }
     const before = this._before!, after = mesh.editMesh.toJSON();
     const meshId = this._meshId!;
-    this.host.pushCmd({
+    const cmd: Command3D = {
       description: this._kind === 'vertex' ? 'Chamfer vertex' : 'Bevel edge',
       undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
       redo: () => { mesh.editMesh = EditMesh.fromJSON(after); mesh.syncFromEditMesh(); },
-    });
+    };
+    this.host.pushCmd(cmd);
     this.host.meshEdit.restoreSelection(meshId, null);
+    // "adjust last operation": the pill can re-run it with another amount / segments (MeshEditManager.redoLastOp)
+    this.host.meshEdit.recordLastOp?.({
+      meshId, op: 'bevel', params: { amount: this._amount, segments: this._segments },
+      target: this._kind === 'vertex' ? { vertices: [...this._vertices] } : { edges: this._edges.map(e => [e[0], e[1]] as [number, number]) },
+      sel: this._selSnap, before, cmd,
+    });
     this._end();
     return true;
   }

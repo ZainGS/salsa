@@ -970,6 +970,7 @@ function buildBoneOverlayGeometry(
   showSkeleton:         boolean,
   showSpringBones:      boolean,
   showFkBones:          boolean,
+  extraSelected:        ReadonlySet<number> | null = null,
 ): { verts: Float32Array; idxs: Uint32Array; vertCount: number; idxCount: number; lineVerts: Float32Array; lineVertCount: number } {
   const verts: number[] = [];
   const idxs:  number[] = [];
@@ -1082,7 +1083,9 @@ function buildBoneOverlayGeometry(
     if (j.index === selectedJoint && !selectedJointIsTail) continue; // drawn separately below
     if (!visible(j.index)) continue;                                 // visibility toggle
     const jx = j.worldMatrix[12], jy = j.worldMatrix[13], jz = j.worldMatrix[14];
-    const col = (j.index === hoveredJoint || j.index === programmaticHoverIdx) ? COL_JOINT_HOVER
+    // (a multi-selection's other joints — UI review §4 tap-select — draw as selected too)
+    const col = extraSelected?.has(j.index)  ? COL_JOINT_SELECTED
+              : (j.index === hoveredJoint || j.index === programmaticHoverIdx) ? COL_JOINT_HOVER
               : j.parentIndex < 0        ? COL_ROOT_JOINT
               : COL_JOINT;
     addUvSphere(verts, idxs, jx, jy, jz, jointRadius, col, 4, 6);
@@ -2479,6 +2482,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     showSkeleton = true,
     showSpringBones = true,
     showFkBones = true,
+    extraSelected: ReadonlySet<number> | null = null,
   ): void {
     const { joints } = skeleton.data;
     if (joints.length === 0) return;
@@ -2492,7 +2496,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     const { verts, idxs, vertCount, idxCount, lineVerts, lineVertCount } = buildBoneOverlayGeometry(
       skeleton, jointRadius, hoveredJointIdx, selectedJointIdx, selectedJointIsTail, hoveredTailJointIdx,
-      camera.position, weightPaintMode, programmaticHoverIdx, showSkeleton, showSpringBones, showFkBones,
+      camera.position, weightPaintMode, programmaticHoverIdx, showSkeleton, showSpringBones, showFkBones, extraSelected,
     );
     if (idxCount === 0) return;
 

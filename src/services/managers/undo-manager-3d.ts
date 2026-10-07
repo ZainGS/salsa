@@ -87,6 +87,24 @@ export class UndoManager3D {
     return true;
   }
 
+  /** The command {@link undo} would revert next (null when none) — "is my command still the last step?". */
+  peekUndo(): Command3D | null { return this._pointer >= 0 ? this._stack[this._pointer] : null; }
+
+  /**
+   * Drop the command {@link undo} would revert next WITHOUT running its undo (the caller has already put the state
+   * back itself), plus the redo history above it. Used by "adjust last operation": the op's step is replaced by a
+   * re-run, so the net stack is one step. Returns false when there is nothing to drop.
+   */
+  discardUndoTop(): boolean {
+    if (this._pointer < 0) return false;
+    for (let i = this._pointer + 1; i < this._stack.length; i++) this._stack[i].dispose?.();
+    const top = this._stack[this._pointer];
+    this._stack = this._stack.slice(0, this._pointer);
+    this._pointer--;
+    top.dispose?.();
+    return true;
+  }
+
   clear(): void {
     for (const cmd of this._stack) cmd.dispose?.();
     this._stack = [];

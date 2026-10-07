@@ -1275,6 +1275,10 @@ export class Renderer3D {
   private _hoveredJointIdx: number | null = null;
   private _selectedJointIdx: number | null = null;
   private _selectedJointIsTail = false;
+  /** The other joints of a multi-selection (drawn as selected; the gizmo stays on the primary). */
+  private _extraSelectedJoints: ReadonlySet<number> | null = null;
+  /** The armature tool strip's Select / IK / Add Bone / Weight tools hide the joint gizmo. */
+  private _jointGizmoHidden = false;
   // True while the user is actively placing a bone (between clicks). Suppresses
   // the joint translation gizmo so it doesn't distract during bone drawing.
   private _bonePlacementActive = false;
@@ -3941,11 +3945,11 @@ export class Renderer3D {
         pass, this._boneOverlaySkeleton, this.camera,
         this._hoveredJointIdx, this._selectedJointIdx, this._selectedJointIsTail, this._hoveredTailJointIdx,
         this._weightPaintActive, this._programmaticHoverJoint, this._weightPaintShowSkeleton,
-        this._showSpringBones, this._showFkBones,
+        this._showSpringBones, this._showFkBones, this._extraSelectedJoints,
       );
       // Joint gizmo on the selected head joint — suppressed during weight paint
       // and while actively placing a bone (so it doesn't distract mid-draw).
-      if (!this._weightPaintActive && !this._bonePlacementActive && this._selectedJointIdx !== null && !this._selectedJointIsTail) {
+      if (!this._weightPaintActive && !this._bonePlacementActive && !this._jointGizmoHidden && this._selectedJointIdx !== null && !this._selectedJointIsTail) {
         const j = this._boneOverlaySkeleton.data.joints[this._selectedJointIdx];
         if (j) {
           const wp: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
@@ -3977,6 +3981,10 @@ export class Renderer3D {
   getHoveredJoint(): number | null { return this._hoveredJointIdx; }
   setSelectedJoint(idx: number | null, isTail = false): void { this._selectedJointIdx = idx; this._selectedJointIsTail = isTail; }
   getSelectedJoint(): number | null { return this._selectedJointIdx; }
+  /** The other joints of a multi-selection (null / empty = none). */
+  setExtraSelectedJoints(joints: ReadonlySet<number> | null): void { this._extraSelectedJoints = joints && joints.size ? new Set(joints) : null; }
+  /** Hide the joint move / rotate gizmo (the armature tool strip's non-transform tools). */
+  setJointGizmoHidden(hidden: boolean): void { this._jointGizmoHidden = hidden; }
   /** Toggle bone-placement state — suppresses the joint gizmo while drawing a bone. */
   setBonePlacementActive(active: boolean): void { this._bonePlacementActive = active; }
   setHoveredTailJoint(idx: number | null): void { this._hoveredTailJointIdx = idx; }

@@ -73,6 +73,11 @@ export interface IKChain {
    */
   poleTarget?: [number, number, number];
   /**
+   * The joint the pole was placed from (setArmatureIK3D's `poleJointIndex` — the tool strip's "tap a joint as the
+   * pole"): `poleTarget` is that joint's world position when it was set. Informational (the solver reads poleTarget).
+   */
+  poleJointIdx?: number;
+  /**
    * FK/IK blend weight: 0 = pure FK (localRotation), 1 = pure IK (default).
    * Values in between slerp between localRotation and the FABRIK-solved rotation,
    * allowing smooth transitions between FK poses and IK-driven poses.

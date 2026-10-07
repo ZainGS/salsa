@@ -46,6 +46,10 @@ import { claimPointerEvent } from '../../renderer/util/pointer-claims';
 /** Short random id (module-local, mirrors the Scene3DManager helper). Used by addIKChain. */
 const _nanoid = () => Math.random().toString(36).slice(2, 10);
 
+/** The armature tool strip (UI review 2026-10-07 §4). */
+export type ArmatureTool = 'select' | 'rotate' | 'move' | 'addbone' | 'ik' | 'weight';
+export const ARMATURE_TOOLS: readonly ArmatureTool[] = ['select', 'rotate', 'move', 'addbone', 'ik', 'weight'];
+
 /** What an armature press grabs (TOUCH-9 pick-on-down): bone placement (a tap), the FK rotate ring, the joint move
  *  gizmo (with its drag plane start), an IK handle, a tail sphere or a head sphere. */
 export type ArmTarget =
@@ -172,7 +176,21 @@ export class Scene3DArmature {
 
     // ── (b) bone overlay + joint ─────────────────────────────────────────────────────────────────────
     private _boneOverlaySkeletonId: string | null = null;
-    private _selectedJointIndex: number | null = null;
+    /** The PRIMARY selected joint (the gizmo's). An accessor (UI review §4): any change notifies the joint-selection
+     *  listeners, and a change made by the legacy single-select paths drops the rest of a multi-selection. */
+    private __selJoint: number | null = null;
+    private get _selectedJointIndex(): number | null { return this.__selJoint; }
+    private set _selectedJointIndex(v: number | null) {
+        if (v === this.__selJoint) return;
+        this.__selJoint = v;
+        if (!this._jointSelKeepExtras && this._extraJoints.size > 0) { this._extraJoints.clear(); this._syncExtraJoints(); }
+        this._emitJointSelection();
+    }
+    /** The other joints of a multi-selection (additive tap / selectArmatureJoint3D(…, true)), in selection order. */
+    private _extraJoints = new Set<number>();
+    private _jointSelKeepExtras = false;
+    private _jointSelListeners = new Set<(sel: { skeletonId: string; jointIndex: number }[]) => void>();
+    private _jointSelKey = '';
     private _hoveredJointIndex: number | null = null;
     private _jointMouseDownCleanup?: () => void;
     private _boneOverlayExplicit = false;
@@ -1305,6 +1323,10 @@ export class Scene3DArmature {
     getBoneOverlaySkeletonId(): string | null { return this._boneOverlaySkeletonId; }
 
     setArmatureToolMode(mode: 'move' | 'rotate'): void {
+        // the legacy Move / Rotate buttons ARE the tool strip's Move / Rotate tools
+        if (this._armTool !== mode) this._leaveArmTool(mode);
+        this._armTool = mode;
+        this._setJointGizmoHidden(false);
         this._armatureToolMode = mode;
         this.renderer3D.setArmatureToolMode(mode);
         // Clear any in-progress gizmo hover so the new tool type renders immediately.
@@ -2165,6 +2187,7 @@ export class Scene3DArmature {
         // no drags. Up / cancel always run so a drag can never stay stuck.
         const onDown = (e: PointerEvent) => {
             if (this.host.isPlaying) return;
+            this._armShift = !!e.shiftKey;   // additive joint select (Shift, or the host's latch)
             const took = gesture.down(e);
             if (e.pointerType !== 'touch') stopMouseDown = took;
         };
@@ -2208,7 +2231,7 @@ export class Scene3DArmature {
         gr.hitScale = touch ? Scene3DArmature.TOUCH_HIT_SCALE : 1;
         try {
             let axis: GizmoAxis = null;
-            if (this._selectedJointIndex !== null && !this._selectedJointIsTail && !wp && !this._bonePlacementMode) {
+            if (this._selectedJointIndex !== null && !this._selectedJointIsTail && !wp && !this._bonePlacementMode && !this._jointGizmoHidden) {
                 const j = skel.data.joints[this._selectedJointIndex];
                 if (j) {
                     const p: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
@@ -2369,6 +2392,15 @@ export class Scene3DArmature {
             case 'head': {
                 const j = joints[t.joint];
                 if (!j) return false;
+                // Tool strip (UI review §4): Shift / the additive latch toggles the joint in a multi-selection; the
+                // Select and IK tools only select (no drag). The press is taken back exactly by a 2nd finger.
+                const additive = this._armShift || (this.ctx.interactionService as { additiveSelect3D?: boolean }).additiveSelect3D === true;
+                if (additive || this._armTool === 'select' || this._armTool === 'ik') {
+                    const snap = this._snapshotJointSelection();
+                    this.selectArmatureJoint(skel.id, t.joint, additive);
+                    this._armRestore = () => this._restoreJointSelection(snap);
+                    return true;
+                }
                 // Select the pressed joint and emit so the panel syncs (head sphere → branch-here semantics).
                 this._selectedJointIndex = t.joint;
                 this._selectedJointIsTail = false;
@@ -2697,12 +2729,268 @@ export class Scene3DArmature {
     }
 
     private _endBonePlacement(): void {
+        const skelId = this._bonePlacementSkeletonId;
         this._bonePlacementMode = false;
         this._bonePlacementSkeletonId = null;
         this._bonePlacementPendingIdx = null;
         this.renderer3D.setBonePlacementActive(false);
+        // The tool strip's Add Bone tool stays on: the next tap adds the next bone (extending from the new tail).
+        if (this._armTool === 'addbone' && skelId) this.enterBonePlacementMode3D(skelId);
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
+    }
+
+    // ── Armature tool strip + tap-select (UI review 2026-10-07 §4) ───────────────────────────────────
+
+    /** The active tool of the armature tool strip. */
+    private _armTool: ArmatureTool = 'move';
+    /** The last overlay press had Shift held. */
+    private _armShift = false;
+    /** The Weight tool entered weight paint (leaving the tool exits it). */
+    private _armWeightEntered = false;
+    private _jointGizmoHidden = false;
+
+    private _setJointGizmoHidden(hidden: boolean): void {
+        this._jointGizmoHidden = hidden;
+        (this.renderer3D as { setJointGizmoHidden?(h: boolean): void }).setJointGizmoHidden?.(hidden);
+    }
+
+    private _syncExtraJoints(): void {
+        (this.renderer3D as { setExtraSelectedJoints?(s: ReadonlySet<number> | null): void }).setExtraSelectedJoints?.(this._extraJoints.size ? this._extraJoints : null);
+    }
+
+    /** The selected joints (primary first, then the rest in selection order) of the overlay skeleton. */
+    getSelectedArmatureJoints(): { skeletonId: string; jointIndex: number }[] {
+        const id = this._boneOverlaySkeletonId, p = this.__selJoint;
+        if (!id || p === null) return [];
+        return [p, ...[...this._extraJoints].filter(j => j !== p)].map(jointIndex => ({ skeletonId: id, jointIndex }));
+    }
+
+    /** Subscribe to joint-selection changes (tap, panel, programmatic, a removed bone); returns the unsubscribe. */
+    onJointSelectionChanged(cb: (sel: { skeletonId: string; jointIndex: number }[]) => void): () => void {
+        this._jointSelListeners.add(cb);
+        return () => { this._jointSelListeners.delete(cb); };
+    }
+
+    private _emitJointSelection(): void {
+        const sel = this.getSelectedArmatureJoints();
+        const key = sel.map(s => `${s.skeletonId}:${s.jointIndex}`).join(',');
+        if (key === this._jointSelKey) return;
+        this._jointSelKey = key;
+        for (const cb of [...this._jointSelListeners]) { try { cb(sel); } catch (err) { console.warn('[3D] joint selection listener', err); } }
+    }
+
+    private _snapshotJointSelection(): { primary: number | null; tail: boolean; extras: number[] } {
+        return { primary: this.__selJoint, tail: this._selectedJointIsTail, extras: [...this._extraJoints] };
+    }
+
+    private _restoreJointSelection(s: { primary: number | null; tail: boolean; extras: number[] }): void {
+        this._jointSelKeepExtras = true;
+        try {
+            this._extraJoints = new Set(s.extras);
+            this._selectedJointIndex = s.primary;
+            this._selectedJointIsTail = s.tail;
+        } finally { this._jointSelKeepExtras = false; }
+        this.renderer3D.setSelectedJoint(s.primary, s.tail);
+        this._syncExtraJoints();
+        this._emitJointSelection();
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Select joint `jointIndex` of the overlay skeleton (tap-select). Not additive: only it. Additive: toggles it in a
+     * multi-selection (an added joint becomes the primary — the gizmo's; removing the primary promotes the most recent
+     * other one). The Weight tool paints the new primary joint. False when `skeletonId` is not the overlay skeleton or
+     * the joint does not exist.
+     */
+    selectArmatureJoint(skeletonId: string, jointIndex: number, additive = false): boolean {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel || skeletonId !== this._boneOverlaySkeletonId || !skel.data.joints[jointIndex]) return false;
+        const cur = this.__selJoint;
+        let primary: number | null = jointIndex;
+        const extras = new Set(this._extraJoints);
+        if (additive && cur !== null) {
+            const selected = cur === jointIndex || extras.has(jointIndex);
+            if (selected) {
+                extras.delete(jointIndex);
+                if (cur === jointIndex) { const rest = [...extras]; primary = rest.length ? rest[rest.length - 1] : null; if (primary !== null) extras.delete(primary); }
+                else primary = cur;
+            } else {
+                extras.add(cur);
+                extras.delete(jointIndex);
+            }
+        } else extras.clear();
+        this._jointSelKeepExtras = true;
+        try {
+            this._extraJoints = extras;
+            this._selectedJointIndex = primary;
+            this._selectedJointIsTail = false;
+        } finally { this._jointSelKeepExtras = false; }
+        this.renderer3D.setSelectedJoint(primary);
+        this._syncExtraJoints();
+        if (this._armTool === 'weight' && this._weightPaint.isActive() && primary !== null) this._weightPaint.setWeightPaintJoint3D(primary);
+        this._emitJointSelection();
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    /**
+     * The overlay skeleton's joint (head) nearest client point (clientX, clientY) on screen within `radiusCss` CSS px
+     * (default 24), or null — only while a bone overlay is shown (Armature mode). Hidden bone categories are skipped.
+     */
+    pickArmatureJointAt(clientX: number, clientY: number, radiusCss = 24): { skeletonId: string; jointIndex: number; jointName: string } | null {
+        const id = this._boneOverlaySkeletonId;
+        const skel = id ? this.getSkeleton(id) : null;
+        const el = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!id || !skel || !el) return null;
+        const r = el.getBoundingClientRect();
+        const vp = this.renderer3D.getCamera().getViewProjectionMatrix() as unknown as ArrayLike<number>;
+        const bv = (this.renderer3D as { getBoneVisibility?(): { spring: boolean; fk: boolean } }).getBoneVisibility?.() ?? { spring: true, fk: true };
+        const spring = new Set<number>();
+        for (const c of skel.data.springChains ?? []) if (c.enabled) for (const ji of c.jointIndices) spring.add(ji);
+        let best: number | null = null, bestD = radiusCss;
+        for (const j of skel.data.joints) {
+            if (!(spring.has(j.index) ? bv.spring : bv.fk) && j.index !== this.__selJoint) continue;
+            const wx = j.worldMatrix[12], wy = j.worldMatrix[13], wz = j.worldMatrix[14];
+            const cw = vp[3] * wx + vp[7] * wy + vp[11] * wz + vp[15];
+            if (!(cw > 1e-9)) continue;
+            const nx = (vp[0] * wx + vp[4] * wy + vp[8] * wz + vp[12]) / cw, ny = (vp[1] * wx + vp[5] * wy + vp[9] * wz + vp[13]) / cw;
+            const sx = r.left + (nx + 1) * 0.5 * r.width, sy = r.top + (1 - ny) * 0.5 * r.height;
+            const d = Math.hypot(sx - clientX, sy - clientY);
+            if (d <= bestD) { bestD = d; best = j.index; }
+        }
+        return best === null ? null : { skeletonId: id, jointIndex: best, jointName: skel.data.joints[best].name };
+    }
+
+    getArmatureActiveTool(): ArmatureTool { return this._armTool; }
+
+    /** Leaving the current tool for `next`: Add Bone stops placing, Weight leaves weight paint (if it entered it). */
+    private _leaveArmTool(next: ArmatureTool): void {
+        if (this._armTool === 'addbone' && next !== 'addbone' && this._bonePlacementMode) this.exitBonePlacementMode3D();
+        if (this._armTool === 'weight' && next !== 'weight' && this._armWeightEntered) {
+            this._armWeightEntered = false;
+            if (this._weightPaint.isActive()) this._weightPaint.exitWeightPaintMode3D();
+        }
+    }
+
+    /**
+     * Switch the armature tool strip's tool (UI review §4): select (tap selects, no gizmo, no drag), rotate / move (the
+     * joint gizmo — FK rotate / bind-pose move), addbone (bone placement stays on: each tap on the mesh adds a bone from
+     * the selected joint), ik (taps select the IK end joint; setArmatureIK3D configures it; IK handles stay draggable),
+     * weight (weight paint of the overlay skeleton's skinned mesh on the selected joint). False (tool unchanged) when the
+     * tool needs a skeleton / a skinned mesh that isn't there.
+     */
+    setArmatureActiveTool(tool: ArmatureTool): boolean {
+        if (!ARMATURE_TOOLS.includes(tool)) return false;
+        const skelId = this._boneOverlaySkeletonId;
+        if ((tool === 'addbone' || tool === 'weight') && !skelId) return false;
+        if (tool === 'weight' && !this._weightPaint.isActive()) {
+            const meshId = this._meshForSkeleton(skelId!);
+            const mesh = meshId ? this.getMesh(meshId) : null;
+            if (!meshId || !(mesh instanceof SkinnedMesh3D)) return false;
+            this._leaveArmTool(tool);
+            const joint = this.__selJoint ?? 0;
+            if (!this._weightPaint.enterWeightPaintMode3D(meshId, skelId!, joint)) return false;
+            this._armWeightEntered = true;
+        } else {
+            this._leaveArmTool(tool);
+        }
+        if (tool === 'move' || tool === 'rotate') this.setArmatureToolMode(tool);
+        this._armTool = tool;
+        this._setJointGizmoHidden(tool !== 'move' && tool !== 'rotate');
+        if (tool === 'addbone' && !this._bonePlacementMode) this.enterBonePlacementMode3D(skelId!);
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    /**
+     * Add a child joint of `parentJointIndex` (-1 = a new root): its head at the parent's tail, its tail continuing the
+     * parent's bone (same direction and length; a root gets [0, 0.3, 0]). The new joint becomes the selection (when the
+     * skeleton is the overlay's). ONE undo step. Returns the new joint index, or -1.
+     */
+    addArmatureChildJoint(skeletonId: string, parentJointIndex: number, name?: string): number {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return -1;
+        const joints = skel.data.joints;
+        if (!Number.isInteger(parentJointIndex) || parentJointIndex < -1 || parentJointIndex >= joints.length) return -1;
+        const parent = parentJointIndex >= 0 ? joints[parentJointIndex] : null;
+        const localPos: [number, number, number] = parent ? [...parent.tailOffset] as [number, number, number] : [0, 0, 0];
+        let tail: [number, number, number] = parent ? [...parent.tailOffset] as [number, number, number] : [0, 0.3, 0];
+        if (!(Math.hypot(tail[0], tail[1], tail[2]) > 1e-6)) tail = [0, 0.3, 0];
+        const nm = name?.trim() || `joint_${joints.length}`;
+        const before = this._snapshotJointSelection();
+        const add = (): number => {
+            const idx = skel.addJoint(parentJointIndex, localPos, nm);
+            skel.setJointTailOffset(idx, tail);
+            if (skeletonId === this._boneOverlaySkeletonId) this.selectArmatureJoint(skeletonId, idx, false);
+            this.ctx.emitSceneGraphChanged();
+            this.ctx.scheduleRender();
+            return idx;
+        };
+        const idx = add();
+        this.host.undoManager.push({
+            description: 'Add bone',
+            undo: () => {
+                if (skel.data.joints.length === idx + 1) skel.removeJoint(idx);
+                if (skeletonId === this._boneOverlaySkeletonId) this._restoreJointSelection(before);
+                this.ctx.emitSceneGraphChanged();
+                this.ctx.scheduleRender();
+            },
+            redo: () => { if (skel.data.joints.length === idx) add(); },
+        });
+        return idx;
+    }
+
+    /**
+     * IK on the chain ending at `jointIndex` (the tool strip's IK + the joint properties' "chain length + pole"): creates
+     * the chain when there is none (target = the joint's position), sets its length (≥ 2, as addIKChain), enabled, and
+     * the pole — `poleJointIndex` a joint (the pole target is placed at that joint's current world position), null =
+     * no pole, undefined = unchanged. Returns the chain id, or null (no such skeleton / joint; or disabling a chain that
+     * doesn't exist — nothing to do). Not an undo step (as the other IK chain setters).
+     */
+    setArmatureIK(skeletonId: string, jointIndex: number, opts: { chainLength: number; poleJointIndex?: number | null; enabled: boolean }): string | null {
+        const skel = this.getSkeleton(skeletonId);
+        const joints = skel?.data.joints;
+        if (!skel || !joints?.[jointIndex]) return null;
+        let chain = skel.data.ikChains?.find(c => c.endJointIdx === jointIndex) ?? null;
+        const len = Math.max(2, Math.min(64, Math.round(Number.isFinite(opts.chainLength) ? opts.chainLength : 2)));
+        if (!chain) {
+            if (!opts.enabled) return null;
+            const id = this.addIKChain(skeletonId, jointIndex, len);
+            chain = skel.data.ikChains?.find(c => c.id === id) ?? null;
+            if (!chain) return null;
+        }
+        if (chain.chainLength !== len) this.setIKChainLength(skeletonId, chain.id, len);
+        if (chain.enabled !== !!opts.enabled) this.setIKChainEnabled(skeletonId, chain.id, !!opts.enabled);
+        if (opts.poleJointIndex === null) {
+            delete chain.poleJointIdx;
+            if (chain.poleTarget) this.clearPoleTarget(skeletonId, chain.id);
+        } else if (typeof opts.poleJointIndex === 'number') {
+            const pj = joints[opts.poleJointIndex];
+            if (pj && opts.poleJointIndex !== jointIndex) {
+                chain.poleJointIdx = opts.poleJointIndex;
+                this.setPoleTarget(skeletonId, chain.id, pj.worldMatrix[12], pj.worldMatrix[13], pj.worldMatrix[14]);
+            }
+        }
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return chain.id;
+    }
+
+    /** The IK chain ending at `jointIndex` (setArmatureIK3D's settings + its id / target / pole target), or null. */
+    getArmatureIK(skeletonId: string, jointIndex: number): {
+        chainId: string; chainLength: number; poleJointIndex: number | null; enabled: boolean;
+        target: [number, number, number]; poleTarget: [number, number, number] | null;
+    } | null {
+        const skel = this.getSkeleton(skeletonId);
+        const c = skel?.data.ikChains?.find(ch => ch.endJointIdx === jointIndex);
+        if (!skel || !c) return null;
+        const pj = typeof c.poleJointIdx === 'number' && c.poleJointIdx < skel.data.joints.length ? c.poleJointIdx : null;
+        return {
+            chainId: c.id, chainLength: c.chainLength, poleJointIndex: pj, enabled: c.enabled,
+            target: [...c.target] as [number, number, number], poleTarget: c.poleTarget ? [...c.poleTarget] as [number, number, number] : null,
+        };
     }
 
     disableTransformControls(): void {

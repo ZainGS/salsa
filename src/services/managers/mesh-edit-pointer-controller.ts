@@ -24,7 +24,7 @@ import type { MeshEditManager } from './mesh-edit-manager';
 import type { Command3D } from './undo-manager-3d';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
-import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
+import { EditMesh, type KnifePoint } from '../../scene-graph/shapes/edit-mesh';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { isPointerEventClaimed } from '../../renderer/util/pointer-claims';
 import { EditFacePicker, pickFaceFullScene } from './mesh-edit-face-pick';
@@ -34,6 +34,21 @@ import { GizmoRenderer, hitTestGizmoAt, type GizmoAxis, type GizmoMode } from '.
 import type { MeshEditGizmoDraw } from '../../renderer/3d/mesh-edit-overlay-renderer';
 
 export type MeshEditSelectionMode = 'vertex' | 'face' | 'edge';
+
+/** The Edit Mesh tool strip (UI review 2026-10-07 §4): one active tool. select = taps select, no gizmo; move / rotate /
+ *  scale = the selection gizmo in that mode; loopcut = tap / hover an edge to preview, tap / click to cut; knife = taps
+ *  on the surface add cut points (applyMeshEditKnife3D cuts); extrude / inset / bevel = the host runs the op (selection
+ *  works as in select). */
+export type MeshEditTool = 'select' | 'move' | 'rotate' | 'scale' | 'extrude' | 'inset' | 'loopcut' | 'knife' | 'bevel';
+export const MESH_EDIT_TOOLS: readonly MeshEditTool[] = ['select', 'move', 'rotate', 'scale', 'extrude', 'inset', 'loopcut', 'knife', 'bevel'];
+
+/** What {@link MeshEditPointerController.pickElementAt} found under a point. */
+export interface MeshEditElementHit { kind: MeshEditSelectionMode; index: number; selected: boolean }
+
+/** A knife tap within this many canvas px (× the touch scale) of a vertex / edge of the hit face snaps onto it. */
+const KNIFE_SNAP_PX = 12;
+/** A MOUSE press on the selection that moved further than this (CSS px) is a drag (it moves the selection). */
+const MOUSE_DRAG_SLOP_PX = 4;
 
 /** Radius (canvas device pixels) within which a vertex/edge midpoint counts as "hit". */
 const VERTEX_PICK_RADIUS_PX = 14;
@@ -172,6 +187,46 @@ export class MeshEditPointerController {
    *  (ElementTransformRouter.setGizmoMode); 'move' by default so the gizmo is there on entering. */
   gizmoMode: GizmoMode = 'move';
 
+  /** UI review §4 (tablet-first): a one-finger / mouse drag that STARTS on an already-selected vertex / edge / face
+   *  moves the whole selection on the view plane (an element grab, source 'drag': live, one undo step on release, a
+   *  2nd finger / right click / Esc / pointercancel cancels). A drag that starts elsewhere keeps the old behaviour. */
+  dragMovesSelection = true;
+  /** A MOUSE press on a selected element, waiting to become a drag (moves the selection) or a click (selects). */
+  private _selPress: { id: number; clientX: number; clientY: number; px: number; py: number; additive: boolean } | null = null;
+  /** The active tool of the tool strip (setMeshEditActiveTool3D). 'move' = the historic default (gizmo 'move'). */
+  private _tool: MeshEditTool = 'move';
+  /** Loop Cut tool: cuts and their position for the next cut (the pill / adjust-last-op change them). */
+  loopCutCount = 1;
+  loopCutPosition = 0.5;
+  /** Loop Cut tool: the edge whose loop is previewed (mouse hover / a finger on it). */
+  private _loopHover: { he: number; em: EditMesh } | null = null;
+  /** Loop Cut tool: the press that cuts on release (a finger may slide to another edge first). */
+  private _loopPress: { id: number; touch: boolean } | null = null;
+  private _loopAt: { x: number; y: number } | null = null;
+  private _loopFrame = 0;
+  /** Knife tool: the tapped surface points (object space) on this EditMesh. */
+  private _knife: { meshId: string; em: EditMesh; points: KnifePoint[] } | null = null;
+
+  /** The active Edit Mesh tool. */
+  get tool(): MeshEditTool { return this._tool; }
+
+  /**
+   * Switch the tool strip's tool. move / rotate / scale show the selection gizmo in that mode; every other tool hides it.
+   * Leaving the Knife drops its points; leaving Loop Cut drops the preview; a running element transform is cancelled.
+   * Selecting extrude / inset / bevel changes nothing else (the host runs those ops). False for an unknown tool.
+   */
+  setTool(tool: MeshEditTool): boolean {
+    if (!MESH_EDIT_TOOLS.includes(tool)) return false;
+    if (this.transform.active) this._endElementTransform(false);
+    if (tool !== 'knife') this._knife = null;
+    if (tool !== 'loopcut') { this._loopHover = null; this._loopPress = null; }
+    this._tool = tool;
+    this.gizmoMode = tool === 'move' || tool === 'rotate' || tool === 'scale' ? tool : null;
+    this._gizmoHover = null;
+    this._scheduleRender();
+    return true;
+  }
+
   // ── Public API ──────────────────────────────────────────────────────────────
 
   attach(canvas: HTMLCanvasElement, meshId: string, onSelectionChange?: () => void): void {
@@ -223,6 +278,10 @@ export class MeshEditPointerController {
     this._xfPointer = null;
     this._lastMouse = null;
     this._gizmoHover = null;
+    this._selPress = null;
+    this._loopPress = null;
+    this._loopHover = null;
+    this._knife = null;
   }
 
   setMode(mode: MeshEditSelectionMode): void {
@@ -232,13 +291,17 @@ export class MeshEditPointerController {
     this._dragging = false;
     this._dragVertexIdx = -1;
     this._pending = null;
+    this._selPress = null;
     if (this._canvas) this._canvas.style.cursor = 'crosshair';
   }
 
   get mode(): MeshEditSelectionMode { return this._mode; }
   get isAttached(): boolean { return this._canvas !== null; }
   /** True while a vertex drag (or a finger press that may become one) owns a pointer. */
-  get isBusy(): boolean { return this._dragging || this._pending !== null || this._bevelPointer !== null || this._xfPointer !== null; }
+  get isBusy(): boolean {
+    return this._dragging || this._pending !== null || this._bevelPointer !== null || this._xfPointer !== null
+      || this._selPress !== null || this._loopPress !== null;
+  }
 
   // ── Pointer handlers ────────────────────────────────────────────────────────
 
@@ -255,12 +318,21 @@ export class MeshEditPointerController {
       if (e.isPrimary && !this._dragging && !this._pending) this._touchIds.clear();
       this._touchIds.add(id);
       // A 2nd finger is a camera gesture: drop the press, cancel (restore) a vertex drag; never pick.
-      if (this._touchIds.size > 1) { this._pending = null; this._cancelDrag(); return; }
+      if (this._touchIds.size > 1) { this._pending = null; this._loopDrop(); this._cancelDrag(); return; }
       // 7.3b P1: a finger UV paint took (not stopped, so the orbit controller can pinch) is a brush stroke — no pick.
       if (isPointerEventClaimed(e)) return;
       if (e.isPrimary === false) return;
       // A finger on a handle of the selection gizmo drags it at once (fatter hit, as the object gizmo).
       if (!this._scene3d.getTouchNavigate3D?.() && this._gizmoDown(e, TOUCH_PICK_SCALE)) return;
+      // Loop Cut: the finger previews the loop under it at once; the lift cuts.
+      if (this._tool === 'loopcut' && !this._scene3d.getTouchNavigate3D?.()) {
+        this._rect = this._canvas.getBoundingClientRect();
+        this._pickScale = TOUCH_PICK_SCALE;
+        const at = this._toCanvasPx(e.clientX, e.clientY);
+        this._loopPress = { id, touch: true };
+        this._loopPreviewAt(at.x, at.y);
+        return;
+      }
       // TOUCH-6: nothing on the press — a tap selects on release, a drag from a vertex moves it.
       this._pending = { id, clientX: e.clientX, clientY: e.clientY, additive };
       this._rect = this._canvas.getBoundingClientRect();
@@ -271,6 +343,20 @@ export class MeshEditPointerController {
     // The selection gizmo's handles win over the vertex / edge / face under them.
     if (this._gizmoDown(e, 1)) return;
     const { x: px, y: py } = this._toCanvasPx(e.clientX, e.clientY);
+
+    if (this._tool === 'knife') { this.knifeAddAt(px, py); return; }
+    if (this._tool === 'loopcut') {
+      this._loopPress = { id: e.pointerId ?? 0, touch: false };
+      try { this._canvas.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+      this._loopPreviewAt(px, py);
+      return;
+    }
+    // A press ON the selection waits: a drag moves the selection, a click selects as usual (on release).
+    if (this.dragMovesSelection && this._hasSelection() && this._canDragVertex() && this._isSelectedAt(px, py)) {
+      this._selPress = { id: e.pointerId ?? 0, clientX: e.clientX, clientY: e.clientY, px, py, additive };
+      try { this._canvas.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+      return;
+    }
 
     if (this._mode === 'vertex') {
       const vi = this._pickVertex(px, py);
@@ -291,15 +377,33 @@ export class MeshEditPointerController {
     if (this.transform.active) { this._xfMove(e); return; }
     if (this.bevel.active) { this._bevelMove(e); return; }
     const touch = e.pointerType === 'touch';
-    // A finger press that moved past the slop: in vertex mode a drag from a vertex picks it up (from the PRESS point,
-    // so it follows the finger exactly); otherwise it isn't a tap any more and does nothing.
+    // A mouse press on the selection that moved past the slop: the selection follows it (from the PRESS point).
+    const sp = this._selPress;
+    if (sp && (e.pointerId ?? 0) === sp.id) {
+      if (Math.hypot(e.clientX - sp.clientX, e.clientY - sp.clientY) <= MOUSE_DRAG_SLOP_PX) return;
+      this._selPress = null;
+      if (!this._beginSelectionDrag(sp.id, sp.px, sp.py, e) && this._canvas) {
+        try { this._canvas.releasePointerCapture(sp.id); } catch { /* gone */ }
+      }
+      return;
+    }
+    // Loop Cut: a held press (finger or mouse) previews the loop under the pointer (once per frame).
+    if (this._loopPress && (e.pointerId ?? 0) === this._loopPress.id) { this._scheduleLoopPreview(e.clientX, e.clientY); return; }
+    // A finger press that moved past the slop: from the SELECTION it moves the selection; in vertex mode a drag from a
+    // vertex picks it up (from the PRESS point, so it follows the finger exactly); otherwise it isn't a tap any more and
+    // does nothing.
     const p = this._pending;
     if (p && touch && (e.pointerId ?? 0) === p.id) {
       if (Math.hypot(e.clientX - p.clientX, e.clientY - p.clientY) <= MeshEditPointerController.TAP_SLOP_PX) return;
       this._pending = null;
-      if (this._mode !== 'vertex' || this._touchIds.size > 1 || this._scene3d.getTouchNavigate3D?.()) return;
+      if (this._touchIds.size > 1 || this._scene3d.getTouchNavigate3D?.() || this._tool === 'knife') return;
       this._pickScale = TOUCH_PICK_SCALE;
       const at = this._toCanvasPx(p.clientX, p.clientY);
+      if (this.dragMovesSelection && this._hasSelection() && this._canDragVertex() && this._isSelectedAt(at.x, at.y)) {
+        this._beginSelectionDrag(p.id, at.x, at.y, e);
+        return;
+      }
+      if (this._mode !== 'vertex') return;
       const vi = this._pickVertex(at.x, at.y);
       if (vi < 0 || !this._canDragVertex()) return;
       this._dragSelSnap = this._meshEdit.snapshotSelection(this._meshId);
@@ -316,6 +420,7 @@ export class MeshEditPointerController {
       this._scheduleDragFrame();
       return;
     }
+    if (!touch && this._tool === 'loopcut') { this._scheduleLoopPreview(e.clientX, e.clientY); return; }   // mouse hover previews the loop
     if (touch || (this._mode !== 'vertex' && this.gizmoMode === null)) return;   // a finger has no hover
     // Mouse hover: the selection gizmo's handle under the pointer lights up; in vertex mode the cursor shows "grab"
     // over a vertex — resolved once per frame (a pick is O(V)).
@@ -347,14 +452,48 @@ export class MeshEditPointerController {
     if (this.bevel.active || this._bevelPointer !== null || this._bevelPending) { this._bevelUp(e); return; }
     const touch = e.pointerType === 'touch';
     if (touch) this._touchIds.delete(e.pointerId ?? 0);
+    const sp = this._selPress;
+    if (sp && (e.pointerId ?? 0) === sp.id) {
+      // A CLICK on the selection (no drag): the usual select at the press point.
+      this._selPress = null;
+      if (this._canvas) { try { this._canvas.releasePointerCapture(sp.id); } catch { /* gone */ } }
+      if (this._canvas && this._meshId) {
+        this._pickScale = 1;
+        if (this._mode === 'vertex') {
+          const vi = this._pickVertex(sp.px, sp.py);
+          if (vi >= 0) { this._meshEdit.selectVertex(this._meshId, vi, sp.additive); this._onSelectionChange?.(); this._scheduleRender(); }
+        } else {
+          this._selectAt(sp.px, sp.py, sp.additive);
+        }
+      }
+      this._rect = null;
+      return;
+    }
+    const lp = this._loopPress;
+    if (lp && (e.pointerId ?? 0) === lp.id) {
+      // Loop Cut: the release cuts the previewed loop (the edge under the release point).
+      this._loopPress = null;
+      if (this._canvas && !lp.touch) { try { this._canvas.releasePointerCapture(lp.id); } catch { /* gone */ } }
+      if (this._canvas) {
+        this._pickScale = lp.touch ? TOUCH_PICK_SCALE : 1;
+        const at = this._toCanvasPx(e.clientX, e.clientY);
+        this._loopPreviewAt(at.x, at.y);
+        const h = this._loopHover;
+        if (h && h.em === this._getMesh()?.editMesh) this._loopCut(h.he);
+        if (lp.touch) this._loopHover = null;   // (a finger has no hover; the mouse keeps previewing)
+      }
+      this._rect = null;
+      return;
+    }
     const p = this._pending;
     if (p && touch && (e.pointerId ?? 0) === p.id) {
-      // A TAP: select at the release point (vertex mode selects only — a drag needs movement).
+      // A TAP: select at the release point (vertex mode selects only — a drag needs movement); the Knife adds a point.
       this._pending = null;
       if (this._canvas && this._meshId) {
         this._pickScale = TOUCH_PICK_SCALE;
         const at = this._toCanvasPx(e.clientX, e.clientY);
-        this._selectAt(at.x, at.y, p.additive);
+        if (this._tool === 'knife') this.knifeAddAt(at.x, at.y);
+        else this._selectAt(at.x, at.y, p.additive);
       }
       this._rect = null;
       return;
@@ -409,6 +548,8 @@ export class MeshEditPointerController {
       return;
     }
     if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+    if (this._selPress && (e.pointerId ?? 0) === this._selPress.id) { this._selPress = null; return; }
+    if (this._loopPress && (e.pointerId ?? 0) === this._loopPress.id) { this._loopDrop(); return; }
     if (this._pending && (e.pointerId ?? 0) === this._pending.id) { this._pending = null; return; }
     if (this._dragPointerId === null || e.pointerId === undefined || e.pointerId === this._dragPointerId) this._cancelDrag();
   }
@@ -478,7 +619,17 @@ export class MeshEditPointerController {
   /** Capture-phase press while a MODAL transform runs (mouse): left = Apply, right = Cancel — before the orbit
    *  controller (a right-drag pans) or a selection pick sees it. Fingers / pen fall through to {@link _xfDown}. */
   private _handleDownCapture(e: PointerEvent): void {
-    if (!this._canvas || !this.transform.active || this.transform.source !== 'modal') return;
+    if (!this._canvas || !this.transform.active) return;
+    if (this.transform.source === 'drag') {
+      // a right click while dragging the selection cancels it (and its context menu is swallowed)
+      if (e.pointerType !== 'mouse' || e.button !== 2) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      this._suppressMenuUntil = Date.now() + 1500;
+      this._endElementTransform(false);
+      return;
+    }
+    if (this.transform.source !== 'modal') return;
     if (e.pointerType !== 'mouse' || (e.button !== 0 && e.button !== 2)) return;   // middle: the camera
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -543,7 +694,8 @@ export class MeshEditPointerController {
   private _xfUp(e: PointerEvent): void {
     if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
     if (this._xfPointer === null || (e.pointerId ?? 0) !== this._xfPointer) return;
-    if (this.transform.source === 'gizmo') { this._endElementTransform(true); return; }   // a gizmo drag applies on release
+    // a gizmo drag / a drag of the selection applies on release
+    if (this.transform.source === 'gizmo' || this.transform.source === 'drag') { this._endElementTransform(true); return; }
     this._flushXfFrame();
     this._xfReleasePointer();
     this.transform.pointerEnd();
@@ -551,7 +703,7 @@ export class MeshEditPointerController {
 
   /** A 2nd finger / pointercancel: a modal drag's movement is dropped (the earlier drags stay); a gizmo drag is cancelled. */
   private _xfAbortPointer(): void {
-    if (this.transform.active && this.transform.source === 'gizmo') { this._endElementTransform(false); return; }
+    if (this.transform.active && (this.transform.source === 'gizmo' || this.transform.source === 'drag')) { this._endElementTransform(false); return; }
     this._dropXfFrame();
     this._xfReleasePointer();
     this.transform.pointerAbort();
@@ -615,6 +767,22 @@ export class MeshEditPointerController {
     return true;
   }
 
+  /** A drag that started on the selection: an element GRAB (source 'drag') from the press point (canvas px), the
+   *  pointer's current position applied at once. False when nothing could start (nothing selected, a skinned body). */
+  private _beginSelectionDrag(pointerId: number, px: number, py: number, now: PointerEvent): boolean {
+    if (!this._canvas || !this._meshId || this.bevel.active) return false;
+    if (!this.transform.begin(this._meshId, 'grab', { source: 'drag' })) return false;
+    try { this._canvas.setPointerCapture(pointerId); } catch { /* pointer already gone */ }
+    this._xfPointer = pointerId;
+    this._gizmoHover = null;
+    this.transform.pointerStart(px, py, this._canvas.width, this._canvas.height);
+    this._xfAt = { clientX: now.clientX, clientY: now.clientY, ctrl: !!(now.ctrlKey || now.metaKey) };
+    this._applyXfMove();
+    this._canvas.style.cursor = 'grabbing';
+    this._onSelectionChange?.();
+    return true;
+  }
+
   /** The selection gizmo for the edit overlay (MeshEditDrawData.gizmo), or null when it is hidden. */
   gizmoDrawData(): MeshEditGizmoDraw | null {
     const g = this._gizmoTarget();
@@ -629,6 +797,7 @@ export class MeshEditPointerController {
       handles: () => this._meshEdit.isEditing && !!this._meshEdit.activeMeshId,
       isActive: () => this.transform.active,
       isModal: () => this.transform.active && this.transform.source === 'modal',
+      acceptsAxis: () => this.transform.active && (this.transform.source === 'modal' || this.transform.source === 'drag'),
       mode: () => this.transform.mode,
       axis: () => this.transform.shortcutAxis,
       numeric: () => this.transform.numeric,
@@ -637,7 +806,12 @@ export class MeshEditPointerController {
       appendNumeric: (ch) => this.transform.appendNumeric(ch),
       commit: () => { if (this.transform.active) this._endElementTransform(true); },
       cancel: () => { if (this.transform.active) this._endElementTransform(false); },
-      setGizmoMode: (mode) => { this.gizmoMode = mode; this._gizmoHover = null; this._scheduleRender(); },
+      setGizmoMode: (mode) => {
+        // the tool strip follows: a gizmo mode IS the move / rotate / scale tool
+        if (mode === 'move' || mode === 'rotate' || mode === 'scale') { if (this._tool !== mode) this.setTool(mode); }
+        else if (this._tool === 'move' || this._tool === 'rotate' || this._tool === 'scale') this._tool = 'select';
+        this.gizmoMode = mode; this._gizmoHover = null; this._scheduleRender();
+      },
       dragInfo: () => {
         const s = this.transform.state();
         if (!s || s.source !== 'gizmo') return null;
@@ -772,6 +946,274 @@ export class MeshEditPointerController {
     this._bevelWheelOn = want;
     if (want) w.addEventListener('wheel', this._onBevelWheel, { capture: true, passive: false });
     else w.removeEventListener('wheel', this._onBevelWheel, { capture: true });
+  }
+
+  // ── Picking API (sm.pickMeshEditElementAt3D) ────────────────────────────────
+
+  /**
+   * The vertex / edge / face (by the current selection mode) under client (CSS) point (clientX, clientY), whether it is
+   * selected, or null (nothing within reach / not attached). Edges are half-edge indices (what selectEdge3D /
+   * loopCut3D / setSharpEdges3D take). `touch` = the finger's ×2 vertex / edge radius.
+   */
+  pickElementAt(clientX: number, clientY: number, touch = false): MeshEditElementHit | null {
+    if (!this._canvas || !this._meshId) return null;
+    this._rect = null;
+    this._pickScale = touch ? TOUCH_PICK_SCALE : 1;
+    const at = this._toCanvasPx(clientX, clientY);
+    const hit = this._elementAt(at.x, at.y);
+    this._pickScale = 1;
+    return hit ? { ...hit, selected: this._isSelected(hit.kind, hit.index) } : null;
+  }
+
+  /** The element (current mode) under canvas px. */
+  private _elementAt(px: number, py: number): { kind: MeshEditSelectionMode; index: number } | null {
+    const kind = this._mode;
+    const index = kind === 'vertex' ? this._pickVertex(px, py) : kind === 'edge' ? this._pickEdge(px, py) : this._pickFace(px, py);
+    return index >= 0 ? { kind, index } : null;
+  }
+
+  /** A vertex is selected when it is in the selection's vertex set; an edge when it (or its twin) is selected, or both
+   *  its ends are selected vertices; a face when it is selected. */
+  private _isSelected(kind: MeshEditSelectionMode, index: number): boolean {
+    if (!this._meshId) return false;
+    const sel = this._meshEdit.getSelection(this._meshId);
+    const em = this._getMesh()?.editMesh;
+    if (!sel || !em) return false;
+    if (kind === 'vertex') return this._meshEdit.selectedVertexIndices(this._meshId).includes(index);
+    if (kind === 'face') return sel.faces.has(index);
+    const he = em.halfEdges[index];
+    if (!he) return false;
+    if (sel.edges.has(index) || (he.twin >= 0 && sel.edges.has(he.twin))) return true;
+    const ends = em.getHalfEdgeVertices(index);
+    return !!ends && sel.vertices.has(ends[0]) && sel.vertices.has(ends[1]);
+  }
+
+  /** Anything is selected on the edited mesh (skips the extra pick on a press when nothing is). */
+  private _hasSelection(): boolean {
+    const sel = this._meshId ? this._meshEdit.getSelection(this._meshId) : null;
+    return !!sel && (sel.vertices.size > 0 || sel.edges.size > 0 || sel.faces.size > 0);
+  }
+
+  /** The element under canvas px is part of the selection (a drag from it moves the selection). */
+  private _isSelectedAt(px: number, py: number): boolean {
+    const hit = this._elementAt(px, py);
+    return !!hit && this._isSelected(hit.kind, hit.index);
+  }
+
+  // ── Loop Cut tool ───────────────────────────────────────────────────────────
+
+  private _scheduleLoopPreview(clientX: number, clientY: number): void {
+    this._loopAt = { x: clientX, y: clientY };
+    if (this._loopFrame) return;
+    let ran = false;
+    const id = this._frame(() => {
+      ran = true;
+      this._loopFrame = 0;
+      const at = this._loopAt;
+      this._loopAt = null;
+      if (!at || !this._canvas || this._tool !== 'loopcut') return;
+      if (!this._loopPress) this._rect = null;   // a hover reads the rect fresh
+      this._pickScale = this._loopPress?.touch ? TOUCH_PICK_SCALE : 1;
+      const c = this._toCanvasPx(at.x, at.y);
+      this._loopPreviewAt(c.x, c.y);
+    });
+    if (!ran) this._loopFrame = id;
+  }
+
+  /** Preview the loop through the edge under canvas px (none there → no preview). */
+  private _loopPreviewAt(px: number, py: number): void {
+    const em = this._getMesh()?.editMesh;
+    const he = em ? this._pickEdge(px, py) : -1;
+    const next = em && he >= 0 && em.loopRing(he).length > 0 ? { he, em } : null;
+    const prev = this._loopHover;
+    if (prev?.he === next?.he && prev?.em === next?.em) return;
+    this._loopHover = next;
+    this._scheduleRender();
+  }
+
+  /** A second finger / pointercancel during a Loop Cut press: nothing is cut. */
+  private _loopDrop(): void {
+    if (!this._loopPress) return;
+    this._loopPress = null;
+    this._loopHover = null;
+    this._scheduleRender();
+  }
+
+  /** Cut the loop through half-edge `he` with the tool's count / position (one undo step; the last op). */
+  private _loopCut(he: number): boolean {
+    if (!this._meshId || !this._canDragVertex()) return false;
+    const ok = this._meshEdit.loopCuts(this._meshId, he, this.loopCutCount, this.loopCutPosition);
+    this._loopHover = null;
+    if (ok) { this._onSelectionChange?.(); this._scheduleRender(); }
+    return ok;
+  }
+
+  // ── Knife tool ──────────────────────────────────────────────────────────────
+
+  /** Knife points placed so far (0 when the knife has none / the mesh changed under them). */
+  get knifePointCount(): number {
+    const k = this._knife;
+    if (!k) return 0;
+    if (this._getMesh()?.editMesh !== k.em || this._meshId !== k.meshId) { this._knife = null; return 0; }
+    return k.points.length;
+  }
+
+  /** Knife: add the surface point under canvas px (snapped onto a vertex / edge of the hit face within
+   *  {@link KNIFE_SNAP_PX}). False when the ray misses the mesh. */
+  knifeAddAt(px: number, py: number): boolean {
+    const mesh = this._getMesh();
+    const em = mesh?.editMesh;
+    if (!mesh || !em || !this._canvas || !this._meshId || mesh instanceof SkinnedMesh3D) return false;
+    if (this._knife && (this._knife.em !== em || this._knife.meshId !== this._meshId)) this._knife = null;
+    const hit = this._raycastFace(mesh, px, py);
+    if (!hit) return false;
+    let p = hit.point;
+    // snap onto a vertex / edge of the hit face (screen space)
+    const project = this._projector(mesh, this._canvas.width, this._canvas.height);
+    const fv = em.getFaceVertices(hit.face);
+    const scr = fv.map(v => { const s = project(em.vertices[v].x, em.vertices[v].y, em.vertices[v].z); return s ? { x: s.x, y: s.y } : null; });
+    const r = KNIFE_SNAP_PX * this._pickScale;
+    let best = r, snapped: [number, number, number] | null = null;
+    fv.forEach((v, k) => {
+      const s = scr[k];
+      if (!s) return;
+      const d = Math.hypot(s.x - px, s.y - py);
+      if (d <= best) { best = d; const q = em.vertices[v]; snapped = [q.x, q.y, q.z]; }
+    });
+    if (!snapped) {
+      best = r;
+      for (let k = 0; k < fv.length; k++) {
+        const a = scr[k], b = scr[(k + 1) % fv.length];
+        if (!a || !b) continue;
+        const ex = b.x - a.x, ey = b.y - a.y, L2 = ex * ex + ey * ey;
+        if (L2 <= 0) continue;
+        const t = Math.max(0, Math.min(1, ((px - a.x) * ex + (py - a.y) * ey) / L2));
+        const d = Math.hypot(a.x + ex * t - px, a.y + ey * t - py);
+        if (d <= best) {
+          best = d;
+          const A = em.vertices[fv[k]], B = em.vertices[fv[(k + 1) % fv.length]];
+          snapped = [A.x + (B.x - A.x) * t, A.y + (B.y - A.y) * t, A.z + (B.z - A.z) * t];
+        }
+      }
+    }
+    if (snapped) p = snapped;
+    (this._knife ??= { meshId: this._meshId, em, points: [] }).points.push({ face: hit.face, x: p[0], y: p[1], z: p[2] });
+    this._scheduleRender();
+    this._onSelectionChange?.();
+    return true;
+  }
+
+  /** Knife: cut along the placed points (≥ 2) — one undo step. Returns the number of faces split (0 = nothing cut).
+   *  The points are dropped either way. */
+  knifeApply(): number {
+    const k = this._knife;
+    this._knife = null;
+    this._scheduleRender();
+    const mesh = this._getMesh();
+    if (!k || k.points.length < 2 || !mesh || mesh.editMesh !== k.em || this._meshId !== k.meshId) return 0;
+    // the cutting planes contain the current view (eye / view direction), in object space
+    const cam = this._scene3d.getCamera?.() ?? null;
+    let eye: [number, number, number] | null = null, viewDir: [number, number, number] | null = null;
+    const inv = mat4.invert(mat4.create(), mesh.localMatrix as unknown as mat4);
+    if (cam && inv) {
+      if (cam.mode === 'orthographic') {
+        const d = vec4.transformMat4(vec4.create(), vec4.fromValues(cam.target[0] - cam.position[0], cam.target[1] - cam.position[1], cam.target[2] - cam.position[2], 0), inv);
+        viewDir = [d[0], d[1], d[2]];
+      } else {
+        const e = vec4.transformMat4(vec4.create(), vec4.fromValues(cam.position[0], cam.position[1], cam.position[2], 1), inv);
+        eye = [e[0] / e[3], e[1] / e[3], e[2] / e[3]];
+      }
+    }
+    const n = this._meshEdit.knifePath(k.meshId, k.points, { eye, viewDir });
+    if (n > 0) this._onSelectionChange?.();
+    return n;
+  }
+
+  /** Knife: drop the placed points (nothing cut). */
+  knifeCancel(): void {
+    if (!this._knife) return;
+    this._knife = null;
+    this._scheduleRender();
+    this._onSelectionChange?.();
+  }
+
+  /** The nearest edit-mesh face under canvas px and the object-space hit point (planar faces; null = a miss). */
+  private _raycastFace(mesh: Mesh3D, px: number, py: number): { face: number; point: [number, number, number] } | null {
+    const em = mesh.editMesh, cam = this._scene3d.getCamera?.();
+    if (!em || !cam || !this._canvas) return null;
+    const ray = screenRay(cam.getViewProjectionMatrix() as unknown as mat4, px, py, this._canvas.width, this._canvas.height);
+    const inv = mat4.invert(mat4.create(), mesh.localMatrix as unknown as mat4);
+    if (!ray || !inv) return null;
+    const o4 = vec4.transformMat4(vec4.create(), vec4.fromValues(ray.origin[0], ray.origin[1], ray.origin[2], 1), inv);
+    const d4 = vec4.transformMat4(vec4.create(), vec4.fromValues(ray.dir[0], ray.dir[1], ray.dir[2], 0), inv);
+    const o = [o4[0] / o4[3], o4[1] / o4[3], o4[2] / o4[3]], d = [d4[0], d4[1], d4[2]];
+    let best: { face: number; point: [number, number, number]; t: number } | null = null;
+    for (let fi = 0; fi < em.faces.length; fi++) {
+      const fv = em.getFaceVertices(fi);
+      if (fv.length < 3) continue;
+      const P = fv.map(v => em.vertices[v]);
+      let nx = 0, ny = 0, nz = 0;
+      for (let k = 0; k < P.length; k++) {
+        const a = P[k], b = P[(k + 1) % P.length];
+        nx += (a.y - b.y) * (a.z + b.z); ny += (a.z - b.z) * (a.x + b.x); nz += (a.x - b.x) * (a.y + b.y);
+      }
+      const denom = nx * d[0] + ny * d[1] + nz * d[2];
+      if (Math.abs(denom) < 1e-18) continue;
+      const t = (nx * (P[0].x - o[0]) + ny * (P[0].y - o[1]) + nz * (P[0].z - o[2])) / denom;
+      if (!(t > 0) || (best && t >= best.t)) continue;
+      const hx = o[0] + d[0] * t, hy = o[1] + d[1] * t, hz = o[2] + d[2] * t;
+      // point in polygon, in the plane of the two axes the normal is least aligned with
+      const ax = Math.abs(nx), ay = Math.abs(ny), az = Math.abs(nz);
+      const U = (p: { x: number; y: number; z: number }) => (ax >= ay && ax >= az ? p.y : p.x);
+      const V = (p: { x: number; y: number; z: number }) => (az >= ax && az >= ay ? p.y : p.z);
+      const hu = U({ x: hx, y: hy, z: hz }), hv = V({ x: hx, y: hy, z: hz });
+      let inside = false;
+      for (let k = 0, j = P.length - 1; k < P.length; j = k++) {
+        const uk = U(P[k]), vk = V(P[k]), uj = U(P[j]), vj = V(P[j]);
+        if ((vk > hv) !== (vj > hv) && hu < ((uj - uk) * (hv - vk)) / (vj - vk) + uk) inside = !inside;
+      }
+      if (inside) best = { face: fi, point: [hx, hy, hz], t };
+    }
+    return best ? { face: best.face, point: best.point } : null;
+  }
+
+  // ── Overlay lines: Chamfer guides + Knife path + Loop Cut preview ───────────
+
+  /** Every tool line for the edit overlay (MeshEditDrawData.guides): world-space xyz pairs, or null. */
+  guideLines(): Float32Array | null {
+    const parts: ArrayLike<number>[] = [];
+    const bev = this.bevel.guideLines();
+    if (bev) parts.push(bev);
+    const mesh = this._getMesh();
+    const m = mesh?.localMatrix as unknown as ArrayLike<number> | undefined;
+    const toW = (x: number, y: number, z: number, out: number[]): void => {
+      out.push(m![0] * x + m![4] * y + m![8] * z + m![12], m![1] * x + m![5] * y + m![9] * z + m![13], m![2] * x + m![6] * y + m![10] * z + m![14]);
+    };
+    if (mesh && m && this._tool === 'knife' && this.knifePointCount > 0) {
+      const pts = this._knife!.points, out: number[] = [];
+      for (let i = 0; i + 1 < pts.length; i++) { toW(pts[i].x, pts[i].y, pts[i].z, out); toW(pts[i + 1].x, pts[i + 1].y, pts[i + 1].z, out); }
+      // a small cross on every point (screen-constant size)
+      const cam = this._scene3d.getCamera?.();
+      for (const p of pts) {
+        const w: number[] = []; toW(p.x, p.y, p.z, w);
+        const s = cam ? GizmoRenderer.computeGizmoScale(cam, w as unknown as [number, number, number]) * 0.06 : 0.02;
+        for (const ax of [[s, 0, 0], [0, s, 0], [0, 0, s]]) out.push(w[0] - ax[0], w[1] - ax[1], w[2] - ax[2], w[0] + ax[0], w[1] + ax[1], w[2] + ax[2]);
+      }
+      if (out.length) parts.push(out);
+    }
+    const h = this._loopHover;
+    if (mesh && m && this._tool === 'loopcut' && h && h.em === mesh.editMesh) {
+      const seg = h.em.loopCutPreview(h.he, this.loopCutCount, this.loopCutPosition), out: number[] = [];
+      for (let i = 0; i + 2 < seg.length; i += 3) toW(seg[i], seg[i + 1], seg[i + 2], out);
+      if (out.length) parts.push(out);
+    }
+    if (parts.length === 0) return null;
+    if (parts.length === 1 && parts[0] instanceof Float32Array) return parts[0];
+    const total = parts.reduce((s, p) => s + p.length, 0);
+    const res = new Float32Array(total);
+    let o = 0;
+    for (const p of parts) { res.set(p, o); o += p.length; }
+    return res;
   }
 
   // ── Selection + drag ────────────────────────────────────────────────────────
@@ -975,6 +1417,8 @@ export class MeshEditPointerController {
     this._bevelPointer = null;
     this._bevelPending = null;
     if (this._hoverFrame) { this._cancelFrame(this._hoverFrame); this._hoverFrame = 0; }
+    if (this._loopFrame) { this._cancelFrame(this._loopFrame); this._loopFrame = 0; }
+    this._loopAt = null;
     this._dropXfFrame();
     this._dragAt = null;
     this._hoverAt = null;

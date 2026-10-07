@@ -364,6 +364,7 @@ export class Skeleton3D extends Node {
           chainLength: ch.chainLength,
           target:      [...ch.target] as [number, number, number],
           ...(ch.poleTarget ? { poleTarget: [...ch.poleTarget] as [number, number, number] } : {}),
+          ...(typeof ch.poleJointIdx === 'number' ? { poleJointIdx: ch.poleJointIdx } : {}),
           blendWeight: ch.blendWeight ?? 1,
           enabled:     ch.enabled,
         })),
@@ -419,6 +420,7 @@ export class Skeleton3D extends Node {
       chainLength: ch.chainLength ?? 2,
       target:      ch.target ?? [0, 0, 0],
       ...(ch.poleTarget ? { poleTarget: ch.poleTarget as [number, number, number] } : {}),
+      ...(typeof ch.poleJointIdx === 'number' ? { poleJointIdx: ch.poleJointIdx } : {}),
       blendWeight: ch.blendWeight ?? 1,
       enabled:     ch.enabled ?? true,
     }));
