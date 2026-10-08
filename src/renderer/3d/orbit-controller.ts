@@ -19,6 +19,7 @@
 import { vec3 } from 'gl-matrix';
 import { Camera3D } from './camera-3d';
 import { addZonelessListener, removeZonelessListener } from '../util/zoneless-listeners';
+import { isPointerEventClaimed } from '../util/pointer-claims';
 
 export interface OrbitControllerConfig {
   /** Initial orbit radius (distance from target). */
@@ -156,6 +157,25 @@ export class OrbitController {
   /** Optional pan override (CSS-pixel deltas of the finger midpoint): return true when the host applied the pan
    *  itself (an ortho view whose target is pinned to the 2D illustration view), false to let the orbit pan run. */
   onTouchPan?: (dx: number, dy: number) => boolean;
+  // ── Edit-view navigation (Edit Mesh / UV editor / Armature; round-3 tablet feedback 2026-10-08) ──
+  /** Live host check: an edit view owns this controller. Then a PEN or ONE-FINGER drag that no tool claimed (pointer-
+   *  claims: the tool marks the presses it takes — a drag on the selection, a gizmo handle, a paint stroke) ORBITS once
+   *  it moves past {@link TOOL_DRAG_SLOP_PX} (a tap stays the tool's); two fingers PAN + pinch zoom (three still pan).
+   *  The mouse is unchanged (Alt+left orbit, middle / right pan, wheel). */
+  isEditNav?: () => boolean;
+  /** Live host check: the host's Pan (hand) tool is on in the edit view — any one-pointer drag (mouse left, pen, one
+   *  finger) PANS from the press (the tools ignore the press). */
+  isPanTool?: () => boolean;
+  /** Pen / finger movement (CSS px) that turns an unclaimed edit-view press into a camera orbit. */
+  static TOOL_DRAG_SLOP_PX = 8;
+  /** Edit navigation is on (see {@link isEditNav}). */
+  get editNavActive(): boolean { return !this.freeLookNav && !!this.isEditNav?.(); }
+  private get _panToolOn(): boolean { return this.editNavActive && !!this.isPanTool?.(); }
+  /** An edit-view pen / finger press that orbits once it moves past the slop, unless a tool claimed its event. */
+  private _navCand: { id: number; x: number; y: number; ev: object; touch: boolean } | null = null;
+  /** The pointer of a pen nav drag this controller captured (released on its up). */
+  private _navCaptured: number | null = null;
+
   /** Movement (CSS px) under which a touch still counts as a TAP (double-tap detection). */
   static TAP_SLOP_PX = 10;
   /** Max gap between the two taps of a double-tap (ms) and their max distance (CSS px). */
@@ -167,7 +187,7 @@ export class OrbitController {
   get activeTouchCount(): number { return this._touches.size; }
   private _touches = new Map<number, { x: number; y: number }>();
   private _touchGesture: 'none' | 'one' | 'two' | 'three' = 'none';
-  private _touchOne: 'orbit' | 'look' | null = null;
+  private _touchOne: 'orbit' | 'look' | 'pan' | null = null;
   private _touchMidX = 0;
   private _touchMidY = 0;
   private _touchDist = 0;
@@ -270,6 +290,7 @@ export class OrbitController {
     removeZonelessListener(this._canvas, 'pointercancel', this._onPointerCancel);
     if (this._prevTouchAction !== null && this._canvas.style) { this._canvas.style.touchAction = this._prevTouchAction; this._prevTouchAction = null; }
     this._touches.clear(); this._touchGesture = 'none'; this._tap = null;
+    this._navCand = null; this._navCaptured = null;
     if (this._onContextMenu) { this._canvas.removeEventListener('contextmenu', this._onContextMenu); this._onContextMenu = undefined; }
     this._canvas = null;
   }
@@ -297,6 +318,19 @@ export class OrbitController {
       this._dragPointerId = e.pointerId ?? null;
       return;
     }
+    // Edit views: the Pan tool pans with any left drag; a pen press orbits once it drags past the slop unclaimed.
+    if (e.button === 0 && !e.altKey && this.editNavActive) {
+      if (this._panToolOn) {
+        this._isDragging = true; this._isMiddleDrag = true;
+        this._lastX = e.clientX; this._lastY = e.clientY;
+        this._dragPointerId = e.pointerId ?? null;
+        return;
+      }
+      if (e.pointerType === 'pen') {
+        this._navCand = { id: e.pointerId ?? 0, x: e.clientX, y: e.clientY, ev: e, touch: false };
+        return;
+      }
+    }
     // Classic scheme (every other mode): LMB orbit (Alt-gated in altOrbitOnly), MMB/RMB pan.
     if (e.button === 0) {
       if (this.altOrbitOnly && !e.altKey) return;
@@ -313,6 +347,17 @@ export class OrbitController {
 
   private handlePointerMove(e: PointerEvent): void {
     if (e.pointerType === 'touch') { this._touchMove(e); return; }
+    const c = this._navCand;
+    if (c && !c.touch && (e.pointerId ?? 0) === c.id) {
+      if (Math.hypot(e.clientX - c.x, e.clientY - c.y) <= OrbitController.TOOL_DRAG_SLOP_PX) return;
+      this._navCand = null;
+      if (!this.enabled || isPointerEventClaimed(c.ev)) return;   // a tool took the press (it drags)
+      // the drag is the camera's: orbit from the PRESS point (the movement so far applies at once)
+      this._isDragging = true; this._isMiddleDrag = false;
+      this._lastX = c.x; this._lastY = c.y;
+      this._dragPointerId = c.id;
+      try { this._canvas?.setPointerCapture?.(c.id); this._navCaptured = c.id; } catch { /* pointer already gone */ }
+    }
     if (!this.enabled || !this._isDragging) return;
     // Only the pointer that started the drag moves the camera (a second pointer used to share _lastX → a jump).
     if (this._dragPointerId !== null && e.pointerId !== undefined && e.pointerId !== this._dragPointerId) return;
@@ -332,8 +377,18 @@ export class OrbitController {
 
   private handlePointerUp(e: PointerEvent): void {
     if (e.pointerType === 'touch') { this._touchUp(e, false); return; }
+    if (this._navCand && !this._navCand.touch && (e.pointerId ?? 0) === this._navCand.id) {
+      // (a pointerleave of a captured nav drag is not its end)
+      if (e.type !== 'pointerleave') this._navCand = null;
+      return;
+    }
+    if (e.type === 'pointerleave' && this._navCaptured !== null && e.pointerId === this._navCaptured) return;
     // A different pointer lifting (e.g. a pen while the mouse drags) doesn't end the drag it didn't start.
     if (this._isDragging && this._dragPointerId !== null && e.pointerId !== undefined && e.pointerId !== this._dragPointerId) return;
+    if (this._navCaptured !== null) {
+      try { this._canvas?.releasePointerCapture?.(this._navCaptured); } catch { /* not captured */ }
+      this._navCaptured = null;
+    }
     if (this._isLookDrag) { this._isLookDrag = false; this.onLookEnd?.(); }   // RMB released → host stops WASD fly
     this._isDragging = false;
     this._dragPointerId = null;
@@ -383,11 +438,21 @@ export class OrbitController {
     const n = this._touches.size;
     if (n === 1) {
       this._tap = { id, x: e.clientX, y: e.clientY, t: this._now(), moved: false };
+      this._navCand = null;
       if (!this.enabled) { this._touchGesture = 'none'; return; }
+      if (this.editNavActive && !this.touchNavLock) {
+        // Edit views: the Pan tool pans at once; otherwise the finger is the tool's until it drags past the slop
+        // unclaimed — then it orbits (_touchMove).
+        if (this._panToolOn) { this._touchOne = 'pan'; this._touchGesture = 'one'; return; }
+        this._touchOne = null; this._touchGesture = 'none';
+        this._navCand = { id, x: e.clientX, y: e.clientY, ev: e, touch: true };
+        return;
+      }
       this._touchOne = this._oneFingerAction();
       this._touchGesture = this._touchOne ? 'one' : 'none';
       return;
     }
+    this._navCand = null;
     this._tap = null;                                     // a 2nd finger: not a tap
     if (!this.enabled) { this._touchGesture = 'none'; return; }
     this._beginMultiTouch();
@@ -401,10 +466,20 @@ export class OrbitController {
     p.x = e.clientX; p.y = e.clientY;
     if (this._tap && this._tap.id === id && !this._tap.moved
         && Math.hypot(e.clientX - this._tap.x, e.clientY - this._tap.y) > OrbitController.TAP_SLOP_PX) this._tap.moved = true;
+    const nc = this._navCand;
+    if (nc && nc.touch && nc.id === id && this._touchGesture === 'none') {
+      if (Math.hypot(e.clientX - nc.x, e.clientY - nc.y) <= OrbitController.TOOL_DRAG_SLOP_PX) return;
+      this._navCand = null;
+      if (!this.enabled || isPointerEventClaimed(nc.ev)) return;   // a tool took the press (it drags)
+      this._touchOne = 'orbit'; this._touchGesture = 'one';
+      this.orbit(e.clientX - nc.x, e.clientY - nc.y);               // from the PRESS point
+      return;
+    }
     if (!this.enabled) return;
     if (this._touchGesture === 'one') {
       if (this._touchOne === 'look') this.lookAround(dx, dy);
       else if (this._touchOne === 'orbit') this.orbit(dx, dy);
+      else if (this._touchOne === 'pan') this._touchPan(dx, dy);
       return;
     }
     if (this._touchGesture !== 'two' && this._touchGesture !== 'three') return;
@@ -413,8 +488,9 @@ export class OrbitController {
     const prevDist = this._touchDist;
     this._touchMidX = c.x; this._touchMidY = c.y; this._touchDist = c.dist;
     if (this._touchGesture === 'three') { this._touchPan(mdx, mdy); return; }
-    // altOrbitOnly (tool modes): two fingers ORBIT (one finger is the tool's); otherwise two fingers PAN.
-    if (this.altOrbitOnly && !this.touchNavLock) { if (mdx !== 0 || mdy !== 0) this.orbit(mdx, mdy); }
+    // altOrbitOnly (tool modes): two fingers ORBIT (one finger is the tool's); otherwise two fingers PAN. Edit views
+    // orbit with one finger off the selection, so there two fingers PAN.
+    if (this.altOrbitOnly && !this.touchNavLock && !this.editNavActive) { if (mdx !== 0 || mdy !== 0) this.orbit(mdx, mdy); }
     else this._touchPan(mdx, mdy);
     if (prevDist > 0 && c.dist > 0) this.pinch(c.dist / prevDist, c.x, c.y);
   }
@@ -423,6 +499,7 @@ export class OrbitController {
     const id = e.pointerId ?? 0;
     if (!this._touches.has(id)) return;                   // pointerleave after pointerup, or never tracked
     this._touches.delete(id);
+    if (this._navCand?.id === id) this._navCand = null;
     try { this._canvas?.releasePointerCapture?.(id); } catch { /* not captured */ }
     const tap = this._tap;
     if (tap && tap.id === id) {

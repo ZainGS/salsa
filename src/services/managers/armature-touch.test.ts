@@ -122,18 +122,27 @@ describe('Scene3DArmature overlay — pick on down (TOUCH-9)', () => {
 });
 
 describe('Scene3DArmature overlay — fingers (TOUCH-9 / TOUCH-8)', () => {
-  it('a finger press picks with ×2 hit radii but selects nothing until it moves', () => {
-    const { canvas, sel, hitScales } = setup();
+  it('a finger press picks with ×2 hit radii; on an UNSELECTED joint a drag is the camera ORBIT, a tap selects it; a SELECTED one drags', () => {
+    const { canvas, skel, sel, hitScales } = setup();
     fire(canvas, 'pointerdown', { pointerType: 'touch', clientX: 200, clientY: 300 });
     expect(hitScales).toEqual([2]);
     expect(sel().idx).toBeNull();
     fire(canvas, 'pointermove', { pointerType: 'touch', clientX: 230, clientY: 300 });
-    expect(sel().idx).toBe(1);
+    fire(canvas, 'pointerup', { pointerType: 'touch', clientX: 230, clientY: 300, buttons: 0 });
+    expect(sel().idx).toBeNull();                      // the drag orbited (the orbit controller's), nothing picked
+    fire(canvas, 'pointerdown', { pointerType: 'touch', clientX: 200, clientY: 300 });
+    fire(canvas, 'pointerup', { pointerType: 'touch', clientX: 202, clientY: 301, buttons: 0 });
+    expect(sel().idx).toBe(1);                         // a tap selects
+    const p0 = [...skel.data.joints[1].localPosition];
+    fire(canvas, 'pointerdown', { pointerType: 'touch', clientX: 200, clientY: 300 });
+    fire(canvas, 'pointermove', { pointerType: 'touch', clientX: 240, clientY: 280 });
+    expect(skel.data.joints[1].localPosition).not.toEqual(p0);   // the selected joint drags
+    fire(canvas, 'pointerup', { pointerType: 'touch', clientX: 240, clientY: 280, buttons: 0 });
   });
 
-  it('a 2nd finger restores the joint position AND the previous joint selection exactly', () => {
+  it('a 2nd finger restores the joint position AND the joint selection exactly', () => {
     const { canvas, skel, sel, select, orbit } = setup();
-    select(0);
+    select(1);
     const p0 = [...skel.data.joints[1].localPosition];
     fire(canvas, 'pointerdown', { pointerType: 'touch', pointerId: 1, clientX: 200, clientY: 300 });
     fire(canvas, 'pointermove', { pointerType: 'touch', pointerId: 1, clientX: 260, clientY: 250 });
@@ -141,8 +150,8 @@ describe('Scene3DArmature overlay — fingers (TOUCH-9 / TOUCH-8)', () => {
     expect(sel().idx).toBe(1);
     fire(canvas, 'pointerdown', { pointerType: 'touch', pointerId: 2, isPrimary: false, clientX: 500, clientY: 300 });
     expect(skel.data.joints[1].localPosition).toEqual(p0);
-    expect(sel().idx).toBe(0);
-    expect(sel().field).toBe(0);
+    expect(sel().idx).toBe(1);
+    expect(sel().field).toBe(1);
     expect(orbit.enabled).toBe(true);                  // handed to the pinch / two-finger orbit
     fire(canvas, 'pointermove', { pointerType: 'touch', pointerId: 1, clientX: 300, clientY: 200 });
     expect(skel.data.joints[1].localPosition).toEqual(p0);   // blocked until every finger lifts

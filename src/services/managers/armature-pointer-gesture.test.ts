@@ -199,3 +199,39 @@ describe('ArmaturePointerGesture — finger (TOUCH-9)', () => {
     expect(b.g.state).toBe('idle');
   });
 });
+
+describe('ArmaturePointerGesture — tapOnly targets on a pen / finger (round-3: drags off the selection orbit)', () => {
+  function withTapOnly() {
+    const s = setup();
+    const h = (s.g as unknown as { h: ArmGestureHandlers<T> }).h;
+    h.tapOnly = () => true;
+    return s;
+  }
+  it('a pen / finger drag past the slop drops the press unclaimed (nothing begins: the camera orbits it)', () => {
+    for (const pointerType of ['pen', 'touch']) {
+      const { g, log, ev } = withTapOnly();
+      expect(g.down(ev({ pointerType, clientX: 10, clientY: 10 }))).toBe(true);
+      g.move(ev({ pointerType, clientX: 14, clientY: 10 }));
+      expect(g.state).toBe('pending');
+      g.move(ev({ pointerType, clientX: 40, clientY: 10 }));
+      expect(g.state).toBe('idle');
+      g.up(ev({ pointerType, clientX: 40, clientY: 10, buttons: 0 }));
+      expect(log).toEqual(['pick 10,10']);
+    }
+  });
+  it('a tap on a drag target selects it (begin + end at the press point); the mouse keeps the old press', () => {
+    const { g, log, ev } = withTapOnly();
+    g.down(ev({ pointerType: 'pen', clientX: 10, clientY: 10 }));
+    g.up(ev({ pointerType: 'pen', clientX: 12, clientY: 11, buttons: 0 }));
+    expect(log).toEqual(['pick 10,10', 'begin 10,10', 'end']);
+    log.length = 0;
+    g.down(ev({ clientX: 10, clientY: 10 }));
+    expect(log).toEqual(['pick 10,10', 'begin 10,10']);
+    expect(g.state).toBe('dragging');
+  });
+  it('a pen drag on a target that is not tapOnly is claimed (the camera leaves it)', () => {
+    const { g, log, ev } = setup();
+    g.down(ev({ pointerType: 'pen', clientX: 10, clientY: 10 }));
+    expect(log).toEqual(['pick 10,10', 'begin 10,10', 'claim']);
+  });
+});

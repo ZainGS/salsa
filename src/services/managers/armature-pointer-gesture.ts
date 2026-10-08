@@ -14,6 +14,10 @@
  *    Finger presses are never stopped (the orbit controller must see every finger) — the host claims them instead.
  *  - pointercancel cancels (restores); lostpointercapture / a move with no button held end the drag — it can never
  *    stay stuck.
+ *  - PEN / FINGER on a `tapOnly` target (round-3 feedback: bone placement, a joint that is not selected): a tap acts on
+ *    the release (a joint: selected, like a click); a drag past {@link ArmaturePointerGesture.TAP_SLOP_PX} drops the
+ *    press — it was never claimed, so the orbit controller turns it into a camera orbit. Every other press the
+ *    armature takes is claimed (pen included), so the camera leaves it alone.
  */
 
 /** A client rect (the canvas' getBoundingClientRect). */
@@ -35,6 +39,10 @@ export interface ArmGestureHandlers<T> {
   pick(clientX: number, clientY: number, rect: ArmClientRect, touch: boolean): T | null;
   /** True for a target that acts once (bone placement) instead of dragging. */
   isTap(t: T): boolean;
+  /** PEN / FINGER only: the target acts on a TAP alone (bone placement, an unselected joint) — the press is not
+   *  claimed, and a drag past {@link ArmaturePointerGesture.TAP_SLOP_PX} is left to the camera (it orbits). A tap on
+   *  a drag target selects it (begin + end, like a click). Absent = the old rules. */
+  tapOnly?(t: T): boolean;
   /** A tap target fires: at the press for the mouse, at the release for a finger (only when it moved ≤ the slop). */
   tap(t: T, clientX: number, clientY: number, rect: ArmClientRect): void;
   /** A finger is moving with a pending tap target (bone placement: the tail preview follows it). */
@@ -69,7 +77,7 @@ export class ArmaturePointerGesture<T> {
   private owner: number | null = null;
   private rect: ArmClientRect | null = null;
   private frame = 0;
-  private pend: { t: T; x: number; y: number; tap: boolean; moved: boolean } | null = null;
+  private pend: { t: T; x: number; y: number; tap: boolean; moved: boolean; nav?: boolean } | null = null;
   private hoverFrame = 0;
   private hoverAt: { x: number; y: number } | null = null;
 
@@ -84,6 +92,7 @@ export class ArmaturePointerGesture<T> {
   /** pointerdown. Returns true when the armature took the press (the host stops a MOUSE press's mousedown). */
   down(e: ArmGesturePointer): boolean {
     const touch = e.pointerType === 'touch';
+    const nav = touch || e.pointerType === 'pen';
     if (touch) {
       // The primary finger starts a new contact sequence: any ids still tracked are stale (a missed up).
       if (e.isPrimary && (this.mode === 'idle' || this.mode === 'blocked')) { this.touches.clear(); this.mode = 'idle'; }
@@ -98,9 +107,17 @@ export class ArmaturePointerGesture<T> {
     this.cancelHover();
     this.rect = rect;
     const tap = this.h.isTap(t);
+    if (nav && this.h.tapOnly?.(t)) {
+      // a tap acts on the release; a drag past the slop drops the press (the camera orbits it) — not claimed
+      this.owner = e.pointerId;
+      this.mode = 'pending';
+      this.pend = { t, x: e.clientX, y: e.clientY, tap: true, moved: false, nav: true };
+      return true;
+    }
     if (!touch) {
       if (tap) { this.h.tap(t, e.clientX, e.clientY, rect); this.rect = null; return true; }
       if (!this.h.begin(t, e.clientX, e.clientY, rect)) { this.rect = null; return false; }
+      if (nav) this.h.claim?.(e);   // a pen drag: the camera leaves it alone
       this.owner = e.pointerId;
       this.mode = 'dragging';
       this.io.capture(e.pointerId);
@@ -125,7 +142,11 @@ export class ArmaturePointerGesture<T> {
         const p = this.pend!;
         const far = Math.hypot(e.clientX - p.x, e.clientY - p.y);
         if (p.tap) {
-          if (far > ArmaturePointerGesture.TAP_SLOP_PX) p.moved = true;
+          if (far > ArmaturePointerGesture.TAP_SLOP_PX) {
+            p.moved = true;
+            if (p.nav) { this.dropPending(); this.finish(); return; }   // the camera's drag now
+          }
+          if (!this.h.isTap(p.t)) return;
           this.h.pendingMove?.(p.t, e.clientX, e.clientY, rect);
           return;
         }
@@ -159,7 +180,8 @@ export class ArmaturePointerGesture<T> {
         this.dropPending();
         this.finish();
         if (!p.moved && Math.hypot(e.clientX - p.x, e.clientY - p.y) <= ArmaturePointerGesture.TAP_SLOP_PX) {
-          this.h.tap(p.t, e.clientX, e.clientY, rect);
+          if (this.h.isTap(p.t)) this.h.tap(p.t, e.clientX, e.clientY, rect);
+          else if (this.h.begin(p.t, p.x, p.y, rect)) this.h.end();   // a tap on a joint selects it (like a click)
         }
         return;
       }

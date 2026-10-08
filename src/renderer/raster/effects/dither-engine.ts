@@ -13,7 +13,7 @@
  *   Async operation — requires `await applyAsync()` instead of `apply()`.
  *
  * Supported algorithms:
- *   GPU (ordered):  Bayer, Halftone (dot/line/diamond), Blue Noise, Noise
+ *   GPU (ordered):  Bayer, Halftone (14 screen shapes, see HALFTONE_SHAPES), Blue Noise, Noise
  *   WASM (diffusion): Floyd-Steinberg, Atkinson, Jarvis-Judice-Ninke, Stucki, Sierra, Sierra Lite
  */
 
@@ -144,9 +144,7 @@ const WGSL_EDGE_HELPERS = /* wgsl */ `
 export type DitherAlgorithm =
   // GPU compute (ordered, real-time)
   | 'bayer'
-  | 'halftone_dot'
-  | 'halftone_line'
-  | 'halftone_diamond'
+  | HalftoneAlgorithm   // 'halftone_dot' | 'halftone_line' | ... one value per HALFTONE_SHAPES entry
   | 'blue_noise'
   | 'noise'
   // Rust/WASM (error diffusion, async)
@@ -157,8 +155,39 @@ export type DitherAlgorithm =
   | 'sierra'
   | 'sierra_lite';
 
+/** Halftone screen shapes, in SHADER INDEX order (params[0].y) — append only: the index is the
+ *  shader's switch case, and dot / line / diamond (0..2) are the original three that saved documents
+ *  use. rings / spiral are GLOBAL patterns (centred on the texture), the rest are per-cell. */
+export const HALFTONE_SHAPES = [
+  'dot', 'line', 'diamond',
+  'square', 'cross', 'ellipse', 'wavy', 'crosshatch', 'rings', 'spiral', 'hexagon', 'star', 'heart', 'triangle',
+] as const;
+
 /** Shape of a halftone screen cell. */
-export type HalftoneShape = 'dot' | 'line' | 'diamond';
+export type HalftoneShape = typeof HALFTONE_SHAPES[number];
+
+/** The dither algorithm value for each halftone shape ('halftone_' + shape — the stored form). */
+export type HalftoneAlgorithm = `halftone_${HalftoneShape}`;
+
+/** True for every 'halftone_*' algorithm (including a shape this build does not know — it renders as Dot). */
+export function isHalftoneAlgorithm(algorithm: string): algorithm is HalftoneAlgorithm {
+  return typeof algorithm === 'string' && algorithm.startsWith('halftone_');
+}
+
+/** The shader shape index of a halftone algorithm: dot 0, line 1, diamond 2, then HALFTONE_SHAPES order.
+ *  An unknown 'halftone_*' value (a newer document) falls back to 0 (Dot); a non-halftone algorithm is -1. */
+export function halftoneShapeIndex(algorithm: string): number {
+  if (!isHalftoneAlgorithm(algorithm)) return -1;
+  const i = (HALFTONE_SHAPES as readonly string[]).indexOf(algorithm.slice('halftone_'.length));
+  return i < 0 ? 0 : i;
+}
+
+/** Every dither algorithm this engine supports, in UI order (GPU ordered first, then WASM error diffusion).
+ *  Hosts can feature-detect a halftone shape by looking its algorithm value up here. */
+export const DITHER_ALGORITHMS: readonly DitherAlgorithm[] = [
+  'bayer', ...HALFTONE_SHAPES.map((s): HalftoneAlgorithm => `halftone_${s}`), 'blue_noise', 'noise',
+  'floyd_steinberg', 'atkinson', 'jarvis_judice_ninke', 'stucki', 'sierra', 'sierra_lite',
+];
 
 /** How the dither pattern maps to colors. */
 export type DitherColorMode =
@@ -384,16 +413,15 @@ export class DitherEngine {
       case 'bayer':
         this.applyBayer(texture, w, h, config, enc);
         break;
-      case 'halftone_dot':
-      case 'halftone_line':
-      case 'halftone_diamond':
-        this.applyHalftone(texture, w, h, config, enc);
-        break;
       case 'blue_noise':
         this.applyBlueNoise(texture, w, h, config, enc);
         break;
       case 'noise':
         this.applyNoise(texture, w, h, config, enc);
+        break;
+      default:
+        // Every 'halftone_*' shape (an unknown one from a newer document renders as Dot).
+        if (isHalftoneAlgorithm(config.algorithm)) this.applyHalftone(texture, w, h, config, enc);
         break;
     }
 
@@ -721,8 +749,7 @@ export class DitherEngine {
   private applyHalftone(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
     this.ensureHalftonePipeline();
 
-    const shapeIdx = cfg.algorithm === 'halftone_dot' ? 0 :
-                     cfg.algorithm === 'halftone_line' ? 1 : 2;
+    const shapeIdx = Math.max(0, halftoneShapeIndex(cfg.algorithm));
     const angleRad = (cfg.halftoneAngle * Math.PI) / 180;
 
     // params: [colorLevels, halftoneShape, strength, patternScale,
@@ -774,19 +801,69 @@ export class DitherEngine {
 
       ${WGSL_APPLY_COLOR_MAPPING}
       ${WGSL_EDGE_HELPERS}
-      // Generate a halftone threshold for a rotated cell grid.
-      // Returns 0..1 threshold value.
-      fn halftoneThreshold(px: f32, py: f32, angle: f32, freq: f32, shape: i32, texW: f32, texH: f32) -> f32 {
-        // Normalize pixel coords to [0, freq] range
+      const HT_TAU: f32 = 6.28318531;
+      const HT_SQRT3: f32 = 1.7320508;
+
+      // Pixel coords to the ROTATED screen space (one unit = one cell). ONE scale for both axes: pixels are square,
+      // so square cells (round dots) need the same scale on x and y - the old "aspect" factor (texW / texH) on y
+      // stretched every cell on a non-square texture (oval dots on a portrait / landscape page).
+      fn halftoneRot(px: f32, py: f32, angle: f32, freq: f32, texW: f32) -> vec2<f32> {
         let scale = freq / texW;
         let nx = px * scale;
-        let ny = py * scale * (texW / texH); // correct aspect ratio
-
-        // Rotate by screen angle
+        let ny = py * scale;
         let cs = cos(angle);
         let sn = sin(angle);
-        let rx = nx * cs - ny * sn;
-        let ry = nx * sn + ny * cs;
+        return vec2<f32>(nx * cs - ny * sn, nx * sn + ny * cs);
+      }
+
+      // Honeycomb: offset from the NEAREST hexagon centre (centres at (i, j*sqrt3) and (i + 0.5, (j + 0.5)*sqrt3),
+      // neighbours one unit apart). Two offset rectangular grids, keep the closer centre.
+      fn htHexOffset(p: vec2<f32>) -> vec2<f32> {
+        let r = vec2<f32>(1.0, HT_SQRT3);
+        let h = r * 0.5;
+        let a = p - r * floor(p / r) - h;
+        let q = p - h;
+        let b = q - r * floor(q / r) - h;
+        return select(b, a, dot(a, a) < dot(b, b));
+      }
+
+      // Shape GAUGES: the scale at which p sits on the shape outline (0 at the shape origin, 1 on the unit outline).
+      // Level sets are scaled copies of the shape, so the ink grows as the same shape. p.y points UP.
+      // 5-point star, tip radius 1, inner radius 0.5: |p| over the outline radius in that direction.
+      fn htStarGauge(p: vec2<f32>) -> f32 {
+        let a0 = atan2(p.x, p.y);                                        // 0 = straight up (a tip)
+        let a = abs(a0 - (HT_TAU / 5.0) * round(a0 / (HT_TAU / 5.0)));   // 0..36 degrees from the nearest tip
+        let rs = 0.5 * 0.58778525;                                       // inner radius * sin 36
+        let rc = 0.5 * 0.80901699 - 1.0;                                 // inner radius * cos 36 - tip radius
+        return length(p) * (cos(a) * rs - sin(a) * rc) / rs;
+      }
+      // Disc of radius |c| centred at c (the origin is on its rim): p is inside k*disc for k >= |p|^2 / (2 p.c).
+      fn htDiscGauge(p: vec2<f32>, c: vec2<f32>) -> f32 {
+        let pc = dot(p, c);
+        return select(1.0e4, dot(p, p) / max(2.0 * pc, 1.0e-6), pc > 1.0e-6);
+      }
+      // Classic heart: a 45-degree square of side 1 plus two discs on its upper edges (union = min of gauges).
+      fn htHeartGauge(p: vec2<f32>) -> f32 {
+        let gSq = (abs(p.x) + abs(p.y)) / 0.70710678;
+        let c = vec2<f32>(0.35355339, 0.35355339);
+        return min(gSq, min(htDiscGauge(p, c), htDiscGauge(p, vec2<f32>(-c.x, c.y))));
+      }
+      // Upward equilateral triangle, inradius 1, centroid at the origin.
+      fn htTriangleGauge(p: vec2<f32>) -> f32 {
+        return max(-p.y, max(0.8660254 * p.x + 0.5 * p.y, -0.8660254 * p.x + 0.5 * p.y));
+      }
+      // Figurative shapes do not tile, so the last tones fill in with a square growing from the cell centre
+      // (starts at 0.6, reaches the cell edge at 1) - the cell still goes solid smoothly instead of all at once.
+      fn htFillTail(t: f32, cx: f32, cy: f32) -> f32 {
+        return min(t, 0.6 + 0.4 * max(abs(cx), abs(cy)) * 2.0);
+      }
+
+      // Generate a halftone threshold for a rotated cell grid.
+      // Returns 0..1 threshold value. ctr = the texture centre in pre-patternScale pixels (the rings / spiral origin).
+      fn halftoneThreshold(px: f32, py: f32, angle: f32, freq: f32, shape: i32, texW: f32, texH: f32, ctr: vec2<f32>) -> f32 {
+        let r = halftoneRot(px, py, angle, freq, texW);
+        let rx = r.x;
+        let ry = r.y;
 
         // Position within cell (fractional part), centered at 0
         let cx = fract(rx) - 0.5;
@@ -803,7 +880,60 @@ export class DitherEngine {
           case 1: {
             threshold = abs(cy) * 2.0;
           }
-          // Diamond
+          // Square (Chebyshev)
+          case 3: {
+            threshold = max(abs(cx), abs(cy)) * 2.0;
+          }
+          // Cross: a plus whose arms reach the cell edges at 0.5, then thicken into a grid
+          case 4: {
+            let ax = abs(cx);
+            let ay = abs(cy);
+            threshold = max(min(ax, ay) * 2.0, max(ax, ay));
+          }
+          // Ellipse (chain dot): y weighted 1.5x, so dots touch along x first and join into chains in the midtones
+          case 5: {
+            threshold = length(vec2<f32>(cx, cy * 1.5)) / 0.9013878;
+          }
+          // Wavy lines: the line screen with a sine offset along the line (period 3 cells, amplitude 0.3 cell)
+          case 6: {
+            let wy = ry + 0.3 * sin(rx * (HT_TAU / 3.0));
+            threshold = abs(fract(wy) - 0.5) * 2.0;
+          }
+          // Crosshatch: one line direction for the light tones, the perpendicular set joins from 0.45 on
+          case 7: {
+            threshold = min(abs(cy) * 2.0, 0.45 + 0.55 * abs(cx) * 2.0);
+          }
+          // Concentric rings (GLOBAL): distance from the texture centre, one ring per cell width
+          case 8: {
+            let d = length(vec2<f32>(px, py) - ctr) * (freq / texW);
+            threshold = abs(fract(d) - 0.5) * 2.0;
+          }
+          // Spiral (GLOBAL): one Archimedean arm around the texture centre, arm spacing one cell width,
+          // the screen angle rotates it
+          case 9: {
+            let v = vec2<f32>(px, py) - ctr;
+            let d = length(v) * (freq / texW);
+            let a = atan2(v.y, v.x) - angle;
+            threshold = abs(fract(d - a / HT_TAU) - 0.5) * 2.0;
+          }
+          // Hexagon: honeycomb cells, hex distance to the nearest centre (1 on the shared edges)
+          case 10: {
+            let o = abs(htHexOffset(r));
+            threshold = max(o.x, dot(o, vec2<f32>(0.5, 0.8660254))) * 2.0;
+          }
+          // Star: 5 points, tips touch the cell edge at 0.625
+          case 11: {
+            threshold = htFillTail(htStarGauge(vec2<f32>(cx, -cy)) * 1.25, cx, cy);
+          }
+          // Heart: full cell width at about 0.85 (origin a little below the cell centre so the heart sits centred)
+          case 12: {
+            threshold = htFillTail(htHeartGauge(vec2<f32>(cx, -cy) * 1.45 + vec2<f32>(0.0, 0.0732)), cx, cy);
+          }
+          // Triangle: full cell width at about 0.85 (centroid 0.12 below the cell centre)
+          case 13: {
+            threshold = htFillTail(htTriangleGauge(vec2<f32>(cx, 0.12 - cy)) / 0.34, cx, cy);
+          }
+          // Diamond (2, and the fallback)
           default: {
             threshold = (abs(cx) + abs(cy));
           }
@@ -812,29 +942,30 @@ export class DitherEngine {
         return clamp(threshold, 0.0, 1.0);
       }
 
-      // The screen-cell INDEX a pixel falls in (same rotate math as halftoneThreshold) — the unit
-      // the edge-density dropout removes, so dots vanish as whole dots.
-      fn halftoneCell(px: f32, py: f32, angle: f32, freq: f32, texW: f32, texH: f32) -> vec2<i32> {
-        let scale = freq / texW;
-        let nx = px * scale;
-        let ny = py * scale * (texW / texH);
-        let cs = cos(angle);
-        let sn = sin(angle);
-        let rx = nx * cs - ny * sn;
-        let ry = nx * sn + ny * cs;
-        return vec2<i32>(i32(floor(rx)), i32(floor(ry)));
+      // The screen-cell INDEX a pixel falls in (same rotate math as halftoneThreshold) - the unit
+      // the edge-density dropout removes, so dots vanish as whole dots. Hexagon uses its honeycomb
+      // cell (id = centre * (2, 2 / sqrt3)); every other shape, the global rings / spiral included,
+      // drops square cells of the rotated grid (as the line screen does: whole line segments).
+      fn halftoneCell(px: f32, py: f32, angle: f32, freq: f32, texW: f32, texH: f32, shape: i32) -> vec2<i32> {
+        let r = halftoneRot(px, py, angle, freq, texW);
+        if (shape == 10) {
+          let c = r - htHexOffset(r);
+          return vec2<i32>(i32(round(c.x * 2.0)), i32(round(c.y * (2.0 / HT_SQRT3))));
+        }
+        return vec2<i32>(i32(floor(r.x)), i32(floor(r.y)));
       }
 
-      // Inverse of halftoneCell: the cell CENTRE back in pre-patternScale pixel coords — the one
+      // Inverse of halftoneCell: the cell CENTRE back in pre-patternScale pixel coords - the one
       // point the density dropout evaluates the edge factor at (all-or-nothing per dot).
-      fn halftoneCellCenterPx(cell: vec2<i32>, angle: f32, freq: f32, texW: f32, texH: f32) -> vec2<f32> {
-        let c = vec2<f32>(f32(cell.x) + 0.5, f32(cell.y) + 0.5);
+      fn halftoneCellCenterPx(cell: vec2<i32>, angle: f32, freq: f32, texW: f32, texH: f32, shape: i32) -> vec2<f32> {
+        var c = vec2<f32>(f32(cell.x) + 0.5, f32(cell.y) + 0.5);
+        if (shape == 10) { c = vec2<f32>(f32(cell.x) * 0.5, f32(cell.y) * (HT_SQRT3 * 0.5)); }
         let cs = cos(angle);
         let sn = sin(angle);
         let nx = c.x * cs + c.y * sn;      // inverse rotation = transpose
         let ny = -c.x * sn + c.y * cs;
         let scale = freq / texW;
-        return vec2<f32>(nx / scale, ny / (scale * (texW / texH)));
+        return vec2<f32>(nx / scale, ny / scale);   // same scale on both axes (square cells)
       }
 
       @compute @workgroup_size(8, 8)
@@ -861,7 +992,8 @@ export class DitherEngine {
         let px = f32(gid.x) / patternScale;
         let py = f32(gid.y) / patternScale;
 
-        let threshold = halftoneThreshold(px, py, angle, freq, shape, texW, texH);
+        let ctr = vec2<f32>(texW, texH) * (0.5 / patternScale);   // texture centre, pre-patternScale (rings / spiral)
+        let threshold = halftoneThreshold(px, py, angle, freq, shape, texW, texH, ctr);
         let spread = 1.0 / colorLevels;
         let bias = (threshold - 0.5) * spread;
 
@@ -875,8 +1007,8 @@ export class DitherEngine {
         var cellDropped = false;
         let edgeDensity = params[7].w;
         if (edgeDensity > 0.001) {
-          let cell = halftoneCell(px, py, angle, freq, texW, texH);
-          let centerPx = halftoneCellCenterPx(cell, angle, freq, texW, texH) * patternScale;
+          let cell = halftoneCell(px, py, angle, freq, texW, texH, shape);
+          let centerPx = halftoneCellCenterPx(cell, angle, freq, texW, texH, shape) * patternScale;
           let eCell = edgeAt(vec2<i32>(centerPx), params[7].x);
           if (edgeCellRand(cell, u32(params[3].y)) > 1.0 - edgeDensity * (1.0 - eCell)) { cellDropped = true; }
         }

@@ -76,6 +76,10 @@ export const EDIT_VIEW_ELEVATION = 0.45;
 export const EDIT_VIEW_PADDING = 1.7;
 /** Re-entering the same mesh's edit view within this long after leaving it is a mode SWITCH: the camera is kept. */
 export const EDIT_CAMERA_KEEP_MS = 1500;
+/** Armature entry framing: the mesh from the current direction (front-on from the 2D view), filling most of the view. */
+export const ARMATURE_VIEW_PADDING = 1.33;
+/** Which edit mode owns the decoupled edit camera: Edit Mesh / UV editor, or the Armature. */
+export type EditViewOwner = 'meshEdit' | 'armature';
 const nowMs = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
 const _armTmpA = vec3.create();
@@ -227,7 +231,18 @@ export class Scene3DArmature {
     /** The Edit Mesh / UV camera at its last exit — re-used when the same mesh's edit view is re-entered right away
      *  (a mode SWITCH: Edit Mesh ↔ UV editor exits one and enters the other in the same click), so switching modes
      *  keeps the user's camera instead of re-framing (UI review 2026-10-07 §3 #17). */
-    private _lastEditCam: { meshId: string; target: [number, number, number]; azimuth: number; elevation: number; radius: number; zoom: number; at: number } | null = null;
+    private _lastEditCam: { meshId: string; target: [number, number, number]; azimuth: number; elevation: number; radius: number; zoom: number; framedZoom: number; at: number } | null = null;
+    /** The mode that owns the DECOUPLED edit camera (`_meshEditZoom`, the wheel interceptor, cameraOwnsView): Edit Mesh /
+     *  UV ('meshEdit', enableMeshEditOrbit) or the Armature ('armature', enterArmatureMode3D / showBoneOverlay3D).
+     *  The Armature used to follow the 2D zoom: framed on entry, then the next pan / zoom / Add Skeleton snapped the
+     *  camera back to the 2D view (the "armature camera jump"). A teardown only releases the camera while its own mode
+     *  still owns it. */
+    private _editViewOwner: EditViewOwner | null = null;
+    /** The armature view's mesh (the kept-camera key on leaving) and the cameraOwnsView value it replaced. */
+    private _armCamMeshId: string | null = null;
+    private _armPrevCameraOwnsView: boolean | null = null;
+    /** The edit view's zoom when it was last framed (entry / Frame): the zoom readout's 100 %. */
+    private _editFramedZoom: number | null = null;
 
     // ── (e) IK/FK + joint drag ───────────────────────────────────────────────────────────────────────
     private _isDraggingJoint = false;
@@ -344,8 +359,13 @@ export class Scene3DArmature {
         this.ctx.scheduleRender();
     }
 
+    /** An edit view / orbit owns the camera: the 2D illustration sync must not touch it. */
+    private get _orbitOwnsCamera(): boolean {
+        return this._boneOverlayExplicit || this._meshEditOrbitCenter !== null || this._editViewOwner !== null;
+    }
+
     syncIllustrationCamera(panX: number, panY: number, zoom: number, canvasW: number, canvasH: number): void {
-        if (this._boneOverlayExplicit || this._meshEditOrbitCenter) {
+        if (this._orbitOwnsCamera) {
             // Orbit controller owns the camera. Keep sync fresh for delta tracking
             // and pan-speed calibration, but don't touch the camera directly.
             this._illustrationSync = { panX, panY, zoom, canvasW, canvasH };
@@ -365,7 +385,7 @@ export class Scene3DArmature {
         // branch pins the target every frame) and zoom (the wheel dolly early-returns in ortho), while ROTATE
         // still works. That was the "reload into 3D Free → can't pan/zoom until I toggle modes" bug. The stored
         // projection re-applies when orbit mode exits (syncIllustrationCamera guards the same way, line ~276).
-        if (this._boneOverlayExplicit || this._meshEditOrbitCenter) { this.ctx.scheduleRender(); return; }
+        if (this._orbitOwnsCamera) { this.ctx.scheduleRender(); return; }
         this.renderer3D.getCamera().mode = mode;
         if (this._illustrationSync) {
             this._applyIllustrationCamera();
@@ -376,7 +396,7 @@ export class Scene3DArmature {
 
     private _applyIllustrationCamera(): void {
         if (!this._illustrationSync) return;
-        if (this._boneOverlayExplicit || this._meshEditOrbitCenter) return; // orbit owns the camera
+        if (this._orbitOwnsCamera) return; // orbit owns the camera
         const { panX, panY, zoom, canvasW, canvasH } = this._illustrationSync;
         const cam = this.renderer3D.getCamera();
 
@@ -493,6 +513,8 @@ export class Scene3DArmature {
                 this._orbitController.attach(liveCanvas as HTMLCanvasElement);
             }
             const hadMomentum = this._orbitController.update();
+            // The Armature's own edit camera (decoupled from the 2D view like Edit Mesh — see _editViewOwner).
+            if (this._editViewOwner === 'armature' && this._meshEditZoom != null) return this._applyDecoupledOrtho(hadMomentum);
             if (this._boneOverlayExplicit) {
                 // Orbit controller owns the camera in armature mode.
                 if (this._armatureOrbitCenter) {
@@ -553,18 +575,7 @@ export class Scene3DArmature {
                 // The target is NOT pinned to `oc` (pinning reset it every frame, so pan never stuck) and the 2D
                 // illustration pan/zoom is NOT read or written — so navigating the object never shifts the 2D
                 // artboard (cameraOwnsView blocks the raster pan/zoom path; the wheel interceptor owns the wheel).
-                if (this._meshEditZoom != null) {
-                    ctrl.applySpherical();                 // orbit + pan own the target
-                    cam.orthoSize = 1 / this._meshEditZoom;
-                    cam.orthoOffsetX = 0;
-                    cam.orthoOffsetY = 0;
-                    const canvasH = this._illustrationSync?.canvasH
-                        ?? this.ctx.webgpuRenderer.getCanvas()?.height ?? 1000;
-                    const r = Math.max(0.001, ctrl.radius);
-                    ctrl.panSpeed = cam.orthoSize / (canvasH * r);   // world units / pixel = orthoSize / canvasH
-                    if (hadMomentum) this.ctx.scheduleRender();
-                    return false;
-                }
+                if (this._meshEditZoom != null) return this._applyDecoupledOrtho(hadMomentum);
 
                 // LEGACY fallback (only if a mode failed to seed `_meshEditZoom`): the old illustration weld —
                 // target pinned at oc, orthoSize + pan derived from the 2D view.
@@ -641,6 +652,22 @@ export class Scene3DArmature {
         }
 
         return this._orbitController;
+    }
+
+    /** One frame of a DECOUPLED ortho edit view: orbit + pan own the target, the view's own zoom sets orthoSize. */
+    private _applyDecoupledOrtho(hadMomentum: boolean): boolean {
+        const ctrl = this._orbitController!, cam = this.renderer3D.getCamera();
+        const animating = this._stepEditAnim();   // an animated Frame (animateEditView) moves the view first
+        ctrl.applySpherical();                 // orbit + pan own the target
+        cam.orthoSize = 1 / (this._meshEditZoom ?? 1);
+        cam.orthoOffsetX = 0;
+        cam.orthoOffsetY = 0;
+        const canvasH = this._illustrationSync?.canvasH
+            ?? this.ctx.webgpuRenderer.getCanvas()?.height ?? 1000;
+        const r = Math.max(0.001, ctrl.radius);
+        ctrl.panSpeed = cam.orthoSize / (canvasH * r);   // world units / pixel = orthoSize / canvasH
+        if (hadMomentum || animating) this.ctx.scheduleRender();
+        return false;
     }
 
     private _ensureViewGizmo(): void {
@@ -739,6 +766,9 @@ export class Scene3DArmature {
     }
 
     enableMeshEditOrbit(meshId: string): void {
+        // The Armature still holds the edit camera (its teardown hasn't run yet): hand its claim over (cameraOwnsView,
+        // the wheel) and keep its camera for this switch, so the late teardown has nothing of Edit Mesh's to undo.
+        if (this._editViewOwner === 'armature') this._releaseArmatureView();
         this.enableOrbitControls({ altOrbitOnly: true });
 
         const cam = this.renderer3D.getCamera();
@@ -755,6 +785,7 @@ export class Scene3DArmature {
             this._orbitController.radius = kept.radius;
             this._orbitController.setSpherical(kept.azimuth, kept.elevation);
             this._meshEditZoom = kept.zoom;
+            this._editFramedZoom = kept.framedZoom;
             cam.orthoSize = 1 / Math.max(0.0001, kept.zoom);
             this._meshEditOrbitCenter = meshCenter ? [meshCenter[0], meshCenter[1], meshCenter[2]] : [kept.target[0], kept.target[1], kept.target[2]];
         } else {
@@ -770,6 +801,7 @@ export class Scene3DArmature {
             }
             this.frameMesh(meshId, EDIT_VIEW_PADDING);
             this._meshEditZoom = 1 / Math.max(0.0001, cam.orthoSize);
+            this._editFramedZoom = this._meshEditZoom;
 
             if (meshCenter) {
                 cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
@@ -790,6 +822,7 @@ export class Scene3DArmature {
         cam.orthoOffsetX = 0;
         cam.orthoOffsetY = 0;
 
+        this._editViewOwner = 'meshEdit';
         this._installMeshEditWheel();
         // Edit Mesh pan is now DECOUPLED (orbit controller moves the target; wheel interceptor owns zoom), so
         // claim the view: cameraOwnsView=true blocks the raster pan/zoom path from touching the 2D artboard.
@@ -810,9 +843,11 @@ export class Scene3DArmature {
         const oc = this._orbitController, camNow = this.renderer3D.getCamera();
         this._lastEditCam = this._meshEditCamMeshId && oc && this._meshEditZoom != null ? {
             meshId: this._meshEditCamMeshId, target: [camNow.target[0], camNow.target[1], camNow.target[2]],
-            azimuth: oc.azimuth, elevation: oc.elevation, radius: oc.radius, zoom: this._meshEditZoom, at: nowMs(),
+            azimuth: oc.azimuth, elevation: oc.elevation, radius: oc.radius, zoom: this._meshEditZoom,
+            framedZoom: this._editFramedZoom ?? this._meshEditZoom, at: nowMs(),
         } : null;
         this._meshEditCamMeshId = null;
+        if (this._editViewOwner === 'meshEdit') { this._editViewOwner = null; this._editFramedZoom = null; this._editAnim = null; }
         this.ctx.interactionService.suppressBoxSelect = false;
         this._meshEditOrbitCenter = null;
         this._meshEditOrthoX = 0;
@@ -870,6 +905,7 @@ export class Scene3DArmature {
     exitMeshOrbit3D(): void {
         this._meshEditOrbitCenter = null;
         this._meshEditZoom = null;          // defensive: if an Edit-Mesh session exits through this path
+        if (this._editViewOwner === 'meshEdit') { this._editViewOwner = null; this._meshEditCamMeshId = null; }
         this._removeMeshEditWheel();
         // Restore the cameraOwnsView we claimed on entry (surface-paint / group-orbit / Edit-Mesh via this path).
         if (this._meshEditPrevCameraOwnsView != null) {
@@ -1063,6 +1099,10 @@ export class Scene3DArmature {
     private _wireOrbitTouch(orb: OrbitController): void {
         orb.touchNavLock = this._touchNavLock;
         orb.onDoubleTap = (x, y) => this.touchDoubleTapHandler?.(x, y);
+        // Edit views (Edit Mesh / UV / Armature): a pen / finger drag off the selection orbits, two fingers pan, the
+        // host's Pan tool pans (live: they follow the mode, whichever controller instance is up).
+        orb.isEditNav = () => this._editViewOwner !== null;
+        orb.isPanTool = () => this.isEditPanTool();
         // Ortho pinch: the decoupled creator view zooms `_meshEditZoom` (like its wheel interceptor); an illustration-
         // synced ortho view zooms the 2D view, which the per-frame sync turns into orthoSize.
         orb.onTouchZoom = (ratio, cx, cy) => {
@@ -1107,8 +1147,12 @@ export class Scene3DArmature {
 
     showBoneOverlay3D(skeletonId: string | null, meshId?: string): void {
         if (!skeletonId) {
-            // Panel explicitly closed — release ownership and tear down dedicated listeners
-            this.ctx.interactionService.suppressBoxSelect = false;
+            // Panel explicitly closed — release ownership and tear down dedicated listeners. When another edit mode
+            // already took the camera over (a host that entered Edit Mesh / UV before this teardown ran), its orbit,
+            // gizmo mode and box-select suppression are left alone.
+            const otherOwnsView = this._editViewOwner === 'meshEdit';
+            if (this._editViewOwner === 'armature') this._releaseArmatureView();
+            if (!otherOwnsView) this.ctx.interactionService.suppressBoxSelect = false;
             this._boneOverlayExplicit = false;
             this._boneOverlaySkeletonId = null;
             this._selectedJointIndex = null;
@@ -1138,11 +1182,13 @@ export class Scene3DArmature {
                 }
                 this._armatureSavedMeshRotation = null;
             }
-            // Restore T/R/S gizmo — joint selection sets mode to null to hide
-            // the mesh gizmo while bone gizmos are showing; reset on exit.
-            this.setGizmoMode('move');
-            // Disable orbit controls now that armature editing is done.
-            this.disableOrbitControls();
+            if (!otherOwnsView) {
+                // Restore T/R/S gizmo — joint selection sets mode to null to hide
+                // the mesh gizmo while bone gizmos are showing; reset on exit.
+                this.setGizmoMode('move');
+                // Disable orbit controls now that armature editing is done.
+                this.disableOrbitControls();
+            }
             this.ctx.emitSceneGraphChanged();
             this.ctx.scheduleRender();
             return;
@@ -1177,56 +1223,12 @@ export class Scene3DArmature {
         // Zero mesh rotation if not already done by enterArmatureMode3D.
         if (meshId) this._zeroMeshRotationForArmature(meshId);
 
-        if (this._armatureOrbitCenter === null) {
-            // First activation or re-entry. Reset camera to current illustration state
-            // so syncFromCamera() always derives correct spherical coords — avoids a
-            // visible jump on re-entry if prior exit left the camera in a stale position.
-            const cam = this.renderer3D.getCamera();
-            if (this._illustrationSync) {
-                const { panX, panY, zoom, canvasH } = this._illustrationSync;
-                const cx = -panX / (canvasH * zoom);
-                const cy =  panY / (canvasH * zoom);
-                cam.lookAt(cx, cy, 10, cx, cy, 0);
-                cam.orthoSize = 1 / zoom;
-            }
-
-            // Activate orbit (or flip existing controller to altOrbitOnly).
-            if (!this._orbitController) {
-                this.enableOrbitControls({ altOrbitOnly: true });
-            } else {
-                this._orbitController.altOrbitOnly = true;
-            }
-
-            // Point the orbit pivot at the mesh center and re-derive spherical coords.
-            const meshCenter = this.getMeshCenter(meshId ?? null);
-            if (meshCenter) {
-                cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
-                this._orbitController?.syncFromCamera();
-                this._armatureOrbitCenter = [meshCenter[0], meshCenter[1], meshCenter[2]];
-            } else {
-                const t = cam.target;
-                this._armatureOrbitCenter = [t[0], t[1], t[2]];
-            }
-
-            // Initialise the ortho-offset accumulator so the mesh stays at its current
-            // screen position after orbit takes over the camera.
-            if (this._illustrationSync) {
-                const { panX, panY, zoom, canvasH } = this._illustrationSync;
-                const cx = -panX / (canvasH * zoom);
-                const cy =  panY / (canvasH * zoom);
-                const oc = this._armatureOrbitCenter;
-                this._armatureOrthoX = cx - oc[0];
-                this._armatureOrthoY = cy - oc[1];
-                this._armatureIllustrationCx = cx;
-                this._armatureIllustrationCy = cy;
-            } else {
-                this._armatureOrthoX = 0;
-                this._armatureOrthoY = 0;
-                this._armatureIllustrationCx = 0;
-                this._armatureIllustrationCy = 0;
-            }
-            cam.orthoOffsetX = this._armatureOrthoX;
-            cam.orthoOffsetY = this._armatureOrthoY;
+        // The Armature's own edit camera (framed once on entry, then only the user's orbit / pan / zoom move it). This
+        // used to reset the camera to the 2D view here — the jump on Add Skeleton — and then follow the 2D zoom.
+        if (this._editViewOwner !== 'armature') this._enterArmatureView(meshId);
+        else if (this._armatureOrbitCenter === null) {
+            const t = this.renderer3D.getCamera().target;
+            this._armatureOrbitCenter = [t[0], t[1], t[2]];
         }
 
         this._ensureViewGizmo();
@@ -1245,9 +1247,179 @@ export class Scene3DArmature {
             // Zero mesh rotation before framing so the camera sees the canonical front-facing pose.
             this._zeroMeshRotationForArmature(meshId);
             this.isolateMesh3D(meshId);
-            this.frameMesh(meshId, 1.33);
         }
+        this._enterArmatureView(meshId);
         this.ctx.scheduleRender();
+    }
+
+    /**
+     * Claim the Armature's edit camera (the same decoupled ortho view Edit Mesh uses): the orbit controller owns the
+     * camera, `_meshEditZoom` is its zoom (wheel / pinch / the host's zoom box), cameraOwnsView keeps pan / zoom off the
+     * 2D artboard. A fresh entry frames `meshId` from the current direction (front-on from the 2D view); a mode switch
+     * on the same mesh (Edit Mesh / UV left right before) keeps that camera. Idempotent.
+     */
+    private _enterArmatureView(meshId: string | undefined): void {
+        if (this._editViewOwner === 'armature') return;
+        const cam = this.renderer3D.getCamera();
+        // Edit Mesh / UV still up (its teardown didn't run first): carry its camera and zoom over as they are.
+        const takeOver = this._editViewOwner === 'meshEdit' && this._meshEditZoom != null;
+        if (!this._orbitController) this.enableOrbitControls({ altOrbitOnly: true });
+        else this._orbitController.altOrbitOnly = true;
+        cam.mode = 'orthographic';
+        const kept = meshId && !takeOver ? this._takeKeptEditCamera(meshId) : null;
+        if (kept && this._orbitController) {
+            cam.setTarget(kept.target[0], kept.target[1], kept.target[2]);
+            this._orbitController.radius = kept.radius;
+            this._orbitController.setSpherical(kept.azimuth, kept.elevation);
+            this._meshEditZoom = kept.zoom;
+            this._editFramedZoom = kept.framedZoom;
+        } else if (!takeOver) {
+            if (!meshId || !this.frameMesh(meshId, ARMATURE_VIEW_PADDING)) this._orbitController?.syncFromCamera();   // target + orthoSize
+            this._meshEditZoom = 1 / Math.max(0.0001, cam.orthoSize);
+            this._editFramedZoom = this._meshEditZoom;
+        }
+        cam.orthoSize = 1 / Math.max(0.0001, this._meshEditZoom ?? 1);
+        const t = cam.target;
+        this._armatureOrbitCenter = [t[0], t[1], t[2]];
+        this._armatureOrthoX = 0;
+        this._armatureOrthoY = 0;
+        cam.orthoOffsetX = 0;
+        cam.orthoOffsetY = 0;
+        this._armCamMeshId = meshId ?? null;
+        if (takeOver) { this._meshEditCamMeshId = null; this._meshEditOrbitCenter = null; }
+        this._editViewOwner = 'armature';
+        this._installMeshEditWheel();
+        if (takeOver) { this._armPrevCameraOwnsView = this._meshEditPrevCameraOwnsView; this._meshEditPrevCameraOwnsView = null; }
+        if (this._armPrevCameraOwnsView === null) this._armPrevCameraOwnsView = this.ctx.interactionService.cameraOwnsView;
+        this.ctx.interactionService.cameraOwnsView = true;
+        this.enableViewGizmo();
+        this.ctx.scheduleRender();
+    }
+
+    /** Leave the Armature's edit camera (showBoneOverlay3D(null)): remember it so a switch to Edit Mesh / UV on the same
+     *  mesh keeps it, drop the decoupled zoom + wheel interceptor, give cameraOwnsView back. The caller tears the orbit
+     *  down. */
+    private _releaseArmatureView(): void {
+        const oc = this._orbitController, cam = this.renderer3D.getCamera();
+        this._lastEditCam = this._armCamMeshId && oc && this._meshEditZoom != null ? {
+            meshId: this._armCamMeshId, target: [cam.target[0], cam.target[1], cam.target[2]],
+            azimuth: oc.azimuth, elevation: oc.elevation, radius: oc.radius, zoom: this._meshEditZoom,
+            framedZoom: this._editFramedZoom ?? this._meshEditZoom, at: nowMs(),
+        } : null;
+        this._editViewOwner = null;
+        this._armCamMeshId = null;
+        this._meshEditZoom = null;
+        this._editFramedZoom = null;
+        this._editAnim = null;
+        this._removeMeshEditWheel();
+        if (this._armPrevCameraOwnsView !== null) {
+            this.ctx.interactionService.cameraOwnsView = this._armPrevCameraOwnsView;
+            this._armPrevCameraOwnsView = null;
+        }
+        this._forceIllustrationResync();
+    }
+
+    /** Which edit mode owns the decoupled edit camera (null = none). */
+    get editViewOwner(): EditViewOwner | null { return this._editViewOwner; }
+
+    /** The host's Pan (hand) tool is on in an edit view (ShapeManager.enablePanningTool): a drag pans the edit camera
+     *  and the mode's tools ignore the press. */
+    isEditPanTool(): boolean {
+        return this._editViewOwner !== null && (this.ctx.interactionService as { isPanToolSelected?: boolean }).isPanToolSelected === true;
+    }
+
+    /**
+     * Frame the edit view's subject with its entry framing, keeping the current view angle: Edit Mesh / UV — the mesh
+     * (60 %); Armature — its mesh. Re-seeds the view's zoom (and the zoom readout's 100 %). False outside an edit view.
+     */
+    frameEditView(): boolean {
+        const owner = this._editViewOwner;
+        if (!owner) return false;
+        const id = owner === 'armature' ? this._armCamMeshId : this._meshEditCamMeshId;
+        if (!id || !this.frameMesh(id, owner === 'armature' ? ARMATURE_VIEW_PADDING : EDIT_VIEW_PADDING)) return false;
+        this._editFramedZoom = this._meshEditZoom;
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    /** A running edit-camera move (animateEditView): from / to the target, orbit angles and zoom, what the last frame set
+     *  (anything else moving the camera since — the user's orbit / pan / zoom — ends it there). */
+    private _editAnim: {
+        from: { target: [number, number, number]; azimuth: number; elevation: number; zoom: number };
+        to: { target: [number, number, number]; azimuth: number; elevation: number; zoom: number };
+        t0: number; ms: number;
+        set: { target: [number, number, number]; azimuth: number; elevation: number; zoom: number } | null;
+    } | null = null;
+
+    /**
+     * ANIMATE the edit camera (Edit Mesh / UV / Armature's decoupled ortho view) to an orbit target + azimuth / elevation
+     * + zoom over `ms` (ease in-out; the azimuth the short way round; the zoom in log space). The edit view's own state
+     * moves (the orbit controller, `_meshEditZoom`), so everything after it — orbit, pan, zoom, Frame — carries on from
+     * there. Any other camera move while it runs (the user orbits / pans / zooms) ends it where it is. False outside an
+     * edit view.
+     */
+    animateEditView(to: { target: [number, number, number]; azimuth: number; elevation: number; zoom: number }, ms = 250): boolean {
+        const ctrl = this._orbitController;
+        if (!this._editViewOwner || this._meshEditZoom == null || !ctrl) return false;
+        if (![...to.target, to.azimuth, to.elevation, to.zoom].every(Number.isFinite) || !(to.zoom > 0)) return false;
+        const cam = this.renderer3D.getCamera();
+        const from = { target: [cam.target[0], cam.target[1], cam.target[2]] as [number, number, number], azimuth: ctrl.azimuth, elevation: ctrl.elevation, zoom: this._meshEditZoom };
+        let daz = (to.azimuth - from.azimuth) % (2 * Math.PI);
+        if (daz > Math.PI) daz -= 2 * Math.PI;
+        if (daz < -Math.PI) daz += 2 * Math.PI;
+        const elevation = Math.max(ctrl.minElevation, Math.min(ctrl.maxElevation, to.elevation));
+        const zoom = Math.max(1e-3, Math.min(1e4, to.zoom));
+        this._editAnim = { from, to: { target: [...to.target], azimuth: from.azimuth + daz, elevation, zoom }, t0: nowMs(), ms: Math.max(0, ms), set: null };
+        if (!(ms > 0)) this._stepEditAnim();
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    /** True while an edit-camera move (animateEditView) runs. */
+    get isEditViewAnimating(): boolean { return this._editAnim !== null; }
+
+    /** One frame of the edit-camera move: true while it still runs (the caller keeps the frames coming). */
+    private _stepEditAnim(): boolean {
+        const a = this._editAnim, ctrl = this._orbitController;
+        if (!a) return false;
+        if (!ctrl || !this._editViewOwner || this._meshEditZoom == null) { this._editAnim = null; return false; }
+        const cam = this.renderer3D.getCamera();
+        const s = a.set;
+        const near = (x: number, y: number): boolean => Math.abs(x - y) <= 1e-5 * (1 + Math.abs(y));
+        if (s && !(near(ctrl.azimuth, s.azimuth) && near(ctrl.elevation, s.elevation) && near(this._meshEditZoom, s.zoom)
+            && near(cam.target[0], s.target[0]) && near(cam.target[1], s.target[1]) && near(cam.target[2], s.target[2]))) {
+            this._editAnim = null;   // the user moved the camera: stop here
+            return false;
+        }
+        const k = a.ms > 0 ? Math.max(0, Math.min(1, (nowMs() - a.t0) / a.ms)) : 1;
+        const e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;   // ease in-out (cubic)
+        const lerp = (x: number, y: number): number => x + (y - x) * e;
+        const target: [number, number, number] = [lerp(a.from.target[0], a.to.target[0]), lerp(a.from.target[1], a.to.target[1]), lerp(a.from.target[2], a.to.target[2])];
+        const zoom = Math.exp(lerp(Math.log(a.from.zoom), Math.log(a.to.zoom)));
+        cam.setTarget(target[0], target[1], target[2]);
+        ctrl.azimuth = lerp(a.from.azimuth, a.to.azimuth);
+        ctrl.elevation = lerp(a.from.elevation, a.to.elevation);
+        ctrl.stopDamping();
+        ctrl.applySpherical();
+        this._meshEditZoom = zoom;
+        cam.orthoSize = 1 / zoom;
+        a.set = { target: [cam.target[0], cam.target[1], cam.target[2]], azimuth: ctrl.azimuth, elevation: ctrl.elevation, zoom };
+        if (k >= 1) { this._editAnim = null; return false; }
+        return true;
+    }
+
+    /** Zoom the edit view by `factor` (> 1 = in): the decoupled ortho zoom (the zoom box's − / +). False outside one. */
+    zoomEditView(factor: number): boolean {
+        if (!this._editViewOwner || this._meshEditZoom == null || !Number.isFinite(factor) || factor <= 0) return false;
+        this._meshEditZoom = Math.max(1e-3, Math.min(1e4, this._meshEditZoom * factor));
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    /** The edit view's zoom relative to its framing (1 = as framed on entry / by Frame), or null outside an edit view. */
+    getEditViewZoom(): number | null {
+        if (!this._editViewOwner || this._meshEditZoom == null) return null;
+        return this._meshEditZoom / Math.max(1e-6, this._editFramedZoom ?? this._meshEditZoom);
     }
 
     /** The mesh to frame for a skeleton: `preferred` if it rides this skeleton, else the skeleton's procedural body,
@@ -2181,6 +2353,9 @@ export class Scene3DArmature {
         }, {
             pick: (x, y, r, touch) => { const p = toPx(x, y, r); return this._armPick(p.x, p.y, el.width, el.height, touch); },
             isTap: (t) => t.kind === 'place',
+            // Pen / finger (round-3 feedback): bone placement and a joint that is NOT selected act on a tap only — a drag
+            // from there is the camera's (it orbits). A drag from a selected joint (or a gizmo / IK handle) moves it.
+            tapOnly: (t) => t.kind === 'place' || ((t.kind === 'head' || t.kind === 'tail') && !this._isJointSelected(t.joint)),
             tap: (_t, x, y, r) => { const p = toPx(x, y, r); this._placeBoneAt(p.x, p.y, el.width, el.height); },
             pendingMove: (_t, x, y, r) => { const p = toPx(x, y, r); this._bonePlacementPreview(p.x, p.y, el.width, el.height); },
             begin: (t, x, y, r) => this._armBegin(t, x, y),
@@ -2199,6 +2374,7 @@ export class Scene3DArmature {
         // no drags. Up / cancel always run so a drag can never stay stuck.
         const onDown = (e: PointerEvent) => {
             if (this.host.isPlaying) return;
+            if (this.isEditPanTool()) return;   // the host's Pan tool: the drag pans the camera
             this._armShift = !!e.shiftKey;   // additive joint select (Shift, or the host's latch)
             this._armPointerType = e.pointerType || 'mouse';
             const took = gesture.down(e);
@@ -2229,6 +2405,11 @@ export class Scene3DArmature {
             gesture.reset();   // a live drag ends normally (its pose kept); a pending finger press is dropped
             if (this._armGesture === gesture) this._armGesture = null;
         };
+    }
+
+    /** The joint is in the joint selection (the primary or one of a multi-selection). */
+    private _isJointSelected(joint: number): boolean {
+        return this._selectedJointIndex === joint || this._extraJoints.has(joint);
     }
 
     /** Ray-test the armature handles at canvas px (x, y): the selected joint's gizmo axis (move / rotate), an IK handle,

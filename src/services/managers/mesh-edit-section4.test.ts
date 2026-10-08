@@ -20,6 +20,7 @@ import { UndoManager3D } from './undo-manager-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { Camera3D } from '../../renderer/3d/camera-3d';
+import { isPointerEventClaimed } from '../../renderer/util/pointer-claims';
 import type { Scene3DManager } from './scene3d-manager';
 import type { ManagerContext } from './manager-context';
 import type { InteractionService } from '../interaction-service';
@@ -193,6 +194,76 @@ describe('A — drag on the selection moves it (setMeshEditDragMovesSelection3D)
   });
 });
 
+describe('A2 — pen / finger: drags of the selection are the tool’s (claimed), any other drag the camera’s', () => {
+  it('pen: a drag from the selection moves it (claimed, one step); a drag from an unselected vertex is not claimed and moves nothing', () => {
+    const t = setup();
+    t.c.setTool('select');
+    t.c.setMode('vertex');
+    const top = t.faceWhere(v => v.y > 0);
+    const verts = t.em().getFaceVertices(top);
+    t.meshEdit.selectVertex(t.mesh.id, verts[0]);
+    const p0 = t.pos();
+    const at = t.vertexAt(verts[0]);
+    const pen = { pointerType: 'pen', pointerId: 3 };
+    const down = t.fire('pointerdown', { ...pen, clientX: at.x, clientY: at.y });
+    expect(isPointerEventClaimed(down)).toBe(true);
+    t.fire('pointermove', { ...pen, clientX: at.x + 40, clientY: at.y });
+    t.flush();
+    expect(t.c.transform.state()?.source).toBe('drag');
+    t.fire('pointerup', { ...pen, clientX: at.x + 40, clientY: at.y });
+    expect(t.pos()[verts[0]]).not.toEqual(p0[verts[0]]);
+    expect(t.undo.stackSize).toBe(1);
+    // an unselected vertex: the press waits unclaimed, the drag leaves the mesh alone
+    const q0 = t.pos();
+    const other = t.vertexAt(verts[2]);
+    const down2 = t.fire('pointerdown', { ...pen, pointerId: 4, clientX: other.x, clientY: other.y });
+    expect(isPointerEventClaimed(down2)).toBe(false);
+    t.fire('pointermove', { ...pen, pointerId: 4, clientX: other.x + 40, clientY: other.y });
+    t.flush();
+    t.fire('pointerup', { ...pen, pointerId: 4, clientX: other.x + 40, clientY: other.y });
+    expect(t.pos()).toEqual(q0);
+    expect(t.c.transform.active).toBe(false);
+    expect([...(t.meshEdit.getSelection(t.mesh.id)?.vertices ?? [])]).toEqual([verts[0]]);
+    expect(t.undo.stackSize).toBe(1);
+  });
+
+  it('finger: pointercancel restores a drag of the selection exactly (no step)', () => {
+    const t = setup();
+    t.c.setTool('select');
+    t.c.setMode('vertex');
+    const top = t.faceWhere(v => v.y > 0);
+    const verts = t.em().getFaceVertices(top);
+    t.meshEdit.selectVertex(t.mesh.id, verts[0]);
+    const p0 = t.pos();
+    const at = t.vertexAt(verts[0]);
+    t.fire('pointerdown', { pointerType: 'touch', pointerId: 5, clientX: at.x, clientY: at.y });
+    t.fire('pointermove', { pointerType: 'touch', pointerId: 5, clientX: at.x + 40, clientY: at.y });
+    t.flush();
+    expect(t.pos()).not.toEqual(p0);
+    t.fire('pointercancel', { pointerType: 'touch', pointerId: 5 });
+    expect(t.pos()).toEqual(p0);
+    expect(t.undo.stackSize).toBe(0);
+  });
+
+  it('the host Pan tool: presses are ignored (no select, no drag) while it is on', () => {
+    const t = setup();
+    let pan = true;
+    (t.c as unknown as { _scene3d: Record<string, unknown> })._scene3d.isEditPanTool3D = () => pan;
+    t.c.setMode('face');
+    const top = t.faceWhere(v => v.y > 0);
+    const at = t.faceCentre(top);
+    for (const pointerType of ['mouse', 'pen', 'touch']) {
+      t.fire('pointerdown', { pointerType, clientX: at.x, clientY: at.y });
+      t.fire('pointerup', { pointerType, clientX: at.x, clientY: at.y });
+    }
+    expect(t.meshEdit.getSelection(t.mesh.id)?.faces.size ?? 0).toBe(0);
+    pan = false;
+    t.fire('pointerdown', { clientX: at.x, clientY: at.y });
+    t.fire('pointerup', { clientX: at.x, clientY: at.y });
+    expect([...(t.meshEdit.getSelection(t.mesh.id)?.faces ?? [])]).toEqual([top]);
+  });
+});
+
 describe('B — pickElementAt', () => {
   it('returns the vertex / edge / face under the point (by mode) and whether it is selected; null off the mesh', () => {
     const t = setup();
@@ -285,7 +356,11 @@ describe('D — tool strip, Knife, Loop Cut', () => {
     expect(t.em().vertices.length).toBe(16);
     expect(t.em().faces.length).toBe(14);
     expect(t.undo.stackSize).toBe(1);
-    expect(t.meshEdit.getLastOp()).toEqual({ op: 'loopCut', params: { count: 2, position: 0.5 } });
+    // (the position is the pointer's along the edge — the click was on its midpoint)
+    const last = t.meshEdit.getLastOp()!;
+    expect(last.op).toBe('loopCut');
+    expect(last.params.count).toBe(2);
+    expect(last.params.position as number).toBeCloseTo(0.5, 6);
   });
 });
 

@@ -75,7 +75,7 @@ import { removeVectorLayerWithContent, recoverOrphanedVectorContent, type Vector
 import { OnionSkinConfig } from '../animation';
 import { ConnectorService, SnapResult } from './connector-service';
 import { LayerBlendMode, RasterCompositor, type CompositorLayerInfo } from '../renderer/raster/core/raster-compositor';
-import { DitherConfig, DitherAlgorithm, DitherColorMode, defaultDitherConfig, DitherEngine } from '../renderer/raster/effects/dither-engine';
+import { DitherConfig, DitherAlgorithm, DitherColorMode, defaultDitherConfig, DitherEngine, DITHER_ALGORITHMS } from '../renderer/raster/effects/dither-engine';
 import { TextEffectEngine, TextEffectType, TextEffectConfig, TextEffectParams, TextCaptureConfig, ChromaticAberrationParams, GlowParams, WaveParams, GlitchParams, OutlineParams, CustomShaderParams, CustomShaderCompileResult, defaultChromaticAberration, defaultGlow, defaultWave, defaultGlitch, defaultOutline, defaultCustomShader } from '../renderer/raster/effects/text-effect-engine';
 import type { FrameLinkAnimation, FrameLinkAnimationType, FrameLinkLoopMode } from '../animation';
 import { DEFAULT_FRAME_LINK_ANIMATION } from '../animation';
@@ -2489,7 +2489,9 @@ class ShapeManager {
 
     /**
      * Quick-switch the dither algorithm.
-     * Available: 'bayer' | 'halftone_dot' | 'halftone_line' | 'halftone_diamond' | 'blue_noise' | 'noise'
+     * Available: see {@link ShapeManager.DitherAlgorithms} - 'bayer', 'halftone_<shape>' (dot / line / diamond / square /
+     * cross / ellipse / wavy / crosshatch / rings / spiral / hexagon / star / heart / triangle), 'blue_noise', 'noise',
+     * and the WASM error-diffusion set.
      */
     public setDitherAlgorithm(algorithm: DitherAlgorithm): void {
         const cfg = this.getDitherConfig();
@@ -2548,12 +2550,9 @@ class ShapeManager {
 
     /** Get available dither algorithm names for UI dropdowns. */
     public static get DitherAlgorithms(): DitherAlgorithm[] {
-        return [
-          // GPU ordered (real-time)
-          'bayer', 'halftone_dot', 'halftone_line', 'halftone_diamond', 'blue_noise', 'noise',
-          // WASM error diffusion (async)
-          'floyd_steinberg', 'atkinson', 'jarvis_judice_ninke', 'stucki', 'sierra', 'sierra_lite',
-        ];
+        // GPU ordered (real-time: bayer, every halftone shape, blue noise, noise), then WASM error diffusion (async).
+        // Hosts feature-detect halftone shapes against this list.
+        return [...DITHER_ALGORITHMS];
     }
 
     /** Check if a given algorithm requires async WASM execution (error diffusion). */
@@ -3520,9 +3519,19 @@ class ShapeManager {
     /** TOUCH-10: the SNAP latch — while on, 3D gizmo drags snap (grid / angle / scale step / vertex) like holding Ctrl. */
     public setSnapToggle3D(on: boolean): void { this.interactionService.snapLatch3D = !!on; }
     public getSnapToggle3D(): boolean { return this.interactionService.snapLatch3D === true; }
-    /** TOUCH-10 "Frame selected": in Edit Mesh the selected vertices / edges / faces (else the whole mesh), otherwise
-     *  the selected meshes (else everything). False when nothing could be framed (e.g. in the armature, whose camera
-     *  follows the 2D view zoom). */
+    /** The EDIT CAMERA of Edit Mesh, the UV editor and the Armature (one decoupled ortho view: its own zoom, never the
+     *  2D canvas zoom). True while one of those modes owns the camera — hosts route their zoom box / Fit here then. */
+    public isEditViewActive3D(): boolean { return this.scene3d.isEditViewActive3D(); }
+    /** Frame the edit view's subject (the mesh; Armature: its mesh) with the mode's entry framing, keeping the view
+     *  angle; the zoom readout's 100 % is reset to it. False outside an edit view. */
+    public frameEditView3D(): boolean { return this.scene3d.frameEditView3D(); }
+    /** Zoom the edit view by `factor` (> 1 = in, e.g. 1.25 per zoom-box step). False outside an edit view. */
+    public zoomEditView3D(factor: number): boolean { return this.scene3d.zoomEditView3D(factor); }
+    /** The edit view's zoom relative to its framing (1 = as framed on entry or by frameEditView3D), null outside one. */
+    public getEditViewZoom3D(): number | null { return this.scene3d.getEditViewZoom3D(); }
+    /** TOUCH-10 "Frame selected": in Edit Mesh the selected vertices / edges / faces (else the whole mesh); in the
+     *  Armature its mesh (the edit view's framing); otherwise the selected meshes (else everything). False when nothing
+     *  could be framed. */
     public frameSelected3D(padding = 1.4): boolean {
         const id = this.meshEdit.activeMeshId;
         if (!id) return this.scene3d.frameSelection3D(padding);
@@ -3537,6 +3546,33 @@ class ShapeManager {
         };
         const [minX, maxX] = grow(b.minX, b.maxX), [minY, maxY] = grow(b.minY, b.maxY), [minZ, maxZ] = grow(b.minZ, b.maxZ);
         return this.scene3d.frameWorldBounds3D({ minX, minY, minZ, maxX, maxY, maxZ }, padding);
+    }
+    /** The Edit Mesh pill's Frame (next Edit Mesh batch §3): faces selected whose area-weighted normals mostly agree
+     *  (one face, a flat panel) → the edit camera animates (~250 ms) to look straight at them, centred and fitted with
+     *  `padding`, with the minimal roll-free turn; anything else (faces facing different ways, vertices, edges, nothing
+     *  selected, outside an edit view) → {@link frameSelected3D} (centre + zoom, no turn). */
+    public frameEditSelection3D(padding = 1.4): boolean {
+        const id = this.meshEdit.activeMeshId;
+        const sel = id ? this.meshEdit.getSelection(id) : null;
+        const mesh = id ? this.scene3d.getMesh(id) : null;
+        const em = mesh?.editMesh;
+        if (id && sel && mesh && em && sel.faces.size > 0 && this._meshEditPointerController.mode === 'face' && this.scene3d.isEditViewActive3D()) {
+            const m = mesh.localMatrix as unknown as ArrayLike<number>;
+            const polys: number[][] = [];
+            for (const fi of sel.faces) {
+                if (fi < 0 || fi >= em.faces.length) continue;
+                const out: number[] = [];
+                for (const vi of em.getFaceVertices(fi)) {
+                    const v = em.vertices[vi];
+                    out.push(m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12], m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13], m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14]);
+                }
+                polys.push(out);
+            }
+            const all = this.meshEdit.selectionWorldBounds(id, true);
+            const minHalf = all ? 0.05 * Math.max(all.maxX - all.minX, all.maxY - all.minY, all.maxZ - all.minZ, 1e-3) : 0;
+            if (this.scene3d.frameEditFacesOn3D(polys, padding, minHalf)) return true;
+        }
+        return this.frameSelected3D(padding);
     }
     /** Whether a capture-phase 3D tool (UV paint, the armature) claimed this pointer event — it then lets the press
      *  through for the camera's pinch / orbit, but no other tool (a mesh pick) may act on it. */
@@ -8225,6 +8261,27 @@ class ShapeManager {
         }
         return ok;
     }
+
+    /** Cancel the last parametric op (a live preview's Cancel): the mesh and the selection exactly as before it, and NO
+     *  undo step left — not even a redo entry. False when there is no valid last op (nothing changed). */
+    public cancelMeshEditLastOp3D(): boolean {
+        const ok = this.meshEdit.cancelLastOp();
+        if (ok) this.scheduleRender();
+        return ok;
+    }
+
+    /** LIVE OP PREVIEW (the host shows the last extrude / inset / subdivide as a preview until Apply / Cancel): while
+     *  on, a face tap re-targets the op — resolved against the mesh before it, the op re-runs on the new selection with
+     *  the same params (one undo step) — drags of the selection orbit instead of moving it, and the selection gizmo
+     *  hides. Off on leaving Edit Mesh. */
+    public setMeshEditOpPreview3D(on: boolean): void {
+        this._meshEditPointerController.opPreview = !!on;
+        this.scheduleRender();
+    }
+    public getMeshEditOpPreview3D(): boolean { return this._meshEditPointerController.opPreview; }
+
+    /** Drop a held Loop Cut press (Esc while the finger / button is down): nothing is cut. False when there is none. */
+    public cancelMeshEditLoopCut3D(): boolean { return this._meshEditPointerController.cancelLoopCutPress(); }
 
     /**
      * Run a smart-project (box/triplanar) UV unwrap on the mesh.

@@ -3,8 +3,9 @@
  * fake canvas, a real EditMesh box + MeshEditManager selection, a real Camera3D for the projection):
  *  - the mouse selects on the press (unchanged); Shift or the additive latch adds;
  *  - a finger selects on a TAP (release point), never on the press, never after a drag or a pinch;
- *  - a finger DRAG from a vertex selects + moves it; a 2nd finger / pointercancel restores every vertex and the
- *    previous selection exactly with no undo entry;
+ *  - a finger / pen DRAG from an unselected vertex selects and moves nothing, and is not claimed (round-3: the camera
+ *    orbits it; drags of the selection: mesh-edit-section4.test.ts);
+ *  - a pen selects on a TAP (release) like a finger;
  *  - drag moves are applied once per frame (one mesh sync), flushed on release (one undo entry).
  */
 import { describe, it, expect } from 'vitest';
@@ -12,7 +13,7 @@ import { MeshEditPointerController } from './mesh-edit-pointer-controller';
 import { MeshEditManager } from './mesh-edit-manager';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { Camera3D } from '../../renderer/3d/camera-3d';
-import { claimPointerEvent } from '../../renderer/util/pointer-claims';
+import { claimPointerEvent, isPointerEventClaimed } from '../../renderer/util/pointer-claims';
 import type { Scene3DManager } from './scene3d-manager';
 import type { ManagerContext } from './manager-context';
 import type { Command3D } from './undo-manager-3d';
@@ -69,11 +70,12 @@ function setup(opts: { additive?: boolean; faceHit?: boolean } = {}) {
   });
   c.attach(canvas, 'm');
   const fire = (type: string, init: Init, claim = false) => canvas.dispatchEvent(makeEvent(type, init, claim));
+  const fireEvent = (e: Event) => canvas.dispatchEvent(e);
   const flush = () => { const fs = frames.splice(0); fs.forEach(f => f()); };
   // Client position of vertex `i` (canvas = client here: rect 800×600 at 0,0).
   const at = (i: number) => { const v = editMesh.vertices[i]; const s = project(v.x, v.y, v.z, 800, 600)!; return { clientX: s.x, clientY: s.y }; };
   const sel = () => meshEdit.getSelection('m') ?? { vertices: new Set<number>(), edges: new Set<number>(), faces: new Set<number>() };
-  return { c, fire, flush, at, sel, meshEdit, editMesh, cmds, syncs: () => syncs, setAdditive: (on: boolean) => { additive = on; } };
+  return { c, fire, fireEvent, flush, at, sel, meshEdit, editMesh, cmds, syncs: () => syncs, setAdditive: (on: boolean) => { additive = on; } };
 }
 
 /** The vertex nearest the camera at the top-right (projected inside the canvas, not occluded by the pick math). */
@@ -148,48 +150,21 @@ describe('MeshEditPointerController — fingers (TOUCH-5 / TOUCH-6)', () => {
     expect(t.sel().faces.size).toBe(0);
   });
 
-  it('a finger DRAG from a vertex selects + moves it; a 2nd finger restores the vertices and the selection exactly', () => {
+  it('a finger DRAG from an UNSELECTED vertex is the camera ORBIT (nothing selected or moved, press not claimed)', () => {
     const t = setup();
     t.c.setMode('vertex');
-    t.meshEdit.selectVertex('m', 2);                  // the selection before the gesture
+    t.meshEdit.selectVertex('m', 2);
     const before = t.editMesh.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }));
     const p = t.at(V);
-    t.fire('pointerdown', { pointerType: 'touch', ...p });
+    const down = makeEvent('pointerdown', { pointerType: 'touch', ...p });
+    t.fireEvent(down);
+    expect(isPointerEventClaimed(down)).toBe(false);
     t.fire('pointermove', { pointerType: 'touch', clientX: p.clientX + 40, clientY: p.clientY });
     t.flush();
-    expect([...t.sel().vertices]).toEqual([V]);
-    expect(t.editMesh.vertices[V].x).not.toBeCloseTo(before[V].x, 5);
-    t.fire('pointerdown', { pointerType: 'touch', pointerId: 2, isPrimary: false, clientX: 700, clientY: 300 });
-    expect(t.editMesh.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }))).toEqual(before);
-    expect([...t.sel().vertices]).toEqual([2]);
-    t.fire('pointerup', { pointerType: 'touch', pointerId: 1, clientX: p.clientX + 60, clientY: p.clientY });
-    t.flush();
-    expect(t.cmds).toHaveLength(0);                   // no undo entry
-    expect(t.editMesh.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }))).toEqual(before);
-  });
-
-  it('pointercancel restores a finger drag too', () => {
-    const t = setup();
-    t.c.setMode('vertex');
-    const before = t.editMesh.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }));
-    const p = t.at(V);
-    t.fire('pointerdown', { pointerType: 'touch', ...p });
-    t.fire('pointermove', { pointerType: 'touch', clientX: p.clientX + 40, clientY: p.clientY });
-    t.flush();
-    t.fire('pointercancel', { pointerType: 'touch' });
-    expect(t.editMesh.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }))).toEqual(before);
-    expect(t.sel().vertices.size).toBe(0);
-    expect(t.cmds).toHaveLength(0);
-  });
-
-  it('a finger drag that completes pushes ONE undo entry', () => {
-    const t = setup();
-    t.c.setMode('vertex');
-    const p = t.at(V);
-    t.fire('pointerdown', { pointerType: 'touch', ...p });
-    t.fire('pointermove', { pointerType: 'touch', clientX: p.clientX + 40, clientY: p.clientY });
     t.fire('pointerup', { pointerType: 'touch', clientX: p.clientX + 40, clientY: p.clientY });
-    expect(t.cmds).toHaveLength(1);
+    expect([...t.sel().vertices]).toEqual([2]);
+    expect(t.editMesh.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }))).toEqual(before);
+    expect(t.cmds).toHaveLength(0);
   });
 
   it('the additive latch applies to finger taps too', () => {
@@ -210,4 +185,36 @@ describe('MeshEditPointerController — fingers (TOUCH-5 / TOUCH-6)', () => {
     t.fire('pointerup', { pointerType: 'touch', ...p });
     expect(t.sel().vertices.size).toBe(0);
   });
+});
+
+describe('MeshEditPointerController — pen (round-3: a pen with no side button navigates)', () => {
+  it('a pen TAP selects on release (nothing on the press); Shift / the latch adds', () => {
+    const t = setup();
+    t.c.setMode('vertex');
+    const p = t.at(V);
+    t.fire('pointerdown', { pointerType: 'pen', ...p });
+    expect(t.sel().vertices.size).toBe(0);
+    t.fire('pointerup', { pointerType: 'pen', clientX: p.clientX + 2, clientY: p.clientY + 1 });
+    expect([...t.sel().vertices]).toEqual([V]);
+    t.setAdditive(true);
+    t.meshEdit.selectVertex('m', 2);
+    t.fire('pointerdown', { pointerType: 'pen', ...p });
+    t.fire('pointerup', { pointerType: 'pen', ...p });
+    expect([...t.sel().vertices].sort()).toEqual([2, V].sort());
+    expect(t.cmds).toHaveLength(0);
+  });
+
+  it('a pen DRAG off the selection selects / moves nothing and is not claimed (the camera orbits it)', () => {
+    const t = setup();
+    t.c.setMode('face');
+    const before = t.editMesh.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }));
+    const down = makeEvent('pointerdown', { pointerType: 'pen', clientX: 400, clientY: 300 });
+    t.fireEvent(down);
+    expect(isPointerEventClaimed(down)).toBe(false);
+    t.fire('pointermove', { pointerType: 'pen', clientX: 460, clientY: 300 });
+    t.fire('pointerup', { pointerType: 'pen', clientX: 460, clientY: 300 });
+    expect(t.sel().faces.size).toBe(0);
+    expect(t.editMesh.vertices.map(v => ({ x: v.x, y: v.y, z: v.z }))).toEqual(before);
+  });
+
 });

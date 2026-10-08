@@ -27,7 +27,7 @@ import type { WebGPURenderer } from '../../renderer/core/webgpu-renderer';
 import { hexToRgba } from '../../utils/color';
 import { FloodFillEngine, type FloodFillOptions } from '../../renderer/raster/tools/flood-fill-engine';
 import { LayerBlendMode } from '../../renderer/raster/core/raster-compositor';
-import { DitherConfig, DitherAlgorithm, DitherColorMode, defaultDitherConfig, DitherEngine } from '../../renderer/raster/effects/dither-engine';
+import { DitherConfig, DitherAlgorithm, DitherColorMode, defaultDitherConfig, DitherEngine, DITHER_ALGORITHMS } from '../../renderer/raster/effects/dither-engine';
 import type { DualBrushSettings, DualBrushBlendOp, ColorJitter, WetEdgeSettings, StrokeTextureSettings, StabilizationMethod, BrushStabilization } from '../../renderer/raster/brushes/brush-preset';
 import type { FrameLinkAnimation, FrameLinkAnimationType, FrameLinkLoopMode } from '../../animation';
 import { DEFAULT_FRAME_LINK_ANIMATION } from '../../animation';
@@ -563,8 +563,7 @@ export class RasterManager {
     setDitherPerChannel(perChannel: boolean): void { const cfg = this.getDitherConfig(); cfg.perChannel = perChannel; this.setDitherConfig(cfg); }
 
     static get DitherAlgorithms(): DitherAlgorithm[] {
-        return ['bayer', 'halftone_dot', 'halftone_line', 'halftone_diamond', 'blue_noise', 'noise',
-                'floyd_steinberg', 'atkinson', 'jarvis_judice_ninke', 'stucki', 'sierra', 'sierra_lite'];
+        return [...DITHER_ALGORITHMS];
     }
     static isErrorDiffusion(algorithm: DitherAlgorithm): boolean { return DitherEngine.isErrorDiffusion(algorithm); }
 

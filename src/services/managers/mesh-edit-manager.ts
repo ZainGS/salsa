@@ -890,6 +890,57 @@ export class MeshEditManager {
     return true;
   }
 
+  /**
+   * CANCEL the last parametric op (a live preview's Cancel): the mesh exactly as before it, its undo step DROPPED (not
+   * undone — no redo entry is left), the selection as before it; the record is forgotten. False when there is no valid
+   * last op (nothing changed then).
+   */
+  cancelLastOp(): boolean {
+    const r = this._validLastOp();
+    if (!r) return false;
+    const mesh = this._getMesh(r.meshId)!;
+    if (r.cmd && !(this._undo?.discardTop() ?? false)) { this._lastOp = null; return false; }
+    if (r.cmd) {   // (no step = a re-run that changed nothing: the mesh already is `before`)
+      mesh.editMesh = EditMesh.fromJSON(r.before);
+      mesh.syncFromEditMesh();
+    }
+    this.restoreSelection(r.meshId, r.sel);
+    this._lastOp = null;
+    return true;
+  }
+
+  /**
+   * Live preview re-target, step 1 (a tap while the last FACE op — extrudeRegion / insetRegion / subdivide — previews):
+   * put the mesh back to before the op (its step dropped) and the selection as before it, keeping the record (with no
+   * step) so {@link rerunLastOpOnSelection} can run it again on the selection the tap makes. False (nothing changed)
+   * when the last op is not a valid face op on `meshId`.
+   */
+  revertLastFaceOpForRetarget(meshId: string): boolean {
+    const r = this._validLastOp();
+    if (!r || r.meshId !== meshId || !(r.op === 'extrudeRegion' || r.op === 'insetRegion' || r.op === 'subdivide')) return false;
+    const mesh = this._getMesh(r.meshId)!;
+    if (r.cmd && !(this._undo?.discardTop() ?? false)) { this._lastOp = null; return false; }
+    const below = this._undo?.peek() ?? null;
+    if (r.cmd) {
+      mesh.editMesh = EditMesh.fromJSON(r.before);
+      mesh.syncFromEditMesh();
+    }
+    this.restoreSelection(r.meshId, r.sel);
+    this._lastOp = { ...r, cmd: null, below, em: mesh.editMesh!, attr: mesh.editMesh!.attrVersion };
+    return true;
+  }
+
+  /** Live preview re-target, step 2: run the last op again (same params) on the faces selected NOW, from the mesh before
+   *  it — one undo step (none when there are no faces: the mesh stays as before, the record stays for the next tap). */
+  rerunLastOpOnSelection(meshId: string): boolean {
+    const r = this._validLastOp();
+    if (!r || r.meshId !== meshId || r.cmd) return false;
+    const snap = this.snapshotSelection(meshId);
+    r.sel = snap;
+    r.target = { ...r.target, faces: [...(snap?.faces ?? [])] };
+    return this.redoLastOp({});
+  }
+
   /** Cap every hole (or, when vertices / edges on a hole are selected, just those holes) — one undo step. Returns the
    *  number of holes filled. */
   fillHoles(meshId: string, touching?: Iterable<number> | null): number {

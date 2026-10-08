@@ -213,6 +213,9 @@ import { DEFAULT_TOON_SHADOWS, DEFAULT_RIM_LIGHT } from '../../renderer/3d/mater
 import type { SkinnedMeshData } from './skin-deform-metrics';
 import { SimLod, newSimSlot, SIM_NEAR, type SimSlot } from '../../world/sim-lod';
 import { computeFogEye } from '../../renderer/3d/fog-horizon';
+import { faceOnFraming } from './edit-face-frame';
+/** Edit Mesh Frame on faces: the face-on camera move (frameEditFacesOn3D). */
+const EDIT_FACE_FRAME_MS = 250;
 export type { DrapeProxy, LiveClothHandle };
 export type { ArrayToolMode };
 export type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta };
@@ -1618,7 +1621,8 @@ export class Scene3DManager {
      *  camera over the real prior mode we need to restore on exit. */
     private _inCameraSubMode(): boolean {
         return this._armature.getMeshEditOrbitCenter() !== null
-            || this._armature.getBoneOverlaySkeletonId() !== null;
+            || this._armature.getBoneOverlaySkeletonId() !== null
+            || this._armature.editViewOwner !== null;   // the Armature's edit camera before a skeleton is shown
     }
 
     /**
@@ -1729,10 +1733,33 @@ export class Scene3DManager {
         return true;
     }
 
-    /** TOUCH-10 "Frame selected" outside Edit Mesh: the selected meshes, else everything. False in the armature
-     *  (its ortho camera follows the 2D view's zoom, so it can't be framed from here). Edit Mesh frames its selection
-     *  through ShapeManager.frameSelected3D. */
+    /** Edit Mesh / UV / Armature edit camera (the decoupled ortho view those modes own): is one up, Frame (the entry
+     *  framing, current angle), zoom by a factor (> 1 = in), and its zoom relative to that framing (1 = 100 %). */
+    isEditViewActive3D(): boolean { return this._armature.editViewOwner !== null; }
+    frameEditView3D(): boolean { return this._armature.frameEditView(); }
+    zoomEditView3D(factor: number): boolean { return this._armature.zoomEditView(factor); }
+    getEditViewZoom3D(): number | null { return this._armature.getEditViewZoom(); }
+    /** The host's Pan tool is on in an edit view: the edit tools ignore presses (the drag pans the camera). */
+    isEditPanTool3D(): boolean { return this._armature.isEditPanTool(); }
+    /** Animate the edit camera (~250 ms) to look straight at these WORLD-space faces (flat xyz lists): their area-weighted
+     *  normal toward the camera, centred, fitted with `padding`; the minimal, roll-free turn (edit-face-frame.ts). False
+     *  outside an edit view, or when the faces' normals don't mostly agree (the caller frames without turning then). */
+    frameEditFacesOn3D(faces: ArrayLike<number>[], padding = 1.4, minHalf = 0, ms = EDIT_FACE_FRAME_MS): boolean {
+        const orb = this._armature.getOrbitController();
+        if (!this._armature.editViewOwner || !orb) return false;
+        const cam = this.renderer3D.getCamera();
+        const f = faceOnFraming(faces, {
+            azimuth: orb.azimuth, aspect: cam.aspect, padding, minHalf, minElevation: orb.minElevation, maxElevation: orb.maxElevation,
+        });
+        if (!f) return false;
+        return this._armature.animateEditView({ target: f.target, azimuth: f.azimuth, elevation: f.elevation, zoom: 1 / f.halfHeight }, ms);
+    }
+
+    /** TOUCH-10 "Frame selected" outside Edit Mesh: the selected meshes, else everything. In the Armature: its mesh,
+     *  with the edit view's own framing (frameEditView3D). Edit Mesh frames its selection through
+     *  ShapeManager.frameSelected3D. */
     frameSelection3D(padding = 1.4): boolean {
+        if (this._armature.editViewOwner === 'armature') return this._armature.frameEditView();
         if (this._armature.isBoneOverlayActive()) return false;
         const meshes: Mesh3D[] = [];
         for (const id of this.renderer3D.getSelectedMeshIds()) { const m = this.getMesh(id); if (m) meshes.push(m); }
@@ -1999,7 +2026,7 @@ export class Scene3DManager {
      *  its orbit controller to the NEXT screen's canvas (a board) and owned its pan / zoom. Idempotent. */
     resetToDefaultView3D(): void {
         this.exitPlayMode3D();                                   // (no-op when not playing)
-        if (this._armature.isBoneOverlayActive()) this.showBoneOverlay3D(null);
+        if (this._armature.isBoneOverlayActive() || this._armature.editViewOwner === 'armature') this.showBoneOverlay3D(null);
         if (this._previewThroughCameras) this.setPreviewThroughCameras3D(false);
         if (this._lookThroughCamId !== null) this.lookThroughCamera3D(null);
         this._armature.exitMeshOrbit3D();                        // surface-paint / group / creator orbit: hands back its cameraOwnsView claim
@@ -8045,7 +8072,8 @@ export class Scene3DManager {
         if (skeletonId !== null && !this._inCameraSubMode() && !this._armatureEntryCaptured) this._captureCurrentPose();
         this._armature.showBoneOverlay3D(skeletonId, meshId);
         this._pauseIdleForEditMode('armature', skeletonId !== null);
-        if (skeletonId === null && (wasActive || this._armatureEntryCaptured)) this._applyViewState();
+        // (not when Edit Mesh / UV already took the camera over: its own exit restores the view state)
+        if (skeletonId === null && (wasActive || this._armatureEntryCaptured) && this._armature.editViewOwner !== 'meshEdit') this._applyViewState();
         if (skeletonId === null) this._armatureEntryCaptured = false;
     }
     /** True between enterArmatureMode3D (which snapshots the pre-armature camera) and the panel closing. */
