@@ -69,12 +69,12 @@ describe('detectGpuTier', () => {
 
 describe('caps', () => {
   it('desktop caps are the engine defaults (no behaviour change)', () => {
-    expect(capsForTier('desktop')).toEqual({ gpuDriven: true, shaderVariants: true, htmlInCanvas: true, maxDpr: Infinity, maxCanvasPixels: Infinity,
+    expect(capsForTier('desktop')).toEqual({ gpuDriven: true, htmlInCanvas: true, maxDpr: Infinity, maxCanvasPixels: Infinity,
       warmConcurrency: 2, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true, shaderSplitMaxKeys: 96 });
   });
   it('mobile: CPU path, no variants, no HTML-in-canvas, DPR 1.5, ~2.5 MP, one compile at a time, still focus bg', () => {
     const c = capsForTier('mobile');
-    expect(c).toMatchObject({ gpuDriven: false, shaderVariants: false, htmlInCanvas: false, maxDpr: 1.5, maxCanvasPixels: 2_500_000, warmConcurrency: 1, animatedFocusBg: false });
+    expect(c).toMatchObject({ gpuDriven: false, htmlInCanvas: false, maxDpr: 1.5, maxCanvasPixels: 2_500_000, warmConcurrency: 1, animatedFocusBg: false });
     expect(c.shadows && c.ssao && c.ssr && c.taa).toBe(true);
   });
   it('safe = mobile + shadows / SSAO / SSR / TAA off', () => {
@@ -89,7 +89,7 @@ describe('caps', () => {
     expect(resolveGpuCaps('desktop', { indirectFirstInstance: false }).gpuDriven).toBe(false);
     expect(resolveGpuCaps('desktop', { indirectFirstInstance: true }).gpuDriven).toBe(true);
     expect(resolveGpuCaps('desktop').gpuDriven).toBe(true);
-    expect(resolveGpuCaps('desktop', { indirectFirstInstance: false }).shaderVariants).toBe(true);   // only the GPU-driven path needs it
+    expect(resolveGpuCaps('desktop', { indirectFirstInstance: false }).htmlInCanvas).toBe(true);   // only the GPU-driven path needs it
   });
 });
 

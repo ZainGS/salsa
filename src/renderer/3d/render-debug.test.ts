@@ -17,7 +17,8 @@ import {
     RD, RENDER_DEBUG_FLAGS, RENDER_DEBUG_STORAGE_KEY, getRenderDebug, setRenderDebug, loadRenderDebug,
     renderDebugShadeMode, renderDebugShaderBits, rdColorLoad, rdDepthLoad, rdCanvasAlphaMode,
 } from './render-debug';
-import * as mesh3d from './shaders/mesh3d-shaders';
+import { generateMeshFs } from './shaders/mesh-fs-generate';
+import { meshFsAllKey, meshFsBaseKey } from './shaders/mesh-fs-key';
 
 const gg = globalThis as { self?: unknown; crypto?: unknown };
 gg.self ??= globalThis;
@@ -244,8 +245,12 @@ describe('render debug on the real Renderer3D', () => {
 });
 
 describe('render debug in the mesh fragment shaders', () => {
-    const fragments: [string, string][] = Object.entries(mesh3d)
-        .filter(([k, v]) => typeof v === 'string' && k.startsWith('MESH3D_FRAGMENT_SHADER')) as [string, string][];
+    // The generated mesh fragment shaders with the DEBUG hooks (the only mesh fragment source since shader-split
+    // phase 4): the all-features key and the BASE family per layout (a DEBUG key: render debug on).
+    const fragments: [string, string][] = [true, false].flatMap((tex) => [false, true].flatMap((sh): [string, string][] => [
+        [`ALL ${tex ? 'T' : 'U'}${sh ? ' + shadow' : ''}`, generateMeshFs(meshFsAllKey(tex, sh))],
+        [`BASE ${tex ? 'T' : 'U'}${sh ? ' + shadow' : ''}`, generateMeshFs(meshFsBaseKey(tex, sh, true, false))],
+    ]));
 
     it('every mesh fragment shader declares the debug floats and gates every debug return on them', () => {
         expect(fragments.length).toBeGreaterThanOrEqual(8);
@@ -311,18 +316,16 @@ describe('render debug RENDER-1 shader-size tests', () => {
     afterEach(() => { setRenderDebug({ reset: true }); });
 
     it('tinyMeshFS swaps every mesh fragment module for the tiny shader; off = the code unchanged', async () => {
-        const { rdMeshFragmentCode, rdForceShaderVariants } = await import('./render-debug');
+        const { rdMeshFragmentCode } = await import('./render-debug');
         const { MESH3D_FS_TINY } = await import('./shaders/mesh3d-tiny-fs');
-        expect(rdMeshFragmentCode('UBER', MESH3D_FS_TINY)).toBe('UBER');
+        expect(rdMeshFragmentCode('GENERATED', MESH3D_FS_TINY)).toBe('GENERATED');
         setRenderDebug({ tinyMeshFS: true });
-        expect(rdMeshFragmentCode('UBER', MESH3D_FS_TINY)).toBe(MESH3D_FS_TINY);
-        expect(rdForceShaderVariants()).toBe(false);
-        setRenderDebug({ reset: true, forceShaderVariants: true });
-        expect(rdForceShaderVariants()).toBe(true);
-        expect(rdMeshFragmentCode('UBER', MESH3D_FS_TINY)).toBe('UBER');
+        expect(rdMeshFragmentCode('GENERATED', MESH3D_FS_TINY)).toBe(MESH3D_FS_TINY);
+        setRenderDebug({ reset: true, dbgNormal: true });
+        expect(rdMeshFragmentCode('GENERATED', MESH3D_FS_TINY)).toBe('GENERATED');
     });
 
-    it('the tiny shader keeps the uber shader binding + location contract', async () => {
+    it('the tiny shader keeps the mesh fragment shaders\' binding + location contract', async () => {
         const { MESH3D_FS_TINY } = await import('./shaders/mesh3d-tiny-fs');
         expect(MESH3D_FS_TINY).toContain('@group(0) @binding(0) var<storage, read> u_instances');
         expect(MESH3D_FS_TINY).toContain('@group(0) @binding(1) var<uniform> scene');

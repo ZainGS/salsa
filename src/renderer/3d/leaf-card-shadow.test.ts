@@ -7,7 +7,9 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { LEAF_CARD_WGSL, MESH3D_FRAGMENT_SHADER_UNTEXTURED, MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN } from './shaders/mesh3d-shaders';
+import { LEAF_CARD_WGSL } from './shaders/mesh3d-shaders';
+import { generateMeshFs } from './shaders/mesh-fs-generate';
+import { MF, meshFsAllKey, type MeshFsKey } from './shaders/mesh-fs-key';
 import { SHADOW_VERTEX_SHADER } from './shaders/shadow-shaders';
 import { CLUMP_CARD_U0 } from '../../world/branch';
 
@@ -23,7 +25,8 @@ describe('leaf-card silhouettes — colour pass and shadow pass agree', () => {
   });
 
   it('the colour FS (plain + shadow-receiving) cuts cards through leafCardCoverage', () => {
-    for (const src of [MESH3D_FRAGMENT_SHADER_UNTEXTURED, MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN]) {
+    const leafKey = (shadow: boolean): MeshFsKey => ({ ...meshFsAllKey(false, shadow, false, false), styles: 1, feat: MF.LEAF | MF.FOLIAGE | MF.ENV_SPEC, pat: 0, gm: 0 });
+    for (const src of [generateMeshFs(meshFsAllKey(false, false)), generateMeshFs(meshFsAllKey(false, true)), generateMeshFs(leafKey(false)), generateMeshFs(leafKey(true))]) {
       expect(src).toMatch(/leafCardCoverage\(uv\)/);
       expect(src.match(/fn leafLobe\(/g)?.length).toBe(1);
     }

@@ -4,6 +4,8 @@ import { DEFAULT_MATERIAL, encodeMaterialFlags } from './material-3d';
 import { packSceneUniforms, type ScenePackParams } from './scene-uniforms';
 import { DEFAULT_PS1_CONFIG } from './renderer-3d';
 import * as mesh3d from './shaders/mesh3d-shaders';
+import { generateMeshFs } from './shaders/mesh-fs-generate';
+import { meshFsAllKey } from './shaders/mesh-fs-key';
 import * as skinning from './shaders/skinning-shaders';
 import * as shadow from './shaders/shadow-shaders';
 import { Scene3DMaterials } from '../../services/managers/scene3d-materials';
@@ -53,7 +55,9 @@ describe('retro colour — the scope in the scene uniform', () => {
 });
 
 describe('retro colour — every shader quantize site resolves the scope per mesh', () => {
-  const src = [mesh3d, skinning, shadow].flatMap((m) => Object.values(m).filter((v): v is string => typeof v === 'string')).join('\n');
+  // every shader string + the generated mesh fragment shaders (all features, per layout: the only mesh FS source)
+  const src = [...[mesh3d, skinning, shadow].flatMap((m) => Object.values(m).filter((v): v is string => typeof v === 'string')),
+    ...[false, true].flatMap((tex) => [false, true].map((sh) => generateMeshFs(meshFsAllKey(tex, sh))))].join('\n');
   it('no site reads the raw colour depth any more (a raw read would ignore the opt-in bit)', () => {
     expect(src).not.toMatch(/let (colorDepth|cd) = scene\.ps1Config\.w;/);
     const sites = src.match(/let (colorDepth|cd) = select\(scene\.ps1Config\.w, -scene\.ps1Config\.w, scene\.ps1Config\.w < 0\.0 && \([^)]*2147483648u\) != 0u\)/g) ?? [];

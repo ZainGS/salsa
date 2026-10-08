@@ -25,11 +25,8 @@ export type { Material3D } from './material-3d';
 export { generateBox, generateSphere, generatePlane, generateCylinder, generateTorus } from './mesh-generators';
 export type { MeshGeometry } from './mesh-generators';
 
-export {
-  MESH3D_VERTEX_SHADER,
-  MESH3D_FRAGMENT_SHADER,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED,
-} from './shaders/mesh3d-shaders';
+// (the mesh FRAGMENT shaders are generated per feature key since shader-split phase 4: shaders/mesh-fs-generate.ts)
+export { MESH3D_VERTEX_SHADER } from './shaders/mesh3d-shaders';
 
 export { MeshPicker } from './mesh-picker';
 export type { PickResult } from './mesh-picker';

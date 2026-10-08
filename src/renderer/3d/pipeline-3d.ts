@@ -1,10 +1,11 @@
 /**
  * Pipeline3D — WebGPU render pipelines for 3D mesh rendering.
  *
- * Self-contained 3D pipeline manager. Creates and manages:
- *  - Opaque mesh pipeline (depth write ON, depth compare LESS)
- *  - Transparent mesh pipeline (depth write OFF, depth compare LESS, alpha blend)
- *  - Untextured variant (no texture bind group)
+ * Self-contained 3D pipeline manager. Owns the bind group / pipeline layouts, the shared vertex paths and states of
+ * the mesh pipelines, and the pipelines that do not shade meshes (shadow casters, SSAO / SSR prepasses and resolves,
+ * weight paint). The MESH pipelines are the specialised (axis x feature key) pipelines of the shader split
+ * (mesh-fs-pipelines.ts; docs/specs/shader-split.md): each mesh fragment module is generated for the features its
+ * meshes use. The fixed uber-shader pipelines were removed in shader-split phase 4 (2026-10-08).
  *
  * Uses the same depth24plus-stencil8 format as the 2D renderer
  * so both can share the same render pass when compositing 2D+3D.
@@ -12,16 +13,7 @@
 
 import {
   MESH3D_VERTEX_SHADER,
-  MESH3D_FRAGMENT_SHADER,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED,
   MESH3D_VERTEX_SHADER_VERTEX_COLOR,
-  MESH3D_FRAGMENT_SHADER_SHADOW_MODERN,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN,
-  // §3.1 plain (pattern-stripped) fragment variants
-  MESH3D_FRAGMENT_SHADER_PLAIN,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN,
-  MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN,
   SSR_RESOLVE_SHADER,
   SSR_POST_SHADER,
 } from './shaders/mesh3d-shaders';
@@ -35,33 +27,18 @@ import {
   SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED,
   SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT,
   SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT_UNLIT,
-  SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
-  SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
   SKINNED_MESH3D_FRAGMENT_SHADER_WEIGHT_PAINT,
-  SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED_PLAIN,
-  SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN,
 } from './shaders/skinning-shaders';
 import { FLOATS_PER_VERT } from './mesh-generators';
 import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle, type PipelinePriority } from '../core/gpu-pipeline-cache';
-import { specialiseMeshFragment, VB_TEXTURED, VB_NOCULL, VB_PATTERNED, VB_SHADOW } from './shader-variants';
 import { noteTwinSource, packedTwin } from './vertex-pack';
 import { MESH3D_FS_TINY } from './shaders/mesh3d-tiny-fs';
 import { rdMeshFragmentCode } from './render-debug';
-import { MeshFsPipelines, shaderSplitActive, type MeshFsAxis } from './mesh-fs-pipelines';
+import { MeshFsPipelines, type MeshFsAxis } from './mesh-fs-pipelines';
 import { meshFsBaseKey, type MeshFsKey } from './shaders/mesh-fs-key';
 
-/** RENDER DEBUG tinyMeshFS: every mesh / skinned-mesh fragment module goes through this (unchanged when off). */
+/** RENDER DEBUG tinyMeshFS: every generated mesh fragment module goes through this (unchanged when off). */
 const meshFS = (code: string): string => rdMeshFragmentCode(code, MESH3D_FS_TINY);
-
-/** SHADER SPLIT phase 3: the marker of a LAZY uber fragment module (see Pipeline3D._uberFs). */
-const LAZY_FS = Symbol('lazyUberFs');
-type LazyFs = { [LAZY_FS]: { code: string; label?: string } };
-
-/** Background-compile priority of the specialised shader variants (step 8): after the common set, before the rare. */
-export const VARIANT_PRIORITY: PipelinePriority = PIPELINE_PRIORITY.COMMON + 0.5;
-
-/** One specialised fragment variant (shader-variants.ts): its cache handle, request time and compile wall time. */
-interface VariantEntry { h: PipelineHandle<GPURenderPipeline>; key: number; base: number; fast: boolean; t0: number; ms: number; requested: boolean }
 
 /** Byte stride per vertex — derived from FLOATS_PER_VERT so the two stay in sync. */
 export const MESH3D_VERTEX_STRIDE = FLOATS_PER_VERT * Float32Array.BYTES_PER_ELEMENT;
@@ -81,7 +58,6 @@ type PipeAccessor = (() => GPURenderPipeline | null) & { handle: PipelineHandle<
 
 /** Pipelines only an editing tool / opt-in feature uses — warmed after the common set. */
 const RARE_PIPELINES = [
-  'overlayTexturedPipeline', 'postOverlayTexturedPipeline', 'opaqueVertexColorPipeline',
   'skinnedWeightPaintPipeline', 'skinnedWeightPaintUnlitPipeline',
   'ssaoPrepassPipeline', 'ssaoPeelPrepassPipeline', 'ssrResolvePipeline', 'ssrHealPipeline', 'ssrFeatherPipeline',
 ] as const;
@@ -93,48 +69,11 @@ export class Pipeline3D {
   // EVERY render pipeline below is a LAZY ACCESSOR: calling it compiles that ONE pipeline on first use (behind the
   // loading screen, for whatever the scene actually draws) and caches it; warmAllAsync() compiles the rest in the
   // background. Registered via _reg() during construction — see PipeEntry + docs/specs/pipeline-warmup.md.
-  // Pipelines — base (no shadows)
-  private _opaqueTextured!: PipeAccessor;
-  private _overlayTextured!: PipeAccessor;   // always-on-top textured (depthCompare 'always') — the info card
-  private _postOverlayTextured!: PipeAccessor;   // color-only clone (no depth) — drawn AFTER post-processing
-  private _opaqueUntextured!: PipeAccessor;
-  private _transparentTextured!: PipeAccessor;
-  private _transparentUntextured!: PipeAccessor;
-  private _transparentTexturedNoCull!: PipeAccessor;     // doubleSided transparent (both faces draw)
-  private _transparentUntexturedNoCull!: PipeAccessor;
+  // (The mesh pipelines are not here: the shader split's MeshFsPipelines registers them per (axis, key) on first use.)
 
-  // Pipelines — no back-face culling (used by preview renderers and double-sided materials)
-  private _opaqueTexturedNoCull!: PipeAccessor;
-  private _opaqueUntexturedNoCull!: PipeAccessor;
-
-  // Pipeline — vertex color (EditMesh paint; two vertex buffer slots)
-  private _opaqueVertexColor!: PipeAccessor;
-
-  // Pipelines — skinned (LBS) opaque
-  private _skinnedOpaqueTextured!: PipeAccessor;
-  private _skinnedOpaqueUntextured!: PipeAccessor;
+  // Pipelines — skinned weight paint (the weight-paint tool)
   private _skinnedWeightPaint!: PipeAccessor;
   private _skinnedWeightPaintUnlit!: PipeAccessor;
-
-  // Pipelines — shadow-enabled (opaque only; transparent geometry skips shadows)
-  private _opaqueTexturedShadow!: PipeAccessor;
-  private _opaqueTexturedNoCullShadow!: PipeAccessor;
-  private _opaqueUntexturedNoCullShadow!: PipeAccessor;
-  private _opaqueUntexturedShadow!: PipeAccessor;
-
-  // §3.1 PLAIN (pattern-stripped) opaque variants — identical to the above but with the pattern block compiled out.
-  // Meshes with no pattern/window/ground/shade/normal-map (characters, plain props) route here; output is identical.
-  private _opaqueTexturedPlain!: PipeAccessor;
-  private _opaqueUntexturedPlain!: PipeAccessor;
-  private _opaqueTexturedNoCullPlain!: PipeAccessor;
-  private _opaqueUntexturedNoCullPlain!: PipeAccessor;
-  private _opaqueTexturedPlainShadow!: PipeAccessor;
-  private _opaqueUntexturedPlainShadow!: PipeAccessor;
-  private _opaqueTexturedNoCullPlainShadow!: PipeAccessor;
-  private _opaqueUntexturedNoCullPlainShadow!: PipeAccessor;
-  private _skinnedOpaqueTexturedPlain!: PipeAccessor;
-  private _skinnedOpaqueUntexturedPlain!: PipeAccessor;
-  private _skinnedFaceMultiply!: PipeAccessor;
 
   // Granular lazy-pipeline registry: every _reg() call pushes one entry here. Its accessor compiles on first use;
   // warmAllAsync() compiles whichever entries are still un-compiled, off the main thread.
@@ -184,7 +123,7 @@ export class Pipeline3D {
     // createPipelines() only REGISTERS pipelines (via _reg) — it builds shader modules + descriptors but compiles
     // nothing. Each pipeline compiles lazily on first getter access, or in bulk via warmAllAsync().
     this.createPipelines();
-    // SHADER SPLIT (mesh-fs-pipelines.ts): the generated (axis x key) pipelines; nothing is registered until used.
+    // SHADER SPLIT (mesh-fs-pipelines.ts): the generated (axis x key) mesh pipelines; nothing is registered until used.
     this._meshFs = new MeshFsPipelines(device, this._cache, (axis, key, fs, label) => this._describeMeshFs(axis, key, fs, label), meshFS);
     // Background-warm order: tools / debug / niche feature variants drain last (docs/specs/performance-plan.md P2.2).
     for (const n of RARE_PIPELINES) { const h = this.handleOf(n); const e = h && this._pipeEntries.find(x => x.handle === h); if (e) e.priority = PIPELINE_PRIORITY.RARE; }
@@ -206,33 +145,6 @@ export class Pipeline3D {
 
   // Each getter calls its lazy accessor: the FIRST access compiles just that one pipeline (the fallback if the
   // async warm hasn't reached it yet) and caches it — so a draw only pays for what it actually uses.
-  get opaqueTexturedPipeline(): GPURenderPipeline | null { return this._opaqueTextured(); }
-  get overlayTexturedPipeline(): GPURenderPipeline | null { return this._overlayTextured(); }
-  get postOverlayTexturedPipeline(): GPURenderPipeline | null { return this._postOverlayTextured(); }
-  get opaqueUntexturedPipeline(): GPURenderPipeline | null { return this._opaqueUntextured(); }
-  get transparentTexturedPipeline(): GPURenderPipeline | null { return this._transparentTextured(); }
-  get transparentUntexturedPipeline(): GPURenderPipeline | null { return this._transparentUntextured(); }
-  get transparentTexturedNoCullPipeline(): GPURenderPipeline | null { return this._transparentTexturedNoCull(); }
-  get transparentUntexturedNoCullPipeline(): GPURenderPipeline | null { return this._transparentUntexturedNoCull(); }
-  get opaqueTexturedNoCullPipeline(): GPURenderPipeline | null { return this._opaqueTexturedNoCull(); }
-  get opaqueUntexturedNoCullPipeline(): GPURenderPipeline | null { return this._opaqueUntexturedNoCull(); }
-
-  get opaqueTexturedShadowPipeline(): GPURenderPipeline | null { return this._opaqueTexturedShadow(); }
-  get opaqueTexturedNoCullShadowPipeline(): GPURenderPipeline | null { return this._opaqueTexturedNoCullShadow(); }
-  get opaqueUntexturedNoCullShadowPipeline(): GPURenderPipeline | null { return this._opaqueUntexturedNoCullShadow(); }
-  get opaqueUntexturedShadowPipeline(): GPURenderPipeline | null { return this._opaqueUntexturedShadow(); }
-  get opaqueTexturedPlainPipeline(): GPURenderPipeline | null { return this._opaqueTexturedPlain(); }
-  get opaqueUntexturedPlainPipeline(): GPURenderPipeline | null { return this._opaqueUntexturedPlain(); }
-  get opaqueTexturedNoCullPlainPipeline(): GPURenderPipeline | null { return this._opaqueTexturedNoCullPlain(); }
-  get opaqueUntexturedNoCullPlainPipeline(): GPURenderPipeline | null { return this._opaqueUntexturedNoCullPlain(); }
-  get opaqueTexturedPlainShadowPipeline(): GPURenderPipeline | null { return this._opaqueTexturedPlainShadow(); }
-  get opaqueUntexturedPlainShadowPipeline(): GPURenderPipeline | null { return this._opaqueUntexturedPlainShadow(); }
-  get opaqueTexturedNoCullPlainShadowPipeline(): GPURenderPipeline | null { return this._opaqueTexturedNoCullPlainShadow(); }
-  get opaqueUntexturedNoCullPlainShadowPipeline(): GPURenderPipeline | null { return this._opaqueUntexturedNoCullPlainShadow(); }
-  get skinnedOpaqueTexturedPlainPipeline(): GPURenderPipeline | null { return this._skinnedOpaqueTexturedPlain(); }
-  get skinnedOpaqueUntexturedPlainPipeline(): GPURenderPipeline | null { return this._skinnedOpaqueUntexturedPlain(); }
-  /** Face-kit overlays: skinned textured, MULTIPLY blend, no depth write (Renderer3D.drawSkinnedMeshes). */
-  get skinnedFaceMultiplyPipeline(): GPURenderPipeline | null { return this._skinnedFaceMultiply(); }
   get shadowPassPipeline(): GPURenderPipeline | null { return this._shadowPassPipeline(); }
   get skinnedShadowPipeline(): GPURenderPipeline | null { return this._skinnedShadowPipeline(); }
   get ssaoPrepassPipeline(): GPURenderPipeline | null { return this._ssaoPrepassPipeline(); }
@@ -241,88 +153,32 @@ export class Pipeline3D {
   get ssrHealPipeline(): GPURenderPipeline | null { return this._ssrHealPipeline(); }
   get ssrFeatherPipeline(): GPURenderPipeline | null { return this._ssrFeatherPipeline(); }
 
-  get skinnedOpaqueTexturedPipeline(): GPURenderPipeline | null { return this._skinnedOpaqueTextured(); }
-  get skinnedOpaqueUntexturedPipeline(): GPURenderPipeline | null { return this._skinnedOpaqueUntextured(); }
   get skinnedWeightPaintPipeline(): GPURenderPipeline | null { return this._skinnedWeightPaint(); }
   get skinnedWeightPaintUnlitPipeline(): GPURenderPipeline | null { return this._skinnedWeightPaintUnlit(); }
-  get opaqueVertexColorPipeline(): GPURenderPipeline | null { return this._opaqueVertexColor(); }
   get weightPaintBindGroupLayout(): GPUBindGroupLayout { return this._weightPaintBGL; }
 
-  // ── Step 8: specialised fragment variants (shader-variants.ts; performance-plan §P21) ──────────────────────────
-  // The descriptor pieces every opaque mesh pipeline shares (kept from createPipelines for the variant factories).
+  // ── THE MESH PIPELINES: the shader split (mesh-fs-pipelines.ts; docs/specs/shader-split.md) ─────────────────────
+  // The descriptor pieces of every mesh pipeline axis (vertex paths, targets, depth states; built in createPipelines).
+  private _meshFs!: MeshFsPipelines;
   private _vsModule!: GPUShaderModule;
   private _vbLayout!: GPUVertexBufferLayout;
   private _opaqueTarget!: GPUColorTargetState;
   private _opaqueDS!: GPUDepthStencilState;
-  private readonly _variants = new Map<number, (VariantEntry | undefined)[]>();
-  private readonly _variantList: VariantEntry[] = [];
-
-  /** The specialised variant of opaque base `base` (VB_* bits) for material flags `key`, or NULL while it is not
-   *  compiled. A miss queues a background compile (VARIANT_PRIORITY) and NEVER blocks or marks a draw as waiting: the
-   *  caller draws with the base (uber-shader) pipeline meanwhile, which renders the same pixels. */
-  variantPipeline(base: number, key: number, fastPaths: boolean): GPURenderPipeline | null {
-    let row = this._variants.get(key);
-    if (!row) { row = []; this._variants.set(key, row); }
-    const slot = (base & 15) * 2 + (fastPaths ? 1 : 0);
-    let e = row[slot];
-    if (!e) {
-      const tex = (base & VB_TEXTURED) !== 0, nc = (base & VB_NOCULL) !== 0, pat = (base & VB_PATTERNED) !== 0, sh = (base & VB_SHADOW) !== 0;
-      const src = tex
-        ? (pat ? (sh ? MESH3D_FRAGMENT_SHADER_SHADOW_MODERN : MESH3D_FRAGMENT_SHADER) : (sh ? MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN : MESH3D_FRAGMENT_SHADER_PLAIN))
-        : (pat ? (sh ? MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN : MESH3D_FRAGMENT_SHADER_UNTEXTURED) : (sh ? MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN : MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN));
-      const layout = tex ? (sh ? this._pipelineLayoutShadowTextured : this._pipelineLayoutTextured) : (sh ? this._pipelineLayoutShadowUntextured : this._pipelineLayoutUntextured);
-      const label = `MeshVariant:${key >>> 0}:${base}${fastPaths ? 'f' : ''}`;
-      const desc = (): GPURenderPipelineDescriptor => ({
-        label, layout,
-        vertex: { module: this._vsModule, entryPoint: 'vs_main', buffers: [this._vbLayout] },
-        fragment: { module: this.device.createShaderModule({ code: meshFS(specialiseMeshFragment(src, key, fastPaths)), label }), entryPoint: 'fs_main', targets: [this._opaqueTarget] },
-        primitive: { topology: 'triangle-list', cullMode: nc ? 'none' : 'back', frontFace: 'ccw' },
-        depthStencil: this._opaqueDS,
-      });
-      e = { h: this._cache.render(desc, label), key: key >>> 0, base, fast: fastPaths, t0: 0, ms: -1, requested: false };
-      row[slot] = e; this._variantList.push(e);
-    }
-    if (e.h.ready) { const p = e.h.get(); if (p) noteTwinSource(p, e.h.descriptor()); return p; }   // (P22: twin-able)
-    if (!e.requested && !e.h.failed) {
-      e.requested = true; e.t0 = performance.now();
-      const ent = e;
-      void e.h.warm(VARIANT_PRIORITY).then((p) => { if (p) ent.ms = performance.now() - ent.t0; });
-    }
-    return null;
-  }
-
-  // ── SHADER SPLIT phase 1 (mesh-fs-pipelines.ts; docs/specs/shader-split.md) ─────────────────────────────────────
-  private _meshFs!: MeshFsPipelines;
   private _transparentTarget!: GPUColorTargetState;
   private _transparentDS!: GPUDepthStencilState;
   private _skinnedVbLayout!: GPUVertexBufferLayout;
   private _skinnedTexVS!: GPUShaderModule;
   private _skinnedUntexVS!: GPUShaderModule;
-  /** Phase 2 axes: the vertex-colour VS + its two vertex buffers, the face-kit multiply target, the post-overlay
-   *  depth state (the same objects today's pipelines of those axes use). */
+  /** The vertex-colour VS + its two vertex buffers, the face-kit multiply target. */
   private _vcVS!: GPUShaderModule;
   private _vcVbLayouts!: GPUVertexBufferLayout[];
   private _faceMultiplyTarget!: GPUColorTargetState;
-  /** The uber-shader pipelines the split replaces for the meshes it covers (opaque / no-cull x textured x plain / full
-   *  x shadow, transparent, skinned): left out of the boot warm while the split is on (they still compile on demand
-   *  for the meshes the split does not cover). */
-  private readonly _splitReplaced = new Set<PipelineHandle<GPURenderPipeline>>();
-  /** SHADER SPLIT phase 3: the uber-shader fragment modules (~120 KB of WGSL each) created so far. They are created
-   *  on FIRST USE (the first compile of a pipeline that uses one), not at construction: with the split on (the
-   *  default) nothing draws with them unless rolled back or uncovered, so the driver never even parses them. */
-  private readonly _uberFsModules = new Map<LazyFs, GPUShaderModule>();
-
-  /** Diagnostics: how many uber-shader fragment modules exist (0 with the split on and every mesh covered). */
-  get uberFragmentModules(): number { return this._uberFsModules.size; }
-  /** Diagnostics: how many of the uber pipelines the split replaces are compiled (0 with the split on and every
-   *  mesh covered; all of them warmed at boot with the split off). */
-  get uberPipelinesCompiled(): number { let n = 0; for (const h of this._splitReplaced) if (h.ready) n++; return n; }
 
   /** The specialised (axis x key) mesh pipelines (shader split). */
   get meshFs(): MeshFsPipelines { return this._meshFs; }
 
-  /** The pipeline descriptor of split axis `axis` around generated fragment module `fs`: the same states, layouts and
-   *  vertex paths as today's pipeline of that axis (only the fragment module differs). */
+  /** The pipeline descriptor of mesh axis `axis` around generated fragment module `fs`: the layout (from key.tex /
+   *  key.shadow), vertex path, blend, depth and cull of that axis (only the fragment module differs per key). */
   private _describeMeshFs(axis: MeshFsAxis, key: MeshFsKey, fs: GPUShaderModule, label: string): GPURenderPipelineDescriptor {
     const skinned = axis === 'skinned' || axis === 'skinnedFaceMultiply';
     if ((skinned || axis === 'vertexColour' || axis === 'postOverlay') && key.shadow) throw new Error(`Pipeline3D: the ${axis} axis has no shadow-receiving pipeline`);
@@ -345,16 +201,6 @@ export class Pipeline3D {
         : axis === 'skinnedFaceMultiply' ? { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'less' }
           : transparent ? this._transparentDS : this._opaqueDS,
     };
-  }
-
-  /** Step 8 diagnostics: every variant registered so far (key, base, compiled, wall ms from request to ready). */
-  variantStats(): { registered: number; ready: number; pending: number; failed: number; list: { key: number; base: number; fast: boolean; ready: boolean; ms: number }[] } {
-    let ready = 0, pending = 0, failed = 0;
-    const list = this._variantList.map((e) => {
-      if (e.h.ready) ready++; else if (e.h.failed) failed++; else if (e.requested) pending++;
-      return { key: e.key, base: e.base, fast: e.fast, ready: e.h.ready, ms: Math.round(e.ms) };
-    });
-    return { registered: this._variantList.length, ready, pending, failed, list };
   }
 
   get meshBindGroupLayout(): GPUBindGroupLayout { return this._meshBGL; }
@@ -562,11 +408,7 @@ export class Pipeline3D {
   /** Register a pipeline for GRANULAR lazy, NON-BLOCKING compilation and return its accessor (see PipeAccessor).
    *  `priority` orders the background warm (COMMON = every 3D scene soon needs it; RARE = tools / debug / niche). */
   private _reg(descriptor: GPURenderPipelineDescriptor, priority: PipelinePriority = PIPELINE_PRIORITY.COMMON): PipeAccessor {
-    // a LAZY uber fragment module (_uberFs): the descriptor becomes a factory that creates the module on first compile
-    const frag = descriptor.fragment;
-    const lazy = frag && (frag.module as unknown as Partial<LazyFs>)[LAZY_FS] ? frag.module as unknown as LazyFs : null;
-    const src = lazy && frag ? (): GPURenderPipelineDescriptor => ({ ...descriptor, fragment: { ...frag, module: this._uberFsModule(lazy) } }) : descriptor;
-    const h = this._cache.render(src, descriptor.label ?? `Pipeline3D#${this._pipeEntries.length + 1}`);
+    const h = this._cache.render(descriptor, descriptor.label ?? `Pipeline3D#${this._pipeEntries.length + 1}`);
     this._pipeEntries.push({ handle: h, priority });
     // P22: the compiled pipeline is noted with its descriptor, so the renderer can ask for its packed twin (vertex-pack.ts)
     let noted: GPURenderPipeline | null = null;
@@ -575,44 +417,25 @@ export class Pipeline3D {
     return acc;
   }
 
-  /** SHADER SPLIT phase 3: a placeholder for an uber fragment module, resolved by _reg on the pipeline's first compile
-   *  (one real module per placeholder, shared by every pipeline that uses it, as before). */
-  private _uberFs(code: string, label?: string): GPUShaderModule {
-    return { [LAZY_FS]: { code: meshFS(code), label } } as unknown as GPUShaderModule;
-  }
-  private _uberFsModule(lz: LazyFs): GPUShaderModule {
-    let m = this._uberFsModules.get(lz);
-    if (!m) {
-      const { code, label } = lz[LAZY_FS];
-      m = this.device.createShaderModule(label ? { code, label } : { code });
-      this._uberFsModules.set(lz, m);
-    }
-    return m;
-  }
-
-  /** P22: start compiling the packed twin of every compiled pool pipeline (the base set and the shader variants), so
-   *  the renderer can store geometry packed once they are ready (Renderer3D._pkPackOk). */
+  /** P22: start compiling the packed twin of every compiled pool pipeline (the registered set and the mesh
+   *  pipelines), so the renderer can store geometry packed once they are ready (Renderer3D._pkPackOk). */
   requestPackedTwins(): void {
     for (const e of this._pipeEntries) {
       const p = e.handle.ready ? e.handle.get() : null;
       if (p) { noteTwinSource(p, e.handle.descriptor()); packedTwin(this.device, p); }
     }
-    for (const v of this._variantList) {
-      const p = v.h.ready ? v.h.get() : null;
-      if (p) { noteTwinSource(p, v.h.descriptor()); packedTwin(this.device, p); }
-    }
     for (const { p, desc } of this._meshFs.compiled()) { noteTwinSource(p, desc); packedTwin(this.device, p); }
   }
 
-  /** The cache handle behind a public getter name (e.g. 'opaqueTexturedPlainShadowPipeline'), or null. */
+  /** The cache handle behind a public getter name (e.g. 'shadowPassPipeline'), or null. */
   handleOf(getterName: string): PipelineHandle<GPURenderPipeline> | null {
     const base = getterName.replace(/Pipeline$/, '');
     const self = this as unknown as Record<string, PipeAccessor | undefined>;
     return (self['_' + base] ?? self['_' + base + 'Pipeline'])?.handle ?? null;
   }
 
-  /** Queue the named pipelines (public getter names) for a background compile at `priority` — e.g. the variants a
-   *  just-loaded document will draw (Renderer3D.prewarmForScene). Unknown names are ignored. */
+  /** Queue the named pipelines (public getter names) for a background compile at `priority` — e.g. the shadow
+   *  casters a just-loaded document will draw (Renderer3D.prewarmForScene). Unknown names are ignored. */
   warmPipelines(getterNames: readonly string[], priority: PipelinePriority = PIPELINE_PRIORITY.DOCUMENT): void {
     for (const n of getterNames) this.handleOf(n)?.warm(priority);
   }
@@ -622,21 +445,15 @@ export class Pipeline3D {
    *  stuck behind the warm. Idempotent + memoized; resolves when all have settled; never rejects. */
   async warmAllAsync(): Promise<void> {
     return this._warmPromise ??= (async () => {
-      // SHADER SPLIT on (the default since phase 3; shader-split.md §13): the uber pipelines it replaces are not warmed
-      // (they compile on demand only for a mesh the split does not cover, and their ~120 KB fragment modules are not
-      // even created until then: _uberFs); the U / T BASE fallbacks of the opaque axes are warmed instead (spec §5.3:
-      // never *-ALL). Rolled back (mode 'off' / render debug noShaderSplit): today's full uber warm.
-      const split = shaderSplitActive();
-      if (split) {
-        for (const axis of ['opaqueNoCull', 'opaque'] as const) for (const tex of [false, true]) this._meshFs.warm(axis, meshFsBaseKey(tex, false, false, false), PIPELINE_PRIORITY.COMMON);
-        // the seen-keys journal: the keys this device drew last time, after the BASE fallbacks (spec §5.3)
-        const nj = this._meshFs.warmJournal(PIPELINE_PRIORITY.COMMON);
-        if (nj > 0) console.log(`[Salsa][shader-split] warming ${nj} journalled keys`);
-      }
-      const pending = this._pipeEntries.filter(e => !e.handle.ready && !(split && this._splitReplaced.has(e.handle)));
+      // The mesh pipelines (shader-split.md §13.2): the U / T BASE fallbacks of the opaque axes (spec §5.3: never
+      // *-ALL), then the seen-keys journal; a document's exact keys compile with its pre-warm / first draw.
+      for (const axis of ['opaqueNoCull', 'opaque'] as const) for (const tex of [false, true]) this._meshFs.warm(axis, meshFsBaseKey(tex, false, false, false), PIPELINE_PRIORITY.COMMON);
+      // the seen-keys journal: the keys this device drew last time, after the BASE fallbacks (spec §5.3)
+      const nj = this._meshFs.warmJournal(PIPELINE_PRIORITY.COMMON);
+      if (nj > 0) console.log(`[Salsa][shader-split] warming ${nj} journalled keys`);
+      const pending = this._pipeEntries.filter(e => !e.handle.ready);
       const t0 = performance.now();
-      const skipped = split ? this._pipeEntries.filter(e => !e.handle.ready && this._splitReplaced.has(e.handle)).length : 0;
-      console.log(`[Salsa][warm] warming ${pending.length} pipelines in background (${this._pipeEntries.length - pending.length - skipped} already compiled${split ? `; ${skipped} uber pipelines skipped: shader split on` : ''})…`);
+      console.log(`[Salsa][warm] warming ${pending.length} pipelines in background (${this._pipeEntries.length - pending.length} already compiled)…`);
       try {
         await Promise.all(pending.map(e => e.handle.warm(e.priority)));
         console.log(`[Salsa][warm] pipeline warm complete: ${pending.length} compiled in ${Math.round(performance.now() - t0)}ms`);
@@ -646,15 +463,7 @@ export class Pipeline3D {
 
   private createPipelines(): void {
     const vertexModule          = this.device.createShaderModule({ code: MESH3D_VERTEX_SHADER });
-    const fragTexturedModule    = this._uberFs(MESH3D_FRAGMENT_SHADER);   // (lazy: see _uberFs; the same for every uber FS below)
-    const fragUntexturedModule  = this._uberFs(MESH3D_FRAGMENT_SHADER_UNTEXTURED);
     const shadowPassVertModule  = this.device.createShaderModule({ code: SHADOW_VERTEX_SHADER });
-    // Shadow-RECEIVING pipelines use the MODERN fragment shaders (patterns/interiors/relief/point lights/PBR)
-    // with shadow sampling substituted in — the legacy gouraud shadow FS predates the whole pattern system and
-    // silently downgraded anything that received shadows. The modern VS pairs with them (lightSpacePos is
-    // computed in-fragment from worldPos, so no dedicated shadow VS is needed).
-    const shadowFragTexModule   = this._uberFs(MESH3D_FRAGMENT_SHADER_SHADOW_MODERN);
-    const shadowFragUntexModule = this._uberFs(MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN);
 
     // 3D vertex buffer layout: position(vec3) + normal(vec3) + uv(vec2) + tangent(vec4)
     const vertexBufferLayout: GPUVertexBufferLayout = {
@@ -683,8 +492,6 @@ export class Pipeline3D {
       format: this.swapChainFormat,
       // No blending for opaque
     };
-    // step 8: the shared pieces of the specialised variants (variantPipeline)
-    this._vsModule = vertexModule; this._vbLayout = vertexBufferLayout; this._opaqueTarget = opaqueBlend; this._opaqueDS = opaqueDepthStencil;
 
     const transparentBlend: GPUColorTargetState = {
       format: this.swapChainFormat,
@@ -701,136 +508,9 @@ export class Pipeline3D {
         },
       },
     };
-    this._transparentTarget = transparentBlend; this._transparentDS = transparentDepthStencil;   // shader split axes
-
-    // Opaque + Textured
-    this._opaqueTextured = this._reg({
-      layout: this._pipelineLayoutTextured,
-      vertex: {
-        module: vertexModule,
-        entryPoint: 'vs_main',
-        buffers: [vertexBufferLayout],
-      },
-      fragment: {
-        module: fragTexturedModule,
-        entryPoint: 'fs_main',
-        targets: [opaqueBlend],
-      },
-      primitive: {
-        topology: 'triangle-list',
-        cullMode: 'back',
-        frontFace: 'ccw',
-      },
-      depthStencil: opaqueDepthStencil,
-    });
-
-    // Always-on-top textured (the landmark info card): depthCompare 'always' → never occluded; no depth write;
-    // both faces (a billboard quad); alpha-blended. Same textured shader/layout as opaque.
-    this._overlayTextured = this._reg({
-      label: 'OverlayTexturedPipeline',
-      layout: this._pipelineLayoutTextured,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: fragTexturedModule, entryPoint: 'fs_main', targets: [transparentBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' },
-    });
-
-    // POST-PROCESS-IMMUNE overlay: drawn in a standalone pass onto the FINAL (already post-processed) swapchain
-    // image, so the info card bypasses bloom / colour-grade / vignette entirely. It has a depth buffer (the scene
-    // depth texture, CLEARED at pass start so nothing occludes the card) with depth test+write ON, so a 3D EXTRUDED
-    // card self-occludes correctly — only the camera-facing face shows while it spins. cullMode 'none' (both faces
-    // considered; depth picks the nearest). A flat 2D card is a single layer and unaffected.
-    this._postOverlayTextured = this._reg({
-      label: 'PostOverlayTexturedPipeline',
-      layout: this._pipelineLayoutTextured,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: fragTexturedModule, entryPoint: 'fs_main', targets: [transparentBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: true, depthCompare: 'less' },
-    });
-
-    // Opaque + Untextured
-    this._opaqueUntextured = this._reg({
-      layout: this._pipelineLayoutUntextured,
-      vertex: {
-        module: vertexModule,
-        entryPoint: 'vs_main',
-        buffers: [vertexBufferLayout],
-      },
-      fragment: {
-        module: fragUntexturedModule,
-        entryPoint: 'fs_main',
-        targets: [opaqueBlend],
-      },
-      primitive: {
-        topology: 'triangle-list',
-        cullMode: 'back',
-        frontFace: 'ccw',
-      },
-      depthStencil: opaqueDepthStencil,
-    });
-
-    // Transparent + Textured
-    this._transparentTextured = this._reg({
-      layout: this._pipelineLayoutTextured,
-      vertex: {
-        module: vertexModule,
-        entryPoint: 'vs_main',
-        buffers: [vertexBufferLayout],
-      },
-      fragment: {
-        module: fragTexturedModule,
-        entryPoint: 'fs_main',
-        targets: [transparentBlend],
-      },
-      primitive: {
-        topology: 'triangle-list',
-        cullMode: 'back',
-        frontFace: 'ccw',
-      },
-      depthStencil: transparentDepthStencil,
-    });
-
-    // Transparent + Untextured
-    this._transparentUntextured = this._reg({
-      layout: this._pipelineLayoutUntextured,
-      vertex: {
-        module: vertexModule,
-        entryPoint: 'vs_main',
-        buffers: [vertexBufferLayout],
-      },
-      fragment: {
-        module: fragUntexturedModule,
-        entryPoint: 'fs_main',
-        targets: [transparentBlend],
-      },
-      primitive: {
-        topology: 'triangle-list',
-        cullMode: 'back',
-        frontFace: 'ccw',
-      },
-      depthStencil: transparentDepthStencil,
-    });
-
-    // Transparent DOUBLE-SIDED variants (cullMode 'none') — so both faces of a transparent doubleSided mesh draw.
-    // Without these a transparent doubleSided panel (the CD jewel-case lid) had its back-facing triangles culled, so
-    // the far side of the open clear lid rendered nothing. Same states as the single-sided transparent pipelines.
-    this._transparentTexturedNoCull = this._reg({
-      label: 'TransparentTexturedNoCullPipeline',
-      layout: this._pipelineLayoutTextured,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: fragTexturedModule, entryPoint: 'fs_main', targets: [transparentBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: transparentDepthStencil,
-    });
-    this._transparentUntexturedNoCull = this._reg({
-      label: 'TransparentUntexturedNoCullPipeline',
-      layout: this._pipelineLayoutUntextured,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: fragUntexturedModule, entryPoint: 'fs_main', targets: [transparentBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: transparentDepthStencil,
-    });
+    // the mesh pipeline axes (_describeMeshFs)
+    this._vsModule = vertexModule; this._vbLayout = vertexBufferLayout; this._opaqueTarget = opaqueBlend; this._opaqueDS = opaqueDepthStencil;
+    this._transparentTarget = transparentBlend; this._transparentDS = transparentDepthStencil;
 
     // ── Shadow pass: depth-only pipeline ──────────────────────────
     this._shadowPassPipeline = this._reg({
@@ -913,77 +593,6 @@ export class Pipeline3D {
       primitive: { topology: 'triangle-list' },
     });
 
-    // ── Shadow-enabled opaque pipelines (group 2 = shadow BGL) ───
-
-    // Untextured shadow: layout = [meshBGL, shadowBGL] — modern VS + modern shadow-receiving FS.
-    this._opaqueUntexturedShadow = this._reg({
-      layout: this._pipelineLayoutShadowUntextured,
-      vertex: {
-        module: vertexModule,
-        entryPoint: 'vs_main',
-        buffers: [vertexBufferLayout],
-      },
-      fragment: {
-        module: shadowFragUntexModule,
-        entryPoint: 'fs_main',
-        targets: [opaqueBlend],
-      },
-      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-
-    // Textured shadow: layout = [meshBGL, textureBGL, shadowBGL] — modern VS + modern shadow-receiving FS.
-    this._opaqueTexturedShadow = this._reg({
-      layout: this._pipelineLayoutShadowTextured,
-      vertex: {
-        module: vertexModule,
-        entryPoint: 'vs_main',
-        buffers: [vertexBufferLayout],
-      },
-      fragment: {
-        module: shadowFragTexModule,
-        entryPoint: 'fs_main',
-        targets: [opaqueBlend],
-      },
-      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-
-    // NoCull (double-sided) shadow variants — the WORLD CITY meshes are double-sided, and before these
-    // existed they silently fell back to the no-shadow pipelines (the city never RECEIVED its own shadows).
-    this._opaqueTexturedNoCullShadow = this._reg({
-      layout: this._pipelineLayoutShadowTextured,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: shadowFragTexModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-    this._opaqueUntexturedNoCullShadow = this._reg({
-      layout: this._pipelineLayoutShadowUntextured,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: shadowFragUntexModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-
-    // Opaque + Textured, no back-face cull (preview / double-sided materials)
-    this._opaqueTexturedNoCull = this._reg({
-      layout: this._pipelineLayoutTextured,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: fragTexturedModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-
-    // Opaque + Untextured, no back-face cull
-    this._opaqueUntexturedNoCull = this._reg({
-      layout: this._pipelineLayoutUntextured,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: fragUntexturedModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-
     // Comparison sampler for PCF shadow lookups
     this._shadowSampler = this.device.createSampler({
       compare: 'less',
@@ -991,7 +600,7 @@ export class Pipeline3D {
       magFilter: 'linear',
     });
 
-    // ── Vertex color pipeline — EditMesh paint ───────────────────
+    // ── Vertex color axis — EditMesh paint ───────────────────────
     // Two vertex buffer slots: slot 0 = standard geometry, slot 1 = per-vertex rgba (16 bytes).
     // Uses the untextured layout [meshBGL] — no texture group needed.
     // EditMesh output is un-indexed with standalone VB override (baseVertex=0) so
@@ -1006,24 +615,9 @@ export class Pipeline3D {
         ],
       },
     ];
-    this._vcVS = vcVertexModule; this._vcVbLayouts = vcVertexBufferLayouts;   // shader split (vertexColour axis)
-    this._opaqueVertexColor = this._reg({
-      layout: this._pipelineLayoutUntextured,
-      vertex: {
-        module: vcVertexModule,
-        entryPoint: 'vs_main',
-        buffers: vcVertexBufferLayouts,
-      },
-      fragment: {
-        module: fragUntexturedModule,
-        entryPoint: 'fs_main',
-        targets: [opaqueBlend],
-      },
-      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
+    this._vcVS = vcVertexModule; this._vcVbLayouts = vcVertexBufferLayouts;   // (the vertexColour axis)
 
-    // ── Skinned mesh pipelines ────────────────────────────────────
+    // ── Skinned meshes ────────────────────────────────────────────
 
     const skinnedVertexBufferLayout: GPUVertexBufferLayout = {
       arrayStride: SKINNED_MESH3D_VERTEX_STRIDE,
@@ -1039,46 +633,7 @@ export class Pipeline3D {
 
     const skinnedTexVertModule   = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_TEXTURED });
     const skinnedUntexVertModule = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED });
-    this._skinnedVbLayout = skinnedVertexBufferLayout; this._skinnedTexVS = skinnedTexVertModule; this._skinnedUntexVS = skinnedUntexVertModule;   // shader split
-    const skinnedTexFragModule   = this._uberFs(SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED);
-    const skinnedUntexFragModule = this._uberFs(SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED);
-
-    // Skinned opaque + textured — layout: [mesh(0), texture(1), skin(2)]
-    this._skinnedOpaqueTextured = this._reg({
-      layout: this._pipelineLayoutSkinnedTextured,
-      vertex: {
-        module: skinnedTexVertModule,
-        entryPoint: 'vs_main',
-        buffers: [skinnedVertexBufferLayout],
-      },
-      fragment: {
-        module: skinnedTexFragModule,
-        entryPoint: 'fs_main',
-        targets: [opaqueBlend],
-      },
-      // Double-sided: procedural/imported skinned meshes can have inconsistent winding; cull-none
-      // avoids culling their front faces. Visually identical to cull-back for closed meshes.
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-
-    // Skinned opaque + untextured — layout: [mesh(0), skin(1)]
-    this._skinnedOpaqueUntextured = this._reg({
-      layout: this._pipelineLayoutSkinnedUntextured,
-      vertex: {
-        module: skinnedUntexVertModule,
-        entryPoint: 'vs_main',
-        buffers: [skinnedVertexBufferLayout],
-      },
-      fragment: {
-        module: skinnedUntexFragModule,
-        entryPoint: 'fs_main',
-        targets: [opaqueBlend],
-      },
-      // Double-sided (see skinnedOpaqueTextured) — robust against inconsistent winding.
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
+    this._skinnedVbLayout = skinnedVertexBufferLayout; this._skinnedTexVS = skinnedTexVertModule; this._skinnedUntexVS = skinnedUntexVertModule;   // (the skinned axes)
 
     // ── Skinned SHADOW pass (E1 tail c): depth-only, skin-deformed — characters cast shadows. ──
     // cullMode 'none' (like all skinned pipelines — hair cards / skirts are single-sided shells, and
@@ -1102,7 +657,7 @@ export class Pipeline3D {
       layout: this._pipelineLayoutSkinnedWeightPaint,
       vertex: { module: skinnedWPVertModule, entryPoint: 'vs_main', buffers: [skinnedVertexBufferLayout] },
       fragment: { module: skinnedWPFragModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
-      // Double-sided (see skinnedOpaqueTextured) — robust against inconsistent winding.
+      // Double-sided (like every skinned pipeline) — robust against inconsistent winding.
       primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
     });
@@ -1115,44 +670,7 @@ export class Pipeline3D {
       depthStencil: opaqueDepthStencil,
     });
 
-    // ── §3.1 PLAIN (pattern-stripped) opaque pipelines ────────────────────────────────────────────
-    // Same descriptors as their full counterparts — only the fragment MODULE differs (the unconditional
-    // patternMask x3 / windowsPattern / gr_uvMetres block is compiled OUT). The renderer routes meshes with no
-    // pattern/window/ground/shade/normal-map here; output is identical to the full shader for those meshes.
-    //
-    // Registered like everything else — a plain mesh's first draw compiles only the plain variant(s) it uses.
-    const plainFragTex         = this._uberFs(MESH3D_FRAGMENT_SHADER_PLAIN,                       'PlainTex');
-    const plainFragUntex       = this._uberFs(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN,            'PlainUntex');
-    const plainShadowFragTex   = this._uberFs(MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN,         'PlainTexShadow');
-    const plainShadowFragUntex = this._uberFs(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN, 'PlainUntexShadow');
-    const opaquePlainDesc = (layout: GPUPipelineLayout, frag: GPUShaderModule, cull: GPUCullMode): GPURenderPipelineDescriptor => ({
-      layout,
-      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: frag, entryPoint: 'fs_main', targets: [opaqueBlend] },
-      primitive: { topology: 'triangle-list', cullMode: cull, frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-    const plainSkinnedFragTex   = this._uberFs(SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED_PLAIN,   'PlainSkinnedTex');
-    const plainSkinnedFragUntex = this._uberFs(SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN, 'PlainSkinnedUntex');
-    const skinnedPlainDesc = (layout: GPUPipelineLayout, vs: GPUShaderModule, frag: GPUShaderModule): GPURenderPipelineDescriptor => ({
-      // Double-sided; skinned meshes have no separate shadow-receiving pipeline.
-      layout,
-      vertex: { module: vs, entryPoint: 'vs_main', buffers: [skinnedVertexBufferLayout] },
-      fragment: { module: frag, entryPoint: 'fs_main', targets: [opaqueBlend] },
-      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
-      depthStencil: opaqueDepthStencil,
-    });
-    this._opaqueTexturedPlain             = this._reg(opaquePlainDesc(this._pipelineLayoutTextured,         plainFragTex,         'back'));
-    this._opaqueTexturedNoCullPlain       = this._reg(opaquePlainDesc(this._pipelineLayoutTextured,         plainFragTex,         'none'));
-    this._opaqueUntexturedPlain           = this._reg(opaquePlainDesc(this._pipelineLayoutUntextured,       plainFragUntex,       'back'));
-    this._opaqueUntexturedNoCullPlain     = this._reg(opaquePlainDesc(this._pipelineLayoutUntextured,       plainFragUntex,       'none'));
-    this._opaqueTexturedPlainShadow       = this._reg(opaquePlainDesc(this._pipelineLayoutShadowTextured,   plainShadowFragTex,   'back'));
-    this._opaqueTexturedNoCullPlainShadow = this._reg(opaquePlainDesc(this._pipelineLayoutShadowTextured,   plainShadowFragTex,   'none'));
-    this._opaqueUntexturedPlainShadow       = this._reg(opaquePlainDesc(this._pipelineLayoutShadowUntextured, plainShadowFragUntex, 'back'));
-    this._opaqueUntexturedNoCullPlainShadow = this._reg(opaquePlainDesc(this._pipelineLayoutShadowUntextured, plainShadowFragUntex, 'none'));
-    this._skinnedOpaqueTexturedPlain   = this._reg(skinnedPlainDesc(this._pipelineLayoutSkinnedTextured,   skinnedTexVertModule,   plainSkinnedFragTex));
-    this._skinnedOpaqueUntexturedPlain = this._reg(skinnedPlainDesc(this._pipelineLayoutSkinnedUntextured, skinnedUntexVertModule, plainSkinnedFragUntex));
-    // FACE KIT overlays (face-features.ts): the plain skinned textured shaders, MULTIPLY-blended over the lit skin.
+    // FACE KIT overlays (face-features.ts; the skinnedFaceMultiply axis): MULTIPLY-blended over the lit skin.
     // The overlay is unlit (style 6, white) and its texture is a PREMULTIPLIED multiplier m·a, so the blend gives
     // dst·(m·a) + dst·(1 − a) = dst·mix(1, m, a). Destination alpha kept; depth tested, never written.
     this._faceMultiplyTarget = {
@@ -1162,22 +680,6 @@ export class Pipeline3D {
         alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' },
       },
     };
-    this._skinnedFaceMultiply = this._reg({
-      ...skinnedPlainDesc(this._pipelineLayoutSkinnedTextured, skinnedTexVertModule, plainSkinnedFragTex),
-      fragment: { module: plainSkinnedFragTex, entryPoint: 'fs_main', targets: [this._faceMultiplyTarget] },
-      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'less' },
-    });
-
-    // SHADER SPLIT: the uber pipelines the generated ones replace for covered meshes (see _splitReplaced)
-    for (const a of [this._opaqueTextured, this._opaqueUntextured, this._opaqueTexturedNoCull, this._opaqueUntexturedNoCull,
-      this._opaqueTexturedShadow, this._opaqueUntexturedShadow, this._opaqueTexturedNoCullShadow, this._opaqueUntexturedNoCullShadow,
-      this._opaqueTexturedPlain, this._opaqueUntexturedPlain, this._opaqueTexturedNoCullPlain, this._opaqueUntexturedNoCullPlain,
-      this._opaqueTexturedPlainShadow, this._opaqueUntexturedPlainShadow, this._opaqueTexturedNoCullPlainShadow, this._opaqueUntexturedNoCullPlainShadow,
-      this._transparentTextured, this._transparentUntextured, this._transparentTexturedNoCull, this._transparentUntexturedNoCull,
-      this._skinnedOpaqueTextured, this._skinnedOpaqueUntextured, this._skinnedOpaqueTexturedPlain, this._skinnedOpaqueUntexturedPlain,
-      this._opaqueVertexColor, this._postOverlayTextured, this._skinnedFaceMultiply,   // (phase 2 axes)
-      this._overlayTextured,   // (phase 3: the always-on-top card has no draw site; it only compiled the FULL textured uber FS at boot)
-    ]) this._splitReplaced.add(a.handle);
   }
 
 }

@@ -351,17 +351,6 @@ export class GpuDrivenMain {
    *  argument blocks; a range job (cs_ranges, one workgroup per ranged record) draws only its runs in the view.
    *  false = ranged meshes draw whole (Phase A; bit-identical pixels, more triangles). Through Renderer3D.setGpuDriven. */
   static ranges = true;
-  /** PHASE B: every record draws with the FULL (patterned) pipeline variant, so plain and patterned meshes share one
-   *  bucket. The plain variant renders identically (shaders/mesh3d-shaders.ts §3.1) but the city interleaves the two in
-   *  draw order; a pre-recorded bundle switches pipeline at every alternation, culled records included (the CPU path
-   *  only between visible ones), and those switches between visible draws cost GPU time. false = the CPU path's
-   *  per-mesh choice. Through Renderer3D.setGpuDriven.
-   *  DEFAULT OFF (2026-10-03): the full shader costs much more fragment time than the plain one, and the merge made
-   *  every plain mesh pay it: +5-7 ms main pass in the tiled city at 1300x850, the whole GPU-path deficit (direct
-   *  draws of the GPU's visible set with merged pipelines +6.7 ms vs the CPU path, with per-mesh pipelines +0.3 ms).
-   *  The alternation it worked around is gone at the source: the draw rank now keys plain / full
-   *  (Renderer3D.rankPatterned), so plain and patterned records form separate runs. */
-  static mergePatterned = false;
   /** PHASE C: the shadow casters of the GPU records (far map: direct / static / dynamic layers; each near cascade:
    *  static / dynamic) are decided by a compute pass from the same records in light space (the CPU path's rules: light
    *  box, shadow reach, shadow LOD, the P4.2 / P14 static / dynamic split and joiners) and drawn from render bundles;

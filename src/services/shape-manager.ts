@@ -936,6 +936,13 @@ class ShapeManager {
         // Ctrl+Z / Ctrl+Y in Edit Mesh / Armature belong to the host's mode-scoped undo: the engine's 2D-object undo key
         // stands down (it consumed the key whenever the 2D stack was non-empty, so the mode's undo never saw it).
         this.interactionService.undoKeysOwnedByEditMode3D = () => this.meshEdit.isEditing || this.scene3d.isArmatureModeActive3D();
+        // The edit camera orbits around the Edit Mesh selection's centre (nothing selected: the mesh's bounds centre).
+        this.scene3d.setEditSelectionPivotProvider(() => {
+            const id = this.meshEdit.isEditing ? this.meshEdit.activeMeshId : null;
+            if (!id || this.meshEdit.selectedVertexIndices(id).length === 0) return null;
+            const b = this.meshEdit.selectionWorldBounds(id);
+            return b ? [(b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, (b.minZ + b.maxZ) / 2] : null;
+        });
 
         // Supply live edit state to the mesh edit overlay renderer each frame.
         // Handles two independent modes:
@@ -5003,6 +5010,18 @@ class ShapeManager {
         return this.scene3d.getMeshEditBgMode3D();
     }
 
+    /** ONE switch for the edit-mode focus backgrounds' 'wavy' animation — armature, mesh edit / UV and the packaging
+     *  creator stage alike: true = animate, false = drawn frozen (a still frame, no live loop), null = the machine caps
+     *  decide (gpu-capabilities animatedFocusBg; the default). The host's View setting. */
+    public setFocusBgAnimate3D(on: boolean | null): void {
+        this.scene3d.setFocusBgAnimate3D(on);
+    }
+
+    /** The focus backgrounds' 'wavy' theme animates (the switch, else the machine caps). */
+    public getFocusBgAnimate3D(): boolean {
+        return this.scene3d.getFocusBgAnimate3D();
+    }
+
     /**
      * Fit the camera to the given mesh so it fills the viewport during armature editing.
      * Call after showBoneOverlay3D to center the view on the mesh being rigged.
@@ -7605,21 +7624,12 @@ class ShapeManager {
      *  nobody reads; `mdi` = use Chrome's experimental multi-draw-indirect when the device has it and the draw order
      *  has few state buckets. Returns the current values (+ whether the device has multi-draw and the cull compiled). */
     public setGpuDriven3D(o: Parameters<Renderer3D['setGpuDriven']>[0]): ReturnType<Renderer3D['setGpuDriven']> { const r = this.renderer3D.setGpuDriven(o); this.scheduleRender(); return r; }
-    /** Step 8 (performance-plan §P21): the specialised mesh shader variants: `{ enabled }` switches them (A/B; same
-     *  pixels), `{ max }` caps the variant keys; returns the keys in use, compiled / pending pipelines and compile ms. */
-    public setShaderVariants3D(o: Parameters<Renderer3D['setShaderVariants']>[0] = {}): ReturnType<Renderer3D['setShaderVariants']> { const r = this.renderer3D.setShaderVariants(o); this.scheduleRender(); return r; }
-    public getShaderVariants3D(): ReturnType<Renderer3D['setShaderVariants']> { return this.renderer3D.setShaderVariants({}); }
-    /** SHADER SPLIT phase 1 (docs/specs/shader-split.md; docs/ui/gpu-diagnostics.md): `{ enabled }` / `{ mode: 'on' |
-     *  'off' | 'auto' }` switches it per machine (localStorage salsa.shaderSplit; reload for the full effect), `bisect`
-     *  ('none' | 'noTexSample' | 'minimal') picks the RENDER-1 bisect keys, and the test knobs `forceFallback` /
-     *  `noFallback` / `slowCompileMs` exercise the fallback and hold paths. Returns the state + keys, compiled / pending
-     *  pipelines, sizes, compile ms and the exact / fallback / held selection counters. */
-    // (phase 2: also `noStandIn` (shadow stand-in off), `maxKeys` (key cap, session), `exclude` (families on today's
-    // pipelines, per machine: 'patterns' | 'windows' | 'adScreens' | 'ground' | 'water' | 'leaf' | 'triplanar' | 'phase2'),
-    // `clearJournal`; the result adds standIn / widened / exactKeys / maxKeys / journal / exclude.)
-    // (phase 3, 2026-10-07: ON BY DEFAULT on every tier; 'auto' = on. The ROLLBACK is `{ mode: 'off' }` (or
-    // `{ enabled: false }`, or render debug noShaderSplit), then reload; `{ mode: 'auto' }` undoes it. The result adds
-    // uberModules / uberPipelines: uber-shader modules created / replaced uber pipelines compiled, 0 while split.)
+    /** SHADER SPLIT (docs/specs/shader-split.md; docs/ui/gpu-diagnostics.md): the mesh pipelines' diagnostics and test
+     *  knobs. There is no on / off switch: since phase 4 (2026-10-08) the split is the only mesh shader path (the uber
+     *  shader, its rollback and the P21 variants are gone). `bisect` ('none' | 'noTexSample' | 'minimal') picks the
+     *  RENDER-1 bisect keys; `forceFallback` / `noFallback` / `noStandIn` / `slowCompileMs` exercise the fallback, hold
+     *  and shadow stand-in paths; `maxKeys` sets the key cap (session); `clearJournal` / `resetCounters`. Returns the
+     *  keys, compiled / pending pipelines, sizes, compile ms and the exact / fallback / stand-in / held counters. */
     public setShaderSplit3D(o: Parameters<Renderer3D['setShaderSplit']>[0] = {}): ReturnType<Renderer3D['setShaderSplit']> { const r = this.renderer3D.setShaderSplit(o); this.scheduleRender(); return r; }
     public getShaderSplit3D(): ReturnType<Renderer3D['setShaderSplit']> { return this.renderer3D.setShaderSplit({}); }
     /** P15 diagnostics: records / draw order / buckets, the GPU-reported counters (one frame late, `age`), rebuilds,
@@ -8212,6 +8222,19 @@ class ShapeManager {
     public pickMeshEditElementAt3D(clientX: number, clientY: number, touch = false): MeshEditElementHit | null {
         return this._meshEditPointerController.pickElementAt(clientX, clientY, touch);
     }
+
+    /** One-shot FACE PICK in Edit Mesh (Mirror "Use Face": tap the button, then tap a face). The next TAP on a face of
+     *  the edited mesh is consumed — the selection doesn't change — and `onPick(faceIndex)` runs; drags still orbit and
+     *  two fingers still pan / zoom; a tap on no face does nothing. Disarmed by the pick, cancelMeshEditFacePick3D, a
+     *  switch to Vertex / Edge, another tool or leaving Edit Mesh — those call `onPick(null)`. False when Edit Mesh's
+     *  pointer handlers aren't attached. */
+    public armMeshEditFacePick3D(onPick: (faceIndex: number | null) => void): boolean {
+        return this._meshEditPointerController.armFacePick(onPick);
+    }
+    /** Disarm the face pick (its callback gets null). False when none was armed. */
+    public cancelMeshEditFacePick3D(): boolean { return this._meshEditPointerController.cancelFacePick(); }
+    /** A one-shot face pick is armed (armMeshEditFacePick3D). */
+    public isMeshEditFacePickArmed3D(): boolean { return this._meshEditPointerController.facePickArmed; }
 
     /** The Edit Mesh tool strip's tool: select (taps select, no gizmo) | move / rotate / scale (the selection gizmo in
      *  that mode — the same as setMeshEditGizmoMode3D) | extrude / inset / bevel (the host runs the op; selection as

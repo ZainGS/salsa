@@ -305,7 +305,6 @@ export class Scene3DArmature {
     private _wrapperMeshCache: Mesh3D[] | null = null;
     private _wrapperMeshCacheBase: Mesh3D[] | null = null;
     private _thinWrapperTransformSyncs: ((container: MeshGroup3D) => void)[] = [];
-    private _hoverAnimHeld = false;
 
     constructor(
         private readonly ctx: ManagerContext,
@@ -1105,6 +1104,8 @@ export class Scene3DArmature {
         // host's Pan tool pans (live: they follow the mode, whichever controller instance is up).
         orb.isEditNav = () => this._editViewOwner !== null;
         orb.isPanTool = () => this.isEditPanTool();
+        // Edit views orbit around the selection's centre (else the subject's bounds centre); the scene: the target.
+        orb.getOrbitPivot = () => this.getEditOrbitPivot();
         // Ortho pinch: the decoupled creator view zooms `_meshEditZoom` (like its wheel interceptor); an illustration-
         // synced ortho view zooms the 2D view, which the per-frame sync turns into orthoSize.
         orb.onTouchZoom = (ratio, cx, cy) => {
@@ -1323,6 +1324,42 @@ export class Scene3DArmature {
 
     /** Which edit mode owns the decoupled edit camera (null = none). */
     get editViewOwner(): EditViewOwner | null { return this._editViewOwner; }
+
+    /** Host (ShapeManager): the WORLD centre of the Edit Mesh selection (the selected vertices / edges / faces, real
+     *  elements only), or null when nothing is selected / Edit Mesh isn't up. */
+    editSelectionPivotProvider: (() => [number, number, number] | null) | null = null;
+
+    /**
+     * The point an edit-view orbit gesture revolves around (OrbitController.getOrbitPivot, asked when each orbit
+     * starts): Edit Mesh — the selection's centre, else the mesh's bounding-box centre; UV editor — the mesh's
+     * bounding-box centre; Armature — the selected joints' centre, else the mesh's bounds centre (no mesh: the
+     * skeleton's). Null outside an edit view (the scene orbits around its target, as before).
+     */
+    getEditOrbitPivot(): [number, number, number] | null {
+        const owner = this._editViewOwner;
+        if (owner === 'meshEdit') {
+            let sel: [number, number, number] | null = null;
+            try { sel = this.editSelectionPivotProvider?.() ?? null; } catch { sel = null; }
+            return sel ?? this.getMeshCenter(this._meshEditCamMeshId);
+        }
+        if (owner !== 'armature') return null;
+        const skel = this._boneOverlaySkeletonId ? this.getSkeleton(this._boneOverlaySkeletonId) : null;
+        const joints = skel?.data.joints ?? [];
+        const centre = (list: ArrayLike<{ worldMatrix: ArrayLike<number> } | undefined>): [number, number, number] | null => {
+            let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+            for (let i = 0; i < list.length; i++) {
+                const m = list[i]?.worldMatrix;
+                if (!m) continue;
+                const x = m[12], y = m[13], z = m[14];
+                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+                if (x < x0) x0 = x; if (y < y0) y0 = y; if (z < z0) z0 = z;
+                if (x > x1) x1 = x; if (y > y1) y1 = y; if (z > z1) z1 = z;
+            }
+            return x0 <= x1 ? [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2] : null;
+        };
+        const picked = this.getSelectedArmatureJoints().map(s => joints[s.jointIndex]);
+        return (picked.length > 0 ? centre(picked) : null) ?? this.getMeshCenter(this._armCamMeshId) ?? centre(joints);
+    }
 
     /** The host's Pan (hand) tool is on in an edit view (ShapeManager.enablePanningTool): a drag pans the edit camera
      *  and the mode's tools ignore the press. */
@@ -1746,16 +1783,20 @@ export class Scene3DArmature {
         if (!this._boneOverlayExplicit) return;
     }
 
+    /** An edit mode owns the viewport — Edit Mesh / UV (the mesh-edit checker, the shared edit camera), the Armature
+     *  (bone overlay or armature mode, with or without a skeleton yet), Grease Pencil drawing: no object selection /
+     *  deselection by a viewport press or tap, and no object hover highlight. */
+    isObjectInputLocked(): boolean {
+        return this._boneOverlayExplicit || this._editViewOwner !== null || this.renderer3D.armatureModeActive === true
+            || (this._isMeshEditModeFn?.() ?? false) || this.host.gpDrawActive === true;
+    }
+
     setHoveredMesh(id: string | null): void {
         if (this._cityModeActive) id = null;   // City mode: no blue hover outlines on the diorama (it's a workspace, not a selection)
-        // Keep frames flowing while an ANIMATED hover outline is shown (a static mouse must still scroll the pattern).
-        // Balanced begin/end via `_hoverAnimHeld`, mirroring the focus-bg live lease.
-        const needAnim = id != null && this.renderer3D.hoverOutlineAnimated;
-        if (needAnim !== this._hoverAnimHeld) {
-            this._hoverAnimHeld = needAnim;
-            if (needAnim) this.ctx.interactionService.beginInteractive();
-            else this.ctx.interactionService.endInteractive();
-        }
+        if (this.isObjectInputLocked()) id = null;   // edit modes: no object hover highlight (any source)
+        // An ANIMATED outline keeps frames flowing through the renderer's self-evaluating 'hoverOutline' pre-render
+        // callback (Scene3DManager) — for HOVER_ANIM_HOLD_MS after the hover changed / the pointer last moved over it.
+        // (A begin/endInteractive hold here used to keep the loop live for as long as the pointer RESTED on a mesh.)
         if (!id) {
             this.renderer3D.setHoveredMeshIds(new Set());
             this.renderer3D.setHoveredArrayGroupId(null);
@@ -1922,6 +1963,10 @@ export class Scene3DArmature {
                     if (container) this._notifyThinWrapperSync(container);
                     this.ctx.scheduleRender();
                 };
+                // A press on a handle released without moving changed nothing: no (empty) undo step.
+                const same = (a: any, b: any) => !!a && !!b && a.x === b.x && a.y === b.y && a.z === b.z && a.rx === b.rx
+                    && a.ry === b.ry && a.rz === b.rz && a.sx === b.sx && a.sy === b.sy && a.sz === b.sz;
+                if ([...after].every(([id, s]) => same(before.get(id), s))) return;
                 this._undoManager.push({
                     description: 'Transform mesh',
                     undo: () => apply(before),
@@ -1976,7 +2021,9 @@ export class Scene3DArmature {
                 for (const id of meshIds) this._flaRestTransforms.delete(id);
             },
             isInMeshEditMode: () => this._isMeshEditModeFn?.() ?? false,
-            isBoneOverlayActive: () => this._boneOverlayExplicit,
+            // The Armature owns viewport clicks from the moment the mode opens — also before a skeleton exists (the
+            // overlay isn't pinned yet): no mesh click-select / deselect, no mesh gizmo.
+            isBoneOverlayActive: () => this._boneOverlayExplicit || this.renderer3D.armatureModeActive === true,
             isAdditiveSelect: () => this.ctx.interactionService.additiveSelect3D === true,
             isSnapLatched: () => this.ctx.interactionService.snapLatch3D === true,
             isInputSuppressed: () => this.host.isPlaying || this.host.gpDrawActive === true,
@@ -2000,6 +2047,7 @@ export class Scene3DArmature {
                 const g0 = this._getArrayGroup(groupId);
                 if (!g0) return;
                 const key = g0.arrayParams.mode === 'grid' ? 'spacingX' : 'spacing';
+                if (oldSpacing.every((v, i) => v === newSpacing[i])) return;   // released without moving: no step
                 const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
                 this._undoManager.push({
                     description: 'Adjust array spacing',
@@ -2025,7 +2073,7 @@ export class Scene3DArmature {
                 }
             },
             onArraySpacingYCommit: (groupId: string, oldSpacingY: [number, number, number], newSpacingY: [number, number, number]) => {
-                if (!this._getArrayGroup(groupId)) return;
+                if (!this._getArrayGroup(groupId) || oldSpacingY.every((v, i) => v === newSpacingY[i])) return;
                 const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
                 this._undoManager.push({
                     description: 'Adjust grid Y spacing',
@@ -2051,7 +2099,7 @@ export class Scene3DArmature {
                 }
             },
             onArrayRadiusCommit: (groupId: string, oldRadius: number, newRadius: number) => {
-                if (!this._getArrayGroup(groupId)) return;
+                if (!this._getArrayGroup(groupId) || oldRadius === newRadius) return;
                 const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
                 this._undoManager.push({
                     description: 'Adjust radial array radius',
@@ -2853,13 +2901,25 @@ export class Scene3DArmature {
      *  IK hover highlights. A finger never hovers (TOUCH-16). */
     private _armHover(x: number, y: number, w: number, h: number): void {
         this._bonePlacementPreview(x, y, w, h);
-        // Suppress mesh hover highlight during bone placement — clicks belong to the bone system.
-        if (!this._bonePlacementMode) {
+        // No mesh hover highlight during bone placement (clicks belong to the bone system) or in any edit mode (the
+        // mode's own elements are the targets) — and no full-scene hover raycast either (it ran once per frame for as
+        // long as the pen hovered, CPU-skinning a posed body each time its pose changed).
+        if (this._bonePlacementMode || this.isObjectInputLocked()) {
+            if (this._ptrHoverId !== null || this.renderer3D.getHoveredMeshIds().size > 0) {
+                this.setHoveredMesh(null);
+                this._ptrHoverId = null;
+                this._ptrHoverSet = this.renderer3D.getHoveredMeshIds();
+            }
+        } else {
             const id = this.pick3D(x, y, w, h)?.meshId ?? null;
             if (id !== this._ptrHoverId || this.renderer3D.getHoveredMeshIds() !== this._ptrHoverSet) {
                 this.setHoveredMesh(id);
                 this._ptrHoverId = id;
                 this._ptrHoverSet = this.renderer3D.getHoveredMeshIds();
+            } else if (id !== null && this.renderer3D.hoverOutlineAnimated && this.renderer3D.hoverOutlineAnimExpired) {
+                // the pointer moves over the same mesh after its outline animation went idle: run it again
+                this.renderer3D.refreshHoverOutlineAnim();
+                this.ctx.scheduleRender();
             }
         }
         if (!this._gizmoRenderer || !this._boneOverlayExplicit || !this._boneOverlaySkeletonId) return;

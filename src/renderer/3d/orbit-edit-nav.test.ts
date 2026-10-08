@@ -40,7 +40,7 @@ function setup(opts: { editNav?: boolean; pan?: boolean; ortho?: boolean } = {})
 }
 
 describe('OrbitController — edit-view navigation (pen / finger)', () => {
-  it('pen: a drag past the slop orbits from the PRESS point; inside the slop (a tap) nothing moves', () => {
+  it('pen: a drag past the slop orbits, following the pen from where it passed the slop (no jump); a tap moves nothing', () => {
     const t = setup();
     expect(t.orb.editNavActive).toBe(true);
     const az0 = t.orb.azimuth;
@@ -48,16 +48,16 @@ describe('OrbitController — edit-view navigation (pen / finger)', () => {
     t.fire('pointermove', { pointerType: 'pen', clientX: 105, clientY: 100 });
     expect(t.orb.azimuth).toBe(az0);                                   // a tap so far
     t.fire('pointermove', { pointerType: 'pen', clientX: 120, clientY: 100 });
-    expect(t.orb.azimuth).toBeCloseTo(az0 - 20 * t.orb.orbitSpeed, 12);
+    expect(t.orb.azimuth).toBe(az0);                                   // the slop movement isn't applied (no jump)
     t.fire('pointermove', { pointerType: 'pen', clientX: 130, clientY: 100 });
-    expect(t.orb.azimuth).toBeCloseTo(az0 - 30 * t.orb.orbitSpeed, 12);
+    expect(t.orb.azimuth).toBeCloseTo(az0 - 10 * t.orb.orbitSpeed, 12);
     t.fire('pointerup', { pointerType: 'pen', clientX: 130, clientY: 100 });
     t.fire('pointermove', { pointerType: 'pen', clientX: 200, clientY: 100 });   // hover after the lift: nothing
-    expect(t.orb.azimuth).toBeCloseTo(az0 - 30 * t.orb.orbitSpeed, 12);
+    expect(t.orb.azimuth).toBeCloseTo(az0 - 10 * t.orb.orbitSpeed, 12);
     // a tap: press + release inside the slop
     t.fire('pointerdown', { pointerType: 'pen', clientX: 300, clientY: 300 });
     t.fire('pointerup', { pointerType: 'pen', clientX: 303, clientY: 302 });
-    expect(t.orb.azimuth).toBeCloseTo(az0 - 30 * t.orb.orbitSpeed, 12);
+    expect(t.orb.azimuth).toBeCloseTo(az0 - 10 * t.orb.orbitSpeed, 12);
   });
 
   it('pen / finger: a press a tool CLAIMED (a drag of the selection, a gizmo, a stroke) never orbits', () => {
@@ -85,8 +85,10 @@ describe('OrbitController — edit-view navigation (pen / finger)', () => {
     t.fire('pointermove', { pointerType: 'touch', clientX: 104, clientY: 100 });
     expect(t.orb.azimuth).toBe(az0);
     t.fire('pointermove', { pointerType: 'touch', clientX: 140, clientY: 100 });
-    expect(t.orb.azimuth).toBeCloseTo(az0 - 40 * t.orb.orbitSpeed, 12);
-    t.fire('pointerup', { pointerType: 'touch', clientX: 140, clientY: 100 });
+    expect(t.orb.azimuth).toBe(az0);                                  // passing the slop: no jump…
+    t.fire('pointermove', { pointerType: 'touch', clientX: 160, clientY: 100 });
+    expect(t.orb.azimuth).toBeCloseTo(az0 - 20 * t.orb.orbitSpeed, 12);   // …then it follows the finger
+    t.fire('pointerup', { pointerType: 'touch', clientX: 160, clientY: 100 });
     const az1 = t.orb.azimuth, t0 = t.tgt();
     t.fire('pointerdown', { pointerType: 'touch', pointerId: 1, clientX: 300, clientY: 300 });
     t.fire('pointerdown', { pointerType: 'touch', pointerId: 2, isPrimary: false, clientX: 400, clientY: 300 });
@@ -151,7 +153,8 @@ describe('OrbitController — the host Pan tool in an edit view', () => {
     const t1 = t.tgt();
     t.fire('pointerdown', { pointerType: 'pen', clientX: 100, clientY: 100 });
     t.fire('pointermove', { pointerType: 'pen', clientX: 140, clientY: 100 });
-    t.fire('pointerup', { pointerType: 'pen', clientX: 140, clientY: 100 });
+    t.fire('pointermove', { pointerType: 'pen', clientX: 160, clientY: 100 });
+    t.fire('pointerup', { pointerType: 'pen', clientX: 160, clientY: 100 });
     expect(t.tgt()).toEqual(t1);
     expect(t.orb.azimuth).not.toBe(az0);                              // a pen drag orbits again
   });

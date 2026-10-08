@@ -1,8 +1,9 @@
 /**
  * THE MERGED MESH FRAGMENT SHADER TEMPLATE (docs/specs/shader-split.md §3.4; phase 1 of the shader split).
  *
- * ONE source for every mesh fragment shader: the textured and untextured fragment templates of mesh3d-shaders.ts
- * merged line by line, with `//#if` directives (wgsl-preprocess.ts) around every feature block. The generator
+ * ONE source for every mesh fragment shader: the textured and untextured fragment templates of the old uber-shader
+ * (mesh3d-shaders.ts until shader-split phase 4, 2026-10-08) merged line by line, with `//#if` directives
+ * (wgsl-preprocess.ts) around every feature block. The generator
  * (mesh-fs-generate.ts) keeps a key's blocks, removes the rest, and the tree-shaker (wgsl-treeshake.ts) then drops every
  * helper, struct, constant and binding nothing calls any more. So a plain cube's shader contains the plain PBR path,
  * not the ground / window / SSR / CD / toon code the uber-shader carries for every pixel.
@@ -26,14 +27,19 @@
  *                          material features (mesh-fs-key.ts maps them to flag bits)
  *   PAT_1 .. PAT_7         procedural pattern modes; derived: PAT_ANY (1-7), PAT_TILED (1-5), PAT_RELIEF (1-6)
  *   TEX_DIFFUSE            derived: the diffuse texture is sampled (TEX and any of TEXSAMPLE, CUTOUT, TRIPLANAR, GARP)
+ *   PLAIN_ROUTE            the pattern block takes its PLAIN defaults (no pattern mask, window / footprint, ground
+ *                          metric, ad screen), every later block stays as the key says: exactly the pre-split PLAIN
+ *                          uber shader, for the two draw sites that routed a slot to it by another material (the
+ *                          face-kit multiply axis; the planar mirror's multi-material entry). MeshFsKey.plain.
  *
  * The two old templates differ in places (§2.6: inputs 5-7, the fog-horizon fast path, PS1 placement, fog of unlit,
  * glass, board, CD label, debug unlit, the *Untex names, the shadow group). Every difference is kept as a
  * `//#if TEX` / `//#else` pair, so the generated shaders reproduce each template exactly.
  *
- * DRIFT GUARD: shader-split.test.ts generates the all-features key and compares it with today's exported strings
- * (MESH3D_FRAGMENT_SHADER[_UNTEXTURED][_SHADOW_MODERN]) after normalisation. An edit to the old templates that is not
- * mirrored here fails that test. Until phase 4 deletes the old templates, edit BOTH.
+ * DRIFT GUARD: until phase 4 shader-split.test.ts compared the all-features key with the uber-shaders after
+ * normalisation (equal when they were deleted, 2026-10-08); it now checks a frozen sha256 of that normalised text. A
+ * deliberate change to this template or the helper library (mesh3d-shaders.ts) updates the hashes there; treat it as a
+ * pixel change and verify it like one (shader-split.md §6.4). This file is now the ONLY mesh fragment source.
  *
  * No backticks anywhere in the WGSL below (it is a template string).
  */
@@ -42,9 +48,9 @@ import { STYLE_WGSL_FUNCTIONS } from './style-shaders';
 import { CROWD_PALETTE_WGSL } from '../crowd-palette';
 import { PBR_IBL_WGSL, FOG_FADE_WGSL, LEAF_CARD_WGSL, SHADOW_SAMPLE_WGSL } from './mesh3d-shaders';
 
-/** Insert directive lines into a copy of the shared helper library without touching the original text (the legacy
- *  strings stay byte-identical until phase 4 moves the directives into the library itself). Every anchor must occur
- *  exactly once: a drifted anchor throws at module load. */
+/** Insert directive lines into a copy of the shared helper library without touching the original text (the library
+ *  strings in mesh3d-shaders.ts are shared with other passes; moving the directives into the library itself is an
+ *  optional clean-up). Every anchor must occur exactly once: a drifted anchor throws at module load. */
 function injectLibraryDirectives(lib: string): string {
   const edits: [string, string][] = [
     // P4b planar mirror sample (bit 26): its `if` arm and the `else` that chains the SSR arm onto it.
@@ -368,7 +374,7 @@ fn fs_main(
   // fwidth-using helper (patternMask x3, windowsPattern / the footprint, the ground metric) runs at the TOP LEVEL so
   // fwidth stays in uniform control flow; results are gated afterwards. A key without the feature gets the PLAIN
   // default instead (today's PATTERN_BLOCK_PLAIN values: identical for every mesh outside the feature).
-//#if PAT_ANY
+//#if PAT_ANY && !PLAIN_ROUTE
   let patMask = patternMask(uv, patMode, inst.patternParams, scene.ps1Config2.z);
   // Relief step in pattern CELLS. DOTS (mode 2) use a fine step: at 0.35 cell the shifted mask of a small stud
   // never overlaps the stud itself, so every dot grew an offset ghost twin (tactile paving, city-quality S3).
@@ -384,27 +390,27 @@ fn fs_main(
   // P8 shader fast paths (Renderer3D.shaderFastPaths -> scene.cascadeBias.z): bit-identical shortcuts in the facade
   // pattern (windowsPattern / windowShade) and the procedural ground; 0 = the original code paths (A/B).
   let p8Fast = scene.cascadeBias.z > 0.5;
-//#if GROUND || AD_SCREEN
+//#if (GROUND || AD_SCREEN) && !PLAIN_ROUTE
   let gUvFw = fwidth(uv);                                        // P8 ground relief LOD footprint (uniform flow)
 //#else
   let gUvFw = vec2<f32>(0.0, 0.0);
 //#endif
-//#if PAT_6
+//#if PAT_6 && !PLAIN_ROUTE
   let winWL = windowsPattern(uv, inst.patternParams, scene.ps1Config2.z, patMode == 6u, p8Fast);
-//#elif PAT_TILED
+//#elif PAT_TILED && !PLAIN_ROUTE
   let winWL = vec4<f32>(0.0, 0.0, 0.0, patFootprint(uv, inst.patternParams));   // modes 1-5 read only the footprint .w
 //#else
   let winWL = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 //#endif
-//#if GROUND
+//#if GROUND && !PLAIN_ROUTE
   let gUvM = gr_uvMetres(uv, worldPos);
 //#else
   let gUvM = vec2<f32>(0.0, 0.0);
 //#endif
-//#if PAT_6 || AD_SCREEN
+//#if (PAT_6 || AD_SCREEN) && !PLAIN_ROUTE
   let winAx = uvWorldAxes(uv, worldPos);                         // interior-mapping cell frame (uniform flow)
 //#endif
-//#if PAT_ANY
+//#if PAT_ANY && !PLAIN_ROUTE
   var patBase = mix(inst.diffuseColor.rgb, inst.patternColor.rgb, patMask);
 //#else
   var patBase = inst.diffuseColor.rgb;
@@ -417,7 +423,7 @@ fn fs_main(
   emissiveRGB = emissiveRGB * crowdK;
 //#endif
   var roughOverride = inst.roughness;
-//#if PAT_6
+//#if PAT_6 && !PLAIN_ROUTE
   if (patMode == 6u && !fhSkip) {   // fog horizon: a fogged pixel needs no window interior
     let ws = windowShade(uv, inst.patternParams, winWL, worldPos, worldNormal, winAx, scene.cameraPosition.xyz,
                          inst.diffuseColor.rgb, inst.patternColor.rgb, inst.emissive, scene.ps1Config2.z, p8Fast, inst.patternColor.a);
@@ -428,7 +434,7 @@ fn fs_main(
   else
 //#endif
 //#endif
-//#if PAT_7
+//#if PAT_7 && !PLAIN_ROUTE
   if (patMode == 7u) {
 //#if AD_SCREEN
     if (inst.patternParams.z > 1.5) {

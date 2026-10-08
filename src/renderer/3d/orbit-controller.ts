@@ -42,9 +42,10 @@ export interface OrbitControllerConfig {
   panSpeed?: number;
   /** Zoom sensitivity (radius multiplier per scroll step). */
   zoomSpeed?: number;
-  /** Enable damping (smooth deceleration). */
+  /** Enable damping: a release FLING (the orbit glides on briefly, from the speed of the last ~100 ms of the drag).
+   *  The drag itself always follows the pointer 1:1 (orbitSpeed rad / px). */
   enableDamping?: boolean;
-  /** Damping factor (0–1, lower = more damping). */
+  /** Per-frame decay of the release fling (0–1, higher = stops sooner). */
   dampingFactor?: number;
   /** When true, orbit only activates on Alt+left-drag. Plain left-drag is ignored. */
   altOrbitOnly?: boolean;
@@ -168,6 +169,17 @@ export class OrbitController {
   isPanTool?: () => boolean;
   /** Pen / finger movement (CSS px) that turns an unclaimed edit-view press into a camera orbit. */
   static TOOL_DRAG_SLOP_PX = 8;
+  /** Live host: the WORLD point an orbit gesture revolves around, asked once when each orbit gesture STARTS (a mouse
+   *  orbit press, a pen / finger drag turning into an orbit, a one- / two-finger orbit). The camera rig (target +
+   *  position) then turns rigidly around it, so the pivot keeps its place on screen — nothing jumps when the orbit
+   *  starts, and pan / zoom carry on from wherever the orbit left the target. Null / absent = the classic orbit around
+   *  the target. The edit views (Edit Mesh / UV / Armature) return the selection's centre, else the subject's bounds
+   *  centre; the scene's orbit has no hook. */
+  getOrbitPivot?: () => ArrayLike<number> | null;
+  /** The pivot of the current (or last, while its momentum runs) orbit gesture; null = orbit around the target. */
+  private _pivot: [number, number, number] | null = null;
+  /** The pivot the current orbit gesture turns around (null = the target). */
+  get orbitPivot(): readonly [number, number, number] | null { return this._pivot; }
   /** Edit navigation is on (see {@link isEditNav}). */
   get editNavActive(): boolean { return !this.freeLookNav && !!this.isEditNav?.(); }
   private get _panToolOn(): boolean { return this.editNavActive && !!this.isPanTool?.(); }
@@ -204,9 +216,26 @@ export class OrbitController {
    *  share _lastX/_lastY, so a second pointer made the camera jump by the distance between them). */
   private _dragPointerId: number | null = null;
 
-  // Damping velocities
+  // Release-fling velocities (rad per frame; see update()). A drag itself turns the camera DIRECTLY (it follows the
+  // pointer); these only carry the momentum a drag had at its release.
   private _azimuthVel = 0;
   private _elevationVel = 0;
+  /** Orbit movement of the current drag (CSS px, time ms) — pruned to the last {@link FLING_WINDOW_MS}; the release
+   *  fling is measured from it. */
+  private _orbitSamples: { t: number; dx: number; dy: number }[] = [];
+  private _orbitT0 = 0;
+  /** Release fling (damped orbits): only movement within this many ms before the lift counts. */
+  static FLING_WINDOW_MS = 100;
+  /** No movement for this long before the lift = the pointer stopped → no fling. */
+  static FLING_STOP_MS = 50;
+  /** Pointer speed (CSS px / ms) ramp: no fling below the first value, the full fling above the second — a slow,
+   *  careful drag never glides on. */
+  static FLING_MIN_SPEED = 0.25;
+  static FLING_FULL_SPEED = 0.8;
+  /** Cap on the release speed (CSS px / ms), so one odd event delta can't spin the view. */
+  static FLING_MAX_SPEED = 3;
+  /** The whole glide after a release = the pointer's travel over this many ms at its release speed. */
+  static FLING_GLIDE_MS = 120;
 
   // Bound handlers (for cleanup)
   private _onPointerDown: (e: PointerEvent) => void;
@@ -305,6 +334,7 @@ export class OrbitController {
       if (e.button === 0) {
         if (!e.altKey) return;                        // plain LMB → leave it for selection
         this._isDragging = true; this._isMiddleDrag = false; this._isLookDrag = false;   // Alt+LMB orbit
+        this._beginOrbitGesture();
       } else if (e.button === 1) {
         this._isDragging = true; this._isMiddleDrag = true;  this._isLookDrag = false;   // MMB pan
       } else if (e.button === 2) {
@@ -327,6 +357,7 @@ export class OrbitController {
         return;
       }
       if (e.pointerType === 'pen') {
+        if (this.enabled) this.stopDamping();   // a press catches a gliding view
         this._navCand = { id: e.pointerId ?? 0, x: e.clientX, y: e.clientY, ev: e, touch: false };
         return;
       }
@@ -336,6 +367,7 @@ export class OrbitController {
       if (this.altOrbitOnly && !e.altKey) return;
       this._isDragging = true;
       this._isMiddleDrag = false;
+      this._beginOrbitGesture();
     } else if (e.button === 1 || e.button === 2) {
       this._isDragging = true;
       this._isMiddleDrag = true;
@@ -352,11 +384,14 @@ export class OrbitController {
       if (Math.hypot(e.clientX - c.x, e.clientY - c.y) <= OrbitController.TOOL_DRAG_SLOP_PX) return;
       this._navCand = null;
       if (!this.enabled || isPointerEventClaimed(c.ev)) return;   // a tool took the press (it drags)
-      // the drag is the camera's: orbit from the PRESS point (the movement so far applies at once)
+      // The drag is the camera's: it follows the pointer from HERE. The slop movement is not applied (it used to be,
+      // all at once — a jump the moment a slow drag passed the slop).
       this._isDragging = true; this._isMiddleDrag = false;
-      this._lastX = c.x; this._lastY = c.y;
+      this._beginOrbitGesture();
+      this._lastX = e.clientX; this._lastY = e.clientY;
       this._dragPointerId = c.id;
       try { this._canvas?.setPointerCapture?.(c.id); this._navCaptured = c.id; } catch { /* pointer already gone */ }
+      return;
     }
     if (!this.enabled || !this._isDragging) return;
     // Only the pointer that started the drag moves the camera (a second pointer used to share _lastX → a jump).
@@ -375,7 +410,7 @@ export class OrbitController {
     }
   }
 
-  private handlePointerUp(e: PointerEvent): void {
+  private handlePointerUp(e: PointerEvent, cancelled = false): void {
     if (e.pointerType === 'touch') { this._touchUp(e, false); return; }
     if (this._navCand && !this._navCand.touch && (e.pointerId ?? 0) === this._navCand.id) {
       // (a pointerleave of a captured nav drag is not its end)
@@ -390,13 +425,14 @@ export class OrbitController {
       this._navCaptured = null;
     }
     if (this._isLookDrag) { this._isLookDrag = false; this.onLookEnd?.(); }   // RMB released → host stops WASD fly
+    if (this._isDragging) this._releaseOrbit(cancelled);
     this._isDragging = false;
     this._dragPointerId = null;
   }
 
   private handlePointerCancel(e: PointerEvent): void {
     if (e.pointerType === 'touch') { this._touchUp(e, true); return; }
-    this.handlePointerUp(e);
+    this.handlePointerUp(e, true);
   }
 
   // ── Touch gestures (TOUCH-3) ───────────────────────────────────
@@ -428,6 +464,20 @@ export class OrbitController {
     this._touchMidX = c.x; this._touchMidY = c.y; this._touchDist = c.dist;
     this._touchGesture = this._touches.size >= 3 ? 'three' : 'two';
     this._touchOne = null;
+    if (this._touchGesture === 'two' && this._twoFingerOrbits) this._beginOrbitGesture();
+  }
+
+  /** Two fingers ORBIT (altOrbitOnly tool modes outside the edit views); otherwise they pan. */
+  private get _twoFingerOrbits(): boolean { return this.altOrbitOnly && !this.touchNavLock && !this.editNavActive; }
+
+  /** An orbit gesture starts: take the host's pivot for it (see {@link getOrbitPivot}). */
+  private _beginOrbitGesture(): void {
+    this.stopDamping();                       // a running fling ends; the new drag owns the camera
+    this._orbitSamples.length = 0;
+    this._orbitT0 = this._now();
+    const p = this.getOrbitPivot?.() ?? null;
+    this._pivot = p && p.length >= 3 && Number.isFinite(p[0]) && Number.isFinite(p[1]) && Number.isFinite(p[2])
+      ? [p[0], p[1], p[2]] : null;
   }
 
   private _touchDown(e: PointerEvent): void {
@@ -440,6 +490,7 @@ export class OrbitController {
       this._tap = { id, x: e.clientX, y: e.clientY, t: this._now(), moved: false };
       this._navCand = null;
       if (!this.enabled) { this._touchGesture = 'none'; return; }
+      this.stopDamping();   // a finger down catches a gliding view
       if (this.editNavActive && !this.touchNavLock) {
         // Edit views: the Pan tool pans at once; otherwise the finger is the tool's until it drags past the slop
         // unclaimed — then it orbits (_touchMove).
@@ -454,6 +505,7 @@ export class OrbitController {
       if (!this.touchNavLock && isPointerEventClaimed(e)) { this._tap = null; this._touchOne = null; this._touchGesture = 'none'; return; }
       this._touchOne = this._oneFingerAction();
       this._touchGesture = this._touchOne ? 'one' : 'none';
+      if (this._touchOne === 'orbit') this._beginOrbitGesture();
       return;
     }
     this._navCand = null;
@@ -476,7 +528,7 @@ export class OrbitController {
       this._navCand = null;
       if (!this.enabled || isPointerEventClaimed(nc.ev)) return;   // a tool took the press (it drags)
       this._touchOne = 'orbit'; this._touchGesture = 'one';
-      this.orbit(e.clientX - nc.x, e.clientY - nc.y);               // from the PRESS point
+      this._beginOrbitGesture();   // follows the finger from HERE (the slop movement isn't applied — no jump)
       return;
     }
     if (!this.enabled) return;
@@ -494,7 +546,7 @@ export class OrbitController {
     if (this._touchGesture === 'three') { this._touchPan(mdx, mdy); return; }
     // altOrbitOnly (tool modes): two fingers ORBIT (one finger is the tool's); otherwise two fingers PAN. Edit views
     // orbit with one finger off the selection, so there two fingers PAN.
-    if (this.altOrbitOnly && !this.touchNavLock && !this.editNavActive) { if (mdx !== 0 || mdy !== 0) this.orbit(mdx, mdy); }
+    if (this._twoFingerOrbits) { if (mdx !== 0 || mdy !== 0) this.orbit(mdx, mdy); }
     else this._touchPan(mdx, mdy);
     if (prevDist > 0 && c.dist > 0) this.pinch(c.dist / prevDist, c.x, c.y);
   }
@@ -521,6 +573,9 @@ export class OrbitController {
       }
     }
     const n = this._touches.size;
+    // The last finger of a one-finger orbit lifting: the release fling (none after a multi-finger gesture).
+    if (n === 0 && this._touchGesture === 'one' && this._touchOne === 'orbit' && this.enabled) this._releaseOrbit(cancelled);
+    else this._orbitSamples.length = 0;
     if (n === 0) { this._touchGesture = 'none'; this._touchOne = null; return; }
     // A finger left a 3-finger pan → continue as two fingers; after a multi-finger gesture the LAST finger does
     // nothing until it lifts (no surprise orbit when you end a pinch one finger at a time).
@@ -612,17 +667,71 @@ export class OrbitController {
 
   // ── Orbit / Pan ────────────────────────────────────────────────
 
+  /** One drag step: the camera turns DIRECTLY (it follows the pointer, orbitSpeed rad / px) and a frame is requested.
+   *  ★ It used to only ADD the delta to the damping velocity and leave the turn to update() — and request no frame.
+   *  On the on-demand renderer nothing drew while a slow pen drag ran (no frame → no update), the velocity piled up
+   *  undecayed, and the first frame after the release (a tap / selection redraw) spun it all out at once, ×12.5
+   *  (1 / dampingFactor). With damping on, the movement is also recorded for the release fling ({@link _releaseOrbit}). */
   private orbit(dx: number, dy: number): void {
+    if (dx === 0 && dy === 0) return;
+    this._turnTo(this.azimuth - dx * this.orbitSpeed, this.elevation + dy * this.orbitSpeed);
+    this.applySpherical();
+    this.onChange?.();
     if (this.enableDamping) {
-      this._azimuthVel -= dx * this.orbitSpeed;
-      this._elevationVel += dy * this.orbitSpeed;
-    } else {
-      this.azimuth -= dx * this.orbitSpeed;
-      this.elevation += dy * this.orbitSpeed;
-      this.elevation = Math.max(this.minElevation, Math.min(this.maxElevation, this.elevation));
-      this.applySpherical();
-      this.onChange?.();
+      const now = this._now(), s = this._orbitSamples;
+      s.push({ t: now, dx, dy });
+      while (s.length > 1 && now - s[0].t > OrbitController.FLING_WINDOW_MS) s.shift();
     }
+  }
+
+  /** A drag orbit ended: with damping on, start the release FLING from the pointer speed over the last
+   *  {@link FLING_WINDOW_MS} of real movement — none when the pointer had stopped ({@link FLING_STOP_MS}) or the drag
+   *  was slow ({@link FLING_MIN_SPEED}), the full glide only for a quick flick. A cancelled pointer never flings. */
+  private _releaseOrbit(cancelled: boolean): void {
+    const s = this._orbitSamples;
+    if (!this.enableDamping || cancelled || s.length === 0) { s.length = 0; return; }
+    const now = this._now();
+    const last = s[s.length - 1];
+    const winStart = now - OrbitController.FLING_WINDOW_MS;
+    let sx = 0, sy = 0;
+    for (const p of s) if (p.t >= winStart) { sx += p.dx; sy += p.dy; }
+    s.length = 0;
+    if (now - last.t > OrbitController.FLING_STOP_MS) return;          // stopped before the lift
+    const span = Math.max(1000 / 60, now - Math.max(winStart, this._orbitT0));
+    let vx = sx / span, vy = sy / span;                                 // CSS px / ms
+    const speed = Math.hypot(vx, vy);
+    const lo = OrbitController.FLING_MIN_SPEED, hi = OrbitController.FLING_FULL_SPEED;
+    if (!(speed > lo)) return;
+    const k = Math.min(1, (speed - lo) / (hi - lo)) * Math.min(1, OrbitController.FLING_MAX_SPEED / speed);
+    vx *= k; vy *= k;
+    // update() turns by the velocity each frame and decays it by (1 − dampingFactor): the whole glide is
+    // velocity / dampingFactor, so this makes it = the pointer's travel over FLING_GLIDE_MS at the release speed.
+    const g = OrbitController.FLING_GLIDE_MS * Math.max(0.01, this.dampingFactor) * this.orbitSpeed;
+    this._azimuthVel = -vx * g;
+    this._elevationVel = vy * g;
+    this.onChange?.();                                                  // the fling needs its first frame
+  }
+
+  /** Set the orbit angles (elevation clamped). With a gesture pivot ({@link getOrbitPivot}) the target turns around it
+   *  by the same rotation the angles make (yaw about world up, pitch about the camera's right axis), so after
+   *  applySpherical the whole camera rig has turned rigidly around the pivot. */
+  private _turnTo(azimuth: number, elevation: number): void {
+    const el = Math.max(this.minElevation, Math.min(this.maxElevation, elevation));
+    const p = this._pivot;
+    if (p && (azimuth !== this.azimuth || el !== this.elevation)) {
+      const t = this.camera.target;
+      let x = t[0] - p[0], y = t[1] - p[1], z = t[2] - p[2], c: number, s: number, u: number;
+      // R = Ry(az1) · Rx(el0 − el1) · Ry(−az0) — the offset direction is Ry(az) · Rx(−el) · +Z
+      c = Math.cos(-this.azimuth); s = Math.sin(-this.azimuth);
+      u = x * c + z * s; z = -x * s + z * c; x = u;
+      c = Math.cos(this.elevation - el); s = Math.sin(this.elevation - el);
+      u = y * c - z * s; z = y * s + z * c; y = u;
+      c = Math.cos(azimuth); s = Math.sin(azimuth);
+      u = x * c + z * s; z = -x * s + z * c; x = u;
+      this.camera.setTarget(p[0] + x, p[1] + y, p[2] + z);
+    }
+    this.azimuth = azimuth;
+    this.elevation = el;
   }
 
   private pan(dx: number, dy: number): void {
@@ -655,9 +764,7 @@ export class OrbitController {
     if (!this.enableDamping) return false;
 
     if (Math.abs(this._azimuthVel) > 0.00001 || Math.abs(this._elevationVel) > 0.00001) {
-      this.azimuth += this._azimuthVel;
-      this.elevation += this._elevationVel;
-      this.elevation = Math.max(this.minElevation, Math.min(this.maxElevation, this.elevation));
+      this._turnTo(this.azimuth + this._azimuthVel, this.elevation + this._elevationVel);
 
       this._azimuthVel *= (1 - this.dampingFactor);
       this._elevationVel *= (1 - this.dampingFactor);

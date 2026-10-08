@@ -294,3 +294,51 @@ describe('Direct mode switches (Edit Mesh ↔ Armature ↔ UV ↔ scene)', () =>
     expect(scene.editNavActive).toBe(false);
   });
 });
+
+describe('Edit-view orbit pivot (notes 2026-10-08 #1)', () => {
+  const pointer = (canvas: HTMLCanvasElement, type: string, x: number, y: number) => {
+    const e = new Event(type, { cancelable: true });
+    Object.assign(e, { pointerId: 1, pointerType: 'mouse', button: 0, clientX: x, clientY: y, altKey: true, isPrimary: true });
+    canvas.dispatchEvent(e);
+  };
+  const viewXY = (c: Camera3D, p: [number, number, number]) => {
+    const m = c.getViewMatrix() as unknown as Float32Array;
+    return [m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13]];
+  };
+
+  it('Edit Mesh: the selection centre, else the mesh bounds centre; the scene: none', () => {
+    const t = setup();
+    expect(t.arm.getEditOrbitPivot()).toBeNull();
+    t.arm.enableMeshEditOrbit('other');
+    expect(t.arm.getEditOrbitPivot()).toEqual([3, 0, 0]);                 // nothing selected: the mesh's centre
+    t.arm.editSelectionPivotProvider = () => [3.4, 0.2, -0.1];
+    expect(t.arm.getEditOrbitPivot()).toEqual([3.4, 0.2, -0.1]);
+    t.arm.editSelectionPivotProvider = () => null;
+    expect(t.arm.getEditOrbitPivot()).toEqual([3, 0, 0]);
+    t.arm.disableMeshEditOrbit();
+    expect(t.arm.getEditOrbitPivot()).toBeNull();
+  });
+
+  it('Armature with no joint selected: the mesh bounds centre', () => {
+    const t = setup();
+    t.arm.enterArmatureMode3D('other');
+    expect(t.arm.getEditOrbitPivot()).toEqual([3, 0, 0]);
+  });
+
+  it('an Alt+drag orbit in Edit Mesh turns around the selection: it keeps its place on screen through the frames', () => {
+    const t = setup();
+    t.arm.enableMeshEditOrbit('cube');
+    const P: [number, number, number] = [0.5, 0.5, 0.5];                   // a selected corner
+    t.arm.editSelectionPivotProvider = () => P;
+    t.frame();
+    const before = viewXY(t.camera, P), az0 = t.arm.getOrbitController()!.azimuth;
+    pointer(t.canvas, 'pointerdown', 100, 100);
+    t.frame();
+    viewXY(t.camera, P).forEach((v, i) => expect(v).toBeCloseTo(before[i], 6));   // no jump at the start
+    pointer(t.canvas, 'pointermove', 180, 140);
+    pointer(t.canvas, 'pointerup', 180, 140);
+    for (let i = 0; i < 200; i++) t.frame();                                 // momentum runs out
+    viewXY(t.camera, P).forEach((v, i) => expect(v).toBeCloseTo(before[i], 6));
+    expect(Math.abs(t.arm.getOrbitController()!.azimuth - az0)).toBeGreaterThan(0.2);   // it did turn
+  });
+});

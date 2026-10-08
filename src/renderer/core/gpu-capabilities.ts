@@ -20,8 +20,6 @@ export type GpuTier = 'desktop' | 'mobile' | 'safe';
 export interface GpuCaps {
   /** P15 GPU-driven culling + indirect draws may run (Renderer3D.gpuDriven still decides; false forces the CPU path). */
   gpuDriven: boolean;
-  /** P21 specialised shader variants may compile (false = every mesh on the uber-shader). */
-  shaderVariants: boolean;
   /** LiveText may use the HTML-in-canvas capture (false = mode 'none', the OffscreenCanvas fallback, no WebGL probe). */
   htmlInCanvas: boolean;
   /** Max device-pixel ratio of the main canvas backing store (Infinity = the window's DPR, uncapped). */
@@ -48,17 +46,17 @@ export interface GpuCaps {
 
 /** Today's engine defaults: desktop behaviour is unchanged. */
 export const DESKTOP_CAPS: Readonly<GpuCaps> = Object.freeze({
-  gpuDriven: true, shaderVariants: true, htmlInCanvas: true,
+  gpuDriven: true, htmlInCanvas: true,
   maxDpr: Infinity, maxCanvasPixels: Infinity, warmConcurrency: 2,
   shadows: true, ssao: true, ssr: true, taa: true,
   animatedFocusBg: true, shaderSplitMaxKeys: 96,
 });
 
-/** Phones / tablets: the CPU draw path, the uber-shader only, no HTML-in-canvas, DPR ≤ 1.5 and ≤ 2.5 MP, one compile
- *  at a time, a still (frozen 'wavy') focus background. */
+/** Phones / tablets: the CPU draw path, no HTML-in-canvas, DPR ≤ 1.5 and ≤ 2.5 MP, one compile at a time, a smaller
+ *  shader-split key cap, a still (frozen 'wavy') focus background. */
 export const MOBILE_CAPS: Readonly<GpuCaps> = Object.freeze({
   ...DESKTOP_CAPS,
-  gpuDriven: false, shaderVariants: false, htmlInCanvas: false,
+  gpuDriven: false, htmlInCanvas: false,
   maxDpr: 1.5, maxCanvasPixels: 2_500_000, warmConcurrency: 1,
   animatedFocusBg: false, shaderSplitMaxKeys: 40,
 });

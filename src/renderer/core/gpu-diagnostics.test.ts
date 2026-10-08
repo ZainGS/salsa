@@ -147,12 +147,11 @@ describe('caps application', () => {
   const restore = () => proto.applyGpuCaps.call({ _indirectFirstInstance: true }, { ...DESKTOP_CAPS }, false);
   afterEach(restore);
 
-  it('mobile caps switch GPU-driven / variants / HTML-in-canvas / warm concurrency off; desktop restores the defaults', () => {
+  it('mobile caps switch GPU-driven / HTML-in-canvas / warm concurrency off; desktop restores the defaults', () => {
     const fake: Record<string, unknown> = { _indirectFirstInstance: true };
     proto.applyGpuCaps.call(fake, { ...MOBILE_CAPS }, false);
-    expect(Renderer3D.caps).toMatchObject({ gpuDriven: false, shaderVariants: false, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: false });
+    expect(Renderer3D.caps).toMatchObject({ gpuDriven: false, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: false });
     expect(Renderer3D.gpuDrivenActive).toBe(false);
-    expect(Renderer3D.shaderVariantsActive).toBe(false);
     expect(Renderer3D.gpuDriven).toBe(true);           // the switch / preference itself is untouched
     expect(TextEffectEngine.htmlInCanvasAllowed).toBe(false);
     expect(TextEffectEngine.htmlInCanvasMode()).toBe('none');
@@ -160,7 +159,7 @@ describe('caps application', () => {
     proto.applyGpuCaps.call(fake, { ...SAFE_CAPS }, false);
     expect(Renderer3D.caps).toMatchObject({ shadows: false, ssao: false, ssr: false, taa: false, shaderSplitMaxKeys: 40 });   // (shader split key cap: mobile / safe 40)
     proto.applyGpuCaps.call(fake, { ...DESKTOP_CAPS }, false);
-    expect(Renderer3D.caps).toEqual({ gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true, shaderSplitMaxKeys: 96 });
+    expect(Renderer3D.caps).toEqual({ gpuDriven: true, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true, shaderSplitMaxKeys: 96 });
     expect(Renderer3D.gpuDrivenActive).toBe(true);
     expect(TextEffectEngine.htmlInCanvasAllowed).toBe(true);
     expect(GPUPipelineCache.defaultMaxConcurrentWarm).toBe(2);

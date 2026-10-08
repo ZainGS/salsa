@@ -1,13 +1,13 @@
 /**
- * SHADER SPLIT phase 1 (docs/specs/shader-split.md §6.1): the preprocessor, the tree-shaker, the GOLDEN equivalence of
- * the merged template with today's uber-shaders, the dead-feature lint, the key derivation + its bit-classification
- * guard, and the fallback choice. The pixel identity and the compile check run on a real GPU (Dawn) outside vitest;
- * see shader-split.md "Phase 1 status".
+ * SHADER SPLIT (docs/specs/shader-split.md §6.1): the preprocessor, the tree-shaker, the GOLDEN snapshot of the merged
+ * template's all-features output (frozen at phase 4, when it replaced the uber-shaders it was proven equal to), the
+ * dead-feature lint, the key derivation + its bit-classification guard, and the fallback choice. The pixel identity and
+ * the compile check run on a real GPU (Dawn) outside vitest; see shader-split.md "Phase 1 status".
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import * as legacy from './mesh3d-shaders';
+import { createHash } from 'node:crypto';
 import * as material from '../material-3d';
 import { encodeMaterialFlags, encodeMeshFlags2, type Material3D } from '../material-3d';
 import { preprocessWgsl, compactWgsl, evalDirectiveExpr, stripWgslComments } from './wgsl-preprocess';
@@ -17,8 +17,8 @@ import { MESH3D_FS_TEMPLATE } from './mesh3d-fs-template';
 import {
   MF, MF_ALL, MF_NAMES, MF_BASE_TEX, MF_BASE_UNTEX, MF_BASE_SHADOW_DROP, MF_LIGHT, MATERIAL_FLAG_BITS, FLAGS2_BITS, MESH_FS_DEFINES,
   MESH_FS_G_SHADOW, meshFsKeyOfFlags, meshFsKeyNum, meshFsKeyOfNum, meshFsBaseKey, meshFsAllKey, meshFsKeyCovers, meshFsKeyString,
-  meshFsBisectKey, meshFsDefines, meshFsGroundModeIndex, meshFsNumPlainSafe, meshFsKeyParse, meshFsWidenKey, meshFsCovered,
-  meshFsCoverageExcluding, setMeshFsCoverage, MESH_FS_FAMILIES, type MeshFsKey,
+  meshFsBisectKey, meshFsDefines, meshFsGroundModeIndex, meshFsNumPlainSafe, meshFsNumPlain, meshFsKeyParse, meshFsWidenKey,
+  type MeshFsKey,
 } from './mesh-fs-key';
 import { smallestCovering, MeshFsPipelines, SHADER_SPLIT_JOURNAL_KEY } from '../mesh-fs-pipelines';
 import type { GPUPipelineCache } from '../../core/gpu-pipeline-cache';
@@ -82,27 +82,45 @@ describe('wgsl-treeshake', () => {
   });
 });
 
-// ── golden equivalence (spec §6.1.3) ─────────────────────────────────────────────────────────────────────────────
+// ── golden snapshot (spec §6.1.3) ────────────────────────────────────────────────────────────────────────────────
 
 /** Comments + blank lines stripped, tree-shaken, whitespace collapsed. */
 const norm = (s: string): string => treeShakeWgsl(compactWgsl(s)).replace(/\s+/g, ' ').trim();
 
-describe('golden: the merged template with every feature = today\'s uber-shaders', () => {
-  const cases: [keyof typeof legacy, boolean, boolean][] = [
-    ['MESH3D_FRAGMENT_SHADER_SHADOW_MODERN', true, true],
-    ['MESH3D_FRAGMENT_SHADER', true, false],
-    ['MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN', false, true],
-    ['MESH3D_FRAGMENT_SHADER_UNTEXTURED', false, false],
+describe('golden: the all-features output of the merged template (frozen at phase 4)', () => {
+  // Until phase 4 this test compared the generated all-features shaders with the uber-shaders they replaced
+  // (MESH3D_FRAGMENT_SHADER[_UNTEXTURED][_SHADOW_MODERN]), normalised: equal on 2026-10-08, when the uber-shaders were
+  // deleted. These are the sha256 of that normalised text. A DELIBERATE template / helper-library change updates
+  // them (the failure prints the new hash); an accidental one fails here. Every snapshot change is a pixel change
+  // somewhere: verify it like one (shader-split.md §6.4).
+  const cases: [string, boolean, boolean, string][] = [
+    ['T + shadow', true, true, '3549a6b33265d4a94f2b20e50b3a7c66ea6df9fff8de1a2946fbe62a821425b5'],
+    ['T', true, false, 'a2720b4772c919704a8ccb68c04fa9e0c406858a3822083a3b7d635aee072479'],
+    ['U + shadow', false, true, 'c788fd0f432d800c17cdd2c24881f9d9ff272d99a71afe2abe5142901401bbf6'],
+    ['U', false, false, 'e5d8d2aeee65c985d7e7dcf5e6aa089cbbcacfac79484ce73bd5052a0e424f05'],
   ];
-  for (const [name, tex, shadow] of cases) {
+  for (const [name, tex, shadow, sha] of cases) {
     it(`${name} (tex ${tex}, shadow ${shadow})`, () => {
-      const today = norm(legacy[name] as string);
       const gen = norm(generateMeshFs(meshFsAllKey(tex, shadow, true, true)));
-      if (gen !== today) {
-        let i = 0; while (i < gen.length && gen[i] === today[i]) i++;
-        expect(gen.slice(Math.max(0, i - 120), i + 120)).toBe(today.slice(Math.max(0, i - 120), i + 120));
-      }
+      expect(createHash('sha256').update(gen).digest('hex')).toBe(sha);
       expect(gen.length).toBeGreaterThan(100000);
+    });
+  }
+  // The PLAIN_ROUTE all-features key (MeshFsKey.plain) = the old PLAIN uber-shaders (MESH3D_FRAGMENT_SHADER[_UNTEXTURED]
+  // _PLAIN[_SHADOW_MODERN]): equal on 2026-10-08 after normalisation, up to the order of four constant lets in the
+  // pattern block (p8Fast / gUvFw before winWL / gUvM). Frozen the same way.
+  const plainCases: [string, boolean, boolean, string][] = [
+    ['PLAIN T + shadow', true, true, '0a1ad08beee62eac536b69b9802830808cafc000847f41ce92b3e8a4950558f9'],
+    ['PLAIN T', true, false, '7dd1fbea888536e09ce48e5b378a8d6feaf163135332762efced3be9dd83ed2d'],
+    ['PLAIN U + shadow', false, true, 'cc02753c0aa7545d96e7582caa66da9f8b1c9d4e1d6cbd4ca3975b18cc1374bc'],
+    ['PLAIN U', false, false, '0436d50274f52609582029389ea389945e5addc1d4d2a625df375faa273705b3'],
+  ];
+  for (const [name, tex, shadow, sha] of plainCases) {
+    it(`${name} (tex ${tex}, shadow ${shadow})`, () => {
+      const gen = norm(generateMeshFs({ ...meshFsAllKey(tex, shadow, true, true), plain: true }));
+      expect(createHash('sha256').update(gen).digest('hex')).toBe(sha);
+      expect(gen).not.toMatch(/\b(patternMask|windowsPattern|gr_uvMetres|adScreen|windowShade)\(/);   // the PLAIN pattern block
+      expect(gen).toContain('let grainK');   // ...but the later pattern-gated blocks stay (the PLAIN shader ran them)
     });
   }
   it('every directive identifier the template uses is known, and every known feature name is used', () => {
@@ -168,10 +186,10 @@ describe('dead-feature lint: no identifier of an OFF feature survives in a gener
     }
     expect(bad).toEqual([]);
   });
-  it('the plain / textured PBR keys are a small fraction of the uber-shader', () => {
+  it('the plain / textured PBR keys are a small fraction of the all-features shader (= the old uber-shader)', () => {
     const u = meshFsSize(generateMeshFs(key({ styles: 1, feat: MF.ENV_SPEC })));
     const t = meshFsSize(generateMeshFs(key({ tex: true, styles: 1, feat: MF.ENV_SPEC | MF.TEXSAMPLE })));
-    const today = meshFsSize(compactWgsl(legacy.MESH3D_FRAGMENT_SHADER_PLAIN));
+    const today = meshFsSize(generateMeshFs(meshFsAllKey(true, false, false, false)));
     expect(u.bytes).toBeLessThan(today.bytes * 0.2);
     expect(t.bytes).toBeLessThan(today.bytes * 0.2);
     expect(u.fns).toBeLessThan(25);
@@ -261,29 +279,9 @@ describe('mesh FS key', () => {
       const n = meshFsKeyNum(f, f2, tex, pz, pw);
       const k = meshFsKeyOfFlags(f, f2, tex, { adScreen: ((f >>> 9) & 7) === 7 && pz > 1.5, groundMode: meshFsGroundModeIndex(pw) });
       expect(n).toBeGreaterThanOrEqual(0);
-      expect(meshFsCovered(k)).toBe(true);
       expect(meshFsKeyOfNum(n, 0)).toEqual(k);
       expect(n).toBeLessThan(2 ** 36);
     }
-  });
-
-  it('family exclusion (the per-device safety valve) narrows the coverage and restores it', () => {
-    const win = encodeMaterialFlags(mat({ patternMode: 'windows' })), stripes = encodeMaterialFlags(mat({ patternMode: 'stripes' })), ground = encodeMaterialFlags(mat({ groundShade: true }));
-    try {
-      setMeshFsCoverage(meshFsCoverageExcluding(['windows']));
-      expect(meshFsKeyNum(win, 0, false)).toBe(-1);
-      expect(meshFsKeyNum(stripes, 0, false)).toBeGreaterThanOrEqual(0);
-      setMeshFsCoverage(meshFsCoverageExcluding(['ground', 'patterns']));
-      expect(meshFsKeyNum(ground, 0, false, 0, 4)).toBe(-1);
-      expect(meshFsKeyNum(stripes, 0, false)).toBe(-1);
-      expect(meshFsKeyNum(win, 0, false)).toBeGreaterThanOrEqual(0);
-      setMeshFsCoverage(meshFsCoverageExcluding(['phase2']));   // = phase 1: the BASE features only
-      expect(meshFsKeyNum(win, 0, false)).toBe(-1);
-      expect(meshFsKeyNum(encodeMaterialFlags(mat({ waterShade: true })), 0, false)).toBe(-1);
-      expect(meshFsKeyNum(encodeMaterialFlags(mat({ metalShade: true, renderStyle: 'cel' })), 0, false)).toBeGreaterThanOrEqual(0);
-    } finally { setMeshFsCoverage(meshFsCoverageExcluding([])); }
-    expect(meshFsKeyNum(win, 0, false)).toBeGreaterThanOrEqual(0);
-    expect(MESH_FS_FAMILIES).toContain('phase2');
   });
 
   it('ground-mode index = the template dispatch (mode + 100 * scale10; outside 1..21 = the ashlar GM_0)', () => {
@@ -291,11 +289,32 @@ describe('mesh FS key', () => {
     expect([1504, 2021, 1500, 3000, 1519.4, 1520.6].map(meshFsGroundModeIndex)).toEqual([4, 21, 0, 0, 19, 21]);
   });
 
-  it('PLAIN-safe keys (the face-kit multiply axis, the planar dedup): no pattern block, no ground metric', () => {
-    expect(meshFsNumPlainSafe(meshFsKeyNum(encodeMaterialFlags(mat({ renderStyle: 'unlit', hasTexture: true, rimEnabled: true })), 0, true))).toBe(true);
-    expect(meshFsNumPlainSafe(meshFsKeyNum(encodeMaterialFlags(mat({ patternMode: 'stripes' })), 0, true))).toBe(false);
-    expect(meshFsNumPlainSafe(meshFsKeyNum(encodeMaterialFlags(mat({ groundShade: true })), 0, false, 0, 4))).toBe(false);
+  it('PLAIN-safe keys and the PLAIN-routed key (the face-kit multiply axis, the planar dedup)', () => {
+    const unlit = meshFsKeyNum(encodeMaterialFlags(mat({ renderStyle: 'unlit', hasTexture: true, rimEnabled: true })), 0, true);
+    expect(meshFsNumPlainSafe(unlit)).toBe(true);
+    expect(meshFsNumPlain(unlit)).toBe(unlit);   // identity for a PLAIN-safe key (its pattern block is the default already)
+    const stripes = meshFsKeyNum(encodeMaterialFlags(mat({ renderStyle: 'unlit', hasTexture: true, patternMode: 'stripes' })), 0, true);
+    expect(meshFsNumPlainSafe(stripes)).toBe(false);
+    const ps = meshFsNumPlain(stripes);
+    expect(ps).not.toBe(stripes);
+    expect(meshFsNumPlain(ps)).toBe(ps);   // idempotent
+    expect(meshFsNumPlainSafe(ps)).toBe(false);
+    expect(meshFsKeyOfNum(ps, MESH_FS_G_SHADOW)).toEqual({ ...meshFsKeyOfNum(stripes, MESH_FS_G_SHADOW), plain: true });   // the same key, PLAIN-routed
+    const ground = meshFsKeyNum(encodeMaterialFlags(mat({ groundShade: true, metalShade: true, renderStyle: 'cel' })), 0, false, 0, 4);
+    expect(meshFsKeyOfNum(meshFsNumPlain(ground), 0)).toEqual({ ...meshFsKeyOfNum(ground, 0), plain: true });
+    // its own identity: never drawn by a non-plain superset, nor the reverse; parses back
+    const pk = meshFsKeyOfNum(ps, 0), k = meshFsKeyOfNum(stripes, 0);
+    expect(meshFsKeyCovers(meshFsAllKey(true, false, false, false), pk)).toBe(false);
+    expect(meshFsKeyCovers({ ...meshFsAllKey(true, false, false, false), plain: true }, pk)).toBe(true);
+    expect(meshFsKeyCovers(pk, k)).toBe(false);
+    expect(meshFsKeyParse(meshFsKeyString(pk))).toEqual(pk);
+    expect(meshFsKeyString(pk)).toMatch(/\|plain$/);
+    // the generated module: no pattern mask / ground metric, but the relief + grain block the PLAIN shader ran
+    const code = generateMeshFs(pk);
+    expect(code).not.toMatch(/\bpatternMask\(/);
+    expect(code).toContain('let grainK');
     expect(meshFsNumPlainSafe(-1)).toBe(false);
+    expect(meshFsNumPlain(-1)).toBe(-1);
   });
 
   it('the shadow-receiving BASE leaves out the features no measured shadowed scene uses (the 4,000 budget)', () => {

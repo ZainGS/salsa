@@ -222,3 +222,32 @@ describe('Mesh Edit vertex drag — in-place patch (7.3d item 2)', () => {
     expect(em.patchCompiledPositions(g)).toBeNull();
   });
 });
+
+describe('Mesh Edit vertex drag — no empty undo step (notes 2026-10-08 #4)', () => {
+  it('a mouse click on an unselected vertex selects it and pushes NO "Move vertex" step', () => {
+    const t = setup();
+    const before = t.mesh.editMesh!.vertices.map(v => [v.x, v.y, v.z]);
+    t.fire('pointerdown', { ...t.at });
+    t.fire('pointerup', { ...t.at });
+    t.flush();
+    expect(t.meshEdit.getSelection(t.mesh.id)?.vertices.size).toBe(1);
+    expect(t.cmds).toHaveLength(0);
+    expect(t.mesh.editMesh!.vertices.map(v => [v.x, v.y, v.z])).toEqual(before);
+  });
+
+  it('a drag that comes back to its start moved nothing: no step; a real drag still pushes one', () => {
+    const t = setup();
+    t.fire('pointerdown', { ...t.at });
+    t.fire('pointermove', { clientX: t.at.clientX + 30, clientY: t.at.clientY });
+    t.flush();
+    t.fire('pointermove', { ...t.at });
+    t.flush();
+    t.fire('pointerup', { ...t.at });
+    expect(t.cmds).toHaveLength(0);
+    t.fire('pointerdown', { ...t.at });
+    t.fire('pointermove', { clientX: t.at.clientX + 30, clientY: t.at.clientY });
+    t.fire('pointerup', { clientX: t.at.clientX + 30, clientY: t.at.clientY });
+    expect(t.cmds).toHaveLength(1);
+    expect(t.cmds[0].description).toBe('Move vertex');
+  });
+});

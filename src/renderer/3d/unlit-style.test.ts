@@ -26,7 +26,7 @@ describe('unlit render style', () => {
   });
 
   it('the mesh shader branches on renderStyle == 6u and skips fog + colour-depth when unlit', () => {
-    const src = readFileSync(new URL('./shaders/mesh3d-shaders.ts', import.meta.url), 'utf8');
+    const src = readFileSync(new URL('./shaders/mesh3d-fs-template.ts', import.meta.url), 'utf8');   // (the mesh fragment source since shader-split phase 4)
     expect(src).toContain('renderStyle == 6u');               // the unlit lighting branch
     expect(src).toContain('fogMode != 0u && renderStyle != 6u');   // fog skipped
     expect(src).toContain('cd > 0.0 && renderStyle != 6u');        // PS1 colour-depth skipped

@@ -12,7 +12,8 @@
 import { describe, it, expect } from 'vitest';
 import { Accum3D } from '../../world/meshbuild';
 import { FLOATS_PER_VERT } from './mesh-generators';
-import * as mesh3d from './shaders/mesh3d-shaders';
+import { generateMeshFs } from './shaders/mesh-fs-generate';
+import { meshFsAllKey } from './shaders/mesh-fs-key';
 
 type V3 = [number, number, number];
 const add = (a: V3, b: V3): V3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -220,7 +221,7 @@ describe('interior mapping — shader mirror vs ground-truth room', () => {
   });
 
   it('source lock: the WGSL still carries the mirrored frame + trace', () => {
-    const src = mesh3d.MESH3D_FRAGMENT_SHADER;
+    const src = generateMeshFs(meshFsAllKey(true, false));   // (the window / interior blocks: the all-features shader)
     expect(src).toContain('let winAx = uvWorldAxes(uv, worldPos);');
     expect(src).toContain('let rd = normalize(vec3<f32>((ru - gb * rv) / gdet, (rv - gb * ru) / gdet, dot(r, Nf)));');
     expect(src).toContain('let aspect = mix(aspMeas, 0.85, smoothstep(0.004, 0.02, uvAx.noise));');
@@ -297,7 +298,7 @@ describe('window reveal — the recessed opening (D2)', () => {
     });
   }
   it('source lock: the WGSL reveal matches the mirror and feeds the glass-plane uv', () => {
-    const src = mesh3d.MESH3D_FRAGMENT_SHADER;
+    const src = generateMeshFs(meshFsAllKey(true, false));   // (the window / interior blocks: the all-features shader)
     expect(src).toContain('fn windowReveal(ro: vec3<f32>, rd: vec3<f32>, x0: f32, x1: f32, y0: f32, y1: f32, depth: f32) -> vec4<f32> {');
     expect(src).toContain('if (min(tx, ty) < tg) { face = select(1.0, select(3.0, 2.0, rd.y > 0.0), ty < tx); }');
     expect(src).toContain('let rev = windowReveal(ro, rd, ins.x * aspect, (1.0 - ins.x) * aspect, ins.y, 1.0 - ins.z, revDepth);');

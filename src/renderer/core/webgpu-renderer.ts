@@ -87,7 +87,7 @@ import { SelectionOverlayRenderer } from "../raster/selection/selection-overlay-
 import type { SelectionOverlayState } from "../raster/selection/selection-overlay-renderer";
 import { LiveTextNode } from "../../scene-graph/shapes/live-text";
 import { Renderer3D } from '../3d/renderer-3d';
-import { MeshFsPipelines, SHADER_SPLIT, shaderSplitActive, shaderSplitExcluded, type ShaderSplitMode } from '../3d/mesh-fs-pipelines';
+import { MeshFsPipelines } from '../3d/mesh-fs-pipelines';
 import { Camera3D } from '../3d/camera-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
@@ -1250,7 +1250,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     if (!this._indirectFirstInstance) c.gpuDriven = false;   // the GPU-driven bundles need firstInstance
     this._gpuCaps = c;
     const rc = Renderer3D.caps;
-    rc.gpuDriven = c.gpuDriven; rc.shaderVariants = c.shaderVariants;
+    rc.gpuDriven = c.gpuDriven;
     rc.shadows = c.shadows; rc.ssao = c.ssao; rc.ssr = c.ssr; rc.taa = c.taa; rc.animatedFocusBg = c.animatedFocusBg !== false;
     if (Number.isFinite(c.shaderSplitMaxKeys) && c.shaderSplitMaxKeys > 0) rc.shaderSplitMaxKeys = MeshFsPipelines.maxKeys = Math.floor(c.shaderSplitMaxKeys);
     TextEffectEngine.htmlInCanvasAllowed = c.htmlInCanvas;
@@ -1277,9 +1277,6 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     status: GpuDeviceStatusInfo; lastLoss: GpuLossRecord | null;
     breadcrumbs: GpuCrumb[]; openOps: string[]; errors: GpuErrorRecord[];
     previousSession: { at: number; crumbs: GpuCrumb[]; open: string[] } | null;
-    /** The mesh shader split (shader-split.md §13): active (ON by default on every tier since phase 3; false = rolled
-     *  back), the stored mode ('auto' = the default) and the families kept on the uber-shader. */
-    shaderSplit: { active: boolean; mode: ShaderSplitMode; exclude: string[] };
   } {
     const lim = (l: GPUSupportedLimits | undefined | null): Record<string, number> => {
       const o: Record<string, number> = {};
@@ -1303,7 +1300,6 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       status: this.getDeviceStatus(), lastLoss: readLastGpuLoss(),
       breadcrumbs: getGpuCrumbs(), openOps: getOpenGpuOps(), errors: getGpuErrors(),
       previousSession: this._prevSessionCrumbs,
-      shaderSplit: { active: shaderSplitActive(), mode: SHADER_SPLIT.mode, exclude: [...shaderSplitExcluded()] },
     };
   }
 
@@ -1431,8 +1427,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         r3.distanceLod = old3D.distanceLod;
         r3.distanceLodScale = old3D.distanceLodScale;
         r3.distanceLodBias = old3D.distanceLodBias;
-        r3.orthoScreenLod = old3D.orthoScreenLod;
-      }
+        r3.orthoScreenLod = old3D.orthoScreenLod;      }
     }
     // Raster engines (paint / composite / selection / overlay): re-created below by initializeRasterTexture.
     this.rasterTextureManager = undefined; this._rasterPaintEngine = undefined; this._rasterCompositor = undefined;

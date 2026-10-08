@@ -168,12 +168,19 @@ describe('Scene3DArmature overlay — fingers (TOUCH-9 / TOUCH-8)', () => {
     expect(skel.data.joints[1].localRotation).toEqual(q0);
   });
 
-  it('TOUCH-16: a finger never runs the hover pick; the mouse does (once per frame)', () => {
+  it('TOUCH-16: a finger never runs the hover pick; the mouse does (once per frame) — outside the Armature', () => {
     vi.useFakeTimers();
-    const { canvas, pick3DCalls } = setup();
+    const { arm, canvas, pick3DCalls } = setup();
     fire(canvas, 'pointermove', { pointerType: 'touch', buttons: 0, clientX: 100, clientY: 100 });
     vi.advanceTimersByTime(50);
     expect(pick3DCalls()).toBe(0);
+    // In the Armature (the overlay is up) the mouse / pen hover never picks the MESH either (2026-10-08: no object hover
+    // outline in any edit mode, and no full-scene raycast per hover frame) — only the joint / gizmo hover runs.
+    fire(canvas, 'pointermove', { buttons: 0, clientX: 100, clientY: 100 });
+    vi.advanceTimersByTime(50);
+    expect(pick3DCalls()).toBe(0);
+    // the scene (overlay off): the mouse hover picks, coalesced to one per frame
+    (arm as unknown as { _boneOverlayExplicit: boolean })._boneOverlayExplicit = false;
     fire(canvas, 'pointermove', { buttons: 0, clientX: 100, clientY: 100 });
     fire(canvas, 'pointermove', { buttons: 0, clientX: 110, clientY: 100 });
     vi.advanceTimersByTime(50);

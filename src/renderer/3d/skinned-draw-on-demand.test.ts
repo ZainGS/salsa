@@ -57,17 +57,13 @@ beforeAll(() => {
 const flush = async (k = 6) => { for (let i = 0; i < k; i++) await Promise.resolve(); };
 
 describe('skinned draws under on-demand rendering', () => {
-    // SHADER SPLIT phase 3: the split is ON by default (the part draws with its generated skinned pipeline); the
-    // rollback ('off') draws with today's uber skinned pipeline. Both must wait for the compile the same way.
-    it('a part whose skinned pipeline is compiling is WAITING (not drawn), and the landed compile requests the frame that draws it (split on, the default)', async () => {
-        await scenario(true);
-    });
-    it('the same with the shader split rolled back (mode off: the uber skinned pipeline)', async () => {
-        await scenario(false);
+    // SHADER SPLIT: the part draws with its generated skinned pipeline (the only mesh pipelines since phase 4).
+    it('a part whose skinned pipeline is compiling is WAITING (not drawn), and the landed compile requests the frame that draws it', async () => {
+        await scenario();
     });
 });
 
-async function scenario(split: boolean): Promise<void> {
+async function scenario(): Promise<void> {
         const { Renderer3D } = await import('./renderer-3d');
         const { Camera3D } = await import('./camera-3d');
         const { SkinnedMesh3D } = await import('../../scene-graph/shapes/skinned-mesh-3d');
@@ -78,8 +74,6 @@ async function scenario(split: boolean): Promise<void> {
         const { device, pending } = controlledDevice();
         const r = new Renderer3D(device, cam) as unknown as Record<string, any>;
         const cache = GPUPipelineCache.for(device);
-        r.setShaderSplit({ mode: split ? 'auto' : 'off' });
-        try {
 
         // A one-joint "character" part: a quad in front of the camera, fully weighted to the root.
         const verts = new Float32Array(4 * 12);
@@ -96,10 +90,6 @@ async function scenario(split: boolean): Promise<void> {
         skel.computeWorldMatrices();
         mesh.skeleton = skel; mesh.skeletonId = skel.id;
 
-        const pipeName = mesh.material.hasTexture || mesh.material.hasNormalMap
-            ? (r._usesPatterns(mesh) ? 'skinnedOpaqueTexturedPipeline' : 'skinnedOpaqueTexturedPlainPipeline')
-            : (r._usesPatterns(mesh) ? 'skinnedOpaqueUntexturedPipeline' : 'skinnedOpaqueUntexturedPlainPipeline');
-        expect(r.pipeline.handleOf(pipeName)?.ready, 'precondition: the skinned pipeline is not compiled yet').toBe(false);
         const splitSkinnedReady = (): boolean => r.setShaderSplit({}).list.some((e: { axis: string; key: string; ready: boolean }) => e.axis === 'skinned' && e.ready);
 
         let draws = 0;
@@ -119,15 +109,7 @@ async function scenario(split: boolean): Promise<void> {
 
         // Nothing else happens (no input): the compiles land → the ready event asks for a frame.
         for (let i = 0; i < 20 && pending.length; i++) { for (const p of pending.splice(0)) p.resolve(); await flush(); }
-        if (split) {
-            expect(r.setShaderSplit({}).active).toBe(true);
-            expect(splitSkinnedReady(), 'the part\'s generated skinned pipeline compiled').toBe(true);
-            expect(r.pipeline.handleOf(pipeName)?.ready, 'the uber skinned pipeline is never compiled while split').toBe(false);
-            expect(r.setShaderSplit({}).uberModules).toBe(0);
-        } else {
-            expect(r.setShaderSplit({}).active).toBe(false);
-            expect(r.pipeline.handleOf(pipeName)?.ready).toBe(true);
-        }
+        expect(splitSkinnedReady(), 'the part\'s generated skinned pipeline compiled').toBe(true);
         expect(readyFrames).toBeGreaterThan(0);
 
         // Frame 2 (the requested one) draws the part.
@@ -137,5 +119,4 @@ async function scenario(split: boolean): Promise<void> {
         expect(draws).toBeGreaterThan(0);
         expect(fs.skinnedDrawn).toBe(1);
         expect(fs.skinnedWaiting).toBe(0);
-        } finally { r.setShaderSplit({ mode: 'auto' }); }
 }

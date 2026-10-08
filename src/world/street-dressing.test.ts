@@ -11,8 +11,11 @@ import { computeTextSigns } from './signtext';
 import { buildAwnings } from './awnings';
 import { generateCityLayout } from './layout';
 import { DEFAULT_MATERIAL, encodeMaterialFlags, type Material3D } from '../renderer/3d/material-3d';
-import { MESH3D_FRAGMENT_SHADER } from '../renderer/3d/shaders/mesh3d-shaders';
+import { generateMeshFs } from '../renderer/3d/shaders/mesh-fs-generate';
+import { meshFsAllKey } from '../renderer/3d/shaders/mesh-fs-key';
 import type { WorldGraph } from './types';
+// The all-features mesh fragment shaders (generated since shader-split phase 4; the same code the uber-shader had).
+const MESH3D_FRAGMENT_SHADER = generateMeshFs(meshFsAllKey(true, false));
 
 const city = (seed = 3): WorldGraph =>
   generateCityLayout({ seed, radius: 10, pattern: 'grid', border: 'square' });

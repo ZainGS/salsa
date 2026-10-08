@@ -1092,11 +1092,9 @@ describe('P15 sub-bundles: omitted draws are zero draws, the replay set = the fu
 
   it('the rank keys plain / full shaders: no alternation, plain records keep the plain pipeline, GPU = CPU sequence', async () => {
     const { r, dev, cam, meshes, Renderer3D } = await scene();
-    const { GpuDrivenMain } = await import('./gpu-scene');
     const R3 = Renderer3D as unknown as { gpuDriven: boolean; gpuDrivenLean: boolean; rangeCulling: boolean; rankPatterned: boolean };
-    const prev = { g: R3.gpuDriven, l: R3.gpuDrivenLean, rc: R3.rangeCulling, rp: R3.rankPatterned, mp: GpuDrivenMain.mergePatterned };
+    const prev = { g: R3.gpuDriven, l: R3.gpuDrivenLean, rc: R3.rangeCulling, rp: R3.rankPatterned };
     R3.gpuDriven = true; R3.gpuDrivenLean = false; R3.rangeCulling = false;
-    expect(GpuDrivenMain.mergePatterned).toBe(false);   // the default: the merged full-shader bucket cost main-pass GPU time
     expect(R3.rankPatterned).toBe(true);
     try {
       // every third plain box becomes patterned (the full shader), interleaved with plain ones in the geometry-key order
@@ -1129,17 +1127,17 @@ describe('P15 sub-bundles: omitted draws are zero draws, the replay set = the fu
       for (let f = 0; f < 40; f++) { await Promise.resolve(); r.drawMeshes(recordingPass(em.args).pass, meshes, 1300, 850); }
       expect(runsOf(r._drawOrder.orderedMeshes())).toBeGreaterThan(classes.size);
       expect(gd._buckets.length).toBeGreaterThan(before);
-    } finally { R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; R3.rankPatterned = prev.rp; GpuDrivenMain.mergePatterned = prev.mp; (Renderer3D as unknown as { rankVariants: boolean }).rankVariants = true; }
+    } finally { R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; R3.rankPatterned = prev.rp; (Renderer3D as unknown as { rankVariants: boolean }).rankVariants = true; }
   });
 
-  it('step 8 shader variants: the key is the slot flags, one variant per rank run, state codes carry the id, the switch keeps the order', async () => {
+  it('the frozen draw-rank variant id (step 8 / P21): the key is the slot flags, one variant per rank run', async () => {
     const { r, dev, cam, meshes, Renderer3D } = await scene();
-    const { variantKeyOfMaterial } = await import('./shader-variants');
+    const { variantKeyOfFlags } = await import('./shader-variants');
     const { encodeMaterialFlags } = await import('./material-3d');
-    const R3 = Renderer3D as unknown as { gpuDriven: boolean; gpuDrivenLean: boolean; rangeCulling: boolean; shaderVariants: boolean };
-    const prev = { g: R3.gpuDriven, l: R3.gpuDrivenLean, rc: R3.rangeCulling, sv: R3.shaderVariants };
-    R3.gpuDriven = true; R3.gpuDrivenLean = false; R3.rangeCulling = false; R3.shaderVariants = true;
-    r.setShaderSplit({ mode: 'off' });   // P21 variants only apply on the uber path: the split rolled back (it is on by default since phase 3)
+    const variantKeyOfMaterial = (m: Parameters<typeof encodeMaterialFlags>[0]): number => variantKeyOfFlags(encodeMaterialFlags(m));
+    const R3 = Renderer3D as unknown as { gpuDriven: boolean; gpuDrivenLean: boolean; rangeCulling: boolean };
+    const prev = { g: R3.gpuDriven, l: R3.gpuDrivenLean, rc: R3.rangeCulling };
+    R3.gpuDriven = true; R3.gpuDrivenLean = false; R3.rangeCulling = false;
     try {
       // three families interleaved in the geometry-key order: plain, painted metal, procedural ground
       meshes.forEach((m, i) => { if (/^m\d+$/.test(m.name)) { if (i % 3 === 1) m.material.metalShade = true; else if (i % 3 === 2) m.material.groundShade = true; m.materialDirty = true; } });
@@ -1165,29 +1163,13 @@ describe('P15 sub-bundles: omitted draws are zero draws, the replay set = the fu
       let runs = 0, last = '';
       for (const m of ord) { const k = keyOf(m); if (k !== last) { runs++; last = k; } }
       expect(runs).toBe(new Set(ord.map(keyOf)).size);
-      // GPU state codes: bits 5+ = the variant id of the record's key
-      const gd = r._gd;
-      for (let p = 0; p < gd._nOrder; p++) {
-        const rr = gd._order[p], m = gd._isGroup[rr] ? gd._srcRef[rr] : gd._obj[rr];
-        const id = gd._code[rr] >> 5;
-        expect(id > 0, m.name).toBe(variantKeyOfMaterial(m.material) >= 0);
-        if (id > 0) expect(r._svIds.keyOf(id)).toBe(variantKeyOfMaterial(m.material));
-      }
-      // switching the variants off keeps the draw order (the A/B never moves coplanar draws) and drops the ids
-      const order0 = ord.map((m) => m.id).join(',');
-      r.setShaderVariants({ enabled: false });
-      for (let f = 0; f < 6; f++) { await Promise.resolve(); r.drawMeshes(recordingPass(em.args).pass, meshes, 1300, 850); }
-      expect((r._drawOrder.orderedMeshes() as typeof meshes).map((m) => m.id).join(',')).toBe(order0);
-      for (let p = 0; p < gd._nOrder; p++) expect(gd._code[gd._order[p]] >> 5).toBe(0);
-      const st = r.setShaderVariants({});
-      expect(st.enabled).toBe(false);
-      expect(st.keys).toBeGreaterThanOrEqual(3);
-    } finally { r.setShaderSplit({ mode: 'auto' }); R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; R3.shaderVariants = prev.sv; }
+      expect(r._svIds.size).toBeGreaterThanOrEqual(3);
+    } finally { R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; }
   });
 });
 
-describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
-  it('slot key = material key, state codes carry split ids, GPU = CPU sequence, covered meshes never touch the uber pipelines', async () => {
+describe('shader split (mesh-fs-pipelines.ts): the only mesh pipelines', () => {
+  it('slot key = material key, state codes carry split ids, GPU = CPU sequence', async () => {
     const { r, dev, cam, meshes, Renderer3D } = await scene();
     const R3 = Renderer3D as unknown as { gpuDriven: boolean; gpuDrivenLean: boolean; rangeCulling: boolean; splitKeyOfMesh: (m: unknown) => number; SPLIT_ID_FLAG: number };
     const prev = { g: R3.gpuDriven, l: R3.gpuDrivenLean, rc: R3.rangeCulling };
@@ -1202,7 +1184,6 @@ describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
         else if (i % 5 === 4) m.material.patternMode = 'stripes';
         m.materialDirty = true;
       });
-      expect(r.setShaderSplit({}).active, 'phase 3: on by default (no stored mode)').toBe(true);
       const em = emulator(r, dev.mem);
       dev.onEncode.push(em.run);
       cam.setPosition(0, 40, 90); cam.setTarget(0, 0, 0);
@@ -1231,24 +1212,14 @@ describe('shader split phase 1 (mesh-fs-pipelines.ts)', () => {
         const id = (gd._code[rr] >> 5) & 0x7fff;
         expect((id & R3.SPLIT_ID_FLAG) !== 0, m.name).toBe(R3.splitKeyOfMesh(m) >= 0);
       }
-      // the generated pipelines exist; the PLAIN uber pipelines (only covered meshes would draw with them) never compiled
-      // (a draw's get() compiles synchronously outside a live frame; the document pre-warm may still QUEUE one for the
-      // uncovered vertex-coloured mesh, as today)
+      // the generated pipelines exist (there are no others: the uber pipelines were removed in phase 4)
       const st = r.setShaderSplit({});
       expect(st.pipelines).toBeGreaterThanOrEqual(3);
-      expect(st.uberPipelines, 'no replaced uber pipeline compiled').toBe(0);
-      expect(st.uberModules, 'no uber fragment module created').toBe(0);
       expect(st.list.every((e: { key: string }) => e.key.startsWith('U|') || e.key.startsWith('T|'))).toBe(true);
       for (const n of ['opaqueUntexturedPlainPipeline', 'opaqueUntexturedNoCullPlainPipeline', 'transparentUntexturedPipeline', 'opaqueUntexturedPipeline', 'opaqueUntexturedNoCullPipeline']) {
-        expect(r.pipeline.handleOf(n).ready, n).toBe(false);
+        expect(r.pipeline.handleOf(n), n).toBeNull();
       }
-      // switching the split off (the phase-3 rollback) keeps the draw order and drops the split ids
-      const order0 = (r._drawOrder.orderedMeshes() as typeof meshes).map((m) => m.id).join(',');
-      expect(r.setShaderSplit({ mode: 'off' }).active).toBe(false);
-      for (let f = 0; f < 6; f++) { await Promise.resolve(); r.drawMeshes(recordingPass(em.args).pass, meshes, 1300, 850); }
-      expect((r._drawOrder.orderedMeshes() as typeof meshes).map((m) => m.id).join(',')).toBe(order0);
-      for (let p = 0; p < gd._nOrder; p++) expect(((gd._code[gd._order[p]] >> 5) & R3.SPLIT_ID_FLAG) !== 0).toBe(false);
-    } finally { r.setShaderSplit({ mode: 'auto' }); R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; }
+    } finally { R3.gpuDriven = prev.g; R3.gpuDrivenLean = prev.l; R3.rangeCulling = prev.rc; }
   });
 });
 

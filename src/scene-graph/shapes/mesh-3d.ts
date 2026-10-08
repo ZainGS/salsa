@@ -107,11 +107,9 @@ export class Mesh3D extends Shape {
   /** P16: bumped with geometryEpoch, for THIS mesh only (the Play collision snapshot trusts a member's footprint while
    *  its own geometry version is unchanged, instead of re-reading every member whenever any mesh got geometry). */
   geometryVersion = 0;
-  /** @internal Renderer3D pipeline-prewarm bookkeeping (step 2): the prewarm generation that classified this mesh and
-   *  its material variant bits. setMaterial resets it. Not scene state. */
+  /** @internal Renderer3D pipeline-prewarm bookkeeping (step 2): the prewarm generation that queued this mesh's
+   *  pipelines. setMaterial resets it. Not scene state. */
   _pwGen = 0;
-  /** @internal See _pwGen. */
-  _pwCode = 0;
   private _meshPrimitive: MeshPrimitive;
   private _geometry!: MeshGeometry;
   /** Cached modifier-evaluated geometry. Null when stale; recomputed on first geometry access. */
@@ -187,11 +185,12 @@ export class Mesh3D extends Shape {
   public _gdKSh = NaN;
   /** P15 sub-bundles: the spatial cell the draw rank placed this mesh in (Renderer3D.rankCellM; 0 = none). */
   public _r3RankCell = 0;
-  /** Step 8 (renderer/3d/shader-variants.ts): RENDERER-PRIVATE — the shader-variant key read back from this mesh's
-   *  instance slot at its last write (the exact material flags, or -1 = the uber-shader). */
+  /** Step 8 (renderer/3d/shader-variants.ts): RENDERER-PRIVATE — the draw-rank variant key read back from this mesh's
+   *  instance slot at its last write (the exact material flags, or -1 = no variant family). */
   public _r3VF = -1;
-  /** Shader split (renderer/3d/mesh-fs-pipelines.ts): RENDERER-PRIVATE — the packed phase-1 fragment-shader key read
-   *  back from this mesh's instance slot at its last write (shaders/mesh-fs-key.ts meshFsPhase1Num; -1 = not covered). */
+  /** Shader split (renderer/3d/mesh-fs-pipelines.ts): RENDERER-PRIVATE — the packed fragment-shader key read back from
+   *  this mesh's instance slot at its last write (shaders/mesh-fs-key.ts meshFsKeyNum; -1 = not written yet, or a
+   *  multi-material mesh: those key per slot). */
   public _r3FK = -1;
   /** Ray-pickable? Set false for pure DECORATION that is never individually selected (the whole procedural
    *  city — buildings/props/movers). The picker skips these BEFORE the expensive per-mesh BVH build, so hover/

@@ -23,10 +23,8 @@
  * keeps each block's runtime gate). meshFsKeyCovers is that relation; the `*-BASE` families (meshFsBaseKey) are broad
  * keys pre-warmed as the fallback while an exact key compiles.
  *
- * COVERAGE (meshFsKeyNum, MESH_FS_COVERED): phase 1 selected every key `*-BASE` covers; phase 2 adds the pattern
- * modes 1-5 (+ the footprint), the window facades (+ glass), procedural ground (one key per ground mode: the GM_n
- * directives), water, leaf cards, ad screens and triplanar, i.e. every single-material key. A key outside
- * MESH_FS_COVERED keeps today's pipelines.
+ * COVERAGE: every material key (phase 2 covered every feature, pattern mode and ground mode; since phase 4, 2026-10-08,
+ * there is no other mesh fragment path, so there is no coverage switch and no per-family exclusion any more).
  *
  * PACKED KEY (meshFsKeyNum): the exact material key of one instance slot as one number (feat, style, tex, pattern
  * mode, ground-mode index), memoised on what it reads, so the slot write and the draw walk compare plain numbers.
@@ -111,6 +109,10 @@ export interface MeshFsKey {
   pat: number;
   /** Bit n (0..21) = procedural ground mode n (phase 2; the template compiles every mode while GROUND is set). */
   gm: number;
+  /** PLAIN-ROUTED (phase 4; template PLAIN_ROUTE): the pattern block takes its PLAIN defaults, as the pre-split PLAIN
+   *  uber shader did for the face-kit multiply axis and the planar mirror's multi-material entry (meshFsNumPlain).
+   *  Its own identity: a plain-routed key is only drawn by plain-routed supersets. Absent = false. */
+  plain?: boolean;
 }
 
 // ── Bit classification (the guard) ─────────────────────────────────────────────────────────────────────────────
@@ -241,50 +243,13 @@ export const MESH_FS_G_F16 = 8;
 
 // ── Coverage + the packed key ───────────────────────────────────────────────────────────────────────────────────
 
-/** What the split SELECTS (draws with generated pipelines): feature bits, pattern modes (bit m = mode m) and ground
- *  modes (bit n = GM_n). A key with anything outside it keeps today's pipelines. Phase 1 = the `*-BASE` features;
- *  phase 2 = every feature, pattern mode and ground mode (shader-split.md §11). Narrowed per family by
- *  setMeshFsCoverage (the `exclude` safety valve of sm.setShaderSplit3D). */
-export const MESH_FS_COVERED: { feat: number; pat: number; gm: number } = { feat: MF_ALL, pat: 0xfe, gm: (1 << 22) - 1 };
-
-/** The phase-2 families that can be left on today's pipelines (MESH_FS_EXCLUDE_STORAGE_KEY / sm.setShaderSplit3D
- *  `exclude`). 'phase2' = all of them (= phase-1 coverage: the `*-BASE` features only). */
-export type MeshFsFamily = 'patterns' | 'windows' | 'adScreens' | 'ground' | 'water' | 'leaf' | 'triplanar' | 'phase2';
-export const MESH_FS_FAMILIES: readonly MeshFsFamily[] = ['patterns', 'windows', 'adScreens', 'ground', 'water', 'leaf', 'triplanar', 'phase2'];
-
-/** The coverage with `exclude`d families left on today's pipelines. */
-export function meshFsCoverageExcluding(exclude: readonly MeshFsFamily[]): { feat: number; pat: number; gm: number } {
-  const x = new Set(exclude);
-  if (x.has('phase2')) return { feat: MF_BASE_TEX | MF_BASE_UNTEX, pat: 0, gm: 0 };
-  let feat = MF_ALL, pat = 0xfe, gm = (1 << 22) - 1;
-  if (x.has('patterns')) pat &= ~0x3e;
-  if (x.has('windows')) pat &= ~0x40;
-  if (x.has('adScreens')) { pat &= ~0x80; feat &= ~MF.AD_SCREEN; }
-  if (x.has('ground')) { feat &= ~MF.GROUND; gm = 0; }
-  if (x.has('water')) feat &= ~MF.WATER;
-  if (x.has('leaf')) feat &= ~MF.LEAF;
-  if (x.has('triplanar')) feat &= ~MF.TRIPLANAR;
-  return { feat, pat, gm };
-}
-
-/** Narrow (or restore) the coverage. Clears the packed-key memo: the caller re-derives every slot key (a full
- *  instance repack) and re-codes the GPU-driven records. */
-export function setMeshFsCoverage(c: { feat: number; pat: number; gm: number }): void {
-  MESH_FS_COVERED.feat = c.feat; MESH_FS_COVERED.pat = c.pat; MESH_FS_COVERED.gm = c.gm;
-  keyNumMemo.clear();
-}
-
-/** True when the split selects key `k` (MESH_FS_COVERED). */
-export function meshFsCovered(k: MeshFsKey): boolean {
-  const c = MESH_FS_COVERED;
-  return (k.feat & ~c.feat) === 0 && (k.pat & ~c.pat) === 0 && (k.gm & ~c.gm) === 0;
-}
-
 const P24 = 2 ** 24, P27 = 2 ** 27, P28 = 2 ** 28, P31 = 2 ** 31, P36 = 2 ** 36;
+/** The packed key's PLAIN-ROUTE bit (meshFsNumPlain): above every material field. */
+const PLAIN_BIT = P36;
 
 /** The PACKED exact key of one instance slot: feat + style * 2^24 + tex * 2^27 + patMode * 2^28 + groundModeIndex *
- *  2^31 (< 2^36), or -1 when the split does not cover it (meshFsCovered). `pz` / `pw` are the slot's patternParams.z /
- *  .w (floats 54 / 55: read only for an ad screen / procedural ground). Cheap: called on every instance-slot write. */
+ *  2^31 (< 2^36; always >= 0). `pz` / `pw` are the slot's patternParams.z / .w (floats 54 / 55: read only for an ad
+ *  screen / procedural ground). Cheap: called on every instance-slot write. */
 export function meshFsKeyNum(flags: number, flags2: number, tex: boolean, pz = 0, pw = 0): number {
   // memo on what the key reads: the flags, the static flags2 bits (4 crowd, 7 hair band, 8 lining), the layout, and
   // (only where the shader reads them) the ad-screen switch and the ground-mode index
@@ -295,8 +260,7 @@ export function meshFsKeyNum(flags: number, flags2: number, tex: boolean, pz = 0
   let n = keyNumMemo.get(id);
   if (n === undefined) {
     const k = meshFsKeyOfFlags(f, f2, tex, { adScreen: ad, groundMode: gi < 0 ? 0 : gi });
-    n = !meshFsCovered(k) ? -1
-      : k.feat + Math.round(Math.log2(k.styles)) * P24 + (tex ? P27 : 0) + ((f >>> 9) & 7) * P28 + (gi > 0 ? gi : 0) * P31;
+    n = k.feat + Math.round(Math.log2(k.styles)) * P24 + (tex ? P27 : 0) + ((f >>> 9) & 7) * P28 + (gi > 0 ? gi : 0) * P31;
     keyNumMemo.set(id, n);
   }
   return n;
@@ -305,22 +269,35 @@ const keyNumMemo = new Map<number, number>();
 /** @deprecated phase-1 name of meshFsKeyNum (kept for callers outside the engine). */
 export const meshFsPhase1Num = meshFsKeyNum;
 
-/** The full key of packed key `num` (meshFsKeyNum) under the global bits `g` (MESH_FS_G_*). */
+/** The full key of packed key `num` (meshFsKeyNum, or a PLAIN-routed meshFsNumPlain) under the global bits `g`
+ *  (MESH_FS_G_*). */
 export function meshFsKeyOfNum(num: number, g: number): MeshFsKey {
-  const feat = num % P24, r = Math.floor(num / P24);
+  const plain = num >= PLAIN_BIT;
+  const n = plain ? num - PLAIN_BIT : num;
+  const feat = n % P24, r = Math.floor(n / P24);
   const style = r % 8, tex = Math.floor(r / 8) % 2 === 1, pm = Math.floor(r / 16) % 8, gi = Math.floor(r / 128);
-  return {
+  const k: MeshFsKey = {
     tex, shadow: (g & MESH_FS_G_SHADOW) !== 0, debug: (g & MESH_FS_G_DEBUG) !== 0,
     ssrInline: (g & MESH_FS_G_SSR_INLINE) !== 0, lean: false, f16: (g & MESH_FS_G_F16) !== 0,
     styles: 1 << style, feat, pat: pm ? 1 << pm : 0, gm: (feat & MF.GROUND) !== 0 ? 1 << gi : 0,
   };
+  if (plain) k.plain = true;
+  return k;
 }
 
-/** True when packed key `num` draws the same with today's PLAIN shaders (no pattern block, no ground metric): the
- *  sites that route a mesh to a PLAIN pipeline by a material other than the slot's (the face-kit multiply axis, the
- *  planar mirror's multi-material dedup) use the split only for such keys. */
+/** True when packed key `num` has no pattern mode, no procedural ground and no ad screen (the pattern block of such a
+ *  key is the PLAIN default already). */
 export function meshFsNumPlainSafe(num: number): boolean {
-  return num >= 0 && Math.floor(num / P28) % 8 === 0 && ((num % P24) & (MF.GROUND | MF.AD_SCREEN)) === 0;
+  return num >= 0 && num < PLAIN_BIT && Math.floor(num / P28) % 8 === 0 && ((num % P24) & (MF.GROUND | MF.AD_SCREEN)) === 0;
+}
+
+/** The PLAIN-ROUTED key of packed key `num` (MeshFsKey.plain): the key itself with the pattern block on its PLAIN
+ *  defaults. The two draw sites that drew with the pre-split PLAIN uber shader by a material other than the slot's
+ *  (the face-kit multiply axis; the planar mirror's multi-material entry routed by the MESH material) draw with it,
+ *  so they keep those exact pixels (shader-split.md §14). Identity for a PLAIN-safe key (its pattern block is the
+ *  default already) and for -1. */
+export function meshFsNumPlain(num: number): number {
+  return num < 0 || num >= PLAIN_BIT || meshFsNumPlainSafe(num) ? num : num + PLAIN_BIT;
 }
 
 /** The `*-BASE` family for a layout + globals (spec §4.3): every style, the light + cheap features. The shadow-receiving
@@ -349,7 +326,7 @@ export function meshFsAllKey(tex: boolean, shadow: boolean, debug = true, ssrInl
 /** True when a shader for `a` draws every mesh of key `b` with b's pixels (a is a superset of b). */
 export function meshFsKeyCovers(a: MeshFsKey, b: MeshFsKey): boolean {
   return a.tex === b.tex && a.shadow === b.shadow && a.debug === b.debug && a.ssrInline === b.ssrInline && a.f16 === b.f16
-    && (!a.lean || b.lean)
+    && !!a.plain === !!b.plain && (!a.lean || b.lean)
     && (b.styles & ~a.styles) === 0 && (b.feat & ~a.feat) === 0 && (b.pat & ~a.pat) === 0 && (b.gm & ~a.gm) === 0;
 }
 
@@ -374,7 +351,7 @@ const bitList = (mask: number, max: number): string => { const o: number[] = [];
 /** Canonical key string, e.g. `U|sh|s=01|RIM,ENV_SPEC|p=|gm=|-` (pipeline labels, the id registry, memo keys). */
 export function meshFsKeyString(k: MeshFsKey): string {
   const feats = MF_NAMES.filter((n) => (k.feat & MF[n]) !== 0).join(',');
-  const g = [k.debug ? 'dbg' : '', k.ssrInline ? 'ssr' : '', k.lean ? 'lean' : '', k.f16 ? 'f16' : ''].filter(Boolean).join('+') || '-';
+  const g = [k.debug ? 'dbg' : '', k.ssrInline ? 'ssr' : '', k.lean ? 'lean' : '', k.f16 ? 'f16' : '', k.plain ? 'plain' : ''].filter(Boolean).join('+') || '-';
   return `${k.tex ? 'T' : 'U'}|${k.shadow ? 'sh' : '-'}|s=${(k.styles & 0xff).toString(16).padStart(2, '0')}|${feats}|p=${bitList(k.pat, 7)}|gm=${bitList(k.gm, 21)}|${g}`;
 }
 
@@ -394,9 +371,10 @@ export function meshFsKeyParse(s: string): MeshFsKey | null {
   const pat = bits(p[4], 'p=', 7), gm = bits(p[5], 'gm=', 21);
   if (pat === null || gm === null) return null;
   const g = p[6] === '-' ? [] : p[6].split('+');
-  if (g.some((x) => x !== 'dbg' && x !== 'ssr' && x !== 'lean' && x !== 'f16')) return null;
+  if (g.some((x) => x !== 'dbg' && x !== 'ssr' && x !== 'lean' && x !== 'f16' && x !== 'plain')) return null;
   const k: MeshFsKey = { tex: p[0] === 'T', shadow: p[1] === 'sh', debug: g.includes('dbg'), ssrInline: g.includes('ssr'), lean: g.includes('lean'), f16: g.includes('f16'),
     styles: parseInt(p[2].slice(2), 16), feat, pat, gm };
+  if (g.includes('plain')) k.plain = true;
   return meshFsKeyString(k) === s ? k : null;
 }
 
@@ -407,7 +385,7 @@ export const MESH_FS_DEFINES: ReadonlySet<string> = new Set<string>([
   ...MF_NAMES,
   ...Array.from({ length: 7 }, (_, i) => `PAT_${i + 1}`), 'PAT_ANY', 'PAT_TILED', 'PAT_RELIEF',
   ...Array.from({ length: 22 }, (_, i) => `GM_${i}`),
-  'TEX_DIFFUSE',
+  'TEX_DIFFUSE', 'PLAIN_ROUTE',
 ]);
 
 /** The defined identifiers of key `k` (including the derived PAT_ANY / PAT_TILED / PAT_RELIEF / TEX_DIFFUSE). */
@@ -418,6 +396,7 @@ export function meshFsDefines(k: MeshFsKey): Set<string> {
   if (k.debug) d.add('DEBUG');
   if (k.ssrInline) d.add('SSR_INLINE');
   if (k.lean) d.add('LEAN');
+  if (k.plain) d.add('PLAIN_ROUTE');
   for (let i = 0; i < 8; i++) if (k.styles & (1 << i)) d.add(`STYLE_${i}`);
   for (const n of MF_NAMES) if (k.feat & MF[n]) d.add(n);
   for (let m = 1; m <= 7; m++) if (k.pat & (1 << m)) d.add(`PAT_${m}`);

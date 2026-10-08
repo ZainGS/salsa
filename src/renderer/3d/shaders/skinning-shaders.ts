@@ -14,9 +14,9 @@
  *   Textured:   [meshBGL(0), textureBGL(1), skinBGL(2)]  → skinMatrices @group(2)
  *   Untextured: [meshBGL(0), skinBGL(1)]                 → skinMatrices @group(1)
  *
- * Fragment shaders are identical to the standard non-skinned variants
- * (MESH3D_FRAGMENT_SHADER / MESH3D_FRAGMENT_SHADER_UNTEXTURED) and can be
- * reused directly — they only reference groups 0 and 1 (textures).
+ * Fragment shaders: the generated mesh fragment modules (mesh3d-fs-template.ts, the 'skinned' axis of
+ * mesh-fs-pipelines.ts) are reused directly; they only reference groups 0 and 1 (textures). The skinned VS writes the
+ * same VertexOutput locations 0-8 as the static mesh VS (keep the two in sync).
  */
 
 import { SKIN_BLEND_WGSL } from '../dual-quat-skin';
@@ -257,7 +257,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32) -> VertexO
 //  WEIGHT PAINT variant — skinMatrices at @group(1), per-vertex colors at @group(2)
 //  Pipeline layout: [meshBGL(0), skinBGL(1), weightPaintBGL(2)]
 //  Reads per-vertex heat color from a storage buffer instead of inst.diffuseColor.
-//  Fragment shader: reuse SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED (Gouraud, renderStyle==0 path).
+//  Fragment shader: SKINNED_MESH3D_FRAGMENT_SHADER_WEIGHT_PAINT (below).
 // ═══════════════════════════════════════════════════════════════════════════
 
 export const SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT = /* wgsl */`
@@ -375,16 +375,8 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
 }
 `;
 
-// Fragment shaders for skinned meshes are the standard ones imported from mesh3d-shaders.ts.
-// The skinned vertex shader outputs the same VertexOutput struct, so the fragments are compatible.
-// Re-export them here for convenience so Pipeline3D can import everything from one place.
-export {
-  MESH3D_FRAGMENT_SHADER               as SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED    as SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
-  // §3.1 plain (pattern-stripped) variants — characters have no patterns, so their pipelines use these.
-  MESH3D_FRAGMENT_SHADER_PLAIN            as SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED_PLAIN,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN as SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN,
-} from './mesh3d-shaders';
+// Fragment shaders for skinned meshes are the generated mesh fragment modules (mesh-fs-pipelines.ts 'skinned' /
+// 'skinnedFaceMultiply' axes): the skinned vertex shader outputs the same VertexOutput struct, so they are compatible.
 
 // Dedicated fragment shader for weight paint pipelines.
 // The vertex shader computes the heat color (Gouraud-lit or unlit) and puts it in out.color.

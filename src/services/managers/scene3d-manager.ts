@@ -888,7 +888,9 @@ export class Scene3DManager {
         // calling it and on the interactive count never desyncing (the mesh-edit "bg freezes when I stop orbiting" bug).
         this.ctx.webgpuRenderer.addPreRenderCallback(() => {
             const r = this.renderer3D;
-            return r.meshEditBgAnimating;   // 'wavy', unless this machine's caps freeze it (mobile: a still frame)
+            // 'wavy' on the focus bg showing (armature OR mesh edit — the same rule for both), unless frozen by the
+            // host's switch (setFocusBgAnimate3D) or, when unset, this machine's caps (mobile: a still frame)
+            return r.focusBgAnimating;
         });
         // ★ Same on-demand keep-alive for the ANIMATED hover outline. Its scrolling-pattern phase is read from
         // performance.now() each frame, so it freezes the instant frames stop scheduling — i.e. when the pointer
@@ -4535,6 +4537,19 @@ export class Scene3DManager {
 
     /** Current mesh-edit / UV focus-mode background style. */
     getMeshEditBgMode3D(): import('../../types/armature-3d').ArmatureBgOptions { return this._armature.getMeshEditBgMode3D(); }
+
+    /** ONE switch for the focus backgrounds' 'wavy' animation (armature, mesh edit / UV, the creator stage): true =
+     *  animate, false = a still frame, null = the machine caps decide (the default). Starts / stops the live loop.
+     *  Safe before the renderer boots (the switch is a Renderer3D static; nothing to sync until a renderer exists). */
+    setFocusBgAnimate3D(on: boolean | null): void {
+        Renderer3D.setFocusBgAnimate(on);
+        if (!this.ctx.webgpuRenderer?.peekRenderer3D?.()) return;
+        this._syncFocusBgLiveLoop();   // the mesh-edit hold follows meshEditBgAnimating; the keep-alive self-evaluates
+        this.ctx.scheduleRender();     // one frame: an animating bg keeps the loop going from there, a frozen one stills
+    }
+
+    /** The focus backgrounds' 'wavy' theme animates (the switch, else the machine caps). */
+    getFocusBgAnimate3D(): boolean { return Renderer3D.focusBgAnimateSwitch ?? Renderer3D.caps.animatedFocusBg; }
 
     /** True when the mesh-edit/UV focus background is up AND opaque — i.e. the 2D
      *  illustration content is hidden. Used to also suppress the ephemera overlay. */
@@ -9640,7 +9655,6 @@ export class Scene3DManager {
      */
     // Per-object index sub-ranges within merged city meshes (landmark exact-silhouette hover). meshId → ranges.
     private _meshOutlineRanges = new Map<string, { id: number; start: number; count: number }[]>();
-    private _landmarkAnimHeld = false;
     /** Trace ONE landmark's exact silhouette (from the merged world:lm-* meshes) with the hover-outline style. Pass
      *  null to clear. The city bypasses the normal hover path (city meshes are non-pickable); this is its hover. */
     outlineLandmark3D(landmarkId: number | null): void {
@@ -9655,12 +9669,9 @@ export class Scene3DManager {
             if (!entries.length) entries = null;
         }
         this.renderer3D.setHoverOutlineRanges(entries);
-        const need = entries != null && this.renderer3D.hoverOutlineAnimated;   // keep frames flowing while animated
-        if (need !== this._landmarkAnimHeld) {
-            this._landmarkAnimHeld = need;
-            if (need) this.ctx.interactionService.beginInteractive();
-            else this.ctx.interactionService.endInteractive();
-        }
+        // An animated outline keeps frames flowing via the self-evaluating 'hoverOutline' pre-render callback (for
+        // Renderer3D.HOVER_ANIM_HOLD_MS after the hover changed) — a begin/endInteractive hold here kept the loop live
+        // for as long as the pointer rested on the landmark.
         this.ctx.scheduleRender();
     }
 
@@ -9815,6 +9826,12 @@ export class Scene3DManager {
      * Typically supplied by ShapeManager after both meshEdit and scene3d are initialized.
      */
     setMeshEditDataProvider(fn: () => MeshEditDrawData | null): void { return this._armature.setMeshEditDataProvider(fn); }
+
+    /** The Edit Mesh selection's WORLD centre (null = nothing selected): the edit camera orbits around it (else the
+     *  mesh's bounding-box centre — Scene3DArmature.getEditOrbitPivot). Supplied by ShapeManager. */
+    setEditSelectionPivotProvider(fn: (() => [number, number, number] | null) | null): void { this._armature.editSelectionPivotProvider = fn; }
+    /** The point the edit camera's next orbit gesture revolves around (null outside an edit view). */
+    getEditOrbitPivot3D(): [number, number, number] | null { return this._armature.getEditOrbitPivot(); }
 
     /**
      * Enable the transform gizmo + click-to-select for 3D meshes.

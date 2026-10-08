@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { GROUND_SURFACES, resolveGroundRecipe } from './ground-surfaces';
-import { MESH3D_FRAGMENT_SHADER } from '../renderer/3d/shaders/mesh3d-shaders';
+import { generateMeshFs } from '../renderer/3d/shaders/mesh-fs-generate';
+import { meshFsAllKey } from '../renderer/3d/shaders/mesh-fs-key';
+// The all-features mesh fragment shaders (generated since shader-split phase 4; the same code the uber-shader had).
+const MESH3D_FRAGMENT_SHADER = generateMeshFs(meshFsAllKey(true, false));
 
 describe('ground-surfaces catalog', () => {
     it('includes the shingle surface (mode 9) alongside the existing modes', () => {

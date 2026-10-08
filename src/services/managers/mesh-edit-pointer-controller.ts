@@ -94,6 +94,8 @@ export class MeshEditPointerController {
   private _dragStartCanvasY = 0;
   private _dragStartObjPos: { x: number; y: number; z: number } | null = null;
   private _dragSnapshot: object | null = null;
+  /** A drag frame ran (moveVertex) since the vertex drag began — even a zero-delta one recomputes custom normals. */
+  private _dragApplied = false;
   /** The mesh had custom split normals at the drag start (a move clears them around it; a cancel restores the snapshot). */
   private _dragHadCustomNormals = false;
   /** All vertex positions at drag start — lets the drag re-apply as an absolute move from the
@@ -223,6 +225,87 @@ export class MeshEditPointerController {
   /** The active Edit Mesh tool. */
   get tool(): MeshEditTool { return this._tool; }
 
+  // ── One-shot face pick (Mirror "Use Face": tap the button, then tap a face) ──
+  /** The armed pick's callback (null = not armed). */
+  private _facePick: ((faceIndex: number | null) => void) | null = null;
+  /** The press that may become the pick's tap (released within the slop; a drag is the camera's). */
+  private _facePickPress: { id: number; clientX: number; clientY: number; touch: boolean; pen: boolean } | null = null;
+
+  /**
+   * Arm a ONE-SHOT face pick: the next TAP (mouse click, finger / pen tap) on a face of the edited mesh is consumed —
+   * the selection doesn't change — and `onPick(faceIndex)` runs (a tap on the mirror's copy side gives the real
+   * partner, as every pick). While armed, presses are never claimed: drags orbit, two fingers pan / zoom; a tap on no
+   * face does nothing (still armed). It disarms itself on the pick, and on cancelFacePick / a mode switch away from
+   * Face / another tool / detach — those call `onPick(null)`. A running element transform, Chamfer or plane drag is
+   * cancelled. Arming again replaces the previous pick (its callback gets null). False when not attached.
+   */
+  armFacePick(onPick: (faceIndex: number | null) => void): boolean {
+    if (!this._canvas || !this._meshId || typeof onPick !== 'function') return false;
+    if (this._planeDrag) this.cancelMirrorPlaneDrag();
+    if (this.bevel.active) this.bevel.cancel();
+    if (this.transform.active) this._endElementTransform(false);
+    if (this._dragging) this._cancelDrag();
+    this._pending = null; this._selPress = null; this._loopPress = null;
+    const prev = this._facePick;
+    this._facePick = onPick;
+    this._facePickPress = null;
+    if (prev) { try { prev(null); } catch (err) { console.warn('[MeshEdit] face pick', err); } }
+    return true;
+  }
+
+  /** Disarm the face pick (its callback gets null). False when none was armed. */
+  cancelFacePick(): boolean {
+    const cb = this._facePick;
+    if (!cb) return false;
+    this._facePick = null;
+    this._facePickPress = null;
+    try { cb(null); } catch (err) { console.warn('[MeshEdit] face pick', err); }
+    return true;
+  }
+
+  /** A one-shot face pick is armed (armFacePick). */
+  get facePickArmed(): boolean { return this._facePick !== null; }
+
+  /** While a face pick is armed: remember the press (unclaimed — the camera may take it as a drag). */
+  private _facePickDown(e: PointerEvent): void {
+    const touch = e.pointerType === 'touch';
+    if (touch) {
+      const id = e.pointerId ?? 0;
+      if (e.isPrimary && !this._facePickPress) this._touchIds.clear();
+      this._touchIds.add(id);
+      if (this._touchIds.size > 1) { this._facePickPress = null; return; }   // a 2nd finger: a camera gesture
+    }
+    if (e.button !== 0 || e.isPrimary === false) return;
+    this._facePickPress = { id: e.pointerId ?? 0, clientX: e.clientX, clientY: e.clientY, touch, pen: e.pointerType === 'pen' };
+  }
+
+  /** While a face pick is armed: a press that moved past the slop is a camera drag, not the pick's tap. */
+  private _facePickMove(e: PointerEvent): void {
+    const p = this._facePickPress;
+    if (!p || (e.pointerId ?? 0) !== p.id) return;
+    const slop = p.touch || p.pen ? MeshEditPointerController.TAP_SLOP_PX : MOUSE_DRAG_SLOP_PX;
+    if (Math.hypot(e.clientX - p.clientX, e.clientY - p.clientY) > slop) this._facePickPress = null;
+  }
+
+  /** While a face pick is armed: the tap's release picks the face under it (no face: still armed). */
+  private _facePickUp(e: PointerEvent): void {
+    if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+    const p = this._facePickPress;
+    if (!p || (e.pointerId ?? 0) !== p.id) return;
+    this._facePickPress = null;
+    if (!this._canvas || !this._meshId) return;
+    this._rect = this._canvas.getBoundingClientRect();
+    this._pickScale = p.touch ? TOUCH_PICK_SCALE : 1;
+    const at = this._toCanvasPx(e.clientX, e.clientY);
+    const fi = this._pickFace(at.x, at.y);
+    this._pickScale = 1;
+    this._rect = null;
+    if (fi < 0) return;
+    const cb = this._facePick;
+    this._facePick = null;
+    try { cb?.(fi); } catch (err) { console.warn('[MeshEdit] face pick', err); }
+  }
+
   /**
    * Switch the tool strip's tool. move / rotate / scale show the selection gizmo in that mode; every other tool hides it.
    * Leaving the Knife drops its points; leaving Loop Cut drops the preview; a running element transform is cancelled.
@@ -230,6 +313,7 @@ export class MeshEditPointerController {
    */
   setTool(tool: MeshEditTool): boolean {
     if (!MESH_EDIT_TOOLS.includes(tool)) return false;
+    if (tool !== this._tool) this.cancelFacePick();   // picking another tool ends a one-shot face pick
     if (this.transform.active) this._endElementTransform(false);
     if (tool !== 'knife') this._knife = null;
     if (tool !== 'loopcut') { this._loopHover = null; this._loopPress = null; }
@@ -261,6 +345,7 @@ export class MeshEditPointerController {
 
   detach(): void {
     if (!this._canvas) return;
+    this.cancelFacePick();
     if (this._planeDrag) this.cancelMirrorPlaneDrag();
     if (this.bevel.active) this.bevel.cancel();
     if (this.transform.active) this._endElementTransform(false);
@@ -301,6 +386,7 @@ export class MeshEditPointerController {
   }
 
   setMode(mode: MeshEditSelectionMode): void {
+    if (mode !== 'face') this.cancelFacePick();   // Vertex / Edge ends a one-shot face pick
     if (this.bevel.active && mode !== this._mode) this.bevel.cancel();
     if (this.transform.active && mode !== this._mode) this._endElementTransform(false);
     this._mode = mode;
@@ -323,6 +409,7 @@ export class MeshEditPointerController {
 
   private _handleDown(e: PointerEvent): void {
     if (!this._canvas || !this._meshId) return;
+    if (this._facePick) { this._facePickDown(e); return; }   // a one-shot face pick takes the tap (never the drag)
     if (this._planeDrag) { this._planeDragDown(e); return; }
     // Only handle primary button
     if (e.button !== 0) return;
@@ -438,6 +525,7 @@ export class MeshEditPointerController {
   private _handleMove(e: PointerEvent): void {
     if (!this._canvas || !this._meshId) return;
     if (e.pointerType === 'mouse') this._lastMouse = { clientX: e.clientX, clientY: e.clientY };
+    if (this._facePick) { this._facePickMove(e); return; }
     if (this._planeDrag) { this._planeDragMove(e); return; }
     if (this.transform.active) { this._xfMove(e); return; }
     if (this.bevel.active) { this._bevelMove(e); return; }
@@ -528,6 +616,7 @@ export class MeshEditPointerController {
   }
 
   private _handleUp(e: PointerEvent): void {
+    if (this._facePick) { this._facePickUp(e); return; }
     if (this._planeDrag) { this._planeDragUp(e); return; }
     if (this.transform.active || this._xfPointer !== null) { this._xfUp(e); return; }
     if (this.bevel.active || this._bevelPointer !== null || this._bevelPending) { this._bevelUp(e); return; }
@@ -587,7 +676,15 @@ export class MeshEditPointerController {
     this._finishPatchedDrag();   // 7.3d: one full recompile at the end of an in-place-patched drag
     if (this._dragging && this._dragVertexIdx >= 0 && this._meshId && this._dragSnapshot) {
       const mesh = this._getMesh();
-      if (mesh?.editMesh) {
+      if (mesh?.editMesh && !this._dragMovedAny(mesh.editMesh)) {
+        // A press released without moving anything (a click that selected the vertex): no (empty) undo step. A zero-delta
+        // drag frame may still have recomputed custom normals: put them back exactly.
+        if (this._dragApplied && this._dragHadCustomNormals) {
+          mesh.editMesh = EditMesh.fromJSON(this._dragSnapshot);
+          mesh.syncFromEditMesh();
+          this.dragStats.fullSyncs++;
+        }
+      } else if (mesh?.editMesh) {
         const before = this._dragSnapshot;
         // Snapshot the WHOLE mesh, not just the dragged vertex: with proportional editing the
         // drag also moved neighbours, so a redo that restored only one vertex would leave the
@@ -619,6 +716,11 @@ export class MeshEditPointerController {
   }
 
   private _handleCancel(e: PointerEvent): void {
+    if (this._facePick) {
+      if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+      if (this._facePickPress && (e.pointerId ?? 0) === this._facePickPress.id) this._facePickPress = null;
+      return;
+    }
     if (this._planeDrag) {
       if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
       if (e.pointerId === undefined || e.pointerId === this._planeDrag.pointer) this.cancelMirrorPlaneDrag();
@@ -1274,8 +1376,9 @@ export class MeshEditPointerController {
     return index >= 0 ? { kind, index } : null;
   }
 
-  /** A vertex is selected when it is in the selection's vertex set; an edge when it (or its twin) is selected, or both
-   *  its ends are selected vertices; a face when it is selected. */
+  /** A vertex is selected when it is in the selection's vertex set; an edge when it (or its twin) is in the EDGE
+   *  selection — never because both its ends are selected (Blender's edge mode: two selected edges A–B and C–D don't
+   *  make B–C selected, so a tap on B–C adds it); a face when it is selected. */
   private _isSelected(kind: MeshEditSelectionMode, index: number): boolean {
     if (!this._meshId) return false;
     const sel = this._meshEdit.getSelection(this._meshId);
@@ -1285,9 +1388,7 @@ export class MeshEditPointerController {
     if (kind === 'face') return sel.faces.has(index);
     const he = em.halfEdges[index];
     if (!he) return false;
-    if (sel.edges.has(index) || (he.twin >= 0 && sel.edges.has(he.twin))) return true;
-    const ends = em.getHalfEdgeVertices(index);
-    return !!ends && sel.vertices.has(ends[0]) && sel.vertices.has(ends[1]);
+    return sel.edges.has(index) || (he.twin >= 0 && sel.edges.has(he.twin));
   }
 
   /** Anything is selected on the edited mesh (skips the extra pick on a press when nothing is). */
@@ -1662,6 +1763,7 @@ export class MeshEditPointerController {
     this._dragHadCustomNormals = typeof mesh.editMesh.hasCustomNormals === 'function' && mesh.editMesh.hasCustomNormals();
     this._dragStartObjPos = { x: v.x, y: v.y, z: v.z };
     this._dragStartVerts = mesh.editMesh.vertices.map(vt => ({ x: vt.x, y: vt.y, z: vt.z }));
+    this._dragApplied = false;
     try { this._canvas.setPointerCapture(pointerId); } catch { /* pointer already gone */ }
     this._dragPointerId = pointerId ?? null;
     this._canvas.style.cursor = 'grabbing';
@@ -1700,8 +1802,18 @@ export class MeshEditPointerController {
       }
     }
     mesh.editMesh.moveVertex(this._dragVertexIdx, delta.x, delta.y, delta.z);
+    this._dragApplied = true;
     this._syncDragGeometry(mesh);
     this._scheduleRender();
+  }
+
+  /** True when the vertex drag moved any vertex off its drag-start position (else its release pushes no undo step). */
+  private _dragMovedAny(em: EditMesh): boolean {
+    const start = this._dragStartVerts;
+    if (!start || start.length !== em.vertices.length) return true;
+    const v = em.vertices;
+    for (let i = 0; i < v.length; i++) if (v[i].x !== start[i].x || v[i].y !== start[i].y || v[i].z !== start[i].z) return true;
+    return false;
   }
 
   /** mobile-parity 7.3d: bring the GPU mesh in line with a drag frame. Topology is unchanged mid-drag, so the moved

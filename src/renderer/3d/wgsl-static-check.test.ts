@@ -34,26 +34,17 @@ import * as lofi from './lofi-pass';
 import * as gpuCull from './shaders/gpu-cull-shaders';
 import * as temporalAA from './temporal-aa';
 import * as skyDome from './sky-dome-pass';
-import { specialiseMeshFragment, VARIANT_FAMILIES } from './shader-variants';
 import { generateMeshFs } from './shaders/mesh-fs-generate';
 import { MF, MF_NAMES, meshFsAllKey, meshFsBaseKey, meshFsKeyString, type MeshFsKey } from './shaders/mesh-fs-key';
 
-// Step 8 (shader-variants.ts): the specialised mesh fragment variants are checked like every other shader — each of
-// the 8 base fragment shaders specialised with one key, plus every listed family (PBR and a Cel-HD + toon modifier) on
-// the most common base (untextured, patterned, shadow-receiving).
-const variants: Record<string, string> = {};
-const MESH_FS = Object.keys(mesh3d).filter((k) => /^MESH3D_FRAGMENT_SHADER/.test(k));
-for (const k of MESH_FS) variants[`${k}@ground`] = specialiseMeshFragment((mesh3d as unknown as Record<string, string>)[k], 262144, true);
-for (const f of VARIANT_FAMILIES) for (const mod of [0, (5 << 2) | 0x40000000]) {
-  variants[`MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN@${f | mod}`] = specialiseMeshFragment(mesh3d.MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN, (f | mod) >>> 0, true);
-}
-
-// SHADER SPLIT (shaders/mesh-fs-generate.ts): the generated fragment modules get the same checks - the families
-// (BASE / ALL) per layout, every render style alone, every feature alone and every ground mode alone (shader-split.md §6.1.7).
+// SHADER SPLIT (shaders/mesh-fs-generate.ts): the mesh fragment modules (generated per key; the only mesh fragment
+// source since phase 4) - the families (BASE / ALL, the ALL key also with the debug hooks + inline SSR: the old
+// uber-shader's code) per layout, every render style alone, every feature alone and every ground mode alone
+// (shader-split.md §6.1.7).
 const split: Record<string, string> = {};
 for (const tex of [false, true]) for (const shadow of [false, true]) {
   const base: MeshFsKey = { tex, shadow, debug: false, ssrInline: false, lean: false, f16: false, styles: 1, feat: 0, pat: 0, gm: 0 };
-  const keys: MeshFsKey[] = [meshFsBaseKey(tex, shadow, false, false), meshFsBaseKey(tex, shadow, true, false), meshFsAllKey(tex, shadow, false, false)];
+  const keys: MeshFsKey[] = [meshFsBaseKey(tex, shadow, false, false), meshFsBaseKey(tex, shadow, true, false), meshFsAllKey(tex, shadow, false, false), meshFsAllKey(tex, shadow, true, true)];
   for (let st = 0; st < 8; st++) keys.push({ ...base, styles: 1 << st });
   for (const f of MF_NAMES) keys.push({ ...base, feat: MF[f] | MF.ENV_SPEC });
   for (let m = 1; m <= 7; m++) keys.push({ ...base, pat: 1 << m });
@@ -61,7 +52,7 @@ for (const tex of [false, true]) for (const shadow of [false, true]) {
   for (const k of keys) split[meshFsKeyString(k)] = generateMeshFs(k);
 }
 
-const MODULES: Record<string, Record<string, unknown>> = { mesh3d, skinning, style, highlight, outline, shadow, silhouette, ssao, post, particle, bloom, gizmo, cloth, gp, spriteOutline, postBgKeep, fxaa, iblBake, shadowMinMax, lofi, gpuCull, temporalAA, skyDome, variants, split };
+const MODULES: Record<string, Record<string, unknown>> = { mesh3d, skinning, style, highlight, outline, shadow, silhouette, ssao, post, particle, bloom, gizmo, cloth, gp, spriteOutline, postBgKeep, fxaa, iblBake, shadowMinMax, lofi, gpuCull, temporalAA, skyDome, split };
 
 /** Every exported string that looks like WGSL (has a function or a struct). */
 function shaderStrings(): { name: string; src: string }[] {
@@ -149,8 +140,7 @@ describe('WGSL static checks (every exported shader string)', () => {
 
   it('found the shader sources', () => {
     expect(shaders.length).toBeGreaterThan(20);
-    expect(shaders.some((s) => s.name === 'mesh3d.MESH3D_FRAGMENT_SHADER_UNTEXTURED')).toBe(true);
-    expect(shaders.filter((s) => s.name.startsWith('variants.')).length).toBe(MESH_FS.length + VARIANT_FAMILIES.size * 2);
+    expect(shaders.some((s) => s.name === `split.${meshFsKeyString(meshFsAllKey(false, false))}`)).toBe(true);
     expect(shaders.filter((s) => s.name.startsWith('split.')).length).toBeGreaterThan(100);
   });
 

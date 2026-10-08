@@ -2,9 +2,10 @@
  * RENDER DEBUG tinyMeshFS (render-debug.ts; mobile-parity RENDER-1): a minimal mesh fragment shader swapped in for
  * EVERY mesh / skinned-mesh fragment pipeline when the switch is on (read when the pipelines are created, so it needs
  * a reload). Same bindings (instance storage at 0, scene uniforms at 1) and the same VS -> FS location contract
- * (gouraud colour 0, flat instance index 2, world normal 4) as the uber shader, so it runs against the real data
- * path with ~15 lines of code instead of ~2,700. The tablet's rainbow tiles appear on any runtime-loaded value in
- * the uber shader; if they are gone with this shader, the uber shader's size / complexity is the trigger.
+ * (gouraud colour 0, flat instance index 2, world normal 4) as the generated mesh fragment shaders, so it runs
+ * against the real data path with ~15 lines of code. (RENDER-1 history: the tablet's rainbow tiles appeared on any
+ * runtime-loaded value in the ~2,700-line uber shader and vanished with this one; the shader split, phase 4 since
+ * 2026-10-08, replaced the uber shader for good.)
  */
 export const MESH3D_FS_TINY = /* wgsl */ `
 struct MeshInstance {

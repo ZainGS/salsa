@@ -1,6 +1,7 @@
 /**
- * SPECIALISED MESH FRAGMENT PIPELINES (docs/specs/shader-split.md §5; phases 1-3 of the shader split: ON by default
- * on every tier since phase 3, 2026-10-07; the rollback is SHADER_SPLIT mode 'off' / render debug noShaderSplit).
+ * SPECIALISED MESH FRAGMENT PIPELINES (docs/specs/shader-split.md §5): THE mesh pipelines. Since shader-split phase 4
+ * (2026-10-08) there is no other mesh fragment path: the uber-shader pipelines, the rollback switch and the P21
+ * variants are gone, so every mesh draw (every axis, every tier) goes through this registry.
  *
  * One registry of (axis x key) render pipelines. The axis supplies everything but the fragment module (vertex module
  * and buffers, layout, blend, depth, cull: Pipeline3D's describe callback); the key's fragment module is generated
@@ -20,7 +21,6 @@
  *                                              shaders"), and the `*-BASE` family of that axis is queued so the next
  *                                              new key has a fallback.
  * Outside a live frame (captures, thumbnails, tests) the exact key compiles synchronously, as every pipeline does.
- * NEVER the uber-shader: while the split is on, a covered mesh draws only generated pipelines (spec §9 decision 3).
  *
  * KEY CAP (spec §4.5): at most MeshFsPipelines.maxKeys distinct exact keys per device (96 desktop / 40 mobile:
  * GpuCaps.shaderSplitMaxKeys). Past it a new key is WIDENED (meshFsWidenKey: ground modes, then styles + the light
@@ -39,73 +39,8 @@
 
 import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle, type PipelinePriority } from '../core/gpu-pipeline-cache';
 import { noteTwinSource } from './vertex-pack';
-import { rdNoShaderSplit } from './render-debug';
 import { generateMeshFs, meshFsSize } from './shaders/mesh-fs-generate';
-import { MESH_FS_FAMILIES, meshFsCoverageExcluding, setMeshFsCoverage, type MeshFsFamily, MESH_FS_G_DEBUG, MESH_FS_G_SHADOW, MESH_FS_G_SSR_INLINE, meshFsBaseKey, meshFsBisectKey, meshFsKeyCovers, meshFsKeyOfNum, meshFsKeyParse, meshFsKeyString, meshFsWidenKey, type MeshFsBisect, type MeshFsKey } from './shaders/mesh-fs-key';
-
-// ── The switch (spec §7.1) ─────────────────────────────────────────────────────────────────────────────────────────
-
-/** Per-machine preference: 'on' | 'off' | 'auto' (= the phase default: ON since phase 3). Read once at load. 'off' is
- *  the ROLLBACK (every mesh on the uber-shader, as before the split); a stored 'on' (the phase 1-2 tablet opt-in)
- *  still means on. */
-export const SHADER_SPLIT_STORAGE_KEY = 'salsa.shaderSplit';
-export type ShaderSplitMode = 'on' | 'off' | 'auto';
-/** The phase default ('auto' / no stored value). Phase 3 (shader-split.md §13): ON on every tier: desktop, mobile and
- *  safe mode (§9 decision 8: the smaller shaders are the safer path). */
-export const SHADER_SPLIT_DEFAULT = true;
-
-function readMode(): ShaderSplitMode {
-  try {
-    const v = typeof localStorage !== 'undefined' ? localStorage.getItem(SHADER_SPLIT_STORAGE_KEY) : null;
-    return v === 'on' || v === 'off' ? v : 'auto';
-  } catch { return 'auto'; }
-}
-
-/** The live switch state (Renderer3D reads shaderSplitActive() at draw time; Pipeline3D at its boot warm). */
-export const SHADER_SPLIT: { mode: ShaderSplitMode } = { mode: readMode() };
-
-/** The split is on: the stored mode (auto = the phase default, ON), unless the render-debug rollback switch
- *  noShaderSplit forces it off. */
-export function shaderSplitActive(): boolean {
-  if (rdNoShaderSplit()) return false;
-  return SHADER_SPLIT.mode === 'on' || (SHADER_SPLIT.mode === 'auto' && SHADER_SPLIT_DEFAULT);
-}
-
-/** Set (and persist) the mode. 'auto' removes the stored value. */
-export function setShaderSplitMode(mode: ShaderSplitMode): void {
-  SHADER_SPLIT.mode = mode;
-  try {
-    if (typeof localStorage === 'undefined') return;
-    if (mode === 'auto') localStorage.removeItem(SHADER_SPLIT_STORAGE_KEY); else localStorage.setItem(SHADER_SPLIT_STORAGE_KEY, mode);
-  } catch { /* storage blocked: this session only */ }
-}
-
-if (SHADER_SPLIT.mode === 'off') console.warn(`[Salsa][shader-split] OFF (rollback) from localStorage (${SHADER_SPLIT_STORAGE_KEY}): every mesh on the uber-shader. sm.setShaderSplit3D({ mode: 'auto' }) clears it.`);
-
-/** Per-machine family exclusions (a JSON array of MeshFsFamily): the safety valve for a device where a phase-2 family
- *  looks wrong (for example a driver that compiles the window-facade hash differently, shader-split.md §11.6):
- *  `sm.setShaderSplit3D({ exclude: ['windows'] })` keeps those meshes on today's pipelines; `['phase2']` = phase 1. */
-export const SHADER_SPLIT_EXCLUDE_STORAGE_KEY = 'salsa.shaderSplit.exclude';
-function readExclude(): MeshFsFamily[] {
-  try {
-    const v = typeof localStorage !== 'undefined' ? localStorage.getItem(SHADER_SPLIT_EXCLUDE_STORAGE_KEY) : null;
-    const a = v ? JSON.parse(v) as unknown : null;
-    return Array.isArray(a) ? a.filter((x): x is MeshFsFamily => MESH_FS_FAMILIES.includes(x as MeshFsFamily)) : [];
-  } catch { return []; }
-}
-let _exclude: MeshFsFamily[] = readExclude();
-if (_exclude.length) { setMeshFsCoverage(meshFsCoverageExcluding(_exclude)); console.warn(`[Salsa][shader-split] families on today's pipelines (${SHADER_SPLIT_EXCLUDE_STORAGE_KEY}): ${_exclude.join(', ')}`); }
-/** The excluded families. */
-export function shaderSplitExcluded(): readonly MeshFsFamily[] { return _exclude; }
-/** Set (and persist) the excluded families. The caller re-derives the slot keys (Renderer3D.setShaderSplit). */
-export function setShaderSplitExcluded(ex: readonly MeshFsFamily[]): void {
-  _exclude = ex.filter((x) => MESH_FS_FAMILIES.includes(x));
-  setMeshFsCoverage(meshFsCoverageExcluding(_exclude));
-  try {
-    if (typeof localStorage === 'undefined') return;
-    if (_exclude.length) localStorage.setItem(SHADER_SPLIT_EXCLUDE_STORAGE_KEY, JSON.stringify(_exclude)); else localStorage.removeItem(SHADER_SPLIT_EXCLUDE_STORAGE_KEY);
-  } catch { /* storage blocked: this session only */ }
-}
+import { MESH_FS_G_DEBUG, MESH_FS_G_SHADOW, MESH_FS_G_SSR_INLINE, meshFsBaseKey, meshFsBisectKey, meshFsKeyCovers, meshFsKeyOfNum, meshFsKeyParse, meshFsKeyString, meshFsWidenKey, type MeshFsBisect, type MeshFsKey } from './shaders/mesh-fs-key';
 
 /** The pipeline axes (spec §5.1 MeshAxis). The planar-mirror passes reuse opaqueNoCull / transparentNoCull / skinned
  *  (same layouts; only bind group 0 differs). The always-on-top 'overlay' axis has no draw site (only postOverlay). */

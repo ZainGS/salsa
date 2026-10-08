@@ -39,7 +39,10 @@ import {
 import { MODE_FADE_MS } from '../../renderer/shell/shell-bake';
 import { shellMark } from '../../renderer/shell/shell-perf';
 import { sameProjectList, projectsOfKind } from './shell-project-diff';
-import { unzipSync, strFromU8 } from 'fflate';
+import {
+  openShellImportPicker, readCartListing, shellCartFilesToInstall, SHELL_CART_ACCEPT, SHELL_IMPORT_ACCEPT,
+  type ShellImportHandler,
+} from './shell-import';
 import {
   computeShellLayout,
   computeProjectGrid,
@@ -390,32 +393,35 @@ export class ShellUIManager {
     await this.persistRegistry('registry');
   }
 
-  /** Open the .frogcart file picker and install the chosen cart (the Import tile's action) — for a host's own
+  /** The host's router for the Import tile's files (setImportHandler); null = carts only. */
+  private importHandler: ShellImportHandler | null = null;
+
+  /**
+   * Route the Import tile's files through the host: the picker then takes several files of any Frogmarks kind
+   * (.frogcart, .frogmarks, .frog, a renamed / zipped copy) and `handler` gets them all; it opens what it can itself
+   * (a project) and returns the ones that are carts, which the Shell installs. null = a .frogcart-only picker again.
+   */
+  setImportHandler(handler: ShellImportHandler | null): void { this.importHandler = handler; }
+
+  /** Open the Import picker and import the chosen files (the Import tile's action) — for a host's own
    *  button / keyboard path. Must run inside a user gesture (a click / key handler). */
   importCart(): void { this.importCartFromFile(); }
 
-  /** "Import" tile: open the OS file picker (restricted to .frogcart), then
-   *  install the chosen file locally. Must run inside the click gesture. */
+  /** "Import" tile: open the OS file picker (restricted to .frogcart unless the host routes imports), then
+   *  install the chosen carts locally. Must run inside the click gesture. */
   private importCartFromFile(): void {
     if (typeof document === 'undefined') return;
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.frogcart';
-    input.style.display = 'none';
-    input.addEventListener('change', () => {
-      const file = input.files?.[0];
-      input.remove();
-      if (file) void this.installLocalCart(file);
-    }, { once: true });
-    // Dismissing the picker fires `cancel` (not `change`) in modern browsers → the hidden input would otherwise
-    // stay appended to <body> and accumulate on every cancelled import. Remove it on cancel too.
-    input.addEventListener('cancel', () => input.remove(), { once: true });
-    document.body.appendChild(input);
-    input.click();
+    const handler = this.importHandler;
+    const accept = handler ? SHELL_IMPORT_ACCEPT : SHELL_CART_ACCEPT;
+    openShellImportPicker(document, { accept, multiple: !!handler }, (files) => {
+      void (async () => {
+        for (const file of await shellCartFilesToInstall(files, handler)) await this.installLocalCart(file);
+      })();
+    });
   }
 
   /** Store an imported .frogcart in OPFS and register its cart slot. The cart
-   *  name comes from the zip's manifest.json (`name`), else the filename. */
+   *  name comes from the zip's manifest.json (`title`, else `name`), else the filename. */
   private async installLocalCart(file: File): Promise<void> {
     if (!ShellStorage.isAvailable()) {
       console.warn('[Shell] Cannot import cart — OPFS storage is unavailable.');
@@ -423,16 +429,7 @@ export class ShellUIManager {
     }
     try {
       const buffer = await file.arrayBuffer();
-      let name = file.name.replace(/\.frogcart$/i, '').trim() || 'Cart';
-      let description: string | undefined;
-      try {
-        const mf = unzipSync(new Uint8Array(buffer))['manifest.json'];
-        if (mf) {
-          const m = JSON.parse(strFromU8(mf)) as { name?: unknown; description?: unknown };
-          if (typeof m.name === 'string' && m.name.trim()) name = m.name.trim();
-          if (typeof m.description === 'string') description = m.description;
-        }
-      } catch { /* not a valid zip / no manifest → keep the filename */ }
+      const { name, description } = readCartListing(new Uint8Array(buffer), file.name);
       const id = crypto.randomUUID();
       const opfsPath = await this.storage.writeLocalCart(id, buffer);
       await this.upsertCartSlot({ id, type: 'local', name, description, opfsPath, order: 0 });

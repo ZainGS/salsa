@@ -25,9 +25,9 @@ import { encodeMeshFlags2, FLAGS2_FLOAT as FLAGS2_FLOAT_OFFSET, FLAGS2_DISTANCE_
 import { computeFogEye, defaultFogHorizon, fogHorizonActive, fogHorizonEdge, fogHorizonFlags, sanitizeFogHorizon, type FogHorizonSettings } from './fog-horizon';
 import { Camera3D } from './camera-3d';
 import { Pipeline3D, MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE } from './pipeline-3d';
-import { variantKeyOfFlags, variantKeyOfMaterial, ShaderVariantIds, VB_TEXTURED, VB_NOCULL, VB_PATTERNED, VB_SHADOW } from './shader-variants';
-import { shaderSplitActive, setShaderSplitMode, SHADER_SPLIT, MeshFsPipelines, setShaderSplitExcluded, shaderSplitExcluded, type MeshFsAxis, type MeshFsSplitStats, type ShaderSplitMode } from './mesh-fs-pipelines';
-import { meshFsKeyNum, meshFsNumPlainSafe, MESH_FS_G_SHADOW, MESH_FS_G_DEBUG, MESH_FS_G_SSR_INLINE, type MeshFsBisect, type MeshFsFamily } from './shaders/mesh-fs-key';
+import { variantKeyOfFlags, ShaderVariantIds } from './shader-variants';
+import { MeshFsPipelines, type MeshFsAxis, type MeshFsSplitStats } from './mesh-fs-pipelines';
+import { meshFsKeyNum, meshFsNumPlain, MESH_FS_G_SHADOW, MESH_FS_G_DEBUG, MESH_FS_G_SSR_INLINE, type MeshFsBisect } from './shaders/mesh-fs-key';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { Material3D, encodeMaterialFlags, packRGB8, resolveSceneWind, DEFAULT_SCENE_WIND, type SceneWind3D, resolveSkinRamp, DEFAULT_SKIN_RAMP, type SkinRampSettings, resolveToonShadows, DEFAULT_TOON_SHADOWS, type ToonShadowSettings, resolveRimLight, DEFAULT_RIM_LIGHT, type RimLightSettings } from './material-3d';
@@ -35,7 +35,7 @@ import { MAX_POINT_LIGHTS, packSceneUniforms, selectNearestPointLights, computeL
 import { ShadowRunTester, CasterSig, StaticLayerMembers, copyCascadeBox, cascadeBoxHolds, cascadeDepthMargin, cascadeRefresh, newCascadeCacheState, stepSunDirection, type CascadeCacheState } from './shadow-cache';
 import { DEFAULT_SHADOW_CASCADES, sanitizeShadowCascades, cascadeHalfExtents, cascadeBias, type ShadowCascadeSettings } from './shadow-cascades';
 import { ShadowMinMax } from './shadow-minmax';
-import { RD, renderDebugShadeMode, renderDebugShaderBits, rdColorLoad, rdDepthLoad, rdForceShaderVariants } from './render-debug';
+import { RD, renderDebugShadeMode, renderDebugShaderBits, rdColorLoad, rdDepthLoad } from './render-debug';
 import { shadowLodScreenThreshold, shadowLodThreshold, shadowTexel } from './shadow-lod';
 import { Mesh3D, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
@@ -859,14 +859,9 @@ export class Renderer3D {
   /** PER-MACHINE CAPS (gpu-capabilities.ts, mobile-parity CRASH-8): what this device may run, applied by WebGPURenderer
    *  at start-up and on every device recovery. They clamp the switches at render time and never change a document
    *  setting or a stored preference (the getters that feed the save keep returning the authored values). */
-  static readonly caps = { gpuDriven: true, shaderVariants: true, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true, shaderSplitMaxKeys: 96 };
+  static readonly caps = { gpuDriven: true, shadows: true, ssao: true, ssr: true, taa: true, animatedFocusBg: true, shaderSplitMaxKeys: 96 };
   /** The GPU-driven path is on (the switch AND the device cap). */
   static get gpuDrivenActive(): boolean { return Renderer3D.gpuDriven && Renderer3D.caps.gpuDriven; }
-  /** P21 shader variants are on (the switch AND the device cap). */
-  static get shaderVariantsActive(): boolean {
-    // RENDER DEBUG forceShaderVariants (RENDER-1 test): variants on despite the tier cap.
-    return Renderer3D.shaderVariants && (Renderer3D.caps.shaderVariants || rdForceShaderVariants());
-  }
   /** LEAN: on a frame where no prepass / overlay reads the CPU's camera lists (outlines, SSAO / SSR, a planar mirror,
    *  hover / per-object outlines, the CPU occlusion cull, a verification), the draw-list loop skips the camera-pass
    *  tail (frustum, ranges, pushes) of GPU-culled records. false = the CPU still builds every list (A/B). */
@@ -884,10 +879,6 @@ export class Renderer3D {
   private _gdWasOn = false;
   private _gdAtlasSeen = -1;
   private _gdFdsSeen = false;
-  /** Phase B: the merged (all-patterned) pipeline choice is in force (GpuDrivenMain.mergePatterned + its pipelines ready). */
-  private _gdMergeOk = false;
-  /** SHADER SPLIT: the split state the GPU-driven state codes were derived under (a change re-codes them). */
-  private _gdSplitSeen = false;
   /** The GPU scene could not be created on this device (no compute / indirect support): the CPU path, for good. */
   private _gdFailed = false;
   /** CRASH-10 breadcrumbs: this renderer submitted its first GPU-driven cull dispatch. */
@@ -944,16 +935,13 @@ export class Renderer3D {
       vbGen: () => r._vbOverrideGen,
       stateCode: (m) => {
         const mat = m.material, tex = !!(mat.hasTexture || mat.hasNormalMap);
-        let c = (tex ? T : 0) | ((r.forceDoubleSided || !!mat.doubleSided) ? NC : 0) | ((r._gdMergeOk || r._usesPatterns(m)) ? PT : 0);
+        let c = (tex ? T : 0) | ((r.forceDoubleSided || !!mat.doubleSided) ? NC : 0) | (r._usesPatterns(m) ? PT : 0);
         if (tex && !!m.textureLibraryId && r._atlasLayerMap.has(m.textureLibraryId)) c |= AT;
         if (r._vertexBufferOverrides.has(m.id)) c |= VO;
         else if (r._geomAllocs.get(m.id)?.pk) c |= GD_CODE_PACKED;   // P22: the packed twin + uint16 indices
-        // SHADER SPLIT: a covered mesh carries its split key id (bits 5+, with SPLIT_ID_FLAG) instead of a P21 variant id
-        const sid = shaderSplitActive() ? r._splitIdOf(Renderer3D.splitKeyOfMesh(m)) : 0;
-        if (sid > 0) return c | ((Renderer3D.SPLIT_ID_FLAG | sid) << 5);
-        // step 8: the shader-variant id (bits 5+), from the material (this runs before the frame's slot writes)
-        if (Renderer3D.shaderVariantsActive && m.submeshes.length === 0) c |= r._svIds.idOf(variantKeyOfMaterial(mat)) << 5;
-        return c;
+        // SHADER SPLIT: the mesh's split key id (bits 5+, with SPLIT_ID_FLAG); the bucket = one exact key
+        const sid = r._splitIdOf(Renderer3D.splitKeyOfMesh(m));
+        return sid > 0 ? c | ((Renderer3D.SPLIT_ID_FLAG | sid) << 5) : c;
       },
       texKey: (m, code) => ((code & T) && !(code & AT) ? r.createTextureBindGroup(m) : null),
       rankedMeshes: () => r._drawOrder.orderedMeshes(),
@@ -973,46 +961,17 @@ export class Renderer3D {
       casterUntil: (m) => r._casterUntil(m),
       rankCell: (m) => m._r3RankCell,
       resolve: (code, lead, out: GdBucketRefs) => {
-        // exactly the CPU main pass's choice for a group led by `lead` (_drawMainPass)
-        const P = r.pipeline, sh = r._shadowsEnabled, noCull = (code & NC) !== 0, pat = (code & PT) !== 0;
+        // exactly the CPU main pass's choice for a group led by `lead` (_drawBatched): the bucket's generated pipeline
+        // (exact, a compiled superset, or null = held); a packed bucket draws with that pipeline's twin or waits for it.
+        // (A code without a split key id, only past 16,383 distinct keys, draws nothing: there is no other pipeline.)
+        const sh = r._shadowsEnabled, noCull = (code & NC) !== 0;
         const vid0 = (code >> 5) & GD_CODE_VARIANT_MASK;
-        if (vid0 & Renderer3D.SPLIT_ID_FLAG) {
-          // SHADER SPLIT: the bucket's generated pipeline (exact, a compiled superset, or null = held). Never the uber
-          // shader: a packed bucket draws with that pipeline's twin or waits for it.
-          const sp = r._splitPipe(r._splitNums[vid0 & ~Renderer3D.SPLIT_ID_FLAG], noCull ? 'opaqueNoCull' : 'opaque', sh);
-          out.pipeline = !(code & GD_CODE_PACKED) || !sp ? sp
-            : packedTwin(r.device, sp) ?? packedTwin(r.device, r._splitFallback(r._splitNums[vid0 & ~Renderer3D.SPLIT_ID_FLAG], noCull ? 'opaqueNoCull' : 'opaque', sh));
-          out.bg1 = (code & T) ? (((code & AT) && r._atlasBindGroup) ? r._atlasBindGroup : r.createTextureBindGroup(lead)) : (sh ? r._shadowBindGroup : null);
-          out.bg2 = (code & T) && sh ? r._shadowBindGroup : null;
-          out.bg0 = r.meshBindGroup;
-          out.vb = (code & VO) ? (r._vertexBufferOverrides.get(lead.id) ?? r._geomVB) : r._geomVB;
-          out.ib = r._geomIB;
-          return;
-        }
-        if (code & T) {
-          out.pipeline = sh
-            ? (noCull ? (pat ? P.opaqueTexturedNoCullShadowPipeline : P.opaqueTexturedNoCullPlainShadowPipeline)
-                      : (pat ? P.opaqueTexturedShadowPipeline : P.opaqueTexturedPlainShadowPipeline))
-            : (noCull ? (pat ? P.opaqueTexturedNoCullPipeline : P.opaqueTexturedNoCullPlainPipeline)
-                      : (pat ? P.opaqueTexturedPipeline : P.opaqueTexturedPlainPipeline));
-          out.bg1 = ((code & AT) && r._atlasBindGroup) ? r._atlasBindGroup : r.createTextureBindGroup(lead);
-          out.bg2 = sh ? r._shadowBindGroup : null;
-        } else {
-          out.pipeline = sh
-            ? (noCull ? (pat ? P.opaqueUntexturedNoCullShadowPipeline : P.opaqueUntexturedNoCullPlainShadowPipeline)
-                      : (pat ? P.opaqueUntexturedShadowPipeline : P.opaqueUntexturedPlainShadowPipeline))
-            : (noCull ? (pat ? P.opaqueUntexturedNoCullPipeline : P.opaqueUntexturedNoCullPlainPipeline)
-                      : (pat ? P.opaqueUntexturedPipeline : P.opaqueUntexturedPlainPipeline));
-          out.bg1 = sh ? r._shadowBindGroup : null;
-          out.bg2 = null;
-        }
-        // step 8: the bucket's specialised variant once compiled (a bucket = one variant id = one exact flags value);
-        // a pipeline change re-records the bundle (gdBucketsChanged)
-        const vid = (code >> 5) & GD_CODE_VARIANT_MASK;
-        const base = out.pipeline as GPURenderPipeline | null;
-        if (vid > 0) { const vp = r._variantPipe(r._svIds.keyOf(vid), (code & T) !== 0, noCull, pat); if (vp) out.pipeline = vp; }
-        // P22: a packed bucket draws with the twin (the variant's, or the base pipeline's while that one compiles)
-        if (code & GD_CODE_PACKED) out.pipeline = packedTwin(r.device, out.pipeline as GPURenderPipeline | null) ?? packedTwin(r.device, base);
+        const num = (vid0 & Renderer3D.SPLIT_ID_FLAG) ? r._splitNums[vid0 & ~Renderer3D.SPLIT_ID_FLAG] : -1;
+        const sp = num >= 0 ? r._splitPipe(num, noCull ? 'opaqueNoCull' : 'opaque', sh) : null;
+        out.pipeline = !(code & GD_CODE_PACKED) || !sp ? sp
+          : packedTwin(r.device, sp) ?? packedTwin(r.device, r._splitFallback(num, noCull ? 'opaqueNoCull' : 'opaque', sh));
+        out.bg1 = (code & T) ? (((code & AT) && r._atlasBindGroup) ? r._atlasBindGroup : r.createTextureBindGroup(lead)) : (sh ? r._shadowBindGroup : null);
+        out.bg2 = (code & T) && sh ? r._shadowBindGroup : null;
         out.bg0 = r.meshBindGroup;
         out.vb = (code & VO) ? (r._vertexBufferOverrides.get(lead.id) ?? r._geomVB) : r._geomVB;
         out.ib = r._geomIB;
@@ -1055,20 +1014,6 @@ export class Renderer3D {
     if (this._gdPathLast !== null && path !== this._gdPathLast) { this._shadowMapStale = true; this._cascadeStale = true; }   // the cached static layers re-render from the new path's casters
     this._gdPathLast = path;
     this._gdLean = !this._gdWarm && Renderer3D.gpuDrivenLean && !this._gdListsNeeded();
-    // Phase B merged pipelines: only once every FULL (patterned) variant the merged buckets need has compiled (reading
-    // the getters requests them); until then the CPU path's per-mesh choice, so no plain mesh waits on a pipeline the
-    // CPU path would not use. A flip re-derives the buckets.
-    let merge = GpuDrivenMain.mergePatterned;
-    if (merge) {
-      const P = this.pipeline;
-      merge = this._shadowsEnabled
-        ? !!(P.opaqueTexturedShadowPipeline && P.opaqueTexturedNoCullShadowPipeline && P.opaqueUntexturedShadowPipeline && P.opaqueUntexturedNoCullShadowPipeline)
-        : !!(P.opaqueTexturedPipeline && P.opaqueTexturedNoCullPipeline && P.opaqueUntexturedPipeline && P.opaqueUntexturedNoCullPipeline);
-    }
-    if (merge !== this._gdMergeOk) { this._gdMergeOk = merge; gd.recode(); }
-    // SHADER SPLIT: the state codes carry split key ids, so any switch route (sm, localStorage, render debug) re-codes
-    const split = shaderSplitActive();
-    if (split !== this._gdSplitSeen) { this._gdSplitSeen = split; gd.recode(); }
   }
 
   /** After the draw-list loop: sync the records, upload, dispatch the cull (own submit, before the main pass). */
@@ -1110,7 +1055,7 @@ export class Renderer3D {
   }
 
   /** P15: switch the GPU-driven main pass (Renderer3D.gpuDriven / gpuDrivenLean / multi-draw-indirect use). */
-  setGpuDriven(o: { enabled?: boolean; lean?: boolean; mdi?: boolean; twins?: boolean; prepasses?: boolean; ranges?: boolean; mergePatterned?: boolean; shadows?: boolean; cpuState?: boolean; subBundles?: boolean; rankCellM?: number; rankPatterned?: boolean; shadowCompact?: boolean; boundReach?: boolean }): { enabled: boolean; lean: boolean; mdi: boolean; twins: boolean; prepasses: boolean; ranges: boolean; mergePatterned: boolean; shadows: boolean; cpuState: boolean; subBundles: boolean; rankCellM: number; rankPatterned: boolean; shadowCompact: boolean; boundReach: boolean; mdiAvailable: boolean; ready: boolean } {
+  setGpuDriven(o: { enabled?: boolean; lean?: boolean; mdi?: boolean; twins?: boolean; prepasses?: boolean; ranges?: boolean; shadows?: boolean; cpuState?: boolean; subBundles?: boolean; rankCellM?: number; rankPatterned?: boolean; shadowCompact?: boolean; boundReach?: boolean }): { enabled: boolean; lean: boolean; mdi: boolean; twins: boolean; prepasses: boolean; ranges: boolean; shadows: boolean; cpuState: boolean; subBundles: boolean; rankCellM: number; rankPatterned: boolean; shadowCompact: boolean; boundReach: boolean; mdiAvailable: boolean; ready: boolean } {
     if (o.enabled !== undefined) Renderer3D.gpuDriven = !!o.enabled;
     if (o.shadowCompact !== undefined) GpuDrivenMain.shadowCompact = !!o.shadowCompact;   // P15: compact dynamic shadow lists (same casters, takes effect next frame)
     if (o.boundReach !== undefined) setGdBoundReach(!!o.boundReach);   // P15: the compact lists' CPU bound keeps the shadow-reach test (a tighter K; same casters)
@@ -1123,9 +1068,8 @@ export class Renderer3D {
     if (o.cpuState !== undefined) GpuDrivenMain.cpuState = !!o.cpuState;
     if (o.shadows !== undefined && !!o.shadows !== GpuDrivenMain.shadows) { GpuDrivenMain.shadows = !!o.shadows; this._shadowMapStale = true; this._cascadeStale = true; }
     if (o.ranges !== undefined && !!o.ranges !== GpuDrivenMain.ranges) { GpuDrivenMain.ranges = !!o.ranges; this._gd?.reset(); }
-    if (o.mergePatterned !== undefined && !!o.mergePatterned !== GpuDrivenMain.mergePatterned) { GpuDrivenMain.mergePatterned = !!o.mergePatterned; this._gd?.reset(); }
     if (o.twins !== undefined && !!o.twins !== GpuDrivenMain.twins) { GpuDrivenMain.twins = !!o.twins; this._gd?.reset(); }   // every forced flag changes
-    return { enabled: Renderer3D.gpuDriven, lean: Renderer3D.gpuDrivenLean, mdi: GpuDrivenMain.allowMdi, twins: GpuDrivenMain.twins, prepasses: Renderer3D.gpuDrivenPrepasses, ranges: GpuDrivenMain.ranges, mergePatterned: GpuDrivenMain.mergePatterned, shadows: GpuDrivenMain.shadows, cpuState: GpuDrivenMain.cpuState,
+    return { enabled: Renderer3D.gpuDriven, lean: Renderer3D.gpuDrivenLean, mdi: GpuDrivenMain.allowMdi, twins: GpuDrivenMain.twins, prepasses: Renderer3D.gpuDrivenPrepasses, ranges: GpuDrivenMain.ranges, shadows: GpuDrivenMain.shadows, cpuState: GpuDrivenMain.cpuState,
       subBundles: GpuDrivenMain.subBundles, rankCellM: Renderer3D.rankCellM, rankPatterned: Renderer3D.rankPatterned, shadowCompact: GpuDrivenMain.shadowCompact, boundReach: gdBoundReach, mdiAvailable: this.device.features.has('chromium-experimental-multi-draw-indirect' as GPUFeatureName), ready: !!this._gd?.ready };
   }
   /** The GPU culling mode, loaded from the per-machine preference on first use. A stored 'off' switches the
@@ -1389,16 +1333,30 @@ export class Renderer3D {
    *  loop stays alive while an animated outline is on screen. */
   get hoverOutlineActive(): boolean {
     if (!this.hoverOutlineAnimated) return false;
+    // ★ Only for a while after the hover started / the pointer last moved over it (tablet FPS bug 2026-10-08): a pen
+    // or mouse RESTING on a mesh held the on-demand loop live forever — every frame a full scene render + the
+    // silhouette mask pass + its full-screen composite, just to scroll the pattern. After HOVER_ANIM_HOLD_MS the
+    // loop may idle; the outline stays drawn (its pattern stops) until the pointer moves again.
+    if (this.hoverOutlineAnimExpired) return false;
     if (this._hoverOutlineRanges) return true;
     for (const id of this._hoveredMeshIds) if (!this._selectedMeshIds.has(id)) return true;
     return false;
   }
+  /** How long (ms) an animated hover outline keeps the render loop live after the hover changed / was refreshed. */
+  static HOVER_ANIM_HOLD_MS = 2000;
+  private _hoverAnimT = -Infinity;
+  private static _hoverNow(): number { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
+  /** The pointer moved over the hovered target: let its animated outline run again ({@link hoverOutlineActive}). */
+  refreshHoverOutlineAnim(): void { this._hoverAnimT = Renderer3D._hoverNow(); }
+  /** The hover outline's animation hold ran out (the loop may idle until {@link refreshHoverOutlineAnim}). */
+  get hoverOutlineAnimExpired(): boolean { return Renderer3D._hoverNow() - this._hoverAnimT > Renderer3D.HOVER_ANIM_HOLD_MS; }
   // Sub-range hover source: outline an arbitrary set of index ranges within merged meshes (ONE landmark's exact
   // silhouette out of the merged world:lm-* meshes). Independent of _hoveredMeshIds (which is the whole-mesh path).
   private _hoverOutlineRanges: { meshId: string; indexStart: number; indexCount: number }[] | null = null;
   /** Outline exact index sub-ranges (e.g. one landmark) with the hover style. Pass null to clear. */
   setHoverOutlineRanges(ranges: { meshId: string; indexStart: number; indexCount: number }[] | null): void {
     this._hoverOutlineRanges = ranges && ranges.length ? ranges : null;
+    this.refreshHoverOutlineAnim();
   }
   get hasHoverOutlineRanges(): boolean { return this._hoverOutlineRanges !== null; }
   private _swapChainFormat: GPUTextureFormat;
@@ -2001,22 +1959,16 @@ export class Renderer3D {
         stencilLoadOp: 'clear', stencilClearValue: 0, stencilStoreOp: 'store',
       },
     });
-    const poSplit = shaderSplitActive();
-    const postOverlayPipe = poSplit ? null : this.pipeline.postOverlayTexturedPipeline;
-    if (!poSplit && !postOverlayPipe) { pass.end(); return; }   // P2: still compiling → the card appears a frame later
-    if (postOverlayPipe) pass.setPipeline(postOverlayPipe);
     pass.setBindGroup(0, this.meshBindGroup!);
     const sharedIB = this._geomIB!;
     let poCur: GPURenderPipeline | null = null;
     for (const { mesh, idx } of this._postOverlayEntries) {
       const alloc = this._geomAllocs.get(mesh.id); if (!alloc || alloc.pk) continue;   // (P22: info cards are never packed world geometry)
-      if (poSplit) {
-        // SHADER SPLIT: the post-overlay axis (the textured FULL shader today: the slot key with tex = true)
-        const pk = this._slotKey(idx, true);
-        const p = pk >= 0 ? this._splitPipe(pk, 'postOverlay', false) : this.pipeline.postOverlayTexturedPipeline;
-        if (!p) continue;   // held: the card appears once its shader lands
-        if (p !== poCur) { pass.setPipeline(p); poCur = p; }
-      }
+      // SHADER SPLIT: the post-overlay axis (the slot key with tex = true)
+      const pk = this._slotKey(idx, true);
+      const p = pk >= 0 ? this._splitPipe(pk, 'postOverlay', false) : null;
+      if (!p) continue;   // held: the card appears once its shader lands
+      if (p !== poCur) { pass.setPipeline(p); poCur = p; }
       const override = this._vertexBufferOverrides.get(mesh.id);
       pass.setBindGroup(1, this.createTextureBindGroup(mesh));
       pass.setVertexBuffer(0, override ?? this._geomVB!);
@@ -3702,7 +3654,7 @@ export class Renderer3D {
     );
   }
 
-  setHoveredMeshIds(ids: Set<string>): void { this._hoveredMeshIds = new Set(ids); }
+  setHoveredMeshIds(ids: Set<string>): void { this._hoveredMeshIds = new Set(ids); this.refreshHoverOutlineAnim(); }
   getHoveredMeshIds(): Set<string> { return this._hoveredMeshIds; }
   setHoveredArrayGroupId(id: string | null): void { this._hoveredArrayGroupId = id; }
 
@@ -3759,14 +3711,14 @@ export class Renderer3D {
     if (this._armatureModeActive) {
       const mode = this._armatureBgOpts.mode;
       if (mode !== 'dim' && mode !== 'none') {
-        this._armatureBgPass?.draw(pass, this._armatureBgOpts, canvasW, canvasH);
+        this._armatureBgPass?.draw(pass, this._armatureBgOpts, canvasW, canvasH, null, this.focusBgAnimate);
       }
       return;
     }
     if (this._meshEditBgActive) {
       const mode = this._meshEditBgOpts.mode;
       if (mode !== 'dim' && mode !== 'none') {
-        this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH, mode === 'sky' ? this._skyDomeView(canvasW, canvasH) : null, Renderer3D.caps.animatedFocusBg);
+        this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH, mode === 'sky' ? this._skyDomeView(canvasW, canvasH) : null, this.focusBgAnimate);
       }
       return;
     }
@@ -3798,7 +3750,24 @@ export class Renderer3D {
   /** The mesh-edit focus background is showing AND animates over time ('wavy', unless this machine's caps freeze it —
    *  mobile-parity 7.3b P3), i.e. it needs a frame every vsync. The live-loop holds key on this. */
   get meshEditBgAnimating(): boolean {
-    return this._meshEditBgActive && this._meshEditBgOpts.mode === 'wavy' && Renderer3D.caps.animatedFocusBg;
+    return this._meshEditBgActive && this._meshEditBgOpts.mode === 'wavy' && this.focusBgAnimate;
+  }
+
+  /** ONE switch for every focus background's 'wavy' animation (armature, mesh edit / UV, the creator stage), set by
+   *  the host's View setting: true = animates, false = drawn frozen (a still frame), null = never set: the machine
+   *  caps decide (caps.animatedFocusBg). An explicit choice wins over the caps. A static like the caps: a per-device
+   *  preference, needs no device (it can be set before the renderer exists) and survives device-recovery rebuilds. */
+  static focusBgAnimateSwitch: boolean | null = null;
+  static setFocusBgAnimate(on: boolean | null): void {
+    Renderer3D.focusBgAnimateSwitch = on === null || on === undefined ? null : !!on;
+  }
+  /** The focus background's 'wavy' theme animates (the host switch, else the machine caps). */
+  get focusBgAnimate(): boolean { return Renderer3D.focusBgAnimateSwitch ?? Renderer3D.caps.animatedFocusBg; }
+  /** The focus background ON SCREEN (armature's, which wins, else mesh edit's) animates, i.e. needs a frame every
+   *  vsync. The self-evaluating live-loop keep-alive keys on this (both modes behave the same). */
+  get focusBgAnimating(): boolean {
+    const o = this._armatureModeActive ? this._armatureBgOpts : this._meshEditBgActive ? this._meshEditBgOpts : null;
+    return !!o && o.mode === 'wavy' && this.focusBgAnimate;
   }
 
   /** True when the mesh-edit focus background is active AND opaque (wavy/solid/gradient)
@@ -3899,10 +3868,10 @@ export class Renderer3D {
     this._gizmoRenderer.drawCameraFrustum(pass, this.camera, this._frustumSegments, this._frustumColor, this._frustumOpacity);
   }
 
-  /** §3.1 uber-shader routing: does this mesh use ANY feature that needs the (unconditional) pattern/window/ground
-   *  block in the full fragment shader? If NOT, it can render with the cheaper PLAIN pipeline variant (pattern ALU
-   *  compiled out) — output is identical. Conservative: any pattern, shade bit, or normal map keeps it on the full
-   *  shader, so only truly-plain meshes (characters, plain props/walls) take the fast path. */
+  /** §3.1 plain / patterned CLASS of a mesh: any pattern, shade bit, or normal map = patterned. It once routed the
+   *  uber-shader's PLAIN / FULL pipelines; since shader-split phase 4 it only feeds the frozen draw rank
+   *  (rankPatterned), the CPU batch breaks, the GPU-driven state-code bit and the planar mirror's PLAIN-routed key
+   *  (meshFsNumPlain), all unchanged so the draw order and pixels stay as they were. */
   private _usesPatterns(m: Mesh3D): boolean {
     const mat = m.material;
     return (mat.patternMode !== undefined && mat.patternMode !== 'none')
@@ -4797,93 +4766,50 @@ export class Renderer3D {
     return true;
   }
   /** P2.2 — document-driven warm-up: when the mesh roster changes, queue (DOCUMENT priority, ahead of the generic
-   *  common set) every pipeline variant these meshes route to — textured/untextured × plain/patterned × cull ×
-   *  shadow-receiving, transparent, skinned, and the shadow casters. Visible meshes already requested theirs at top
-   *  priority via the draw itself; this catches the off-screen rest (a character behind the camera, a mirror). */
+   *  common set) the mesh pipelines these meshes draw with (their exact shader-split keys on their axes, then the BASE
+   *  fallback of each axis) and the shadow casters. Visible meshes already requested theirs at top priority via the
+   *  draw itself; this catches the off-screen rest (a character behind the camera, a mirror). */
   private _prewarmSeen = { opaque: -1, skinned: -1, shadows: false };
-  /** Step 2: classify each mesh into a 5-bit variant code (no per-mesh string building) and queue only the pipeline
-   *  names not already queued for this Pipeline3D. `false` = the old per-mesh name Set (A/B reference). */
-  prewarmNewOnly = true;
+  /** The shadow-caster pipeline names queued for this Pipeline3D (each once per generation). */
   private readonly _prewarmQueued = new Set<string>();
   private _prewarmGen = 0;
   private _prewarmFds = false;
   private _prewarmSh = false;
-  private _prewarmSplit = false;
   private static _prewarmGenSeq = 0;
   private _prewarmPipe: unknown = null;
-  private readonly _prewarmCodes = new Uint8Array(32);
-  /** Diagnostics: how many names the last roster change actually queued. */
+  /** Diagnostics: how many pipeline names the last roster change queued (the shadow casters). */
   private _prewarmLastQueued = 0;
   private _prewarmForScene(meshes: readonly Mesh3D[], skinned: boolean): void {
     const k = skinned ? 'skinned' : 'opaque';
     if (this._prewarmSeen[k] === meshes.length && this._prewarmSeen.shadows === this._shadowsEnabled) return;
     this._prewarmSeen[k] = meshes.length; this._prewarmSeen.shadows = this._shadowsEnabled;
-    if (this.prewarmNewOnly) { this._prewarmCoded(meshes, skinned); return; }
-    const names = new Set<string>();
-    const sh = this._shadowsEnabled ? 'Shadow' : '';
-    for (const m of meshes) {
-      const T = (m.material.hasTexture || m.material.hasNormalMap) ? 'Textured' : 'Untextured';
-      const plain = this._usesPatterns(m) ? '' : 'Plain';
-      if (skinned) { names.add(`skinnedOpaque${T}${plain}Pipeline`); continue; }
-      const noCull = (this.forceDoubleSided || !!m.material.doubleSided) ? 'NoCull' : '';
-      if (m.material.opacity < 1) { names.add(`transparent${T}${noCull}Pipeline`); continue; }
-      names.add(`opaque${T}${noCull}${plain}${sh}Pipeline`);
-      if (m.submeshes.length > 0) names.add(`opaque${T}${noCull}${sh}Pipeline`);   // multi-material → full variant
-    }
-    if (sh) names.add(skinned ? 'skinnedShadowPipeline' : 'shadowPassPipeline');
-    this.pipeline.warmPipelines([...names], PIPELINE_PRIORITY.DOCUMENT);
-  }
-  /** The same name set as the loop above, from per-mesh variant bits: 1 textured · 2 plain (no patterns) ·
-   *  4 noCull · 8 transparent · 16 has submeshes. Only names not queued before (for this Pipeline3D) are warmed —
-   *  warming an already queued / compiled name at the same priority is a no-op. */
-  private _prewarmCoded(meshes: readonly Mesh3D[], skinned: boolean): void {
     // The classification generation: a mesh already classified in this generation was queued already, so only the
     // NEW meshes (and ones whose material was set since: setMaterial resets their stamp) are classified. A new
     // Pipeline3D, a shadows toggle or a force-double-sided change starts a new generation (full re-classify).
-    const fds = this.forceDoubleSided, sh0 = this._shadowsEnabled, split = shaderSplitActive();
-    if (this._prewarmPipe !== this.pipeline || this._prewarmFds !== fds || this._prewarmSh !== sh0 || this._prewarmSplit !== split) {
-      this._prewarmPipe = this.pipeline; this._prewarmFds = fds; this._prewarmSh = sh0; this._prewarmSplit = split;
+    const fds = this.forceDoubleSided, sh0 = this._shadowsEnabled;
+    if (this._prewarmPipe !== this.pipeline || this._prewarmFds !== fds || this._prewarmSh !== sh0) {
+      this._prewarmPipe = this.pipeline; this._prewarmFds = fds; this._prewarmSh = sh0;
       this._prewarmQueued.clear(); this._prewarmGen = ++Renderer3D._prewarmGenSeq; this._splitBaseDone.clear();
     }
     const gen = this._prewarmGen;
-    const seen = this._prewarmCodes; seen.fill(0);
-    let any = false;
     for (let i = 0; i < meshes.length; i++) {
       const m = meshes[i];
       if (m._pwGen === gen) continue;
-      const mat = m.material;
-      // SHADER SPLIT: a covered mesh warms its generated pipeline(s) instead of the uber pipeline it would never use
-      if (split && this._splitPrewarmMesh(m, skinned, fds, sh0)) { m._pwGen = gen; continue; }
-      // 1 textured · 2 plain · 4 double-sided (material) · 8 transparent · 16 submeshes
-      const c = ((mat.hasTexture || mat.hasNormalMap) ? 1 : 0) | (this._usesPatterns(m) ? 0 : 2)
-        | (mat.doubleSided ? 4 : 0) | (mat.opacity < 1 ? 8 : 0) | (m.submeshes.length > 0 ? 16 : 0);
-      m._pwGen = gen; m._pwCode = c;
-      seen[skinned ? (c & 3) : (fds ? (c | 4) : c)] = 1;
-      any = true;
+      this._splitPrewarmMesh(m, skinned, fds, sh0);   // SHADER SPLIT: the mesh's generated pipeline(s)
+      m._pwGen = gen;
     }
-    if (split) this._splitWarmBases();   // the BASE fallback of every axis the new meshes use (after their exact keys)
-    if (!any && this._prewarmQueued.size) { this._prewarmLastQueued = 0; return; }
-    const sh = this._shadowsEnabled ? 'Shadow' : '';
+    this._splitWarmBases();   // the BASE fallback of every axis the new meshes use (after their exact keys)
     const names: string[] = [];
     const add = (n: string) => { if (!this._prewarmQueued.has(n)) { this._prewarmQueued.add(n); names.push(n); } };
-    for (let c = 0; c < 32; c++) {
-      if (!seen[c]) continue;
-      const T = (c & 1) ? 'Textured' : 'Untextured', plain = (c & 2) ? 'Plain' : '';
-      if (skinned) { add(`skinnedOpaque${T}${plain}Pipeline`); continue; }
-      const noCull = (c & 4) ? 'NoCull' : '';
-      if (c & 8) { add(`transparent${T}${noCull}Pipeline`); continue; }
-      add(`opaque${T}${noCull}${plain}${sh}Pipeline`);
-      if (c & 16) add(`opaque${T}${noCull}${sh}Pipeline`);
-    }
-    if (sh) add(skinned ? 'skinnedShadowPipeline' : 'shadowPassPipeline');
+    if (this._shadowsEnabled) add(skinned ? 'skinnedShadowPipeline' : 'shadowPassPipeline');
     this._prewarmLastQueued = names.length;
     if (names.length) this.pipeline.warmPipelines(names, PIPELINE_PRIORITY.DOCUMENT);
   }
-  /** Step 2 A/B: incremental draw rank + coded prewarm (both default on). */
+  /** Step 2 A/B: the incremental draw rank (default on). `prewarmNewOnly` is accepted and ignored (always true): its
+   *  A/B reference path, the per-mesh name set of the uber pipelines, was removed in shader-split phase 4. */
   setStructureOptions(o: { incrementalDrawOrder?: boolean; prewarmNewOnly?: boolean }): { incrementalDrawOrder: boolean; prewarmNewOnly: boolean } {
     if (o.incrementalDrawOrder !== undefined) { this._drawOrder.incremental = !!o.incrementalDrawOrder; this._drawOrderDirty = true; }
-    if (o.prewarmNewOnly !== undefined) { this.prewarmNewOnly = !!o.prewarmNewOnly; this._prewarmQueued.clear(); this._prewarmPipe = null; this._prewarmSeen.opaque = -1; this._prewarmSeen.skinned = -1; }
-    return { incrementalDrawOrder: this._drawOrder.incremental, prewarmNewOnly: this.prewarmNewOnly };
+    return { incrementalDrawOrder: this._drawOrder.incremental, prewarmNewOnly: true };
   }
   /** Diagnostics for the structure-change work (draw rank + prewarm). */
   getStructureStats(): { drawRank: { updates: number; merged: number; fullSorts: number; legacy: number; lastAdded: number; lastRemoved: number; size: number; keyCodes: number }; prewarmLastQueued: number; prewarmQueued: number } {
@@ -5422,41 +5348,23 @@ export class Renderer3D {
           pPass.setVertexBuffer(0, sharedVB);
           pPass.setIndexBuffer(sharedIB, 'uint32');
           const pRef = { vb: sharedVB };
-          const PP = this.pipeline;
-          const pSplit = shaderSplitActive();
           for (let _ke = 0; _ke < opaqueForPasses.length; _ke++) { const e = opaqueForPasses[_ke];
             if (e.mesh === planarReflector) continue;   // the mirror does not reflect itself
             const em = e.mesh.material;
             const useTexture = !!(em.hasTexture || em.hasNormalMap);
-            const patterned = this._usesPatterns(e.mesh);
-            // SHADER SPLIT: the slot key on the opaqueNoCull axis (a PLAIN-routed entry only with a PLAIN-safe key: a
-            // multi-material mesh draws its first submesh's slot routed by the MESH material)
-            const psk0 = pSplit ? this._slotKey(e.idx, useTexture) : -1;
-            const psk = psk0 >= 0 && (patterned || meshFsNumPlainSafe(psk0)) ? psk0 : -1;
-            if (psk >= 0) {
-              const sp = this._splitPipe(psk, 'opaqueNoCull', this._shadowsEnabled);
-              this._setPipe(pPass, sp, sp ? this._splitFallback(psk, 'opaqueNoCull', this._shadowsEnabled) ?? sp : null);
-              pPass.setBindGroup(0, this._planarMeshBG);
-              if (useTexture) {
-                const isAtlas = !!e.mesh.textureLibraryId && this._atlasLayerMap.has(e.mesh.textureLibraryId);
-                pPass.setBindGroup(1, (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(e.mesh));
-                if (this._shadowsEnabled) pPass.setBindGroup(2, this._shadowBindGroup!);
-              } else if (this._shadowsEnabled) pPass.setBindGroup(1, this._shadowBindGroup!);
-            } else if (useTexture) {
-              this._setPipe(pPass, this._shadowsEnabled
-                ? (patterned ? PP.opaqueTexturedNoCullShadowPipeline : PP.opaqueTexturedNoCullPlainShadowPipeline)
-                : (patterned ? PP.opaqueTexturedNoCullPipeline : PP.opaqueTexturedNoCullPlainPipeline));
-              pPass.setBindGroup(0, this._planarMeshBG);
+            // SHADER SPLIT: the slot key on the opaqueNoCull axis. An entry routed by a MESH material without patterns
+            // (a multi-material mesh draws its first submesh's slot) draws that key PLAIN-routed (meshFsNumPlain: the
+            // pattern block on its PLAIN defaults, exactly the pre-split PLAIN pipeline; the same key for a PLAIN-safe slot).
+            const psk0 = this._slotKey(e.idx, useTexture);
+            const psk = this._usesPatterns(e.mesh) ? psk0 : meshFsNumPlain(psk0);
+            const sp = psk >= 0 ? this._splitPipe(psk, 'opaqueNoCull', this._shadowsEnabled) : null;
+            this._setPipe(pPass, sp, sp ? this._splitFallback(psk, 'opaqueNoCull', this._shadowsEnabled) ?? sp : null);
+            pPass.setBindGroup(0, this._planarMeshBG);
+            if (useTexture) {
               const isAtlas = !!e.mesh.textureLibraryId && this._atlasLayerMap.has(e.mesh.textureLibraryId);
               pPass.setBindGroup(1, (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(e.mesh));
               if (this._shadowsEnabled) pPass.setBindGroup(2, this._shadowBindGroup!);
-            } else {
-              this._setPipe(pPass, this._shadowsEnabled
-                ? (patterned ? PP.opaqueUntexturedNoCullShadowPipeline : PP.opaqueUntexturedNoCullPlainShadowPipeline)
-                : (patterned ? PP.opaqueUntexturedNoCullPipeline : PP.opaqueUntexturedNoCullPlainPipeline));
-              pPass.setBindGroup(0, this._planarMeshBG);
-              if (this._shadowsEnabled) pPass.setBindGroup(1, this._shadowBindGroup!);
-            }
+            } else if (this._shadowsEnabled) pPass.setBindGroup(1, this._shadowBindGroup!);
             this._drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1);
           }
           // P4b.2: TRANSPARENT meshes in the mirror — drawn after the opaques with the NoCull transparent
@@ -5467,23 +5375,13 @@ export class Renderer3D {
             if (e.mesh === planarReflector) continue;
             const tm = e.submesh ? e.submesh.material : e.mesh.material;
             const useTexture = !!(tm.hasTexture || tm.hasNormalMap);
-            const ptk = pSplit ? this._slotKey(e.idx, useTexture) : -1;   // SHADER SPLIT (today: FULL, so exact)
-            if (ptk >= 0) {
-              const sp = this._splitPipe(ptk, 'transparentNoCull', false);
-              this._setPipe(pPass, sp, sp ? this._splitFallback(ptk, 'transparentNoCull', false) ?? sp : null);
-              pPass.setBindGroup(0, this._planarMeshBG);
-              if (useTexture) {
-                const isAtlas = !!e.mesh.textureLibraryId && this._atlasLayerMap.has(e.mesh.textureLibraryId);
-                pPass.setBindGroup(1, (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(e.mesh));
-              }
-            } else if (useTexture) {
-              this._setPipe(pPass, PP.transparentTexturedNoCullPipeline);
-              pPass.setBindGroup(0, this._planarMeshBG);
+            const ptk = this._slotKey(e.idx, useTexture);   // SHADER SPLIT: the slot key (exact)
+            const sp = ptk >= 0 ? this._splitPipe(ptk, 'transparentNoCull', false) : null;
+            this._setPipe(pPass, sp, sp ? this._splitFallback(ptk, 'transparentNoCull', false) ?? sp : null);
+            pPass.setBindGroup(0, this._planarMeshBG);
+            if (useTexture) {
               const isAtlas = !!e.mesh.textureLibraryId && this._atlasLayerMap.has(e.mesh.textureLibraryId);
               pPass.setBindGroup(1, (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(e.mesh));
-            } else {
-              this._setPipe(pPass, PP.transparentUntexturedNoCullPipeline);
-              pPass.setBindGroup(0, this._planarMeshBG);
             }
             this._drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1, e.submesh);
           }
@@ -5509,17 +5407,14 @@ export class Renderer3D {
       const geoKey     = lead.geometryKey;
       const useTexture = lead.material.hasTexture || lead.material.hasNormalMap;
       const noCull     = this.forceDoubleSided || !!lead.material.doubleSided;
-      const patterned  = this._usesPatterns(lead);   // §3.1: full-shader vs plain (pattern-stripped) pipeline
+      const patterned  = this._usesPatterns(lead);   // (the draw rank's plain / patterned class: never batched together)
       const leadDiff   = lead.diffuseTexture;
       const leadNorm   = lead.normalMapTexture;
       // A mesh is "atlas mode" when its texture is packed into the shared atlas
       // (identified by textureLibraryId). Atlas meshes all share one bind group
       // and can batch across different textures — textureIndex selects the layer.
       const leadIsAtlas = useTexture && !!lead.textureLibraryId && this._atlasLayerMap.has(lead.textureLibraryId);
-      const sv = Renderer3D.shaderVariantsActive;
-      const vk = sv ? lead._r3VF : -1;   // step 8: the shader-variant key (the exact instance flags, or -1)
-      const split = shaderSplitActive();
-      const sk = split ? lead._r3FK : -1;   // SHADER SPLIT: the packed key (>= 0 = drawn with a generated pipeline)
+      const sk = lead._r3FK;   // SHADER SPLIT: the packed key of the slot (the group's generated pipeline)
 
       // Scan forward while same group (geometry + pipeline + texture mode all match)
       let oj = oi + 1;
@@ -5528,9 +5423,8 @@ export class Renderer3D {
         if (m.geometryKey !== geoKey) break;
         if ((m.material.hasTexture || m.material.hasNormalMap) !== useTexture) break;
         if ((this.forceDoubleSided || !!m.material.doubleSided) !== noCull) break;
-        if (this._usesPatterns(m) !== patterned) break;   // §3.1: don't batch plain + patterned into one pipeline
-        if (sv && m._r3VF !== vk) break;   // step 8: one variant (= one exact flags value) per group
-        if (split && m._r3FK !== sk) break;   // SHADER SPLIT: one key per group (and covered / uncovered never mix)
+        if (this._usesPatterns(m) !== patterned) break;   // (the rank class: plain and patterned runs stay apart)
+        if (m._r3FK !== sk) break;   // SHADER SPLIT: one key per group
         if (useTexture) {
           const mIsAtlas = !!m.textureLibraryId && this._atlasLayerMap.has(m.textureLibraryId);
           if (mIsAtlas !== leadIsAtlas) break; // can't mix atlas and standalone in one group
@@ -5541,35 +5435,18 @@ export class Renderer3D {
       }
 
       // Set pipeline + bind groups once for the whole group. Double-sided (noCull) meshes — the whole
-      // world city — now RECEIVE shadows too via the NoCull-shadow pipeline variants.
-      const P = this.pipeline;
-      // SHADER SPLIT: a covered group draws ONLY with a generated pipeline (exact / superset / held); the uber getters
-      // below are not even read for it (reading one requests its compile).
+      // world city — RECEIVE shadows too (the shadow keys on the opaqueNoCull axis).
+      // SHADER SPLIT: the group's generated pipeline (exact / a compiled superset / null = held: the draws are skipped).
       const spl = sk >= 0 ? this._splitPipe(sk, noCull ? 'opaqueNoCull' : 'opaque', this._shadowsEnabled) : null;
-      const vPipe = sk >= 0 ? spl : this._variantPipe(vk, !!useTexture, noCull, patterned);   // step 8: null = the base pipeline below
       const splFb = spl ? this._splitFallback(sk, noCull ? 'opaqueNoCull' : 'opaque', this._shadowsEnabled) ?? spl : null;   // (P22 twin fallback)
+      this._setPipe(pass, spl, splFb);
+      pass.setBindGroup(0, this.meshBindGroup);
       if (useTexture) {
-        const bp = sk >= 0 ? spl : this._shadowsEnabled
-          ? (noCull ? (patterned ? P.opaqueTexturedNoCullShadowPipeline : P.opaqueTexturedNoCullPlainShadowPipeline)
-                    : (patterned ? P.opaqueTexturedShadowPipeline       : P.opaqueTexturedPlainShadowPipeline))
-          : (noCull ? (patterned ? P.opaqueTexturedNoCullPipeline       : P.opaqueTexturedNoCullPlainPipeline)
-                    : (patterned ? P.opaqueTexturedPipeline             : P.opaqueTexturedPlainPipeline));
-        this._setPipe(pass, vPipe ?? bp, sk >= 0 ? splFb : bp);   // (P22: a packed run falls back to the base pipeline's twin)
-        pass.setBindGroup(0, this.meshBindGroup);
         // Atlas meshes share one bind group; standalone meshes get per-mesh bind group
         const texBG = (leadIsAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(lead);
         pass.setBindGroup(1, texBG);
         if (this._shadowsEnabled) pass.setBindGroup(2, this._shadowBindGroup!);
-      } else {
-        const bp = sk >= 0 ? spl : this._shadowsEnabled
-          ? (noCull ? (patterned ? P.opaqueUntexturedNoCullShadowPipeline : P.opaqueUntexturedNoCullPlainShadowPipeline)
-                    : (patterned ? P.opaqueUntexturedShadowPipeline       : P.opaqueUntexturedPlainShadowPipeline))
-          : (noCull ? (patterned ? P.opaqueUntexturedNoCullPipeline       : P.opaqueUntexturedNoCullPlainPipeline)
-                    : (patterned ? P.opaqueUntexturedPipeline             : P.opaqueUntexturedPlainPipeline));
-        this._setPipe(pass, vPipe ?? bp, sk >= 0 ? splFb : bp);   // (P22: a packed run falls back to the base pipeline's twin)
-        pass.setBindGroup(0, this.meshBindGroup);
-        if (this._shadowsEnabled) pass.setBindGroup(1, this._shadowBindGroup!);
-      }
+      } else if (this._shadowsEnabled) pass.setBindGroup(1, this._shadowBindGroup!);
 
       // Split the group into maximal contiguous sub-runs of instance slots.
       // Frustum culling may remove members mid-group, creating gaps in the slot sequence.
@@ -5606,9 +5483,10 @@ export class Renderer3D {
   private _drawOrderCell = -1;
   /** P15: the rank's pipeline class includes the §3.1 plain / full (patterned) shader choice, so plain and patterned
    *  meshes no longer alternate in draw order. Both paths read the rank (ON = OFF by construction). The GPU path then
-   *  keeps the cheap plain pipeline for plain meshes without a pipeline switch per alternation: the merged full-shader
-   *  bucket (GpuDrivenMain.mergePatterned) cost +5-7 ms of main-pass GPU time in the tiled city (performance-plan §P15
-   *  2026-10-03 cause runs). The CPU path's own pipeline switches drop too. false = the old rank. */
+   *  kept the cheap plain pipeline for plain meshes without a pipeline switch per alternation (the merged full-shader
+   *  bucket, removed with the uber shader in shader-split phase 4, cost +5-7 ms of main-pass GPU time in the tiled
+   *  city: performance-plan §P15 2026-10-03 cause runs). The CPU path's own pipeline switches drop too. false = the old
+   *  rank. */
   static rankPatterned = true;
   private _drawOrderPat = false;
   /** The rank cell of `m` (1..2^28; 0 = no box or no cell). Read when the rank is rebuilt; stored on the mesh. */
@@ -5723,34 +5601,23 @@ export class Renderer3D {
     }
 
     // Draw multi-material opaque submesh entries (one draw call per submesh, no batching).
-    const msplit = opaqueMulti.length > 0 && shaderSplitActive();
     for (const { mesh, idx, submesh } of opaqueMulti) {
       const mat  = submesh!.material;
       const noCull = this.forceDoubleSided || !!mat.doubleSided;
       const useTexture = mat.hasTexture || mat.hasNormalMap;
-      // SHADER SPLIT: the submesh's own slot key (today these always draw with the FULL pipelines: any key is exact)
-      const msk = msplit ? this._slotKey(idx, !!useTexture) : -1;
+      // SHADER SPLIT: the submesh's own slot key
+      const msk = this._slotKey(idx, !!useTexture);
       const msp = msk >= 0 ? this._splitPipe(msk, noCull ? 'opaqueNoCull' : 'opaque', this._shadowsEnabled) : null;
       const mspFb = msp ? this._splitFallback(msk, noCull ? 'opaqueNoCull' : 'opaque', this._shadowsEnabled) ?? msp : null;   // (P22 twin fallback)
+      this._setPipe(pass, msp, mspFb);
+      pass.setBindGroup(0, this.meshBindGroup);
       if (useTexture) {
         const texId = submesh!.textureLibraryId ?? '';
         const isAtlas = !!texId && this._atlasLayerMap.has(texId);
-        if (msk >= 0) this._setPipe(pass, msp, mspFb);
-        else this._setPipe(pass, this._shadowsEnabled
-          ? (noCull ? this.pipeline.opaqueTexturedNoCullShadowPipeline : this.pipeline.opaqueTexturedShadowPipeline)
-          : (noCull ? this.pipeline.opaqueTexturedNoCullPipeline : this.pipeline.opaqueTexturedPipeline));
-        pass.setBindGroup(0, this.meshBindGroup);
         const texBG = (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(mesh);
         pass.setBindGroup(1, texBG);
         if (this._shadowsEnabled) pass.setBindGroup(2, this._shadowBindGroup!);
-      } else {
-        if (msk >= 0) this._setPipe(pass, msp, mspFb);
-        else this._setPipe(pass, this._shadowsEnabled
-          ? (noCull ? this.pipeline.opaqueUntexturedNoCullShadowPipeline : this.pipeline.opaqueUntexturedShadowPipeline)
-          : (noCull ? this.pipeline.opaqueUntexturedNoCullPipeline : this.pipeline.opaqueUntexturedPipeline));
-        pass.setBindGroup(0, this.meshBindGroup);
-        if (this._shadowsEnabled) pass.setBindGroup(1, this._shadowBindGroup!);
-      }
+      } else if (this._shadowsEnabled) pass.setBindGroup(1, this._shadowBindGroup!);
       this._drawMesh(pass, mesh, idx, mainVBRef, 1, submesh);
     }
 
@@ -5758,17 +5625,13 @@ export class Renderer3D {
     // Uses a two-slot vertex layout: slot 0 = standard geometry (standalone VB override,
     // baseVertex=0), slot 1 = per-vertex rgba float32x4 color buffer.
     if (opaqueVC.length > 0) {
-      const vcSplit = shaderSplitActive();
-      if (!vcSplit) this._setPipe(pass, this.pipeline.opaqueVertexColorPipeline);
       pass.setBindGroup(0, this.meshBindGroup!);
       for (const { mesh, idx } of opaqueVC) {
         const colorBuf = this._vcColorBuffers.get(mesh.id);
         if (!colorBuf) continue;
-        if (vcSplit) {
-          // SHADER SPLIT: the vertex-colour axis (the untextured FULL shader today: the slot key with tex = false)
-          const vk = this._slotKey(idx, false);
-          this._setPipe(pass, vk >= 0 ? this._splitPipe(vk, 'vertexColour', false) : this.pipeline.opaqueVertexColorPipeline);
-        }
+        // SHADER SPLIT: the vertex-colour axis (the slot key with tex = false)
+        const vk = this._slotKey(idx, false);
+        this._setPipe(pass, vk >= 0 ? this._splitPipe(vk, 'vertexColour', false) : null);
         pass.setVertexBuffer(1, colorBuf);
         this._drawMesh(pass, mesh, idx, mainVBRef);
       }
@@ -5783,20 +5646,18 @@ export class Renderer3D {
         const mat = submesh?.material ?? mesh.material;
         const useTexture = mat.hasTexture || mat.hasNormalMap;
         const noCull = this.forceDoubleSided || !!mat.doubleSided;   // both faces for a doubleSided transparent mesh
-        // SHADER SPLIT: a covered transparent mesh / submesh draws with its generated pipeline (never shadowed; today's
-        // transparent pipelines are FULL, so a submesh's slot key is exact)
-        const tsk = shaderSplitActive() ? (submesh ? this._slotKey(idx, !!useTexture) : mesh._r3FK) : -1;
+        // SHADER SPLIT: a transparent mesh / submesh draws with the generated pipeline of its slot key (never shadowed)
+        const tsk = submesh ? this._slotKey(idx, !!useTexture) : mesh._r3FK;
         const tsp = tsk >= 0 ? this._splitPipe(tsk, noCull ? 'transparentNoCull' : 'transparent', false) : null;
         const tspFb = tsp ? this._splitFallback(tsk, noCull ? 'transparentNoCull' : 'transparent', false) ?? tsp : null;   // (P22 twin fallback)
+        this._setPipe(pass, tsp, tspFb);
         if (useTexture) {
-          this._setPipe(pass, tsk >= 0 ? tsp : noCull ? this.pipeline.transparentTexturedNoCullPipeline : this.pipeline.transparentTexturedPipeline, tspFb);
           pass.setBindGroup(0, this.meshBindGroup);
           const texId = submesh?.textureLibraryId ?? mesh.textureLibraryId ?? '';
           const isAtlas = !!texId && this._atlasLayerMap.has(texId);
           const texBG   = (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(mesh);
           pass.setBindGroup(1, texBG);
         } else {
-          this._setPipe(pass, tsk >= 0 ? tsp : noCull ? this.pipeline.transparentUntexturedNoCullPipeline : this.pipeline.transparentUntexturedPipeline, tspFb);
           pass.setBindGroup(0, this.meshBindGroup);
         }
 
@@ -6328,46 +6189,26 @@ export class Renderer3D {
    *  wall pixels skip the interior-mapped window trace, windowsPattern evaluates only the facade's own material and
    *  returns the footprint alone to non-facade patterned meshes. false = the original code paths (A/B). */
   static shaderFastPaths = true;
-  /** STEP 8 SPECIALISED SHADER VARIANTS (shader-variants.ts; performance-plan §P21): a batched opaque mesh whose
-   *  material flags are in a listed feature family draws with a variant of its fragment shader compiled with those
-   *  flags as constants (same pixels; compiled in the background, the uber-shader until ready). false = every mesh
-   *  on the uber-shader (A/B). Through setShaderVariants / sm.setShaderVariants3D. */
-  static shaderVariants = true;
-  /** Step 8: dense ids of the variant keys in use (the draw rank and the GPU-driven state codes carry them). */
+  /** THE FROZEN DRAW-RANK VARIANT ID (shader-variants.ts; what is left of step 8 / performance-plan §P21): the P21
+   *  shader variants were removed with the uber shader (shader-split phase 4), but the draw rank keeps their key of
+   *  the instance flags in its pipeline class (shader-split.md §5.2: the rank formula is frozen, so coplanar draws
+   *  keep their order). Dense ids of the variant keys in use. */
   private readonly _svIds = new ShaderVariantIds();
-  /** Step 8: bumped when a mesh's variant key changes on a slot write (a look switch): the draw rank re-ranks. */
+  /** Bumped when a mesh's variant key changes on a slot write (a look switch): the draw rank re-ranks. */
   private _svKeyGen = 0;
   private _drawOrderSv = -2;
-  /** Step 8: the draw rank's pipeline class includes the shader-variant id (same-variant meshes form one run, so the
-   *  variants add no pipeline switches by alternation). Independent of shaderVariants (the A/B keeps the order). */
+  /** The draw rank's pipeline class includes the variant id (rankVariants; default on). */
   static rankVariants = true;
   private _svU32: Uint32Array | null = null;
-  /** Step 8: the specialised pipeline for a batched opaque draw with variant key `vk` (-1 = none), or null (the
-   *  caller uses the base pipeline: no variant, variants off, or still compiling). */
-  private _variantPipe(vk: number, tex: boolean, noCull: boolean, pat: boolean): GPURenderPipeline | null {
-    if (vk < 0 || !Renderer3D.shaderVariantsActive) return null;
-    return this.pipeline.variantPipeline((tex ? VB_TEXTURED : 0) | (noCull ? VB_NOCULL : 0) | (pat ? VB_PATTERNED : 0) | (this._shadowsEnabled ? VB_SHADOW : 0), vk, Renderer3D.shaderFastPaths);
-  }
-  /** Step 8: switch the shader variants (A/B) and read their state: keys in use, compiled pipelines, compile times. */
-  setShaderVariants(o: { enabled?: boolean; max?: number } = {}): { enabled: boolean; capped: boolean; keys: number; max: number; registered: number; ready: number; pending: number; failed: number; list: { key: number; base: number; fast: boolean; ready: boolean; ms: number }[] } {
-    if (o.max !== undefined && Number.isFinite(o.max)) this._svIds.max = Math.max(0, Math.floor(o.max));
-    if (o.enabled !== undefined && !!o.enabled !== Renderer3D.shaderVariants) {
-      Renderer3D.shaderVariants = !!o.enabled;
-      this._gd?.recode();   // the GPU-driven state codes carry the variant id
-    }
-    return { enabled: Renderer3D.shaderVariants, capped: !Renderer3D.caps.shaderVariants, keys: this._svIds.size, max: this._svIds.max, ...this.pipeline.variantStats() };
-  }
-  // ── SHADER SPLIT phase 1 (mesh-fs-pipelines.ts; docs/specs/shader-split.md) ─────────────────────────────────────
-  /** The split is on: the default on every tier since phase 3 (shader-split.md §13); off only when rolled back
-   *  (localStorage salsa.shaderSplit = 'off' / sm.setShaderSplit3D({ mode: 'off' }) / render debug noShaderSplit). */
-  static get shaderSplitActive(): boolean { return shaderSplitActive(); }
-  /** GPU-driven state codes: bit 14 of the variant-id field marks a split key id (P21 ids stay below 0x4000). */
+  // ── SHADER SPLIT: the mesh pipelines (mesh-fs-pipelines.ts; docs/specs/shader-split.md) ──────────────────────────
+  // Every mesh draw goes through the split since phase 4 (2026-10-08): no uber shader, no rollback switch.
+  /** GPU-driven state codes: bit 14 of the variant-id field marks a split key id. */
   static readonly SPLIT_ID_FLAG = 0x4000;
   /** Dense ids of the packed split keys GPU-driven state codes carry (1..0x3fff; 0 = none). */
   private readonly _splitIds = new Map<number, number>();
   /** id -> packed key (the GPU-driven resolve) */
   private readonly _splitNums: number[] = [-1];
-  /** The dense id of packed split key `num` (0 when `num` < 0 or the ids ran out: today's pipelines). */
+  /** The dense id of packed split key `num` (0 when `num` < 0 or the ids ran out: that record draws nothing). */
   private _splitIdOf(num: number): number {
     if (num < 0) return 0;
     let id = this._splitIds.get(num);
@@ -6378,19 +6219,25 @@ export class Renderer3D {
     return id;
   }
   /** The packed split key of `m` from its MATERIAL (= the key its slot write derives: the same encode functions and the
-   *  same pattern-slot writer for patternParams.z / .w). -1 = today's pipelines (multi-material meshes key per slot). */
+   *  same pattern-slot writer for patternParams.z / .w). -1 for a multi-material mesh (those key per slot). */
   static splitKeyOfMesh(m: Mesh3D): number {
     if (m.submeshes.length > 0) return -1;
     return Renderer3D._splitKeyOfMaterial(m, m.material, m.isFaceFeatures || !!(m.material.hasTexture || m.material.hasNormalMap));
   }
   private static readonly _splitZW = new Float32Array(64);
   /** The packed split key a slot of mesh `m` written with material `mat` gets, on a `tex` layout (the face-kit multiply
-   *  axis: only PLAIN-safe keys). */
+   *  axis: the PLAIN-routed key, meshFsNumPlain). */
   private static _splitKeyOfMaterial(m: Mesh3D, mat: Material3D, tex: boolean): number {
     const z = Renderer3D._splitZW; z.fill(0);
     Renderer3D.prototype._writePatternSlots.call(null, z, 0, mat);   // (writes floats 48-59 only; uses no instance state)
     const n = meshFsKeyNum(encodeMaterialFlags(mat), encodeMeshFlags2(m), tex, z[54], z[55]);
-    return m.isFaceFeatures && !meshFsNumPlainSafe(n) ? -1 : n;
+    return m.isFaceFeatures ? meshFsNumPlain(n) : n;
+  }
+  /** The packed split key a skinned part draws with: the key its slot write derived (`_r3FK`). A skinned part is drawn
+   *  whole with its MESH material (its slot is written from it), so a part that carries submeshes (no `_r3FK`) keys
+   *  from that material too (rare: a material slot appended through the API). */
+  private _skinnedKey(mesh: Mesh3D, tex: boolean): number {
+    return mesh._r3FK >= 0 || mesh.submeshes.length === 0 ? mesh._r3FK : Renderer3D._splitKeyOfMaterial(mesh, mesh.material, mesh.isFaceFeatures || tex);
   }
   private _slotU32: Uint32Array | null = null;
   /** The packed split key of MAIN instance slot `idx` read back from the CPU copy, on a `tex` layout (the draw sites
@@ -6403,8 +6250,8 @@ export class Renderer3D {
     if (o + 59 >= d.length) return -1;
     return meshFsKeyNum(this._slotU32[o + 43], d[o + FLAGS2_FLOAT_OFFSET], tex, d[o + 54], d[o + 55]);
   }
-  /** Document pre-warm of one mesh with the split on: queue its key(s) on the axes it draws with; false = it has a key
-   *  the split does not cover (the caller queues today's pipelines). Notes the axes for _splitWarmBases. */
+  /** Document pre-warm of one mesh: queue its key(s) on the axes it draws with; false = nothing to queue (a key could
+   *  not be derived, or a weight-paint preview: its own pipelines). Notes the axes for _splitWarmBases. */
   private _splitPrewarmMesh(m: Mesh3D, skinned: boolean, fds: boolean, sh0: boolean): boolean {
     const reg = this.pipeline.meshFs;
     const one = (mat: Material3D, axisMat: Material3D, vc: boolean): boolean => {
@@ -6422,7 +6269,7 @@ export class Renderer3D {
     };
     if (skinned && m.vertexColors) return false;   // a weight-paint preview: its own pipelines
     if (m.submeshes.length > 0) {
-      if (skinned) return false;
+      if (skinned) return one(m.material, m.material, false);   // drawn whole with the mesh material (_skinnedKey)
       let ok = true;
       for (const s of m.submeshes) ok = one(s.material, s.material, false) && ok;
       return ok;
@@ -6444,9 +6291,8 @@ export class Renderer3D {
     }
     this._splitBaseAxes.clear();
   }
-  /** Shadows on (or on at boot) with the split on: queue the shadow-receiving BASE fallbacks of the opaque axes. */
+  /** Shadows on (or on at boot): queue the shadow-receiving BASE fallbacks of the opaque axes. */
   private _splitWarmShadowBase(priority: PipelinePriority): void {
-    if (!shaderSplitActive()) return;
     for (const axis of ['opaqueNoCull', 'opaque'] as const) for (const tex of [false, true]) this.pipeline.meshFs.warmBase(axis, tex, this._splitG(true), priority);
   }
   /** The scene-global key bits, read from the SAME state the uniforms carry this frame: shadows, the render-debug
@@ -6456,8 +6302,10 @@ export class Renderer3D {
     const d = this._iblData;
     return (shadow ? MESH_FS_G_SHADOW : 0) | (d[53] !== 0 || d[54] !== 0 ? MESH_FS_G_DEBUG : 0) | (d[41] > 0.5 && d[52] <= 0.5 ? MESH_FS_G_SSR_INLINE : 0);
   }
-  /** The split pipeline for packed key `num` on `axis` (exact, a compiled superset, or null = held). */
+  /** The split pipeline for packed key `num` on `axis` (exact, a compiled superset, or null = held; null for no key,
+   *  `num` < 0: the slot is not written yet). */
   private _splitPipe(num: number, axis: MeshFsAxis, shadow: boolean): GPURenderPipeline | null {
+    if (num < 0) return null;
     const reg = this.pipeline.meshFs;
     if (reg.onLanded === null) reg.onLanded = () => this.onDeferredWork?.();
     return reg.pick(axis, num, this._splitG(shadow));
@@ -6465,18 +6313,12 @@ export class Renderer3D {
   /** The smallest compiled superset of packed key `num` on `axis` (P22: a packed draw uses its twin while the chosen
    *  pipeline's own twin compiles; same pixels), or null. */
   private _splitFallback(num: number, axis: MeshFsAxis, shadow: boolean): GPURenderPipeline | null {
-    return this.pipeline.meshFs.fallbackPipe(axis, num, this._splitG(shadow));
+    return num < 0 ? null : this.pipeline.meshFs.fallbackPipe(axis, num, this._splitG(shadow));
   }
-  /** SHADER SPLIT switch + diagnostics. `mode` / `enabled` persist per machine (localStorage salsa.shaderSplit):
-   *  'auto' (no stored value) = the phase default, ON since phase 3; `{ mode: 'off' }` / `{ enabled: false }` = the
-   *  ROLLBACK (reload so the boot warm-up compiles the uber pipelines again); `{ enabled: true }` stores 'on'.
-   *  `bisect` (spec §7 phase-1 risk) and the test knobs (forceFallback, noFallback, slowCompileMs) are session-only.
-   *  The result adds `uberModules` / `uberPipelines`: the uber-shader fragment modules created and the uber pipelines
-   *  the split replaces that are compiled (both 0 with the split on and every mesh covered). */
-  setShaderSplit(o: { enabled?: boolean; mode?: ShaderSplitMode; bisect?: MeshFsBisect; forceFallback?: boolean; noFallback?: boolean; noStandIn?: boolean; slowCompileMs?: number; maxKeys?: number; exclude?: MeshFsFamily[]; clearJournal?: boolean; resetCounters?: boolean } = {}): { active: boolean; mode: ShaderSplitMode; bisect: MeshFsBisect; forceFallback: boolean; noFallback: boolean; noStandIn: boolean; slowCompileMs: number; exclude: readonly MeshFsFamily[]; journal: number; uberModules: number; uberPipelines: number } & MeshFsSplitStats {
-    const was = shaderSplitActive();
-    if (o.mode !== undefined) setShaderSplitMode(o.mode);
-    else if (o.enabled !== undefined) setShaderSplitMode(o.enabled ? 'on' : 'off');
+  /** SHADER SPLIT diagnostics + test knobs (the mesh pipelines; there is no on / off switch since phase 4). `bisect`
+   *  (spec §7 phase-1 risk), forceFallback, noFallback, noStandIn and slowCompileMs are session-only test knobs;
+   *  `maxKeys` overrides the tier's key cap for this session. */
+  setShaderSplit(o: { bisect?: MeshFsBisect; forceFallback?: boolean; noFallback?: boolean; noStandIn?: boolean; slowCompileMs?: number; maxKeys?: number; clearJournal?: boolean; resetCounters?: boolean } = {}): { bisect: MeshFsBisect; forceFallback: boolean; noFallback: boolean; noStandIn: boolean; slowCompileMs: number; journal: number } & MeshFsSplitStats {
     const reg = this.pipeline.meshFs, opts = reg.opts;
     if (o.bisect !== undefined && o.bisect !== opts.bisect) { opts.bisect = o.bisect; reg.remap(); }
     if (o.forceFallback !== undefined) opts.forceFallback = !!o.forceFallback;
@@ -6484,17 +6326,9 @@ export class Renderer3D {
     if (o.noStandIn !== undefined) opts.noStandIn = !!o.noStandIn;
     if (o.slowCompileMs !== undefined && Number.isFinite(o.slowCompileMs)) opts.slowCompileMs = Math.max(0, o.slowCompileMs);
     if (o.maxKeys !== undefined && Number.isFinite(o.maxKeys)) { MeshFsPipelines.maxKeys = Math.max(1, Math.floor(o.maxKeys)); reg.remap(); }   // (this session; the tier cap returns on reload)
-    if (o.exclude !== undefined && Array.isArray(o.exclude)) {
-      // a family exclusion changes which slots get split keys: re-derive every key (full instance repack) + re-code
-      setShaderSplitExcluded(o.exclude);
-      this.markInstancesDirty(); this._gd?.recode(); reg.remap();
-      this._prewarmSeen.opaque = -1; this._prewarmSeen.skinned = -1;
-    }
     if (o.clearJournal) reg.clearJournal();
     if (o.resetCounters) reg.resetCounters();
-    if (shaderSplitActive() !== was) { this._prewarmSeen.opaque = -1; this._prewarmSeen.skinned = -1; }   // (the GPU-driven re-code: _gdBegin)
-    return { active: shaderSplitActive(), mode: SHADER_SPLIT.mode, bisect: opts.bisect, forceFallback: opts.forceFallback, noFallback: opts.noFallback, noStandIn: opts.noStandIn, slowCompileMs: opts.slowCompileMs, exclude: shaderSplitExcluded(), journal: reg.journal().length,
-      uberModules: this.pipeline.uberFragmentModules, uberPipelines: this.pipeline.uberPipelinesCompiled, ...reg.stats() };
+    return { bisect: opts.bisect, forceFallback: opts.forceFallback, noFallback: opts.noFallback, noStandIn: opts.noStandIn, slowCompileMs: opts.slowCompileMs, journal: reg.journal().length, ...reg.stats() };
   }
   /** FOG HORIZON silhouette fast path (fog-horizon.ts FOG_HORIZON_FAST): fogged pixels return the fog colour early
    *  while Hard edge + linear fog are on. Pixel-identical; false = the full shading path (A/B). */
@@ -7088,18 +6922,18 @@ export class Renderer3D {
     // Here because every slot writer calls this after the matrices (and the material-only rewrites too).
     data[offset + FLAGS2_FLOAT_OFFSET] = encodeMeshFlags2(mesh);
     data[offset + FLAGS2_FLOAT_OFFSET + 1] = mesh.hlodFade >= 0 ? mesh.hlodFade : 0;   // P17 HLOD fade coverage (column 3 .y, x 0 like .x)
-    // STEP 8: the shader-variant key = the flags exactly as just written to this slot (floats 43, a u32), so a variant
-    // pipeline is only ever chosen for a mesh whose instance flags equal its constant. Multi-material meshes: none.
+    // The frozen draw-rank variant id's key (shader-variants.ts) = the flags exactly as just written to this slot
+    // (floats 43, a u32). Multi-material meshes: none.
     if (this._svU32 === null || this._svU32.buffer !== data.buffer) this._svU32 = new Uint32Array(data.buffer);
     const svk = mesh.submeshes.length === 0 ? variantKeyOfFlags(this._svU32[(data.byteOffset >> 2) + offset + 43]) : -1;
     if (svk !== mesh._r3VF) { this._svKeyGen++; mesh._r3VF = svk; }
-    // SHADER SPLIT: the packed key of the flags + flags2 + pattern params just written (-1 = not covered: today's
-    // pipelines; multi-material meshes key per slot at their draw). A face-kit overlay draws on the textured PLAIN
-    // multiply pipeline: its key is textured and PLAIN-safe only.
+    // SHADER SPLIT: the packed key of the flags + flags2 + pattern params just written (multi-material meshes: -1, they
+    // key per slot at their draw). A face-kit overlay draws on the textured multiply axis with the PLAIN-routed key
+    // (meshFsNumPlain: the pattern block on its PLAIN defaults, exactly the pre-split PLAIN pipeline it drew with).
     if (mesh.submeshes.length === 0) {
       const fk = meshFsKeyNum(this._svU32[(data.byteOffset >> 2) + offset + 43], data[offset + FLAGS2_FLOAT_OFFSET],
         mesh.isFaceFeatures || !!(mesh.material.hasTexture || mesh.material.hasNormalMap), data[offset + 54], data[offset + 55]);
-      mesh._r3FK = mesh.isFaceFeatures && !meshFsNumPlainSafe(fk) ? -1 : fk;
+      mesh._r3FK = mesh.isFaceFeatures ? meshFsNumPlain(fk) : fk;
     } else mesh._r3FK = -1;
     const mm = mesh.material;
     if (!mm.groundShade || mm.hasTexture || mm.hasNormalMap || mm.garpTex) return;
@@ -9657,31 +9491,15 @@ export class Renderer3D {
         }
       } else {
         const useTexture = mesh.material.hasTexture || mesh.material.hasNormalMap;
-        const patterned = this._usesPatterns(mesh);   // §3.1: characters are plain → the cheaper skinned pipeline
-        // SHADER SPLIT: a covered part draws with its generated pipeline (skinned: never shadow-receiving)
-        const ssk = shaderSplitActive() ? mesh._r3FK : -1;
-        if (ssk >= 0) {
-          const p = this._splitPipe(ssk, 'skinned', false);
-          if (!p) { fs.skinnedWaiting++; continue; }   // held: the exact key compiles (draws once it lands)
-          if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
-          if (useTexture) {
-            const texBG = this.createTextureBindGroup(mesh);
-            if (texBG !== curBG1) { pass.setBindGroup(1, texBG); curBG1 = texBG; }
-            if (skinBG !== curBG2) { pass.setBindGroup(2, skinBG); curBG2 = skinBG; }
-          } else if (skinBG !== curBG1) { pass.setBindGroup(1, skinBG); curBG1 = skinBG; }
-        } else if (useTexture) {
-          const p = patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline;
-          if (!p) { fs.skinnedWaiting++; continue; }   // P2: still compiling → skip this part (draws once it lands)
-          if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
+        // SHADER SPLIT: the part's generated pipeline (skinned: never shadow-receiving)
+        const p = this._splitPipe(this._skinnedKey(mesh, !!useTexture), 'skinned', false);
+        if (!p) { fs.skinnedWaiting++; continue; }   // held: the exact key compiles (draws once it lands)
+        if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
+        if (useTexture) {
           const texBG = this.createTextureBindGroup(mesh);
           if (texBG !== curBG1) { pass.setBindGroup(1, texBG); curBG1 = texBG; }
           if (skinBG !== curBG2) { pass.setBindGroup(2, skinBG); curBG2 = skinBG; }
-        } else {
-          const p = patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline;
-          if (!p) { fs.skinnedWaiting++; continue; }   // P2: still compiling → skip this part (draws once it lands)
-          if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
-          if (skinBG !== curBG1) { pass.setBindGroup(1, skinBG); curBG1 = skinBG; }
-        }
+        } else if (skinBG !== curBG1) { pass.setBindGroup(1, skinBG); curBG1 = skinBG; }
       }
 
       // Counted HERE, once the draw is really issued (§P15 draw-bug 2026-10-04): it used to count before the pipeline
@@ -9692,22 +9510,15 @@ export class Renderer3D {
 
     // FACE KIT overlays (face-features.ts): drawn after every opaque skinned part with the MULTIPLY pipeline (no depth
     // write), so brows / mouth / blush / hair shadow darken whatever the skin rendered, in any render style.
-    const faceSplit = !!faceOverlays && shaderSplitActive();
-    const faceMulPipe = faceOverlays && !faceSplit ? this.pipeline.skinnedFaceMultiplyPipeline : null;
-    if (faceOverlays && !faceSplit && !faceMulPipe) fs.skinnedWaiting += faceOverlays.length;   // still compiling (ready event re-requests)
     if (skStuck) this.onDeferredWork?.();
-    if (faceOverlays && (faceMulPipe || faceSplit)) {
-      if (faceMulPipe) pass.setPipeline(faceMulPipe);
+    if (faceOverlays) {
       let fmCur: GPURenderPipeline | null = null;
       for (const i of faceOverlays) {
         const mesh = visible[i];
-        if (faceSplit) {
-          // SHADER SPLIT: the face-kit multiply axis (the PLAIN skinned textured shader today; _r3FK is the slot key with
-          // tex = true, -1 unless PLAIN-safe)
-          const p = mesh._r3FK >= 0 ? this._splitPipe(mesh._r3FK, 'skinnedFaceMultiply', false) : this.pipeline.skinnedFaceMultiplyPipeline;
-          if (!p) { fs.skinnedWaiting++; continue; }
-          if (p !== fmCur) { pass.setPipeline(p); fmCur = p; }
-        }
+        // SHADER SPLIT: the face-kit multiply axis (the PLAIN-routed slot key with tex = true: meshFsNumPlain)
+        const p = this._splitPipe(this._skinnedKey(mesh, true), 'skinnedFaceMultiply', false);
+        if (!p) { fs.skinnedWaiting++; continue; }   // held (draws once it lands)
+        if (p !== fmCur) { pass.setPipeline(p); fmCur = p; }
         fs.skinnedDrawn++; fs.skinnedTris += mesh.geometry.indices.length / 3;
         pass.setVertexBuffer(0, this._skinnedVBs.get(mesh.id)!);
         pass.setIndexBuffer(this._skinnedIBs.get(mesh.id)!, 'uint32');
@@ -9807,30 +9618,15 @@ export class Renderer3D {
         pPass.setVertexBuffer(0, vb);
         pPass.setIndexBuffer(ib, 'uint32');
         const useTexture = mesh.material.hasTexture || mesh.material.hasNormalMap;
-        const patterned = this._usesPatterns(mesh);
-        const mk = shaderSplitActive() ? mesh._r3FK : -1;   // SHADER SPLIT: the part's key, as in the main skinned loop
-        if (mk >= 0) {
-          const p = this._splitPipe(mk, 'skinned', false);
-          if (!p) continue;   // held (draws once it lands)
-          if (p !== pPipe) { pPass.setPipeline(p); pPipe = p; }
-          if (useTexture) {
-            const texBG = this.createTextureBindGroup(mesh);
-            if (texBG !== pBG1) { pPass.setBindGroup(1, texBG); pBG1 = texBG; }
-            if (skinBG !== pBG2) { pPass.setBindGroup(2, skinBG); pBG2 = skinBG; }
-          } else if (skinBG !== pBG1) { pPass.setBindGroup(1, skinBG); pBG1 = skinBG; }
-        } else if (useTexture) {
-          const p = patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline;
-          if (!p) continue;   // P2: still compiling → skip
-          if (p !== pPipe) { pPass.setPipeline(p); pPipe = p; }
+        // SHADER SPLIT: the part's key, as in the main skinned loop
+        const p = this._splitPipe(this._skinnedKey(mesh, !!useTexture), 'skinned', false);
+        if (!p) continue;   // held (draws once it lands)
+        if (p !== pPipe) { pPass.setPipeline(p); pPipe = p; }
+        if (useTexture) {
           const texBG = this.createTextureBindGroup(mesh);
           if (texBG !== pBG1) { pPass.setBindGroup(1, texBG); pBG1 = texBG; }
           if (skinBG !== pBG2) { pPass.setBindGroup(2, skinBG); pBG2 = skinBG; }
-        } else {
-          const p = patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline;
-          if (!p) continue;   // P2: still compiling → skip
-          if (p !== pPipe) { pPass.setPipeline(p); pPipe = p; }
-          if (skinBG !== pBG1) { pPass.setBindGroup(1, skinBG); pBG1 = skinBG; }
-        }
+        } else if (skinBG !== pBG1) { pPass.setBindGroup(1, skinBG); pBG1 = skinBG; }
         pPass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
       }
       pPass.end();

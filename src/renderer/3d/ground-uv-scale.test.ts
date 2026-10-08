@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { groundUvWorldScale, GROUND_UV_SCALE_MARKER } from './ground-uv-scale';
 import { generatePlane } from './mesh-generators';
 import * as mesh3d from './shaders/mesh3d-shaders';
+import { generateMeshFs } from './shaders/mesh-fs-generate';
+import { MF, meshFsAllKey } from './shaders/mesh-fs-key';
 
 // Bug 2026-09-29: procedural-ground grout rendered as speckled noise that shimmered (worse zoomed in) because the
 // shader derived metres-per-uv PER PIXEL from f32 screen derivatives. The scale is a per-mesh constant for an affine
@@ -43,7 +45,10 @@ describe('groundUvWorldScale', () => {
 });
 
 describe('the ground shader uses the CPU scale', () => {
-    const shaders = Object.values(mesh3d).filter((v): v is string => typeof v === 'string');
+    // the shader library + the generated mesh fragment shaders (all features, and a ground-only key per layout)
+    const shaders = [...Object.values(mesh3d).filter((v): v is string => typeof v === 'string'),
+        ...[false, true].flatMap((sh) => [generateMeshFs(meshFsAllKey(false, sh)), generateMeshFs(meshFsAllKey(true, sh)),
+            generateMeshFs({ ...meshFsAllKey(false, sh, false, false), styles: 1, feat: MF.GROUND | MF.ENV_SPEC, pat: 0, gm: 1 << 4 })])];
     it('every shader variant with a ground branch switches to uvTransform.xy when the marker is present', () => {
         const withGround = shaders.filter((s) => s.includes('let gUvMs'));
         expect(withGround.length).toBeGreaterThan(0);

@@ -8,6 +8,11 @@
 //   test       vitest run (whole suite)
 //
 // Flags:  --fast            sanity + typecheck + lint without type info + wgsl; no full test run (pre-commit use)
+//         --changed[=REF]   while WORKING: lint only the changed files and run only the tests that import them
+//                           (`vitest related`, through the module graph — city tests don't run for a 2D change).
+//                           Changed = uncommitted + untracked vs HEAD (or vs REF, e.g. --changed=origin/main).
+//                           A change to config / package files runs the whole suite. Run the FULL check before
+//                           committing — `--changed` misses tests that read files at runtime instead of importing.
 //         --steps=a,b       run only these steps (names above)
 //         --bail            stop at the first failing step (default: run everything, then summarise)
 // Every step runs even if an earlier one failed, so one run shows every problem. Exit 1 if any step failed.
@@ -19,11 +24,36 @@ const fast = args.includes('--fast');
 const bail = args.includes('--bail');
 const stepsArg = args.find((a) => a.startsWith('--steps='));
 const only = stepsArg ? new Set(stepsArg.slice('--steps='.length).split(',')) : null;
+const changedArg = args.find((a) => a === '--changed' || a.startsWith('--changed='));
 
 const ESLINT = 'tools/lint/node_modules/eslint/bin/eslint.js';
 const TSC = 'node_modules/typescript/bin/tsc';
 const VITEST = 'node_modules/vitest/vitest.mjs';
 const WGSL_TEST = 'src/renderer/3d/wgsl-static-check.test.ts';
+
+/** --changed: the changed files (repo-relative, forward slashes) and whether the change is global (config). */
+function changedFiles() {
+  const ref = changedArg && changedArg.includes('=') ? changedArg.slice('--changed='.length) : 'HEAD';
+  const git = (a) => (spawnSync('git', a, { encoding: 'utf8' }).stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
+  const files = [...new Set([...git(['diff', '--name-only', ref]), ...git(['ls-files', '--others', '--exclude-standard'])])]
+    .filter((f) => existsSync(f));
+  const global = files.some((f) => /^(package(-lock)?\.json|tsconfig[^/]*\.json|vitest\.config\.\w+|vite\.config\.\w+)$/.test(f));
+  return { files, global };
+}
+const changed = changedArg ? changedFiles() : null;
+const changedSrc = changed ? changed.files.filter((f) => /^src\/.*\.(ts|tsx|js|mjs|wgsl)$/.test(f)) : [];
+const changedLintable = changed ? changed.files.filter((f) => /\.(ts|tsx|js|mjs)$/.test(f)) : [];
+
+function testCmd() {
+  if (!changed || changed.global) return [VITEST, 'run'];
+  // vitest related: the given files' own tests + every test that imports them (transitively)
+  return [VITEST, 'related', '--run', '--passWithNoTests', ...changedSrc];
+}
+function lintCmd() {
+  const base = ['--quiet', '--pass-on-unpruned-suppressions'];
+  if (!changed || changed.global) return [ESLINT, '.', ...base];
+  return [ESLINT, ...base, '--no-warn-ignored', ...changedLintable];
+}
 
 const steps = [
   { name: 'sanity', cmd: ['scripts/check-source-sanity.mjs'] },
@@ -31,13 +61,22 @@ const steps = [
   {
     // --quiet: errors only (warn-level rules are skipped, which is also faster). `npm run lint` shows the warnings.
     // --pass-on-unpruned-suppressions: fixing a baselined error (or --fast skipping a type-aware one) must not fail.
-    name: 'lint', cmd: [ESLINT, '.', '--quiet', '--pass-on-unpruned-suppressions'],
+    name: 'lint', cmd: lintCmd(),
     env: fast ? { LINT_NO_TYPES: '1' } : {},
     pre: () => existsSync(ESLINT) || 'lint toolchain not installed: run `npm run lint:install` (npm ci in tools/lint)',
+    skip: () => changed && !changed.global && changedLintable.length === 0 && 'no changed lintable files',
   },
   { name: 'wgsl', cmd: [VITEST, 'run', WGSL_TEST], when: () => fast || (only && only.has('wgsl')) },
-  { name: 'test', cmd: [VITEST, 'run'], when: () => !fast },
+  {
+    name: 'test', cmd: testCmd(), when: () => !fast,
+    skip: () => changed && !changed.global && changedSrc.length === 0 && 'no changed source files',
+  },
 ];
+if (changed) {
+  console.log(changed.global
+    ? '--changed: a config / package file changed → full lint + full test suite'
+    : `--changed: ${changedSrc.length} changed source file(s) → lint those + only the tests that import them`);
+}
 
 const results = [];
 for (const step of steps) {
@@ -45,8 +84,12 @@ for (const step of steps) {
   console.log(`\n=== ${step.name} ${'='.repeat(Math.max(0, 70 - step.name.length))}`);
   const t0 = Date.now();
   let ok;
+  const skipped = step.skip ? step.skip() : false;
   const pre = step.pre ? step.pre() : true;
-  if (pre !== true) {
+  if (skipped) {
+    console.log(`skipped: ${skipped}`);
+    ok = true;
+  } else if (pre !== true) {
     console.error(pre);
     ok = false;
   } else {

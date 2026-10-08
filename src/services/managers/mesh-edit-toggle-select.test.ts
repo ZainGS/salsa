@@ -17,6 +17,7 @@ import { MeshEditManager } from './mesh-edit-manager';
 import { UndoManager3D } from './undo-manager-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { Camera3D } from '../../renderer/3d/camera-3d';
+import { isPointerEventClaimed } from '../../renderer/util/pointer-claims';
 import type { Scene3DManager } from './scene3d-manager';
 import type { ManagerContext } from './manager-context';
 import type { InteractionService } from '../interaction-service';
@@ -191,6 +192,36 @@ describe('toggle-off — face / vertex / edge', () => {
   });
 });
 
+describe('Edge mode — only the edge selection counts (notes 2026-10-08 #5)', () => {
+  it('two edges A–B and C–D selected: the connecting edge B–C is not selected (a tap adds it; again removes it)', () => {
+    const t = setup();
+    t.c.setMode('edge');
+    const top = t.faceWhere(v => v.y > 0);
+    const h0 = t.em().faces[top].halfEdge, h1 = t.em().halfEdges[h0].next, h2 = t.em().halfEdges[h1].next;
+    const mid = (h: number) => {
+      const [ia, ib] = t.em().getHalfEdgeVertices(h)!;
+      const A = t.em().vertices[ia], B = t.em().vertices[ib];
+      return t.at((A.x + B.x) / 2, (A.y + B.y) / 2, (A.z + B.z) / 2);
+    };
+    t.click(mid(h0));
+    t.click(mid(h2), true);
+    const bc = t.c.pickElementAt(mid(h1).x, mid(h1).y)!;
+    expect([h1, t.em().halfEdges[h1].twin]).toContain(bc.index);
+    expect(bc.selected).toBe(false);
+    // stale vertices (e.g. the ends of A–B and C–D left in the vertex set) don't make B–C count either
+    for (const h of [h0, h2]) for (const v of t.em().getHalfEdgeVertices(h)!) t.sel().vertices.add(v);
+    expect(t.c.pickElementAt(mid(h1).x, mid(h1).y)!.selected).toBe(false);
+    t.sel().vertices.clear();
+    t.click(mid(h1), true);                                            // not selected → added
+    expect(t.sel().edges.size).toBe(3);
+    expect(t.c.pickElementAt(mid(h1).x, mid(h1).y)!.selected).toBe(true);
+    t.click(mid(h1), true);                                            // drawn selected → a tap removes it
+    expect(t.sel().edges.size).toBe(2);
+    expect(t.sel().edges.has(h1) || t.sel().edges.has(t.em().halfEdges[h1].twin)).toBe(false);
+    expect(t.undo.stackSize).toBe(0);
+  });
+});
+
 describe('toggle-off — never on a drag', () => {
   it('Shift-press on a selected face then a drag moves the selection (one step) and keeps every face selected', () => {
     const t = setup();
@@ -277,5 +308,70 @@ describe('toggle-off — through the mirror copy', () => {
     t.tap(t.at(1.5, 0, 0));
     expect([...t.sel().faces]).toEqual([top]);
     expect(t.undo.stackSize).toBe(1);                                  // only the mirror's step
+  });
+});
+
+describe('one-shot face pick (Mirror "Use Face": tap the button, then tap a face)', () => {
+  it('the next face tap / click is consumed: the callback gets the face, the selection does not change', () => {
+    const t = setup();
+    t.c.setMode('face');
+    const top = t.faceWhere(v => v.y > 0), front = t.faceWhere(v => v.z > 0);
+    t.meshEdit.selectFace(t.mesh.id, top);
+    const got: Array<number | null> = [];
+    expect(t.c.armFacePick(f => got.push(f))).toBe(true);
+    expect(t.c.facePickArmed).toBe(true);
+    t.click(t.faceCentre(front));
+    expect(got).toEqual([front]);
+    expect([...t.sel().faces]).toEqual([top]);                         // unchanged
+    expect(t.c.facePickArmed).toBe(false);
+    t.click(t.faceCentre(front));                                      // disarmed: a normal click selects again
+    expect([...t.sel().faces]).toEqual([front]);
+    // a finger tap picks too (and an additive latch doesn't matter)
+    t.latch.on = true;
+    t.c.armFacePick(f => got.push(f));
+    t.tap(t.faceCentre(top));
+    expect(got).toEqual([front, top]);
+    expect([...t.sel().faces]).toEqual([front]);
+    expect(t.undo.stackSize).toBe(0);
+  });
+
+  it('a drag is the camera\'s (no pick, still armed); a tap on no face does nothing; a 2nd finger drops the press', () => {
+    const t = setup();
+    t.c.setMode('face');
+    const front = t.faceWhere(v => v.z > 0);
+    const got: Array<number | null> = [];
+    t.c.armFacePick(f => got.push(f));
+    const p = t.faceCentre(front);
+    const down = t.fire('pointerdown', { pointerType: 'pen', clientX: p.x, clientY: p.y });
+    expect(isPointerEventClaimed(down)).toBe(false);                    // never claimed: the camera may orbit
+    t.fire('pointermove', { pointerType: 'pen', clientX: p.x + 40, clientY: p.y });
+    t.fire('pointerup', { pointerType: 'pen', clientX: p.x + 40, clientY: p.y });
+    expect(got).toEqual([]);
+    t.click({ x: 2, y: 2 });                                           // empty canvas corner
+    expect(got).toEqual([]);
+    expect(t.c.facePickArmed).toBe(true);
+    expect(t.sel().faces.size).toBe(0);                                // (an empty click never deselected / selected)
+    t.fire('pointerdown', { pointerType: 'touch', pointerId: 7, isPrimary: true, clientX: p.x, clientY: p.y });
+    t.fire('pointerdown', { pointerType: 'touch', pointerId: 8, isPrimary: false, clientX: p.x + 80, clientY: p.y });
+    t.fire('pointerup', { pointerType: 'touch', pointerId: 7, clientX: p.x, clientY: p.y });
+    t.fire('pointerup', { pointerType: 'touch', pointerId: 8, clientX: p.x + 80, clientY: p.y });
+    expect(got).toEqual([]);
+    t.tap(p);
+    expect(got).toEqual([front]);
+  });
+
+  it('cancelled (callback null) by cancelFacePick, Vertex / Edge, another tool, re-arming, detach', () => {
+    const t = setup();
+    t.c.setMode('face');
+    const got: Array<string> = [];
+    const arm = (tag: string) => t.c.armFacePick(f => got.push(`${tag}:${f}`));
+    arm('a'); expect(t.c.cancelFacePick()).toBe(true); expect(t.c.cancelFacePick()).toBe(false);
+    arm('b'); t.c.setMode('face'); expect(t.c.facePickArmed).toBe(true); t.c.setMode('edge');
+    t.c.setMode('face');
+    arm('c'); t.c.setTool('select'); expect(t.c.facePickArmed).toBe(true); t.c.setTool('move');
+    arm('d'); arm('e');
+    t.c.detach();
+    expect(got).toEqual(['a:null', 'b:null', 'c:null', 'd:null', 'e:null']);
+    expect(t.c.armFacePick(() => {})).toBe(false);                    // not attached
   });
 });

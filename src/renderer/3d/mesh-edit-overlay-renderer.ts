@@ -472,6 +472,10 @@ export class MeshEditOverlayRenderer {
     // Skipped when the UV editor's "Wireframe" toggle is off (showWireframe === false).
     // P4 (mobile-parity 7.3b): the wireframe doesn't depend on the camera, so its vertex buffer is rebuilt only when
     // something it is made of changed (see _wireframeChanged — an exact compare, no version counters to miss).
+    // Edge mode: an edge is selected when either half-edge of it is in the EDGE selection — never derived from its two
+    // ends (that rule is Vertex mode's, drawn as the thick bands above).
+    const eSel = mode === 'edge' && selection ? selection.edges : null;
+    const edgeSelected = (hi: number, twin: number): boolean => !!eSel && (eSel.has(hi) || (twin >= 0 && eSel.has(twin)));
     if (wireDirty && showWire) for (let hi = 0; hi < em.halfEdges.length; hi++) {
       const he = em.halfEdges[hi];
       if (he.twin >= 0 && he.twin < hi) continue; // skip duplicate of each pair
@@ -480,7 +484,7 @@ export class MeshEditOverlayRenderer {
       const vFrom = prevHe ? em.vertices[prevHe.vertex] : undefined;
       if (!vTo || !vFrom) continue; // degenerate / non-manifold edit mesh (e.g. a procedural soup) — skip
       if (mirrored) {
-        const isSelM = mode === 'edge' && !!selection?.edges.has(hi);
+        const isSelM = edgeSelected(hi, he.twin);
         const colM   = isSelM ? C_SEL_EDGE : he.isSeam ? C_SEAM_EDGE : he.isSharp ? C_SHARP_EDGE : C_UNSEL_EDGE;
         const colC   = faint(colM);
         forEachSegmentImage(planes, vFrom.x, vFrom.y, vFrom.z, vTo.x, vTo.y, vTo.z, (ax, ay, az, bx, by, bz, img) => {
@@ -491,7 +495,7 @@ export class MeshEditOverlayRenderer {
       }
       const wTo   = toW(vTo.x, vTo.y, vTo.z);
       const wFrom = toW(vFrom.x, vFrom.y, vFrom.z);
-      const isSel  = mode === 'edge' && !!selection?.edges.has(hi);
+      const isSel  = edgeSelected(hi, he.twin);
       const col    = isSel ? C_SEL_EDGE : he.isSeam ? C_SEAM_EDGE : he.isSharp ? C_SHARP_EDGE : C_UNSEL_EDGE;
       lineV.push(wFrom[0], wFrom[1], wFrom[2], col[0], col[1], col[2], col[3]);
       lineV.push(wTo[0],   wTo[1],   wTo[2],   col[0], col[1], col[2], col[3]);
