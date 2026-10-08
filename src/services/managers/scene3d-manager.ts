@@ -1743,6 +1743,13 @@ export class Scene3DManager {
      *  a pointer (hosts skip per-move UI work). */
     isArmatureDragActive3D(): boolean { return this._armature.isArmatureDragActive; }
 
+    /** True while the Armature panel is up: armature mode entered (enterArmatureMode3D, the focus background) or the
+     *  bone overlay pinned (showBoneOverlay3D) — until showBoneOverlay3D(null). */
+    isArmatureModeActive3D(): boolean {
+        if (this._armature.isBoneOverlayActive() || this._armatureEntryCaptured) return true;
+        try { return this.renderer3D?.armatureModeActive === true; } catch { return false; }
+    }
+
     /** Pause the procedural idle on a phone / tablet (or safe-mode) GPU tier while an edit mode is up (mobile-parity
      *  TOUCH-9/10 perf): it held the render loop live every vsync for the whole session — armature posing already
      *  stops its pose work, Edit Mesh doesn't need a breathing character. Desktop tiers are unchanged. */

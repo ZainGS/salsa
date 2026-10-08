@@ -26,6 +26,8 @@ import { buildRenderMesh, patchRenderMesh, type RenderGeometry, type RenderState
 import { weldGeometry, type WeldOptions } from './edit-mesh-weld';
 import { buildBevel, bevelLimit, bevelGuides, type BevelSpec, type BevelGuide } from './edit-mesh-bevel';
 import { buildKnifeCut, type KnifePoint, type KnifeOptions } from './edit-mesh-knife';
+import { bisectMirror, unitNormal, type MirrorPlane } from './edit-mesh-mirror';
+export type { MirrorPlane } from './edit-mesh-mirror';
 export type { BevelSpec, BevelGuide } from './edit-mesh-bevel';
 export type { KnifePoint, KnifeOptions } from './edit-mesh-knife';
 
@@ -190,19 +192,63 @@ export interface Modifier {
 
 // ── MirrorModifier ────────────────────────────────────────────────────────────
 
+/** How a mirror was made: 'axis' = the original modifier (across an axis through the origin, the WHOLE mesh mirrored —
+ *  old documents keep exactly that); 'bisect' / 'face' = a PLANE mirror with bisect (edit-mesh-mirror.ts): only the
+ *  real side is kept, the copy is its reflection, the seam is welded. 'face' = made from a face (plane through its
+ *  centroid along its normal), 'bisect' = a plane through the mesh's centre. Both behave the same. */
+export type MirrorMode = 'axis' | 'bisect' | 'face';
+
+/** A mirror's plane as the API reports it: `normal` (unit) points toward the COPY side. */
+export interface MirrorPlaneInfo { mode: MirrorMode; point: [number, number, number]; normal: [number, number, number] }
+
 export class MirrorModifier implements Modifier {
   type = 'mirror' as const;
   enabled = true;
   axis: 'x' | 'y' | 'z' = 'x';
   mergeThreshold = 0.001;
   clipping = true;
+  /** 'axis' = the original behaviour (default — old saves have no mode); 'bisect' / 'face' = the plane mirror. */
+  mode: MirrorMode = 'axis';
+  /** Plane mirror (mode ≠ 'axis'): a point on the plane and its unit normal (toward the copy side), object space. */
+  point: [number, number, number] = [0, 0, 0];
+  normal: [number, number, number] = [1, 0, 0];
+  /** The last apply() passed its input through unchanged (nothing of it on the real side): the plane mirror is inert —
+   *  Edit Mesh picking / the overlay then treat the mesh as unmirrored. */
+  inert = false;
 
   constructor(axis: 'x' | 'y' | 'z' = 'x', clipping = true) {
     this.axis = axis;
     this.clipping = clipping;
   }
 
+  /** A plane mirror (bisect) through `point` with `normal` (normalised; toward the copy side; no direction → -X). */
+  static plane(mode: 'bisect' | 'face', point: ArrayLike<number>, normal: ArrayLike<number>): MirrorModifier {
+    const m = new MirrorModifier('x', true);
+    m.mode = mode;
+    m.point = [point[0] + 0, point[1] + 0, point[2] + 0];
+    m.normal = unitNormal(normal) ?? [-1, 0, 0];
+    return m;
+  }
+
+  /** The plane (an axis mirror: through the origin, the normal along its axis). */
+  getPlane(): MirrorPlaneInfo {
+    if (this.mode === 'axis') {
+      return { mode: 'axis', point: [0, 0, 0], normal: [this.axis === 'x' ? 1 : 0, this.axis === 'y' ? 1 : 0, this.axis === 'z' ? 1 : 0] };
+    }
+    return { mode: this.mode, point: [this.point[0], this.point[1], this.point[2]], normal: [this.normal[0], this.normal[1], this.normal[2]] };
+  }
+
+  /** The bisect plane for the images helpers (null for an axis mirror). */
+  mirrorPlane(): MirrorPlane | null {
+    return this.mode === 'axis' ? null : { point: this.point, normal: this.normal, eps: this.mergeThreshold };
+  }
+
   apply(mesh: EditMeshData): EditMeshData {
+    if (this.mode !== 'axis') {
+      const r = bisectMirror(mesh, { point: this.point, normal: this.normal, eps: this.mergeThreshold });
+      this.inert = r.inert;
+      return r.data;
+    }
     const offset = mesh.vertices.length;
 
     const mirroredVerts = mesh.vertices.map(v => ({
@@ -238,8 +284,12 @@ export class MirrorModifier implements Modifier {
     return combined;
   }
 
+  /** An axis mirror saves exactly the old fields (old documents round-trip byte for byte); a plane mirror adds
+   *  `mode` / `point` / `normal`. */
   toJSON(): object {
-    return { type: this.type, enabled: this.enabled, axis: this.axis, mergeThreshold: this.mergeThreshold, clipping: this.clipping };
+    const base = { type: this.type, enabled: this.enabled, axis: this.axis, mergeThreshold: this.mergeThreshold, clipping: this.clipping };
+    if (this.mode === 'axis') return base;
+    return { ...base, mode: this.mode, point: [this.point[0], this.point[1], this.point[2]], normal: [this.normal[0], this.normal[1], this.normal[2]] };
   }
 }
 
@@ -477,6 +527,48 @@ export class EditMesh {
     }
     this._fromEditMeshData(data);
     this.modifiers.splice(0, index + 1);
+  }
+
+  /**
+   * The enabled PLANE mirrors of the stack (bisect / face mode), in stack order — what Edit Mesh picking and the edit
+   * overlay map the copy side through (edit-mesh-mirror.ts images). Axis mirrors (the old behaviour) and a plane mirror
+   * whose last evaluation was inert are left out.
+   */
+  mirrorPlanes(): MirrorPlane[] {
+    const out: MirrorPlane[] = [];
+    for (const m of this.modifiers) {
+      if (!m.enabled || !(m instanceof MirrorModifier) || m.inert) continue;
+      const p = m.mirrorPlane();
+      if (p) out.push(p);
+    }
+    return out;
+  }
+
+  /** The centre of the vertices' bounding box (object space; [0, 0, 0] for an empty mesh). */
+  boundsCenter(): [number, number, number] {
+    if (this.vertices.length === 0) return [0, 0, 0];
+    let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+    for (const v of this.vertices) {
+      if (v.x < x0) x0 = v.x; if (v.x > x1) x1 = v.x;
+      if (v.y < y0) y0 = v.y; if (v.y > y1) y1 = v.y;
+      if (v.z < z0) z0 = v.z; if (v.z > z1) z1 = v.z;
+    }
+    return [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2];
+  }
+
+  /** Face `fIdx`'s plane: its centroid and unit normal (Newell — robust for n-gons / slightly non-planar faces). Null =
+   *  no such face or a degenerate one. */
+  facePlane(fIdx: number): { point: [number, number, number]; normal: [number, number, number] } | null {
+    if (!(fIdx >= 0 && fIdx < this.faces.length)) return null;
+    const vs = this._getFaceVerts(fIdx);
+    if (vs.length < 3) return null;
+    let nx = 0, ny = 0, nz = 0;
+    for (let k = 0; k < vs.length; k++) {
+      const a = this.vertices[vs[k]], b = this.vertices[vs[(k + 1) % vs.length]];
+      nx += (a.y - b.y) * (a.z + b.z); ny += (a.z - b.z) * (a.x + b.x); nz += (a.x - b.x) * (a.y + b.y);
+    }
+    const n = unitNormal([nx, ny, nz]);
+    return n ? { point: this.getFaceCenter(fIdx), normal: n } : null;
   }
 
   // ── Primitive constructors ────────────────────────────────────────────────
@@ -2975,6 +3067,12 @@ export class EditMesh {
         const mod = new MirrorModifier(m.axis ?? 'x', m.clipping ?? true);
         mod.enabled = m.enabled ?? true;
         mod.mergeThreshold = m.mergeThreshold ?? 0.001;
+        // the plane mirror (round 2); old saves have no `mode` → 'axis' = exactly the old behaviour
+        if (m.mode === 'bisect' || m.mode === 'face') {
+          mod.mode = m.mode;
+          if (Array.isArray(m.point) && m.point.length >= 3) mod.point = [Number(m.point[0]) || 0, Number(m.point[1]) || 0, Number(m.point[2]) || 0];
+          mod.normal = (Array.isArray(m.normal) && m.normal.length >= 3 ? unitNormal(m.normal) : null) ?? [-1, 0, 0];
+        }
         mesh.modifiers.push(mod);
       } else if (m.type === 'subdivision') {
         const mod = new SubdivisionModifier(m.iterations ?? 1);

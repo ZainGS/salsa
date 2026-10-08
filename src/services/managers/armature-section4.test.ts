@@ -93,7 +93,9 @@ function setup() {
     const x = w[12], y = w[13], z = w[14], cw = m[3] * x + m[7] * y + m[11] * z + m[15];
     return { x: ((m[0] * x + m[4] * y + m[8] * z + m[12]) / cw + 1) * 400, y: (1 - (m[1] * x + m[5] * y + m[9] * z + m[13]) / cw) * 300 };
   };
-  return { arm, skel, canvas, r, undoManager, screenOf, sceneEvents: () => sceneEvents };
+  /** The host's additive selection latch (setAdditiveSelect3D). */
+  const latch = (on: boolean) => { (ctx.interactionService as unknown as { additiveSelect3D: boolean }).additiveSelect3D = on; };
+  return { arm, skel, canvas, r, undoManager, screenOf, latch, sceneEvents: () => sceneEvents };
 }
 
 describe('Armature tap-select (selectArmatureJoint3D / getSelectedArmatureJoints3D / onArmatureJointSelectionChanged)', () => {
@@ -250,5 +252,129 @@ describe('setArmatureActiveTool3D', () => {
     t.arm.setArmatureToolMode('move');
     expect(t.arm.getArmatureActiveTool()).toBe('move');
     expect(t.r.gizmoHidden).toBe(false);
+  });
+});
+
+describe('Additive head press (latch / Shift) in Move: toggle on release, a drag past the slop moves', () => {
+  const sel = (t: ReturnType<typeof setup>) => t.arm.getSelectedArmatureJoints().map(s => s.jointIndex);
+
+  it('a tap (no move) toggles on RELEASE: pen, touch, a small wobble inside the slop, Shift + click', () => {
+    const t = setup();
+    t.latch(true);
+    t.arm.selectJoint(0);
+    const p0 = [...t.skel.data.joints[1].localPosition];
+    fire(t.canvas, 'pointerdown', { pointerType: 'pen', clientX: 200, clientY: 300 });
+    expect(sel(t)).toEqual([0]);                                          // nothing on the press
+    fire(t.canvas, 'pointermove', { pointerType: 'pen', clientX: 202, clientY: 302 });   // inside the 4 px slop
+    fire(t.canvas, 'pointerup', { pointerType: 'pen', clientX: 202, clientY: 302, buttons: 0 });
+    expect(sel(t)).toEqual([1, 0]);                                       // added on the release
+    expect(t.skel.data.joints[1].localPosition).toEqual(p0);
+    // a finger tap (inside the 8 px slop) toggles it back off
+    fire(t.canvas, 'pointerdown', { pointerType: 'touch', clientX: 200, clientY: 300 });
+    fire(t.canvas, 'pointermove', { pointerType: 'touch', clientX: 205, clientY: 304 });
+    expect(sel(t)).toEqual([1, 0]);
+    fire(t.canvas, 'pointerup', { pointerType: 'touch', clientX: 205, clientY: 304, buttons: 0 });
+    expect(sel(t)).toEqual([0]);
+    expect(t.skel.data.joints[1].localPosition).toEqual(p0);
+    expect(t.undoManager.stackSize).toBe(0);
+    // Shift + mouse click: the same (toggle on release)
+    t.latch(false);
+    fire(t.canvas, 'pointerdown', { clientX: 200, clientY: 300, shiftKey: true });
+    expect(sel(t)).toEqual([0]);
+    fire(t.canvas, 'pointerup', { clientX: 200, clientY: 300, buttons: 0, shiftKey: true });
+    expect(sel(t)).toEqual([1, 0]);
+    fire(t.canvas, 'pointerdown', { clientX: 200, clientY: 300, shiftKey: true });
+    fire(t.canvas, 'pointerup', { clientX: 200, clientY: 300, buttons: 0, shiftKey: true });
+    expect(sel(t)).toEqual([0]);
+    // a plain mouse click still replaces on the press
+    fire(t.canvas, 'pointerdown', { clientX: 200, clientY: 300 });
+    expect(sel(t)).toEqual([1]);
+    fire(t.canvas, 'pointerup', { clientX: 200, clientY: 300, buttons: 0 });
+    expect(sel(t)).toEqual([1]);
+    expect(t.undoManager.stackSize).toBe(0);                              // no move, no step
+  });
+
+  it('press + drag on a SELECTED joint moves it without toggling; ONE undo step (undo / redo exact)', () => {
+    const t = setup();
+    t.arm.selectArmatureJoint(t.skel.id, 0);
+    t.arm.selectArmatureJoint(t.skel.id, 1, true);                       // [1, 0]
+    t.latch(true);
+    const p0 = [...t.skel.data.joints[1].localPosition];
+    fire(t.canvas, 'pointerdown', { pointerType: 'touch', clientX: 200, clientY: 300 });
+    fire(t.canvas, 'pointermove', { pointerType: 'touch', clientX: 230, clientY: 290 });
+    fire(t.canvas, 'pointermove', { pointerType: 'touch', clientX: 260, clientY: 280 });
+    fire(t.canvas, 'pointerup', { pointerType: 'touch', clientX: 260, clientY: 280, buttons: 0 });
+    const p1 = [...t.skel.data.joints[1].localPosition];
+    expect(p1).not.toEqual(p0);
+    expect(sel(t)).toEqual([1, 0]);                                       // still selected (no toggle)
+    expect(t.undoManager.stackSize).toBe(1);
+    expect(t.undoManager.undoDescription).toBe('Move joint');
+    t.undoManager.undo();
+    expect(t.skel.data.joints[1].localPosition).toEqual(p0);
+    t.undoManager.redo();
+    expect(t.skel.data.joints[1].localPosition).toEqual(p1);
+    // dragging a non-primary selected joint makes it the primary, keeping the rest
+    t.arm.selectArmatureJoint(t.skel.id, 0, true);                       // off: [1]
+    t.arm.selectArmatureJoint(t.skel.id, 0, true);                       // on again as the primary: [0, 1]
+    expect(sel(t)).toEqual([0, 1]);
+    fire(t.canvas, 'pointerdown', { pointerType: 'pen', clientX: 200, clientY: 300 });
+    fire(t.canvas, 'pointermove', { pointerType: 'pen', clientX: 240, clientY: 300 });
+    fire(t.canvas, 'pointerup', { pointerType: 'pen', clientX: 240, clientY: 300, buttons: 0 });
+    expect(sel(t)).toEqual([1, 0]);
+    expect(t.undoManager.stackSize).toBe(2);
+  });
+
+  it('press + drag on an UNSELECTED joint selects it additively, then moves it; no toggle on release', () => {
+    const t = setup();
+    t.arm.selectJoint(0);
+    t.latch(true);
+    const p0 = [...t.skel.data.joints[1].localPosition];
+    fire(t.canvas, 'pointerdown', { pointerType: 'pen', clientX: 200, clientY: 300 });
+    fire(t.canvas, 'pointermove', { pointerType: 'pen', clientX: 250, clientY: 280 });
+    expect(sel(t)).toEqual([1, 0]);                                       // added as the primary at the drag start
+    expect(t.r.selected).toBe(1);
+    fire(t.canvas, 'pointerup', { pointerType: 'pen', clientX: 250, clientY: 280, buttons: 0 });
+    expect(sel(t)).toEqual([1, 0]);
+    expect(t.skel.data.joints[1].localPosition).not.toEqual(p0);
+    expect(t.undoManager.stackSize).toBe(1);
+  });
+
+  it('a 2nd finger / pointercancel / Esc cancel: pose + selection restored exactly, no undo step, no toggle', () => {
+    const t = setup();
+    t.arm.selectJoint(0);
+    t.latch(true);
+    const p0 = [...t.skel.data.joints[1].localPosition];
+    // 2nd finger
+    fire(t.canvas, 'pointerdown', { pointerType: 'touch', clientX: 200, clientY: 300 });
+    fire(t.canvas, 'pointermove', { pointerType: 'touch', clientX: 260, clientY: 280 });
+    expect(t.skel.data.joints[1].localPosition).not.toEqual(p0);
+    expect(sel(t)).toEqual([1, 0]);
+    fire(t.canvas, 'pointerdown', { pointerType: 'touch', pointerId: 2, isPrimary: false, clientX: 500, clientY: 300 });
+    expect(t.skel.data.joints[1].localPosition).toEqual(p0);
+    expect(sel(t)).toEqual([0]);
+    fire(t.canvas, 'pointerup', { pointerType: 'touch', pointerId: 2, isPrimary: false, clientX: 500, clientY: 300, buttons: 0 });
+    fire(t.canvas, 'pointerup', { pointerType: 'touch', clientX: 260, clientY: 280, buttons: 0 });
+    expect(sel(t)).toEqual([0]);
+    // pointercancel (mid-drag, and on a press still deciding)
+    fire(t.canvas, 'pointerdown', { pointerType: 'pen', clientX: 200, clientY: 300 });
+    fire(t.canvas, 'pointermove', { pointerType: 'pen', clientX: 260, clientY: 280 });
+    fire(t.canvas, 'pointercancel', { pointerType: 'pen', clientX: 260, clientY: 280, buttons: 0 });
+    expect(t.skel.data.joints[1].localPosition).toEqual(p0);
+    expect(sel(t)).toEqual([0]);
+    fire(t.canvas, 'pointerdown', { pointerType: 'pen', clientX: 200, clientY: 300 });
+    fire(t.canvas, 'pointercancel', { pointerType: 'pen', clientX: 200, clientY: 300, buttons: 0 });
+    expect(sel(t)).toEqual([0]);
+    // Esc (cancelTransform3D): the later release neither toggles nor moves
+    fire(t.canvas, 'pointerdown', { pointerType: 'pen', clientX: 200, clientY: 300 });
+    fire(t.canvas, 'pointermove', { pointerType: 'pen', clientX: 260, clientY: 280 });
+    expect(t.arm.isArmatureDragActive).toBe(true);
+    t.arm.cancelTransform3D();
+    expect(t.skel.data.joints[1].localPosition).toEqual(p0);
+    expect(sel(t)).toEqual([0]);
+    expect(t.arm.isArmatureDragActive).toBe(false);
+    fire(t.canvas, 'pointerup', { pointerType: 'pen', clientX: 260, clientY: 280, buttons: 0 });
+    expect(sel(t)).toEqual([0]);
+    expect(t.skel.data.joints[1].localPosition).toEqual(p0);
+    expect(t.undoManager.stackSize).toBe(0);
   });
 });

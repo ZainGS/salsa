@@ -26,6 +26,7 @@ import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import type { EditSelection } from '../../services/managers/mesh-edit-manager';
 import type { MeshEditSelectionMode } from '../../services/managers/mesh-edit-pointer-controller';
 import { triangulateFace } from '../../scene-graph/shapes/edit-mesh-render';
+import { forEachPointImage, forEachSegmentImage, forEachPolygonImage, mirrorPlanesKey } from '../../scene-graph/shapes/edit-mesh-mirror';
 
 // Fragment shader for rear (occluded) edges: 4-pixel diagonal stipple pattern.
 // Uses (x+y) % 8 so horizontal, vertical, and diagonal lines all look dashed.
@@ -59,6 +60,11 @@ const C_SEL_FACE:    readonly [number, number, number, number] = [1.0, 0.62, 0.1
 const C_SEL_OUTLINE: readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
 /** Chamfer / Bevel guide (dashed bisector through each target) — the knife preview's yellow. */
 const C_GUIDE:       readonly [number, number, number, number] = [1.0, 0.9, 0.3, 1.0];
+/** The mirror plane handle (sm.setMirrorPlaneHandle3D): a translucent quad + its outline. */
+const C_PLANE_FILL:  readonly [number, number, number, number] = [0.35, 0.75, 1.0, 0.14];
+const C_PLANE_EDGE:  readonly [number, number, number, number] = [0.35, 0.75, 1.0, 0.95];
+/** A plane mirror's COPY side (edit-mesh-mirror.ts images): the same overlay colours at this fraction of their alpha. */
+const MIRROR_COPY_ALPHA = 0.4;
 /** UV cross-highlight tint (cyan): shown when hovering in the UV canvas pane. */
 const C_HOVER_FACE:  readonly [number, number, number, number] = [0.3, 0.85, 1.0,  0.20];
 
@@ -90,6 +96,9 @@ export interface MeshEditDrawData {
    *  by the renderer's gizmo at `center` (world), oriented by `rotation` (null = world axes), on top of the overlay.
    *  Absent / null = no gizmo (nothing selected, no gizmo mode, a modal G / R / S running). */
   gizmo?: MeshEditGizmoDraw | null;
+  /** The mirror plane handle's quad (sm.setMirrorPlaneHandle3D): 4 world-space corners (xyz × 4, around the quad),
+   *  drawn as a translucent fill + outline. Absent / null = hidden. */
+  mirrorPlane?: Float32Array | null;
 }
 
 /** The Edit Mesh selection gizmo as the renderer draws it. */
@@ -259,12 +268,19 @@ export class MeshEditOverlayRenderer {
 
     const lineV: number[] = [];
 
+    // Plane mirrors (bisect / face mode) of the stack: the overlay shows each element where the modifier output has it
+    // — clipped to the real side, plus its reflections (fainter) on the copy side; the discarded part is not drawn.
+    const planes = typeof em.mirrorPlanes === 'function' ? em.mirrorPlanes() : [];   // (test doubles: a plain edit mesh)
+    const mirrored = planes.length > 0;
+    const planesKey = mirrored ? mirrorPlanesKey(planes) : '';
+    const faint = (c: readonly [number, number, number, number]): [number, number, number, number] => [c[0], c[1], c[2], c[3] * MIRROR_COPY_ALPHA];
+
     // ── 0–2. Fills, then (drawn over the wireframe) thick selected edges + dots (triangle-list) ──────────────────
     // TOUCH-9/10 perf: the tri VB is rebuilt only when something it is made of changed — the camera axes / pixel
     // scale, the selection, the hover tint, or the edit mesh / local matrix (which the wireframe snapshot below
     // compares exactly when the wireframe is on). Two ranges: [fills | handles]; the fills go under the wireframe.
     const showWire = data.showWireframe !== false;
-    const wireDirty = this._wireframeChanged(em, lm, mode, selection, showWire);
+    const wireDirty = this._wireframeChanged(em, lm, mode, selection, showWire, planesKey);
     const geomSame = showWire && !wireDirty;
     const scaleKey = orthoWpp > 0 ? orthoWpp : camPos ? perspK : -1;
     if (!this._triInputsSame(rx, ry, rz, ux, uy, uz, mode, selection, data.hoveredFaces, scaleKey,
@@ -288,6 +304,22 @@ export class MeshEditOverlayRenderer {
           if (!vs) continue;
           // The compile's own triangulation (a concave quad / n-gon fills inside its outline, not as a fan)
           const tri = triangulateFace(em.vertices, vs);
+          if (mirrored) {
+            // each triangle clipped to the real side + its reflections (fan-filled)
+            const fc = faint(col);
+            for (let t = 0; t + 2 < tri.length; t += 3) {
+              const a = em.vertices[vs[tri[t]]], b = em.vertices[vs[tri[t + 1]]], c = em.vertices[vs[tri[t + 2]]];
+              forEachPolygonImage(planes, [a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z], (poly, img) => {
+                const k = poly.length / 3, cc = img ? fc : col;
+                for (let j = 1; j + 1 < k; j++) {
+                  pushV(fill, toW(poly[0], poly[1], poly[2]), cc);
+                  pushV(fill, toW(poly[j * 3], poly[j * 3 + 1], poly[j * 3 + 2]), cc);
+                  pushV(fill, toW(poly[j * 3 + 3], poly[j * 3 + 4], poly[j * 3 + 5]), cc);
+                }
+              });
+            }
+            continue;
+          }
           for (const k of tri) {
             const v = em.vertices[vs[k]];
             pushV(fill, toW(v.x, v.y, v.z), col);
@@ -328,10 +360,15 @@ export class MeshEditOverlayRenderer {
         // Thick selected edges: Edge mode = the selected edges; Face mode = the selected faces' outlines; Vertex mode =
         // the edges whose two ends are selected.
         const HE = em.halfEdges;
+        const selOutlineCopy = faint(C_SEL_OUTLINE);
         const thick = (hi: number) => {
           const he = HE[hi], prev = HE[he.prev];
           const from = prev ? V[prev.vertex] : undefined, to = V[he.vertex];
-          if (from && to) band(toW(from.x, from.y, from.z), toW(to.x, to.y, to.z), C_SEL_OUTLINE);
+          if (!from || !to) return;
+          if (!mirrored) { band(toW(from.x, from.y, from.z), toW(to.x, to.y, to.z), C_SEL_OUTLINE); return; }
+          forEachSegmentImage(planes, from.x, from.y, from.z, to.x, to.y, to.z, (ax, ay, az, bx, by, bz, img) => {
+            band(toW(ax, ay, az), toW(bx, by, bz), img ? selOutlineCopy : C_SEL_OUTLINE);
+          });
         };
         if (mode === 'edge') {
           for (const hi of selection.edges) if (HE[hi]) thick(hi);
@@ -353,9 +390,23 @@ export class MeshEditOverlayRenderer {
         // Dots: the vertices in Vertex mode, the face centres in Face mode (each a rim, then the core on top).
         if (mode === 'vertex') {
           const m = lm;
+          const dot = (ox: number, oy: number, oz: number, isSel: boolean, img: number) => {
+            const wx = m[0]*ox + m[4]*oy + m[8]*oz  + m[12];
+            const wy = m[1]*ox + m[5]*oy + m[9]*oz  + m[13];
+            const wz = m[2]*ox + m[6]*oy + m[10]*oz + m[14];
+            const s = wpp(wx, wy, wz);
+            const rim = isSel ? C_SEL_RIM : C_UNSEL_RIM, core = isSel ? C_SEL_VERT : C_UNSEL_VERT;
+            quad(wx, wy, wz, (isSel ? PX_VERT_SEL_RIM : PX_VERT_RIM) * s, img ? faint(rim) : rim);
+            quad(wx, wy, wz, (isSel ? PX_VERT_SEL : PX_VERT) * s, img ? faint(core) : core);
+          };
           for (let vi = 0; vi < V.length; vi++) {
             const v = V[vi];
             if (!v) continue;
+            if (mirrored) {
+              const isSel = selection.vertices.has(vi);
+              forEachPointImage(planes, v.x, v.y, v.z, (x, y, z, img) => dot(x, y, z, isSel, img));
+              continue;
+            }
             const wx = m[0]*v.x + m[4]*v.y + m[8]*v.z  + m[12];
             const wy = m[1]*v.x + m[5]*v.y + m[9]*v.z  + m[13];
             const wz = m[2]*v.x + m[6]*v.y + m[10]*v.z + m[14];
@@ -368,6 +419,23 @@ export class MeshEditOverlayRenderer {
           for (let fi = 0; fi < em.faces.length; fi++) {
             const vs = faceVerts(fi);
             if (!vs) continue;
+            if (mirrored) {
+              // the face centre of each image of the face (real side clipped + reflections)
+              const isSel = selection.faces.has(fi);
+              const pts: number[] = [];
+              for (const vi of vs) { const v = V[vi]; pts.push(v.x, v.y, v.z); }
+              forEachPolygonImage(planes, pts, (poly, img) => {
+                const k = poly.length / 3;
+                let px = 0, py = 0, pz = 0;
+                for (let j = 0; j < k; j++) { px += poly[j * 3]; py += poly[j * 3 + 1]; pz += poly[j * 3 + 2]; }
+                const w = toW(px / k, py / k, pz / k);
+                const s = wpp(w[0], w[1], w[2]);
+                const rim = isSel ? C_SEL_RIM : C_UNSEL_RIM, core = isSel ? C_SEL_VERT : C_UNSEL_VERT;
+                quad(w[0], w[1], w[2], PX_FACE_RIM * s, img ? faint(rim) : rim);
+                quad(w[0], w[1], w[2], PX_FACE * s, img ? faint(core) : core);
+              });
+              continue;
+            }
             let cx = 0, cy = 0, cz = 0;
             for (const vi of vs) { const v = V[vi]; cx += v.x; cy += v.y; cz += v.z; }
             const w = toW(cx / vs.length, cy / vs.length, cz / vs.length);
@@ -411,6 +479,16 @@ export class MeshEditOverlayRenderer {
       const vTo   = em.vertices[he.vertex];
       const vFrom = prevHe ? em.vertices[prevHe.vertex] : undefined;
       if (!vTo || !vFrom) continue; // degenerate / non-manifold edit mesh (e.g. a procedural soup) — skip
+      if (mirrored) {
+        const isSelM = mode === 'edge' && !!selection?.edges.has(hi);
+        const colM   = isSelM ? C_SEL_EDGE : he.isSeam ? C_SEAM_EDGE : he.isSharp ? C_SHARP_EDGE : C_UNSEL_EDGE;
+        const colC   = faint(colM);
+        forEachSegmentImage(planes, vFrom.x, vFrom.y, vFrom.z, vTo.x, vTo.y, vTo.z, (ax, ay, az, bx, by, bz, img) => {
+          const c = img ? colC : colM, a = toW(ax, ay, az), b = toW(bx, by, bz);
+          lineV.push(a[0], a[1], a[2], c[0], c[1], c[2], c[3], b[0], b[1], b[2], c[0], c[1], c[2], c[3]);
+        });
+        continue;
+      }
       const wTo   = toW(vTo.x, vTo.y, vTo.z);
       const wFrom = toW(vFrom.x, vFrom.y, vFrom.z);
       const isSel  = mode === 'edge' && !!selection?.edges.has(hi);
@@ -425,6 +503,27 @@ export class MeshEditOverlayRenderer {
       pass.setBindGroup(0, this._uniBG);   // cached — uniform buffer never recreated
       pass.setVertexBuffer(0, this._triBuf);
       pass.draw(this._triFillFloats / 7);
+    }
+
+    // ── The mirror plane handle's quad: translucent fill + outline (tiny; every frame while shown) ──
+    const mq = data.mirrorPlane;
+    if (mq && mq.length >= 12) {
+      const floats = (6 + 8) * 7, bytes = floats * 4;
+      if (!this._planeBuf) this._planeBuf = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      const o = this._planeScratch;
+      let k = 0;
+      const c = (i: number, col: readonly [number, number, number, number]) => { k = putV(o, k, mq[i * 3], mq[i * 3 + 1], mq[i * 3 + 2], col); };
+      for (const i of [0, 1, 2, 0, 2, 3]) c(i, C_PLANE_FILL);
+      for (const [a, b] of [[0, 1], [1, 2], [2, 3], [3, 0]]) { c(a, C_PLANE_EDGE); c(b, C_PLANE_EDGE); }
+      this.device.queue.writeBuffer(this._planeBuf, 0, o, 0, floats);
+      pass.setPipeline(this._triPipe.get()!);
+      pass.setBindGroup(0, this._uniBG);
+      pass.setVertexBuffer(0, this._planeBuf);
+      pass.draw(6);
+      pass.setPipeline(this._linePipe.get()!);
+      pass.setBindGroup(0, this._uniBG);
+      pass.setVertexBuffer(0, this._planeBuf);
+      pass.draw(8, 1, 6);
     }
 
     // ── Upload (only when rebuilt) and draw line geometry ─────────────────
@@ -492,6 +591,8 @@ export class MeshEditOverlayRenderer {
 
   private _guideBuf: GPUBuffer | null = null;
   private _guideCap = 0;
+  private _planeBuf: GPUBuffer | null = null;
+  private readonly _planeScratch = new Float32Array((6 + 8) * 7);
   private _guideScratch: Float32Array | null = null;
 
   // ── Tri cache (fills + handles: thick selected edges, dots) ───────────────
@@ -556,16 +657,18 @@ export class MeshEditOverlayRenderer {
   private _wfPos = new Float64Array(0);
   private _wfHe = new Int32Array(0);
   private _wfSel: number[] = [];
+  /** The plane mirrors the wireframe was clipped / reflected through (mirrorPlanesKey; '' = none). */
+  private _wfPlanes = '';
   /** Diagnostics / tests: wireframe VB rebuilds. */
   public wireframeBuilds = 0;
 
   /** True (and the snapshot refreshed) when the wireframe's inputs differ from the last build's. */
   private _wireframeChanged(
     em: NonNullable<Mesh3D['editMesh']>, lm: Float32Array, mode: MeshEditSelectionMode,
-    selection: EditSelection | null, show: boolean,
+    selection: EditSelection | null, show: boolean, planesKey = '',
   ): boolean {
     const edgeSel = mode === 'edge' && !!selection;
-    let same = this._wfEm === em && this._wfShow === show && this._wfEdgeSel === edgeSel;
+    let same = this._wfEm === em && this._wfShow === show && this._wfEdgeSel === edgeSel && this._wfPlanes === planesKey;
     if (same) for (let i = 0; i < 16; i++) if (this._wfLm[i] !== lm[i]) { same = false; break; }
     const V = em.vertices, H = em.halfEdges;
     if (same && show) {
@@ -592,7 +695,7 @@ export class MeshEditOverlayRenderer {
     }
     if (same) return false;
     // Changed → snapshot what this build reads.
-    this._wfEm = em; this._wfShow = show; this._wfEdgeSel = edgeSel;
+    this._wfEm = em; this._wfShow = show; this._wfEdgeSel = edgeSel; this._wfPlanes = planesKey;
     for (let i = 0; i < 16; i++) this._wfLm[i] = lm[i];
     if (show) {
       if (this._wfPos.length !== V.length * 3) this._wfPos = new Float64Array(V.length * 3);
@@ -622,6 +725,7 @@ export class MeshEditOverlayRenderer {
     this._triBuf?.destroy();
     this._lineBuf?.destroy();
     this._guideBuf?.destroy();
+    this._planeBuf?.destroy();
   }
 }
 

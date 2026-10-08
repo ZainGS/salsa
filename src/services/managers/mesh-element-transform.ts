@@ -112,6 +112,11 @@ export class MeshElementTransform {
   private _selected = new Int32Array(0);
   private readonly _pivotObj = V3();
   private readonly _pivotW = V3();
+  /** The point the grab's constraint plane passes through (world): the pivot, or its IMAGE when the drag started on a
+   *  mirror modifier's copy side (begin opts.image) — the copy then follows the pointer. */
+  private readonly _grabPivotW = V3();
+  /** Copy-side grab (opts.image): the object-space linear map image → real the move goes through (null = none). */
+  private _imgLinear: mat3 | null = null;
   private readonly _M3 = M3();
   private readonly _Minv3 = M3();
   private readonly _M4 = M4();
@@ -169,7 +174,12 @@ export class MeshElementTransform {
    * skinned body (its vertices can't be sculpted), nothing is selected, or its matrix can't be inverted. A running
    * session is cancelled first. `axis` = the gizmo handle (gizmo source) or an initial constraint.
    */
-  begin(meshId: string, mode: ElementTransformMode, opts: { source?: ElementTransformSource; axis?: GizmoAxis } = {}): boolean {
+  begin(meshId: string, mode: ElementTransformMode, opts: {
+    source?: ElementTransformSource; axis?: GizmoAxis;
+    /** The drag started on a mirror's COPY side: the image's object-space affine map real → image ([L 3x3 column-major
+     *  | t], edit-mesh-mirror.ts imageAffine). A grab then moves the real elements so their image follows the pointer. */
+    image?: ArrayLike<number> | null;
+  } = {}): boolean {
     if (this.active) this.cancel();
     const mesh = this.host.getMesh(meshId);
     const em = mesh?.editMesh;
@@ -193,6 +203,18 @@ export class MeshElementTransform {
     for (const s of sel) { px += V[s].x; py += V[s].y; pz += V[s].z; }
     vec3.set(this._pivotObj, px / sel.length, py / sel.length, pz / sel.length);
     vec3.transformMat4(this._pivotW, this._pivotObj, this._M4);
+    vec3.copy(this._grabPivotW, this._pivotW);
+    this._imgLinear = null;
+    const A = opts.image;
+    if (A && A.length >= 12) {
+      const P = this._pivotObj;
+      const ip = V3(A[0] * P[0] + A[3] * P[1] + A[6] * P[2] + A[9], A[1] * P[0] + A[4] * P[1] + A[7] * P[2] + A[10], A[2] * P[0] + A[5] * P[1] + A[8] * P[2] + A[11]);
+      vec3.transformMat4(this._grabPivotW, ip, this._M4);
+      // reflections are orthogonal: image → real = Lᵀ
+      const L = M3();
+      L[0] = A[0]; L[1] = A[3]; L[2] = A[6]; L[3] = A[1]; L[4] = A[4]; L[5] = A[7]; L[6] = A[2]; L[7] = A[5]; L[8] = A[8];
+      this._imgLinear = L;
+    }
     this._orientation = this.host.getOrientation?.() ?? 'world';
     if (this._orientation === 'local') {
       const m = this._M4;
@@ -323,6 +345,7 @@ export class MeshElementTransform {
 
   private _end(): void {
     this._meshId = null; this._em = null; this._before = null; this._seg = null; this._normals = null;
+    this._imgLinear = null;
     this._start = new Float64Array(0); this._weights = new Float32Array(0);
     this._affected = new Int32Array(0); this._selected = new Int32Array(0);
     this._numeric = ''; this._axis = null;
@@ -385,6 +408,7 @@ export class MeshElementTransform {
       this._touched = true;
       if (this._mode === 'grab') {
         const d = vec3.transformMat3(V3(), this._delta, this._Minv3);   // world move → object move
+        if (this._imgLinear) vec3.transformMat3(d, d, this._imgLinear);   // moved through the mirror's copy
         for (const i of aff) {
           const w = W[i], o = i * 3;
           V[i].x = S[o] + d[0] * w; V[i].y = S[o + 1] + d[1] * w; V[i].z = S[o + 2] + d[2] * w;
@@ -445,7 +469,7 @@ export class MeshElementTransform {
   private _segMove(cam: Camera3D, s: { rx: number; ry: number; cx: number; cy: number }): vec3 {
     const out = V3();
     if (s.rx === s.cx && s.ry === s.cy) return out;
-    const toCam = this._toCam(cam);
+    const toCam = this._toCam(cam, this._grabPivotW);
     const ax = this._axis;
     let n: vec3;
     let along: vec3 | null = null;
@@ -539,8 +563,8 @@ export class MeshElementTransform {
   }
 
   /** Unit vector from the pivot toward the camera (orthographic: the view direction). */
-  private _toCam(cam: Camera3D): vec3 {
-    const from = cam.mode === 'orthographic' ? cam.target : this._pivotW;
+  private _toCam(cam: Camera3D, pivot: vec3 = this._pivotW): vec3 {
+    const from = cam.mode === 'orthographic' ? cam.target : pivot;
     const v = vec3.subtract(V3(), cam.position, from);
     if (vec3.length(v) < 1e-12) return V3(0, 0, 1);
     return vec3.normalize(v, v);
@@ -575,7 +599,7 @@ export class MeshElementTransform {
     const dir = vec3.normalize(V3(), vec3.subtract(V3(), f, o));
     const denom = vec3.dot(n, dir);
     if (Math.abs(denom) < 1e-9) return null;
-    const t = vec3.dot(n, vec3.subtract(V3(), this._pivotW, o)) / denom;
+    const t = vec3.dot(n, vec3.subtract(V3(), this._grabPivotW, o)) / denom;
     if (!Number.isFinite(t)) return null;
     return vec3.scaleAndAdd(V3(), o, dir, t);
   }

@@ -20,7 +20,8 @@ import type { ManagerContext } from './manager-context';
 import type { Command3D } from './undo-manager-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
-import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier, remapFace, type FaceList, type BevelSpec, type KnifePoint, type KnifeOptions } from '../../scene-graph/shapes/edit-mesh';
+import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier, remapFace, type FaceList, type BevelSpec, type KnifePoint, type KnifeOptions, type MirrorPlaneInfo } from '../../scene-graph/shapes/edit-mesh';
+import { unitNormal } from '../../scene-graph/shapes/edit-mesh-mirror';
 import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
 export interface EditSelection {
@@ -186,6 +187,39 @@ export class MeshEditManager {
       sel.edges.clear();
     }
     sel.edges.add(heIdx);
+  }
+
+  /** Toggle-off (Shift / the additive latch on an ALREADY selected vertex): drop it from the selection. In vertex mode the
+   *  selection reads as its vertex set (selectedVertexIndices — also the corners of selected edges / faces), so a vertex
+   *  selected through an edge / face turns the selection into that vertex set minus it. False = it wasn't selected. */
+  deselectVertex(meshId: string, vIdx: number): boolean {
+    const sel = this.getSelection(meshId);
+    if (!sel) return false;
+    if (sel.edges.size === 0 && sel.faces.size === 0) return sel.vertices.delete(vIdx);
+    const set = this.selectedVertexIndices(meshId);
+    if (!set.includes(vIdx)) return false;
+    sel.vertices.clear();
+    for (const v of set) if (v !== vIdx) sel.vertices.add(v);
+    sel.edges.clear();
+    sel.faces.clear();
+    return true;
+  }
+
+  /** Toggle-off of a selected face. False = it wasn't selected. */
+  deselectFace(meshId: string, fIdx: number): boolean {
+    const sel = this.getSelection(meshId);
+    return !!sel && sel.faces.delete(fIdx);
+  }
+
+  /** Toggle-off of a selected edge: either half-edge of the pair is the same edge (both are dropped). False = it
+   *  wasn't selected. */
+  deselectEdge(meshId: string, heIdx: number): boolean {
+    const sel = this.getSelection(meshId);
+    if (!sel) return false;
+    const twin = this._getMesh(meshId)?.editMesh?.halfEdges[heIdx]?.twin ?? -1;
+    const a = sel.edges.delete(heIdx);
+    const b = twin >= 0 && sel.edges.delete(twin);
+    return a || b;
   }
 
   getSelection(meshId: string): EditSelection | null {
@@ -1160,6 +1194,112 @@ export class MeshEditManager {
     const mesh = this._mutateModifiers(meshId, 'Add mirror modifier',
       em => em.modifiers.push(new MirrorModifier(axis, clipping)));
     return mesh?.editMesh ? mesh.editMesh.modifiers.length - 1 : -1;
+  }
+
+  // ── Plane mirror (round 2: Use Face / Bisect Mesh, rotate plane, flip side) ─────────────────────────────────
+
+  /** A live plane preview (setMirrorPlane commit:false): the mesh before the first preview step, so the commit is ONE
+   *  undo step from there and a cancel puts the plane back. Dropped when the mesh / modifier it was taken on changed. */
+  private _mirrorLive: { meshId: string; modIndex: number; mod: MirrorModifier; em: EditMesh; before: object; plane: MirrorPlaneInfo } | null = null;
+
+  /** Add a plane mirror through face `faceIndex`'s centroid along its normal (the copy appears outward from the face).
+   *  One undo step. Returns the modifier index, -1 when the mesh / face isn't there. */
+  addMirrorFromFace(meshId: string, faceIndex: number): number {
+    const em = this._getMesh(meshId)?.editMesh;
+    const pl = em?.facePlane(faceIndex);
+    if (!em || !pl) return -1;
+    const mesh = this._mutateModifiers(meshId, 'Add mirror (face)',
+      e => e.modifiers.push(MirrorModifier.plane('face', pl.point, pl.normal)));
+    return mesh?.editMesh ? mesh.editMesh.modifiers.length - 1 : -1;
+  }
+
+  /** Add a plane mirror through the centre of the mesh's bounds, normal = the object's local -X (copy on -X). One undo
+   *  step. Returns the modifier index, -1 when the mesh isn't editable. */
+  addMirrorBisect(meshId: string): number {
+    const em = this._getMesh(meshId)?.editMesh;
+    if (!em) return -1;
+    const c = em.boundsCenter();
+    const mesh = this._mutateModifiers(meshId, 'Add mirror (bisect)',
+      e => e.modifiers.push(MirrorModifier.plane('bisect', c, [-1, 0, 0])));
+    return mesh?.editMesh ? mesh.editMesh.modifiers.length - 1 : -1;
+  }
+
+  /** The mirror's plane (an old axis mirror: mode 'axis', through the origin along its axis), null when `modIndex` is
+   *  not a mirror. */
+  getMirrorPlane(meshId: string, modIndex: number): MirrorPlaneInfo | null {
+    const mod = this._getMesh(meshId)?.editMesh?.modifiers[modIndex];
+    return mod instanceof MirrorModifier ? mod.getPlane() : null;
+  }
+
+  /**
+   * Move / turn the mirror's plane (`point` and / or `normal`, object space; the normal is normalised and points
+   * toward the copy side). An old axis mirror becomes a bisect mirror starting from its own plane. commit:false = a
+   * live preview (no undo step; the next commit is ONE step from before the first preview); commit:true (default) =
+   * one undo step (none when nothing changed). False = not a mirror / an unusable plane.
+   */
+  setMirrorPlane(meshId: string, modIndex: number, plane: { point?: ArrayLike<number>; normal?: ArrayLike<number> },
+    opts: { commit?: boolean } = {}): boolean {
+    const mesh = this._getMesh(meshId);
+    const em = mesh?.editMesh;
+    const mod = em?.modifiers[modIndex];
+    if (!mesh || !em || !(mod instanceof MirrorModifier)) return false;
+    const cur = mod.getPlane();
+    const point = plane.point ?? cur.point;
+    const normal = plane.normal ? unitNormal(plane.normal) : cur.normal;
+    if (!normal || !(Number.isFinite(point[0]) && Number.isFinite(point[1]) && Number.isFinite(point[2]))) return false;
+    let live = this._mirrorLive;
+    if (live && (live.meshId !== meshId || live.modIndex !== modIndex || live.mod !== mod || live.em !== em)) live = this._mirrorLive = null;
+    const commit = opts.commit !== false;
+    if (!commit && !live) live = this._mirrorLive = { meshId, modIndex, mod, em, before: em.toJSON(), plane: cur };
+    const before = live?.before ?? (commit ? em.toJSON() : null);
+    const startPlane = live?.plane ?? cur;
+    if (mod.mode === 'axis') mod.mode = 'bisect';
+    mod.point = [point[0] + 0, point[1] + 0, point[2] + 0];
+    mod.normal = normal;
+    mesh.syncFromEditMesh();
+    if (!commit) return true;
+    this._mirrorLive = null;
+    const end = mod.getPlane();
+    const same = end.mode === startPlane.mode && end.point.every((v, i) => v === startPlane.point[i]) && end.normal.every((v, i) => v === startPlane.normal[i]);
+    if (same) return true;
+    const after = em.toJSON();
+    this.pushCommand({
+      description: 'Move mirror plane',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before!); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh = EditMesh.fromJSON(after); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /** Drop a live plane preview: the plane goes back to where it was before the first preview step (no undo step).
+   *  False when no preview runs. */
+  cancelMirrorPlanePreview(): boolean {
+    const live = this._mirrorLive;
+    this._mirrorLive = null;
+    if (!live) return false;
+    const mesh = this._getMesh(live.meshId);
+    if (!mesh || mesh.editMesh !== live.em || live.em.modifiers[live.modIndex] !== live.mod) return false;
+    live.mod.mode = live.plane.mode;
+    live.mod.point = [...live.plane.point];
+    if (live.plane.mode !== 'axis') live.mod.normal = [...live.plane.normal];
+    mesh.syncFromEditMesh();
+    return true;
+  }
+
+  /** Swap which side is real (the plane's normal reversed). An old axis mirror becomes a bisect mirror. One undo
+   *  step. False when `modIndex` is not a mirror. */
+  flipMirrorSide(meshId: string, modIndex: number): boolean {
+    const mod = this._getMesh(meshId)?.editMesh?.modifiers[modIndex];
+    if (!(mod instanceof MirrorModifier)) return false;
+    this._mirrorLive = null;
+    this._mutateModifiers(meshId, 'Flip mirror side', (em) => {
+      const m = em.modifiers[modIndex] as MirrorModifier;
+      const p = m.getPlane();
+      m.mode = p.mode === 'axis' ? 'bisect' : p.mode;
+      m.point = p.point;
+      m.normal = [-p.normal[0] + 0, -p.normal[1] + 0, -p.normal[2] + 0];
+    });
+    return true;
   }
 
   addSubdivisionModifier(meshId: string, iterations = 1): number {

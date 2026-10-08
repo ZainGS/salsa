@@ -30,10 +30,19 @@ import type { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 
 type HitScene = { pick3D(px: number, py: number, w: number, h: number): { meshId: string; hitPoint: [number, number, number] } | null };
 
-/** The pre-7.3d face-centre scan: the face whose WORLD-space centre is nearest (hx, hy, hz); ties → the lowest index. */
-export function nearestFaceCenterScan(em: EditMesh, m: ArrayLike<number>, hx: number, hy: number, hz: number): number {
+/** Mirror modifier support (round 2): the hit point mapped back to the real side (world → world) before the face-centre
+ *  search, and the faces that can't be picked (skip[f] = 1: on the discarded side of a bisect mirror). */
+export interface FacePickMirror {
+  mapHit?: ((hx: number, hy: number, hz: number) => [number, number, number]) | null;
+  skip?: Uint8Array | null;
+}
+
+/** The pre-7.3d face-centre scan: the face whose WORLD-space centre is nearest (hx, hy, hz); ties → the lowest index.
+ *  Faces with skip[f] set never win. */
+export function nearestFaceCenterScan(em: EditMesh, m: ArrayLike<number>, hx: number, hy: number, hz: number, skip?: Uint8Array | null): number {
   let bestFace = -1, bestDist = Infinity;
   for (let fi = 0; fi < em.faces.length; fi++) {
+    if (skip && skip[fi]) continue;
     const [cx, cy, cz] = em.getFaceCenter(fi);
     const wx = m[0] * cx + m[4] * cy + m[8]  * cz + m[12];
     const wy = m[1] * cx + m[5] * cy + m[9]  * cz + m[13];
@@ -47,13 +56,13 @@ export function nearestFaceCenterScan(em: EditMesh, m: ArrayLike<number>, hx: nu
 /** The pre-7.3d face pick, verbatim: a full-scene pick3D, the edit mesh must be the nearest hit, then the scan. */
 export function pickFaceFullScene(
   scene3d: HitScene, meshId: string, mesh: { editMesh: EditMesh | null; localMatrix: ArrayLike<number> } | null,
-  px: number, py: number, canvasWidth: number, canvasHeight: number,
+  px: number, py: number, canvasWidth: number, canvasHeight: number, mirror?: FacePickMirror | null,
 ): number {
   const hit = scene3d.pick3D(px, py, canvasWidth, canvasHeight);
   if (!hit || hit.meshId !== meshId) return -1;
   if (!mesh?.editMesh) return -1;
-  const [hx, hy, hz] = hit.hitPoint;
-  return nearestFaceCenterScan(mesh.editMesh, mesh.localMatrix, hx, hy, hz);
+  const [hx, hy, hz] = mirror?.mapHit ? mirror.mapHit(hit.hitPoint[0], hit.hitPoint[1], hit.hitPoint[2]) : hit.hitPoint;
+  return nearestFaceCenterScan(mesh.editMesh, mesh.localMatrix, hx, hy, hz, mirror?.skip);
 }
 
 /** Uniform grid over the world-space face centres (CSR cells). */
@@ -75,7 +84,7 @@ export class EditFacePicker {
   private _grid: FaceGrid | null = null;
 
   /** The face under canvas px (px, py), or -1. Same result as pickFaceFullScene for a ray that reaches the edit mesh. */
-  pick(mesh: Mesh3D, camera: Camera3D, px: number, py: number, canvasWidth: number, canvasHeight: number): number {
+  pick(mesh: Mesh3D, camera: Camera3D, px: number, py: number, canvasWidth: number, canvasHeight: number, mirror?: FacePickMirror | null): number {
     const em = mesh.editMesh;
     if (!em || !mesh.visible || !mesh.pickable) return -1;   // (pick3D skips hidden / non-pickable meshes)
     this.stats.picks++;
@@ -89,8 +98,8 @@ export class EditFacePicker {
     }
     if (!hit) return -1;
     this.stats.hits++;
-    const [hx, hy, hz] = hit.hitPoint;
-    return this._nearest(this._gridFor(mesh, em), hx, hy, hz);
+    const [hx, hy, hz] = mirror?.mapHit ? mirror.mapHit(hit.hitPoint[0], hit.hitPoint[1], hit.hitPoint[2]) : hit.hitPoint;
+    return this._nearest(this._gridFor(mesh, em), hx, hy, hz, mirror?.skip);
   }
 
   /** Drop the caches (edit mode ended). */
@@ -120,7 +129,7 @@ export class EditFacePicker {
   }
 
   /** Ring search of the grid: exactly the old scan's answer (min distance, then the lowest index). */
-  private _nearest(g: FaceGrid, hx: number, hy: number, hz: number): number {
+  private _nearest(g: FaceGrid, hx: number, hy: number, hz: number, skip?: Uint8Array | null): number {
     if (g.n === 0) return -1;
     const { c, cell, nx, ny, nz, start, items } = g;
     // h's cell, clamped one cell outside the grid (clamping toward the grid only shrinks ring distances: the ring
@@ -132,6 +141,7 @@ export class EditFacePicker {
       const cid = (k * ny + j) * nx + i;
       for (let s = start[cid], e = start[cid + 1]; s < e; s++) {
         const f = items[s], o = f * 3;
+        if (skip && skip[f]) continue;
         const d = Math.sqrt((c[o] - hx) ** 2 + (c[o + 1] - hy) ** 2 + (c[o + 2] - hz) ** 2);
         tested++;
         if (d < bestD || (d === bestD && f < best)) { bestD = d; best = f; }

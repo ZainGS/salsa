@@ -60,6 +60,9 @@ export type ArmTarget =
     | { kind: 'tail'; joint: number }
     | { kind: 'head'; joint: number };
 
+/** A head press in progress (see Scene3DArmature._armHead). */
+type ArmHeadPress = { skelId: string; joint: number; p0: [number, number, number]; x: number; y: number; slop: number; pending: boolean };
+
 /** World direction of a joint-gizmo axis (a plane handle → its normal). */
 function _jointAxisDir(a: GizmoAxis): vec3 {
     return a === 'x' ? vec3.fromValues(1, 0, 0) : a === 'y' ? vec3.fromValues(0, 1, 0) : a === 'z' ? vec3.fromValues(0, 0, 1)
@@ -2140,6 +2143,15 @@ export class Scene3DArmature {
     private _armGesture: ArmaturePointerGesture<ArmTarget> | null = null;
     /** Puts back what the live drag changed (pose + joint selection) — a 2nd finger / pointercancel runs it. */
     private _armRestore: (() => void) | null = null;
+    /** The pointerType of the last overlay press (the additive head press's tap / drag slop). */
+    private _armPointerType = 'mouse';
+    /** A head press (move / rotate tool) in progress: the joint, its local position at the press (one 'Move joint' undo
+     *  step on release when it changed), the press point + slop. `pending` = an ADDITIVE press (Shift / the host's
+     *  latch) still deciding: released within the slop → toggle the joint; moved past it → select it (additively,
+     *  unless already selected) and drag it, no toggle. */
+    private _armHead: ArmHeadPress | null = null;
+    /** Mouse / pen press slop (CSS px) before an additive head press becomes a drag (as Edit Mesh's drag-the-selection). */
+    static readonly HEAD_DRAG_SLOP_PX = 4;
     /** The mesh id the pointer hover last set and the renderer's hovered-id set it produced: hovering the same mesh
      *  again is a no-op (it used to allocate a Set + schedule a render on every mouse move). */
     private _ptrHoverId: string | null = null;
@@ -2188,6 +2200,7 @@ export class Scene3DArmature {
         const onDown = (e: PointerEvent) => {
             if (this.host.isPlaying) return;
             this._armShift = !!e.shiftKey;   // additive joint select (Shift, or the host's latch)
+            this._armPointerType = e.pointerType || 'mouse';
             const took = gesture.down(e);
             if (e.pointerType !== 'touch') stopMouseDown = took;
         };
@@ -2392,9 +2405,26 @@ export class Scene3DArmature {
             case 'head': {
                 const j = joints[t.joint];
                 if (!j) return false;
-                // Tool strip (UI review §4): Shift / the additive latch toggles the joint in a multi-selection; the
-                // Select and IK tools only select (no drag). The press is taken back exactly by a 2nd finger.
+                // Tool strip (UI review §4): Shift / the additive latch toggles the joint in a multi-selection (on the
+                // RELEASE of a tap in Move / Rotate — a drag past the slop moves it instead); the Select and IK tools
+                // only select (no drag). The press is taken back exactly by a 2nd finger / pointercancel / Esc.
                 const additive = this._armShift || (this.ctx.interactionService as { additiveSelect3D?: boolean }).additiveSelect3D === true;
+                const p0 = [...j.localPosition] as [number, number, number];
+                const canDrag = this._armTool !== 'select' && this._armTool !== 'ik' && !this._weightPaint.isActive();
+                if (additive && canDrag) {
+                    // Additive press in Move / Rotate: nothing changes yet — the release toggles the joint (a tap), a
+                    // move past the slop drags it instead (_armHeadDragStart). Cancel restores the pose + selection.
+                    const snap = this._snapshotJointSelection();
+                    const hp: ArmHeadPress = {
+                        skelId: skel.id, joint: t.joint, p0, x: clientX, y: clientY, pending: true,
+                        slop: this._armPointerType === 'touch' ? ArmaturePointerGesture.TAP_SLOP_PX : Scene3DArmature.HEAD_DRAG_SLOP_PX,
+                    };
+                    this._armHead = hp;
+                    holdOrbit();
+                    this._armRestore = () => { if (!hp.pending) skel.moveJoint(t.joint, p0); this._restoreJointSelection(snap); };
+                    return true;
+                }
+                // Select / IK tools (and an additive press during weight paint): select (toggle) on the press, no drag.
                 if (additive || this._armTool === 'select' || this._armTool === 'ik') {
                     const snap = this._snapshotJointSelection();
                     this.selectArmatureJoint(skel.id, t.joint, additive);
@@ -2408,12 +2438,12 @@ export class Scene3DArmature {
                 this.ctx.emitSceneGraphChanged();
                 this.ctx.scheduleRender();
                 // Dragging is suppressed during weight paint — pressing a joint just selects it.
-                const p0 = [...j.localPosition] as [number, number, number];
                 if (!this._weightPaint.isActive()) {
                     holdOrbit();
                     this._isDraggingJoint = true;
                     this._dragJointIdx = t.joint;
                     vec3.set(this._dragPlanePoint, j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]);
+                    this._armHead = { skelId: skel.id, joint: t.joint, p0, x: clientX, y: clientY, slop: 0, pending: false };
                     this._armRestore = () => { skel.moveJoint(t.joint, p0); restoreSelection(); };
                 } else {
                     this._armRestore = restoreSelection;
@@ -2441,6 +2471,13 @@ export class Scene3DArmature {
     private _armDragMove(clientX: number, clientY: number, x: number, y: number, w: number, h: number): void {
         const skel = this._boneOverlaySkeletonId ? this.getSkeleton(this._boneOverlaySkeletonId) : null;
         if (!skel) return;
+
+        // ── An additive head press still deciding: within the slop it stays a tap; past it, it becomes the joint drag.
+        const hp = this._armHead;
+        if (hp?.pending) {
+            if (Math.hypot(clientX - hp.x, clientY - hp.y) <= hp.slop) return;
+            if (!this._armHeadDragStart(skel, hp)) return;
+        }
 
         // ── IK handle drag (target or pole) ─────────────────────────
         if (this._draggingIKHandle) {
@@ -2549,14 +2586,73 @@ export class Scene3DArmature {
         this._dragJointIdx = null;
         this._isDraggingTail = false;
         this._dragTailJointIdx = null;
+        this._armHead = null;
     }
 
-    /** The drag finished: keep the result and emit ONCE so the panel refreshes the final position. */
+    /** An additive head press moved past its slop: it is a drag, not a tap — the pressed joint joins the selection
+     *  (additively; already selected → it just becomes the primary, the rest kept) and the joint drag starts. */
+    private _armHeadDragStart(skel: Skeleton3D, hp: ArmHeadPress): boolean {
+        const j = skel.data.joints[hp.joint];
+        if (!j || skel.id !== hp.skelId) return false;
+        hp.pending = false;
+        const cur = this.__selJoint;
+        if (cur !== hp.joint && !this._extraJoints.has(hp.joint)) {
+            this.selectArmatureJoint(skel.id, hp.joint, true);
+        } else if (cur !== hp.joint || this._selectedJointIsTail) {
+            const extras = new Set(this._extraJoints);
+            extras.delete(hp.joint);
+            if (cur !== null && cur !== hp.joint) extras.add(cur);
+            this._jointSelKeepExtras = true;
+            try {
+                this._extraJoints = extras;
+                this._selectedJointIndex = hp.joint;
+                this._selectedJointIsTail = false;
+            } finally { this._jointSelKeepExtras = false; }
+            this.renderer3D.setSelectedJoint(hp.joint);
+            this._syncExtraJoints();
+            this._emitJointSelection();
+            this.ctx.emitSceneGraphChanged();
+        }
+        this._isDraggingJoint = true;
+        this._dragJointIdx = hp.joint;
+        vec3.set(this._dragPlanePoint, j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]);
+        return true;
+    }
+
+    /** The drag finished: keep the result and emit ONCE so the panel refreshes the final position. A head drag that
+     *  moved its joint is ONE 'Move joint' undo step; an additive head press released within its slop toggles the joint. */
     private _armEnd(): void {
+        const hp = this._armHead;
         this._armRestore = null;
         this._armClearDrag();
+        if (hp?.pending) {
+            this.selectArmatureJoint(hp.skelId, hp.joint, true);
+        } else if (hp) {
+            const j = this.getSkeleton(hp.skelId)?.data.joints[hp.joint];
+            const p1 = j ? [...j.localPosition] as [number, number, number] : null;
+            if (p1 && (p1[0] !== hp.p0[0] || p1[1] !== hp.p0[1] || p1[2] !== hp.p0[2])) {
+                const p0 = hp.p0, apply = (p: [number, number, number]) => {
+                    this.getSkeleton(hp.skelId)?.moveJoint(hp.joint, [...p] as [number, number, number]);
+                    this.ctx.emitSceneGraphChanged();
+                    this.ctx.scheduleRender();
+                };
+                (this.host.undoManager as UndoManager3D | undefined)?.push({
+                    description: 'Move joint',
+                    undo: () => apply(p0),
+                    redo: () => apply(p1),
+                });
+            }
+        }
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
+    }
+
+    /** Esc: take back a live armature drag / a pending press (pose + selection restored, no undo step). */
+    private _armAbort(): boolean {
+        const g = this._armGesture;
+        if (!g?.busy) return false;
+        g.abort();
+        return true;
     }
 
     /** The drag was taken back (a 2nd finger → pinch / orbit, or pointercancel): pose + joint selection restored
@@ -3123,6 +3219,7 @@ export class Scene3DArmature {
     }
 
     cancelTransform3D(): void {
+        if (this._armAbort()) return;   // Esc during a joint / handle drag (or a press about to become one)
         this._transformController?.cancelTransform3D();
     }
 

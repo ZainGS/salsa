@@ -1057,7 +1057,7 @@ export class ShellUIManager {
     // Right edge lines up with the bottom panel window's right edge.
     const inset = r.width * this.activeTheme.cardMarginXFrac;
     this.clusterEl.style.right = `${Math.max(0, window.innerWidth - r.right) + inset}px`;
-    // Phone: icons only (the count is in the ⓘ panel and the button's tooltip), so the cluster stays small.
+    // Phone: icons only (the count is in the ⓘ button's tooltip), so the cluster stays small.
     if (this.clusterCountEl) this.clusterCountEl.style.display = compact ? 'none' : '';
   }
 
@@ -1076,7 +1076,7 @@ export class ShellUIManager {
   private _clusterReserveRaf = 0;
 
   private _clusterThemeApplied: ShellThemeName | null = null;   // guards the theme CSS + SVG-glyph rewrite
-  private _clusterCountApplied = -1;                            // guards the cart-count text
+  private _clusterCountApplied = -1;                            // guards the "N CARTS" text
   /** Refresh the cluster's count + theme colors + position. Called on every model rebuild (incl. hover), so the
    *  expensive parts — the CSS-var writes and the per-icon SVG innerHTML re-parse — are guarded to only run when the
    *  THEME actually changes (was: torn down + re-parsed on every mouse-move). */
@@ -1095,17 +1095,17 @@ export class ShellUIManager {
       // Polygon: swap the emoji glyphs for clean Material-style SVG icons; emoji on the other themes.
       const useMat = this.activeTheme.backdropGrid;   // all 3D themes use the Material SVG icons
       for (const ic of this.clusterIcons) {
-        if (useMat) ic.el.innerHTML = `<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" style="display:block" aria-hidden="true"><path d="${ic.mat}"/></svg>`;
+        if (useMat) ic.el.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="display:block"><path d="${ic.mat}"/></svg>`;
         else ic.el.textContent = ic.emoji;
       }
     }
     const n = this.registry.slots.length;
     if (this.clusterCountEl && (themeChanged || n !== this._clusterCountApplied)) {
       this._clusterCountApplied = n;
-      this.clusterCountEl.textContent = shellCartCountLabel(n);
+      this.clusterCountEl.textContent = `${n} CART${n === 1 ? '' : 'S'}`;
       this.clusterCountEl.style.color = rgbaCss(this.activeTheme.chromeText ?? this.activeTheme.ink);   // white on Polygon
       const info = this.clusterIcons.find(ic => ic.key === 'info');
-      if (info) info.el.title = `What is a FrogCart? (${shellCartCountLabel(n).toLowerCase()} on this device)`;
+      if (info) info.el.title = `What is a .frogcart? (${shellCartCountLabel(n).toLowerCase()} on this device)`;
     }
     // The cluster's width changed (mounted, phone ↔ wide, count text): lay the top row out again, once.
     const reserve = this.clusterReservePx();
@@ -1122,42 +1122,34 @@ export class ShellUIManager {
     // theme can dim them (Polygon does — bright cream glares on black). Fallbacks = the default bevel.
     const winBevel = 'border:2px solid;border-color:var(--bv-hi,#fffaf0) var(--bv-lo,#847e6c) var(--bv-lo,#847e6c) var(--bv-hi,#fffaf0);border-radius:0;';
     const row = document.createElement('div');
-    row.style.cssText = `display:flex;align-items:center;gap:2px;background:var(--panel);${winBevel}padding:3px 4px;box-shadow:0 2px 8px rgba(0,0,0,0.18);`;
+    row.style.cssText = `display:flex;align-items:center;gap:2px;background:var(--panel);${winBevel}padding:5px 8px;box-shadow:0 2px 8px rgba(0,0,0,0.18);`;
     // Material-style icon paths (24px). Shown instead of the emoji on Polygon; fill=currentColor → --ink.
-    const MAT_SETTINGS = 'M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z';
+    const MAT_SAVE = 'M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z';
+    const MAT_MEMORY = 'M15 9H9v6h6V9zm-2 4h-2v-2h2v2zm8-2v-2h-2V7c0-1.1-.9-2-2-2h-2V3h-2v2h-2V3H9v2H7c-1.1 0-2 .9-2 2v2H3v2h2v2H3v2h2v2c0 1.1.9 2 2 2h2v2h2v-2h2v2h2v-2h2c1.1 0 2-.9 2-2v-2h2v-2h-2v-2h2zm-4 6H7V7h10v10z';
+    const MAT_PALETTE = 'M12 2C6.49 2 2 6.49 2 12s4.49 10 10 10c1.38 0 2.5-1.12 2.5-2.5 0-.61-.23-1.2-.64-1.67-.08-.1-.13-.21-.13-.33 0-.28.22-.5.5-.5H16c3.31 0 6-2.69 6-6 0-4.96-4.49-9-10-9zm5.5 11c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm-3-4c-.83 0-1.5-.67-1.5-1.5S13.67 6 14.5 6s1.5.67 1.5 1.5S15.33 9 14.5 9zM5 11.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5S7.33 13 6.5 13 5 12.33 5 11.5zm6-4c0 .83-.67 1.5-1.5 1.5S8 8.33 8 7.5 8.67 6 9.5 6s1.5.67 1.5 1.5z';
     const MAT_INFO = 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z';
     this.clusterIcons = [];
-    // Finger-sized on a touch screen (44 px), 36 px with a mouse; sharp corners; a visible keyboard focus ring.
-    let coarse = false;
-    try { coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches; } catch { /* no matchMedia */ }
-    const size = coarse ? 44 : 36;
-    const iconBtn = (glyph: string, key: string, title: string, mat: string, onClick: () => void) => {
+    const iconBtn = (glyph: string, key: string, title: string, mat: string) => {
       const b = document.createElement('button');
-      b.type = 'button';
-      b.textContent = glyph; b.title = title; b.setAttribute('aria-label', title);
-      b.style.cssText = `display:flex;align-items:center;justify-content:center;border:none;background:transparent;color:var(--ink);font-size:18px;line-height:1;width:${size}px;height:${size}px;border-radius:0;cursor:pointer;padding:0;`;
+      b.textContent = glyph; b.title = title;
+      b.style.cssText = 'display:flex;align-items:center;justify-content:center;border:none;background:transparent;color:var(--ink);font-size:17px;line-height:1;width:30px;height:30px;border-radius:8px;cursor:pointer;';
       b.onmouseenter = () => { b.style.background = 'rgba(0,0,0,0.08)'; };
       b.onmouseleave = () => { b.style.background = 'transparent'; };
-      b.onfocus = () => { b.style.outline = '2px solid var(--ink)'; b.style.outlineOffset = '-2px'; };
-      b.onblur = () => { b.style.outline = 'none'; };
-      b.onclick = onClick;
+      b.onclick = () => this.toggleClusterPanel(key);
       this.clusterIcons.push({ el: b, emoji: glyph, mat, key });
       return b;
     };
-    // Settings (themes, storage, install, the local model …) live in the host's Settings — one home for them.
-    row.appendChild(iconBtn('⚙', 'settings', 'Settings', MAT_SETTINGS, () => {
-      this.closeClusterPanel();
-      this.onActivate.emit({ id: SHELL_SETTINGS_ID, kind: 'system' });
-    }));
+    row.appendChild(iconBtn('💾', 'opfs', 'Storage usage', MAT_SAVE));
+    row.appendChild(iconBtn('🧠', 'inference', 'Local model', MAT_MEMORY));
+    row.appendChild(iconBtn('🎨', 'themes', 'Themes', MAT_PALETTE));
     const count = document.createElement('span');
-    count.style.cssText = 'color:var(--ink);font-weight:700;font-size:12px;letter-spacing:0.02em;white-space:nowrap;padding:0 9px;margin:0 3px;border-left:2px solid var(--ink);border-right:2px solid var(--ink);';
+    count.style.cssText = 'color:var(--ink);font-weight:800;font-size:12px;letter-spacing:0.06em;padding:0 9px;margin:0 3px;border-left:2px solid var(--ink);border-right:2px solid var(--ink);';
     this.clusterCountEl = count;
     row.appendChild(count);
-    row.appendChild(iconBtn('ⓘ', 'info', 'What is a FrogCart?', MAT_INFO, () => this.toggleClusterPanel('info')));
+    row.appendChild(iconBtn('ⓘ', 'info', 'What is a .frogcart?', MAT_INFO));
     wrap.appendChild(row);
 
     const panel = document.createElement('div');
-    panel.setAttribute('role', 'note');
     panel.style.cssText = `display:none;box-sizing:border-box;width:min(300px, calc(100vw - 32px));background:var(--panel);${winBevel}padding:12px 14px;color:var(--ink);font-size:13px;line-height:1.5;box-shadow:0 4px 14px rgba(0,0,0,0.22);`;
     this.clusterPanelEl = panel;
     wrap.appendChild(panel);
@@ -1180,9 +1172,77 @@ export class ShellUIManager {
     panel.innerHTML = '';
     if (key === 'info') {
       const p = document.createElement('div'); panel.appendChild(p);
-      const n = this.registry.slots.length;
-      this.typewrite(p, `A FrogCart (.frogcart file) is a self-contained Frogmarks mini-app: a tool, illustration, 3D scene or animation you add to your home screen with Import. Each one gets its own tile here. ${shellCartCountLabel(n)} on this device.`);
+      this.typewrite(p, 'A .frogcart is a self-contained Frogmarks mini-app; a tool, illustration, 3D scene, or animation you install into your dashboard. Each one adds its own tile here.');
+    } else if (key === 'opfs') {
+      panel.textContent = 'Reading storage…';
+      void this.fillOpfsPanel(panel);
+    } else if (key === 'inference') {
+      this.fillInferencePanel(panel);
+    } else if (key === 'themes') {
+      this.fillThemesPanel(panel);
     }
+  }
+
+  private async fillOpfsPanel(panel: HTMLElement): Promise<void> {
+    try {
+      const est = await navigator.storage?.estimate?.();
+      const usedMB = ((est?.usage ?? 0) / 1048576).toFixed(1);
+      const quotaMB = ((est?.quota ?? 0) / 1048576).toFixed(0);
+      const pct = est?.quota ? Math.round(((est.usage ?? 0) / est.quota) * 100) : 0;
+      panel.innerHTML = `<b>Storage (OPFS)</b><br>${usedMB} MB used${quotaMB !== '0' ? ` · ~${quotaMB} MB available (${pct}%)` : ''}`;
+    } catch { panel.textContent = 'Storage estimate unavailable.'; }
+  }
+
+  private fillInferencePanel(panel: HTMLElement): void {
+    const label = document.createElement('div'); label.textContent = 'Local model URL'; label.style.cssText = 'font-weight:700;margin-bottom:6px;';
+    const r = document.createElement('div'); r.style.cssText = 'display:flex;gap:6px;align-items:center;';
+    const input = document.createElement('input');
+    input.type = 'text'; input.placeholder = 'http://localhost:11434'; input.value = this.getLocalModelUrl();
+    input.style.cssText = 'flex:1;min-width:0;border:1px solid var(--ink);background:rgba(255,255,255,0.92);border-radius:8px;padding:6px 8px;color:#111;font-size:13px;outline:none;';
+    const save = document.createElement('button'); save.textContent = 'SAVE';
+    save.style.cssText = 'border:none;background:#e23b2e;color:#fff;font-weight:700;font-size:12px;border-radius:8px;padding:7px 12px;cursor:pointer;';
+    save.onclick = () => { try { localStorage.setItem('frogmarks.localModelUrl', input.value.trim()); } catch { /* ignore */ } save.textContent = 'SAVED'; setTimeout(() => { save.textContent = 'SAVE'; }, 900); };
+    r.appendChild(input); r.appendChild(save);
+    panel.appendChild(label); panel.appendChild(r);
+  }
+
+  private fillThemesPanel(panel: HTMLElement): void {
+    const label = document.createElement('div'); label.textContent = 'Theme'; label.style.cssText = 'font-weight:700;margin-bottom:8px;';
+    panel.appendChild(label);
+    // Per-theme SVG icons (no text labels). fill/stroke=currentColor → tinted by each swatch's accent.
+    const TH_MOON = '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+    const TH_FROG = '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><circle cx="8" cy="9" r="2.6"/><circle cx="16" cy="9" r="2.6"/><path d="M5 12.5a7 5 0 0 0 14 0z"/></svg>';
+    const TH_PINWHEEL = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5a7 7 0 1 1-6.9 8.2"/><path d="M12 9a3 3 0 1 0 2.9 3.7"/></svg>';
+    const TH_POLYGON = '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l10 10-10 10L2 12z"/></svg>';
+    const TH_PRISM = '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3l9 16H3z"/></svg>';
+    const TH_LATTICE = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg>';
+    const grid = document.createElement('div'); grid.style.cssText = 'display:grid;grid-template-columns:repeat(3,1fr);gap:6px;';
+    // Win9x bevel: raised normally, pressed-in (reversed) when active. Colors are the cluster's --bv vars.
+    const raised = 'var(--bv-hi,#fffaf0) var(--bv-lo,#847e6c) var(--bv-lo,#847e6c) var(--bv-hi,#fffaf0)';
+    const sunken = 'var(--bv-lo,#847e6c) var(--bv-hi,#fffaf0) var(--bv-hi,#fffaf0) var(--bv-lo,#847e6c)';
+    const opt = (svg: string, name: ShellThemeName, title: string) => {
+      const th = SHELL_THEMES[name];
+      const sel = this.activeThemeName === name;
+      const b = document.createElement('button');
+      b.title = title;
+      // Each option is a mini chrome swatch: the theme's own bg + accent, sharp corners, a chrome bevel.
+      b.style.cssText = `display:flex;align-items:center;justify-content:center;height:52px;border:2px solid;border-color:${sel ? sunken : raised};border-radius:0;background:${rgbaCss(th.bgBottom)};color:${rgbaCss(th.ink)};cursor:pointer;padding:0;box-shadow:${sel ? 'inset 1px 1px 2px rgba(0,0,0,0.4)' : 'none'};`;
+      b.innerHTML = svg;
+      b.onclick = () => {
+        this.setTheme(name);
+        // Remembered on this device (the host's Settings reads + applies the same key on load).
+        try { localStorage.setItem('frogmarks.shellTheme', name); } catch { /* storage blocked: this session only */ }
+        this.toggleClusterPanel('themes');
+      };
+      return b;
+    };
+    grid.appendChild(opt(TH_MOON, 'moon', 'Moon'));            // row 1 — 2D themes
+    grid.appendChild(opt(TH_FROG, 'frog', 'Frog'));
+    grid.appendChild(opt(TH_PINWHEEL, 'pinwheel', 'Pinwheel'));
+    grid.appendChild(opt(TH_POLYGON, 'polygon', 'Polygon'));   // row 2 — 3D themes
+    grid.appendChild(opt(TH_PRISM, 'prism', 'Prism'));
+    grid.appendChild(opt(TH_LATTICE, 'lattice', 'Lattice'));
+    panel.appendChild(grid);
   }
 
   private typewrite(el: HTMLElement, text: string): void {

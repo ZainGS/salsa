@@ -191,6 +191,13 @@ export class ArmaturePointerGesture<T> {
     this.h.end();
   }
 
+  /** Esc (the host's cancel): a live drag is CANCELLED (restored), a pending press is dropped. The pointer's later
+   *  moves / up are ignored (no owner); touch tracking is left alone (the finger may still be down). */
+  abort(): void {
+    if (this.mode === 'dragging') { this.finish(); this.h.cancel(); return; }
+    if (this.mode === 'pending') { this.dropPending(); this.finish(); }
+  }
+
   /** The pointer left the canvas: drop a pending hover (the host clears its hover highlight). */
   leave(): void { this.cancelHover(); }
 

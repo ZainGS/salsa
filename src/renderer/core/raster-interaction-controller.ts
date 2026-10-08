@@ -223,9 +223,11 @@ export class RasterInteractionController {
       // P1 undo: Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y for 2D vector OBJECT ops. Consumed ONLY when this
       // stack has something to undo/redo — otherwise the event falls through untouched to the host's
       // raster/3D routing. (Path-edit sessions consume their own Ctrl+Z earlier via
-      // stopImmediatePropagation, so a path-anchor session never reaches here.)
+      // stopImmediatePropagation, so a path-anchor session never reaches here.) In Edit Mesh / Armature the host's
+      // mode-scoped undo owns the key: the engine leaves it alone entirely.
       if ((event.ctrlKey || event.metaKey) && !event.altKey
           && (event.key === 'z' || event.key === 'Z' || event.key === 'y' || event.key === 'Y')) {
+          if (this.r.interactionService.undoKeysOwnedByEditMode3D?.()) return;
           const vu = this.r.interactionService.vectorUndo;
           const isRedo = event.key === 'y' || event.key === 'Y' || event.shiftKey;
           if (isRedo ? vu.canRedo : vu.canUndo) {

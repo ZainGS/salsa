@@ -206,6 +206,11 @@ export class InteractionService {
      *  Scene3DArmature; null = no 3D touch navigation. */
     public touchGestures3D: (() => boolean) | null = null;
 
+    /** Returns true while a 3D edit mode with its OWN (host, mode-scoped) undo is up — Edit Mesh or the Armature panel.
+     *  The engine's 2D-object Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z key then stands down entirely (no preventDefault), so the
+     *  host's keymap gets the key. Set by ShapeManager; null = never. */
+    public undoKeysOwnedByEditMode3D: (() => boolean) | null = null;
+
     /** TOUCH-10 (docs/ui/touch-controls.md): the ADDITIVE-SELECT latch. While on, a 3D select press / tap (object
      *  select in TransformController3D, vertex / edge / face select in mesh edit) adds to the selection exactly like
      *  Shift does — a tablet has no Shift. Set through sm.setAdditiveSelect3D. */

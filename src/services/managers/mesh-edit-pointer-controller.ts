@@ -24,10 +24,11 @@ import type { MeshEditManager } from './mesh-edit-manager';
 import type { Command3D } from './undo-manager-3d';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
-import { EditMesh, type KnifePoint } from '../../scene-graph/shapes/edit-mesh';
+import { EditMesh, MirrorModifier, type KnifePoint, type MirrorPlane } from '../../scene-graph/shapes/edit-mesh';
+import { forEachPointImage, forEachSegmentImage, forEachPolygonImage, toRealSide, imageAffine } from '../../scene-graph/shapes/edit-mesh-mirror';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { isPointerEventClaimed } from '../../renderer/util/pointer-claims';
-import { EditFacePicker, pickFaceFullScene } from './mesh-edit-face-pick';
+import { EditFacePicker, pickFaceFullScene, type FacePickMirror } from './mesh-edit-face-pick';
 import { MeshBevelTool } from './mesh-bevel-tool';
 import { MeshElementTransform, gizmoModeToTransform, type ElementTransformMode, type ElementTransformRouter } from './mesh-element-transform';
 import { GizmoRenderer, hitTestGizmoAt, type GizmoAxis, type GizmoMode } from '../../renderer/3d/gizmo-renderer';
@@ -98,6 +99,9 @@ export class MeshEditPointerController {
   /** All vertex positions at drag start — lets the drag re-apply as an absolute move from the
    *  start each frame (no float drift) while routing through moveVertex for proportional falloff. */
   private _dragStartVerts: { x: number; y: number; z: number }[] | null = null;
+  /** The vertex drag started on a mirror's COPY side: that image's affine map (real → image, imageAffine) — the drag
+   *  moves the real vertex so its image follows the pointer. Null = the real vertex. */
+  private _dragImage: Float64Array | null = null;
   /** The selection before a FINGER drag selected its vertex (a cancel puts it back); undefined = not taken. */
   private _dragSelSnap: SelSnap | undefined = undefined;
   /** The canvas rect, read once per press / drag instead of per pointer move. */
@@ -191,8 +195,9 @@ export class MeshEditPointerController {
    *  moves the whole selection on the view plane (an element grab, source 'drag': live, one undo step on release, a
    *  2nd finger / right click / Esc / pointercancel cancels). A drag that starts elsewhere keeps the old behaviour. */
   dragMovesSelection = true;
-  /** A MOUSE press on a selected element, waiting to become a drag (moves the selection) or a click (selects). */
-  private _selPress: { id: number; clientX: number; clientY: number; px: number; py: number; additive: boolean } | null = null;
+  /** A MOUSE press on a selected element, waiting to become a drag (moves the selection when `drag`; otherwise the old
+   *  press behaviour — a single-vertex drag in vertex mode) or a click (selects; an additive click toggles it off). */
+  private _selPress: { id: number; clientX: number; clientY: number; px: number; py: number; additive: boolean; img: number; drag: boolean } | null = null;
   /** The active tool of the tool strip (setMeshEditActiveTool3D). 'move' = the historic default (gizmo 'move'). */
   private _tool: MeshEditTool = 'move';
   /** Loop Cut tool: cuts and their position for the next cut (the pill / adjust-last-op change them). */
@@ -248,6 +253,7 @@ export class MeshEditPointerController {
 
   detach(): void {
     if (!this._canvas) return;
+    if (this._planeDrag) this.cancelMirrorPlaneDrag();
     if (this.bevel.active) this.bevel.cancel();
     if (this.transform.active) this._endElementTransform(false);
     this._finishPatchedDrag();
@@ -282,6 +288,7 @@ export class MeshEditPointerController {
     this._loopPress = null;
     this._loopHover = null;
     this._knife = null;
+    this._planeHover = null;
   }
 
   setMode(mode: MeshEditSelectionMode): void {
@@ -300,13 +307,14 @@ export class MeshEditPointerController {
   /** True while a vertex drag (or a finger press that may become one) owns a pointer. */
   get isBusy(): boolean {
     return this._dragging || this._pending !== null || this._bevelPointer !== null || this._xfPointer !== null
-      || this._selPress !== null || this._loopPress !== null;
+      || this._selPress !== null || this._loopPress !== null || this._planeDrag !== null;
   }
 
   // ── Pointer handlers ────────────────────────────────────────────────────────
 
   private _handleDown(e: PointerEvent): void {
     if (!this._canvas || !this._meshId) return;
+    if (this._planeDrag) { this._planeDragDown(e); return; }
     // Only handle primary button
     if (e.button !== 0) return;
     if (this.transform.active) { this._xfDown(e); return; }
@@ -323,7 +331,7 @@ export class MeshEditPointerController {
       if (isPointerEventClaimed(e)) return;
       if (e.isPrimary === false) return;
       // A finger on a handle of the selection gizmo drags it at once (fatter hit, as the object gizmo).
-      if (!this._scene3d.getTouchNavigate3D?.() && this._gizmoDown(e, TOUCH_PICK_SCALE)) return;
+      if (!this._scene3d.getTouchNavigate3D?.() && (this._planeDown(e, TOUCH_PICK_SCALE) || this._gizmoDown(e, TOUCH_PICK_SCALE))) return;
       // Loop Cut: the finger previews the loop under it at once; the lift cuts.
       if (this._tool === 'loopcut' && !this._scene3d.getTouchNavigate3D?.()) {
         this._rect = this._canvas.getBoundingClientRect();
@@ -340,8 +348,8 @@ export class MeshEditPointerController {
     }
     this._pickScale = 1;
     this._rect = this._canvas.getBoundingClientRect();
-    // The selection gizmo's handles win over the vertex / edge / face under them.
-    if (this._gizmoDown(e, 1)) return;
+    // The mirror plane's rotation rings / the selection gizmo's handles win over the vertex / edge / face under them.
+    if (this._planeDown(e, 1) || this._gizmoDown(e, 1)) return;
     const { x: px, y: py } = this._toCanvasPx(e.clientX, e.clientY);
 
     if (this._tool === 'knife') { this.knifeAddAt(px, py); return; }
@@ -351,9 +359,11 @@ export class MeshEditPointerController {
       this._loopPreviewAt(px, py);
       return;
     }
-    // A press ON the selection waits: a drag moves the selection, a click selects as usual (on release).
-    if (this.dragMovesSelection && this._hasSelection() && this._canDragVertex() && this._isSelectedAt(px, py)) {
-      this._selPress = { id: e.pointerId ?? 0, clientX: e.clientX, clientY: e.clientY, px, py, additive };
+    // A press ON the selection waits: a drag moves the selection, a click selects as usual (on release). An ADDITIVE
+    // press on it waits too (even without drag-moves-selection): the click toggles the element off, a drag never does.
+    const dragSel = this.dragMovesSelection && this._canDragVertex();
+    if ((dragSel || additive) && this._hasSelection() && this._isSelectedAt(px, py)) {
+      this._selPress = { id: e.pointerId ?? 0, clientX: e.clientX, clientY: e.clientY, px, py, additive, img: this._lastPickImg, drag: dragSel };
       try { this._canvas.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
       return;
     }
@@ -374,6 +384,7 @@ export class MeshEditPointerController {
   private _handleMove(e: PointerEvent): void {
     if (!this._canvas || !this._meshId) return;
     if (e.pointerType === 'mouse') this._lastMouse = { clientX: e.clientX, clientY: e.clientY };
+    if (this._planeDrag) { this._planeDragMove(e); return; }
     if (this.transform.active) { this._xfMove(e); return; }
     if (this.bevel.active) { this._bevelMove(e); return; }
     const touch = e.pointerType === 'touch';
@@ -382,9 +393,22 @@ export class MeshEditPointerController {
     if (sp && (e.pointerId ?? 0) === sp.id) {
       if (Math.hypot(e.clientX - sp.clientX, e.clientY - sp.clientY) <= MOUSE_DRAG_SLOP_PX) return;
       this._selPress = null;
-      if (!this._beginSelectionDrag(sp.id, sp.px, sp.py, e) && this._canvas) {
-        try { this._canvas.releasePointerCapture(sp.id); } catch { /* gone */ }
+      if (sp.drag) {
+        if (!this._beginSelectionDrag(sp.id, sp.px, sp.py, e, sp.img) && this._canvas) {
+          try { this._canvas.releasePointerCapture(sp.id); } catch { /* gone */ }
+        }
+        return;
       }
+      // (an additive press without drag-moves-selection) the old press: a vertex-mode drag picks the vertex up from
+      // the PRESS point — already selected, so the selection is unchanged — else nothing
+      const vi = this._mode === 'vertex' && this._canDragVertex() ? this._pickVertex(sp.px, sp.py) : -1;
+      if (vi < 0) {
+        if (this._canvas) { try { this._canvas.releasePointerCapture(sp.id); } catch { /* gone */ } }
+        return;
+      }
+      this._beginVertexDrag(vi, sp.px, sp.py, sp.id);
+      this._dragAt = this._toCanvasPx(e.clientX, e.clientY);
+      this._scheduleDragFrame();
       return;
     }
     // Loop Cut: a held press (finger or mouse) previews the loop under the pointer (once per frame).
@@ -400,7 +424,7 @@ export class MeshEditPointerController {
       this._pickScale = TOUCH_PICK_SCALE;
       const at = this._toCanvasPx(p.clientX, p.clientY);
       if (this.dragMovesSelection && this._hasSelection() && this._canDragVertex() && this._isSelectedAt(at.x, at.y)) {
-        this._beginSelectionDrag(p.id, at.x, at.y, e);
+        this._beginSelectionDrag(p.id, at.x, at.y, e, this._lastPickImg);
         return;
       }
       if (this._mode !== 'vertex') return;
@@ -421,7 +445,7 @@ export class MeshEditPointerController {
       return;
     }
     if (!touch && this._tool === 'loopcut') { this._scheduleLoopPreview(e.clientX, e.clientY); return; }   // mouse hover previews the loop
-    if (touch || (this._mode !== 'vertex' && this.gizmoMode === null)) return;   // a finger has no hover
+    if (touch || (this._mode !== 'vertex' && this.gizmoMode === null && !this._planeTarget())) return;   // a finger has no hover
     // Mouse hover: the selection gizmo's handle under the pointer lights up; in vertex mode the cursor shows "grab"
     // over a vertex — resolved once per frame (a pick is O(V)).
     this._hoverAt = { x: e.clientX, y: e.clientY };
@@ -436,10 +460,12 @@ export class MeshEditPointerController {
       this._pickScale = 1;
       this._rect = null;   // a hover reads the rect fresh (the canvas may have moved since the last press)
       const c = this._toCanvasPx(at.x, at.y);
-      const g = this._gizmoTarget();
+      const pt = this._planeTarget();
+      const g = pt ? { center: pt.centerW, rotation: pt.rotation, mode: 'rotate' as const } : this._gizmoTarget();
       const cam = this._scene3d.getCamera?.();
       const axis = g && cam ? this._gizmoHit(c.x, c.y, g, cam, 1) : null;
-      if (axis !== this._gizmoHover) { this._gizmoHover = axis; this._scheduleRender(); }
+      if (pt) { if (axis !== this._planeHover) { this._planeHover = axis; this._scheduleRender(); } }
+      else if (axis !== this._gizmoHover) { this._gizmoHover = axis; this._scheduleRender(); }
       if (axis) { this._canvas.style.cursor = 'grab'; return; }
       if (this._mode !== 'vertex') { this._canvas.style.cursor = 'crosshair'; return; }
       this._canvas.style.cursor = this._pickVertex(c.x, c.y) >= 0 ? 'grab' : 'crosshair';
@@ -448,23 +474,20 @@ export class MeshEditPointerController {
   }
 
   private _handleUp(e: PointerEvent): void {
+    if (this._planeDrag) { this._planeDragUp(e); return; }
     if (this.transform.active || this._xfPointer !== null) { this._xfUp(e); return; }
     if (this.bevel.active || this._bevelPointer !== null || this._bevelPending) { this._bevelUp(e); return; }
     const touch = e.pointerType === 'touch';
     if (touch) this._touchIds.delete(e.pointerId ?? 0);
     const sp = this._selPress;
     if (sp && (e.pointerId ?? 0) === sp.id) {
-      // A CLICK on the selection (no drag): the usual select at the press point.
+      // A CLICK on the selection (no drag): the usual select at the press point — an additive one (Shift / the latch)
+      // toggles the element off.
       this._selPress = null;
       if (this._canvas) { try { this._canvas.releasePointerCapture(sp.id); } catch { /* gone */ } }
       if (this._canvas && this._meshId) {
         this._pickScale = 1;
-        if (this._mode === 'vertex') {
-          const vi = this._pickVertex(sp.px, sp.py);
-          if (vi >= 0) { this._meshEdit.selectVertex(this._meshId, vi, sp.additive); this._onSelectionChange?.(); this._scheduleRender(); }
-        } else {
-          this._selectAt(sp.px, sp.py, sp.additive);
-        }
+        this._selectAt(sp.px, sp.py, sp.additive, true);
       }
       this._rect = null;
       return;
@@ -487,13 +510,14 @@ export class MeshEditPointerController {
     }
     const p = this._pending;
     if (p && touch && (e.pointerId ?? 0) === p.id) {
-      // A TAP: select at the release point (vertex mode selects only — a drag needs movement); the Knife adds a point.
+      // A TAP: select at the release point (vertex mode selects only — a drag needs movement; an additive tap on a
+      // selected element toggles it off); the Knife adds a point.
       this._pending = null;
       if (this._canvas && this._meshId) {
         this._pickScale = TOUCH_PICK_SCALE;
         const at = this._toCanvasPx(e.clientX, e.clientY);
         if (this._tool === 'knife') this.knifeAddAt(at.x, at.y);
-        else this._selectAt(at.x, at.y, p.additive);
+        else this._selectAt(at.x, at.y, p.additive, true);
       }
       this._rect = null;
       return;
@@ -536,6 +560,11 @@ export class MeshEditPointerController {
   }
 
   private _handleCancel(e: PointerEvent): void {
+    if (this._planeDrag) {
+      if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+      if (e.pointerId === undefined || e.pointerId === this._planeDrag.pointer) this.cancelMirrorPlaneDrag();
+      return;
+    }
     if (this.transform.active || this._xfPointer !== null) {
       if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
       if (this._xfPointer !== null && (e.pointerId === undefined || e.pointerId === this._xfPointer)) this._xfAbortPointer();
@@ -557,6 +586,7 @@ export class MeshEditPointerController {
   /** The drag's pointer lost capture without an up (the browser / another handler took it): end the drag normally
    *  (after a normal up it is already over — no-op). */
   private _handleLostCapture(e: PointerEvent): void {
+    if (this._planeDrag && e.pointerId === this._planeDrag.pointer) { this._planeDragUp(e); return; }
     if (this._xfPointer !== null && e.pointerId === this._xfPointer) { this._xfUp(e); return; }
     if (!this._dragging || this._dragPointerId === null || e.pointerId !== this._dragPointerId) return;
     this._handleUp(e);
@@ -719,6 +749,7 @@ export class MeshEditPointerController {
   private _gizmoTarget(): { center: [number, number, number]; rotation: Float32Array | null; mode: 'move' | 'rotate' | 'scale' } | null {
     const mode = this.gizmoMode;
     if (!this._canvas || !this._meshId || mode === null || this.bevel.active) return null;
+    if (this._planeTarget()) return null;   // one handle at a time: the mirror plane's rings replace the selection gizmo
     if (this.transform.active && this.transform.source === 'modal') return null;
     const mesh = this._getMesh();
     const em = mesh?.editMesh;
@@ -737,7 +768,7 @@ export class MeshEditPointerController {
   }
 
   /** The gizmo handle under canvas px (x, y), or null. */
-  private _gizmoHit(x: number, y: number, g: NonNullable<ReturnType<MeshEditPointerController['_gizmoTarget']>>,
+  private _gizmoHit(x: number, y: number, g: { center: [number, number, number]; rotation: Float32Array | null; mode: 'move' | 'rotate' | 'scale' },
     cam: NonNullable<ReturnType<Scene3DManager['getCamera']>>, hitScale: number): GizmoAxis {
     if (!this._canvas) return null;
     const ray = screenRay(cam.getViewProjectionMatrix() as unknown as mat4, x, y, this._canvas.width, this._canvas.height);
@@ -769,9 +800,12 @@ export class MeshEditPointerController {
 
   /** A drag that started on the selection: an element GRAB (source 'drag') from the press point (canvas px), the
    *  pointer's current position applied at once. False when nothing could start (nothing selected, a skinned body). */
-  private _beginSelectionDrag(pointerId: number, px: number, py: number, now: PointerEvent): boolean {
+  private _beginSelectionDrag(pointerId: number, px: number, py: number, now: PointerEvent, img = 0): boolean {
     if (!this._canvas || !this._meshId || this.bevel.active) return false;
-    if (!this.transform.begin(this._meshId, 'grab', { source: 'drag' })) return false;
+    // a drag that started on a mirror's COPY side moves the real elements so the copy follows the pointer
+    const planes = img ? this._mirrorPlanes() : [];
+    const image = img && planes.length ? imageAffine(planes, img) : null;
+    if (!this.transform.begin(this._meshId, 'grab', { source: 'drag', image })) return false;
     try { this._canvas.setPointerCapture(pointerId); } catch { /* pointer already gone */ }
     this._xfPointer = pointerId;
     this._gizmoHover = null;
@@ -785,6 +819,11 @@ export class MeshEditPointerController {
 
   /** The selection gizmo for the edit overlay (MeshEditDrawData.gizmo), or null when it is hidden. */
   gizmoDrawData(): MeshEditGizmoDraw | null {
+    const pt = this._planeTarget();
+    if (pt) {
+      const dragging = this._planeDrag ? this._planeDrag.axis : null;
+      return { center: pt.centerW, rotation: pt.rotation, mode: 'rotate', hovered: dragging ? null : this._planeHover, dragging };
+    }
     const g = this._gizmoTarget();
     if (!g) return null;
     const dragging = this.transform.active && this.transform.source === 'gizmo' ? this.transform.axis : null;
@@ -805,7 +844,7 @@ export class MeshEditPointerController {
       constrainAxis: (axis) => this.transform.setAxis(axis),
       appendNumeric: (ch) => this.transform.appendNumeric(ch),
       commit: () => { if (this.transform.active) this._endElementTransform(true); },
-      cancel: () => { if (this.transform.active) this._endElementTransform(false); },
+      cancel: () => { if (this._planeDrag) this.cancelMirrorPlaneDrag(); if (this.transform.active) this._endElementTransform(false); },
       setGizmoMode: (mode) => {
         // the tool strip follows: a gizmo mode IS the move / rotate / scale tool
         if (mode === 'move' || mode === 'rotate' || mode === 'scale') { if (this._tool !== mode) this.setTool(mode); }
@@ -946,6 +985,207 @@ export class MeshEditPointerController {
     this._bevelWheelOn = want;
     if (want) w.addEventListener('wheel', this._onBevelWheel, { capture: true, passive: false });
     else w.removeEventListener('wheel', this._onBevelWheel, { capture: true });
+  }
+
+  // ── Mirror plane handle (sm.setMirrorPlaneHandle3D) ─────────────────────────
+
+  /** Which mirror's plane is shown with its rotation handle (null = none). One at a time. */
+  private _planeHandle: { meshId: string; modIndex: number } | null = null;
+  /** A drag of one of the plane's rotation rings: live preview, one undo step on release, a 2nd finger / Esc /
+   *  pointercancel puts the plane back. */
+  private _planeDrag: {
+    pointer: number; axis: 'x' | 'y' | 'z'; meshId: string; modIndex: number;
+    startNormal: [number, number, number]; rx: number; ry: number; cx: number; cy: number; touch: boolean;
+  } | null = null;
+  private _planeHover: GizmoAxis = null;
+  private _planeFrame = 0;
+  private _planeMoved = false;
+  /** The image (bitmask of mirror reflections, edit-mesh-mirror.ts) the last vertex / edge / face pick hit through:
+   *  0 = the real side. A drag from a copy-side pick moves the real element so the copy follows the pointer. */
+  private _lastPickImg = 0;
+
+  /**
+   * Show mirror modifier `modIndex`'s plane on the canvas (a translucent quad sized to the mesh + its outline) with a
+   * rotation handle (the rotate-gizmo rings at the plane's point, object axes): dragging a ring turns the plane about
+   * its point. Null hides it. Only while the mesh is in Edit Mesh (the handle hides itself otherwise).
+   */
+  setMirrorPlaneHandle(meshId: string | null, modIndex: number | null): void {
+    if (this._planeDrag) this.cancelMirrorPlaneDrag();
+    this._planeHandle = meshId !== null && modIndex !== null && modIndex >= 0 ? { meshId, modIndex } : null;
+    this._planeHover = null;
+    this._scheduleRender();
+  }
+
+  /** The shown plane handle (null = none). */
+  get mirrorPlaneHandle(): { meshId: string; modIndex: number } | null { return this._planeHandle ? { ...this._planeHandle } : null; }
+
+  /** The shown handle's mesh / mirror / plane (object space) and the gizmo placement (world point, object rotation). */
+  private _planeTarget(): { mesh: Mesh3D; mod: MirrorModifier; point: [number, number, number]; normal: [number, number, number]; centerW: [number, number, number]; rotation: Float32Array } | null {
+    const h = this._planeHandle;
+    if (!h || !this._meshEdit.isEditing || this._meshEdit.activeMeshId !== h.meshId) return null;
+    const mesh = this._scene3d.getMesh(h.meshId);
+    const mod = mesh?.editMesh?.modifiers[h.modIndex];
+    if (!mesh || !(mod instanceof MirrorModifier)) return null;
+    const pl = mod.getPlane();
+    const w = this._objToWorld(pl.point[0], pl.point[1], pl.point[2], mesh);
+    return {
+      mesh, mod, point: pl.point, normal: pl.normal, centerW: [w.x, w.y, w.z],
+      rotation: GizmoRenderer.rotationOf(mesh.localMatrix as unknown as ArrayLike<number>) as unknown as Float32Array,
+    };
+  }
+
+  /** The plane quad for the edit overlay: 4 world-space corners (xyz × 4, in order around the quad), centred on the
+   *  mesh's bounds centre projected onto the plane, sized to the mesh. Null when no handle shows. */
+  mirrorPlaneQuad(): Float32Array | null {
+    const t = this._planeTarget();
+    const em = t?.mesh.editMesh;
+    if (!t || !em) return null;
+    const n = t.normal, p = t.point;
+    let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+    for (const v of em.vertices) {
+      if (v.x < x0) x0 = v.x; if (v.x > x1) x1 = v.x;
+      if (v.y < y0) y0 = v.y; if (v.y > y1) y1 = v.y;
+      if (v.z < z0) z0 = v.z; if (v.z > z1) z1 = v.z;
+    }
+    if (!(x1 >= x0)) { x0 = y0 = z0 = -0.5; x1 = y1 = z1 = 0.5; }
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, cz = (z0 + z1) / 2;
+    const half = Math.max(0.05, Math.hypot(x1 - x0, y1 - y0, z1 - z0) * 0.6);
+    const d = (cx - p[0]) * n[0] + (cy - p[1]) * n[1] + (cz - p[2]) * n[2];
+    const qx = cx - d * n[0], qy = cy - d * n[1], qz = cz - d * n[2];
+    // in-plane basis: u = n × (the axis least aligned with n), v = n × u
+    const a: [number, number, number] = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    let ux = n[1] * a[2] - n[2] * a[1], uy = n[2] * a[0] - n[0] * a[2], uz = n[0] * a[1] - n[1] * a[0];
+    const ul = Math.hypot(ux, uy, uz) || 1; ux /= ul; uy /= ul; uz /= ul;
+    const vx = n[1] * uz - n[2] * uy, vy = n[2] * ux - n[0] * uz, vz = n[0] * uy - n[1] * ux;
+    const out = new Float32Array(12);
+    const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+    corners.forEach(([su, sv], k) => {
+      const w = this._objToWorld(qx + (ux * su + vx * sv) * half, qy + (uy * su + vy * sv) * half, qz + (uz * su + vz * sv) * half, t.mesh);
+      out[k * 3] = w.x; out[k * 3 + 1] = w.y; out[k * 3 + 2] = w.z;
+    });
+    return out;
+  }
+
+  /** A press on one of the plane handle's rings starts a rotation drag of the plane. */
+  private _planeDown(e: PointerEvent, hitScale: number): boolean {
+    if (!this._canvas || !this._meshId) return false;
+    const t = this._planeTarget();
+    const cam = this._scene3d.getCamera?.();
+    if (!t || !cam || this._meshId !== this._planeHandle!.meshId) return false;
+    this._rect = this._canvas.getBoundingClientRect();
+    const at = this._toCanvasPx(e.clientX, e.clientY);
+    const axis = this._gizmoHit(at.x, at.y, { center: t.centerW, rotation: t.rotation, mode: 'rotate' }, cam, hitScale);
+    if (axis !== 'x' && axis !== 'y' && axis !== 'z') return false;
+    try { this._canvas.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
+    this._planeDrag = {
+      pointer: e.pointerId ?? 0, axis, meshId: this._planeHandle!.meshId, modIndex: this._planeHandle!.modIndex,
+      startNormal: [t.normal[0], t.normal[1], t.normal[2]], rx: at.x, ry: at.y, cx: at.x, cy: at.y, touch: e.pointerType === 'touch',
+    };
+    this._planeMoved = false;
+    this._planeHover = null;
+    e.stopPropagation();
+    this._canvas.style.cursor = 'grabbing';
+    this._scheduleRender();
+    return true;
+  }
+
+  /** Another press while the plane drags: a 2nd finger is a camera gesture — the drag is cancelled. */
+  private _planeDragDown(e: PointerEvent): void {
+    if (e.pointerType !== 'touch') return;
+    const id = e.pointerId ?? 0;
+    this._touchIds.add(id);
+    if (id !== this._planeDrag!.pointer) this.cancelMirrorPlaneDrag();
+  }
+
+  private _planeDragMove(e: PointerEvent): void {
+    const d = this._planeDrag!;
+    if ((e.pointerId ?? 0) !== d.pointer) return;
+    const at = this._toCanvasPx(e.clientX, e.clientY);
+    d.cx = at.x; d.cy = at.y;
+    if (this._planeFrame) return;
+    let ran = false;
+    const id = this._frame(() => { ran = true; this._planeFrame = 0; this._applyPlaneDrag(false); });
+    if (!ran) this._planeFrame = id;
+  }
+
+  private _planeDragUp(e: PointerEvent): void {
+    const d = this._planeDrag!;
+    if (e.pointerType === 'touch') this._touchIds.delete(e.pointerId ?? 0);
+    if ((e.pointerId ?? 0) !== d.pointer) return;
+    if (this._planeFrame) { this._cancelFrame(this._planeFrame); this._planeFrame = 0; }
+    const at = this._toCanvasPx(e.clientX, e.clientY);
+    d.cx = at.x; d.cy = at.y;
+    this._applyPlaneDrag(true);
+    this._endPlaneDrag();
+  }
+
+  /** Cancel a plane rotation drag: the plane goes back exactly, no undo step. False when none runs. */
+  cancelMirrorPlaneDrag(): boolean {
+    if (!this._planeDrag) return false;
+    if (this._planeFrame) { this._cancelFrame(this._planeFrame); this._planeFrame = 0; }
+    if (this._planeMoved) this._meshEdit.cancelMirrorPlanePreview();
+    this._endPlaneDrag();
+    return true;
+  }
+
+  private _endPlaneDrag(): void {
+    const d = this._planeDrag;
+    this._planeDrag = null;
+    this._planeMoved = false;
+    if (d && this._canvas) { try { this._canvas.releasePointerCapture(d.pointer); } catch { /* gone */ } }
+    if (this._canvas) this._canvas.style.cursor = 'crosshair';
+    this._rect = null;
+    this._scheduleRender();
+    this._onSelectionChange?.();
+  }
+
+  /** The plane's normal for the drag so far: the start normal turned about the ring's object axis by the screen
+   *  sweep (the gizmo rule: a ring facing the camera follows the pointer's angle around the pivot; edge-on, the drag
+   *  distance). commit = the release: one undo step (none when it did not move). */
+  private _applyPlaneDrag(commit: boolean): void {
+    const d = this._planeDrag;
+    const mesh = d ? this._scene3d.getMesh(d.meshId) : null;
+    const cam = this._scene3d.getCamera?.();
+    if (!d || !mesh?.editMesh || !this._canvas) return;
+    const mod = mesh.editMesh.modifiers[d.modIndex];
+    if (!(mod instanceof MirrorModifier)) return;
+    const pl = mod.getPlane();
+    let angle = 0;
+    const ai = d.axis === 'x' ? 0 : d.axis === 'y' ? 1 : 2;
+    if (cam && (d.cx !== d.rx || d.cy !== d.ry)) {
+      const m = mesh.localMatrix as unknown as ArrayLike<number>;
+      let axW: [number, number, number] = [m[ai * 4], m[ai * 4 + 1], m[ai * 4 + 2]];
+      const al = Math.hypot(axW[0], axW[1], axW[2]) || 1;
+      axW = [axW[0] / al, axW[1] / al, axW[2] / al];
+      const cW = this._objToWorld(pl.point[0], pl.point[1], pl.point[2], mesh);
+      const from = cam.mode === 'orthographic' ? cam.target : [cW.x, cW.y, cW.z];
+      let tx = cam.position[0] - from[0], ty = cam.position[1] - from[1], tz = cam.position[2] - from[2];
+      const tl = Math.hypot(tx, ty, tz) || 1; tx /= tl; ty /= tl; tz /= tl;
+      const faceDot = axW[0] * tx + axW[1] * ty + axW[2] * tz;
+      const c = this._projector(mesh, this._canvas.width, this._canvas.height)(pl.point[0], pl.point[1], pl.point[2]);
+      if (Math.abs(faceDot) > 0.5 && c) {
+        let sweep = Math.atan2(d.cy - c.y, d.cx - c.x) - Math.atan2(d.ry - c.y, d.rx - c.x);
+        while (sweep > Math.PI) sweep -= 2 * Math.PI;
+        while (sweep < -Math.PI) sweep += 2 * Math.PI;
+        angle = -Math.sign(faceDot) * sweep;
+      } else {
+        angle = ((d.cx - d.rx) + (d.cy - d.ry)) / 300 * Math.PI * 2;
+      }
+    }
+    // Rodrigues: the start normal about object axis e_ai
+    const n = d.startNormal, k: [number, number, number] = [ai === 0 ? 1 : 0, ai === 1 ? 1 : 0, ai === 2 ? 1 : 0];
+    const cs = Math.cos(angle), sn = Math.sin(angle);
+    const kxn = [k[1] * n[2] - k[2] * n[1], k[2] * n[0] - k[0] * n[2], k[0] * n[1] - k[1] * n[0]];
+    const kd = k[0] * n[0] + k[1] * n[1] + k[2] * n[2];
+    const normal: [number, number, number] = [0, 1, 2].map(i => n[i] * cs + kxn[i] * sn + k[i] * kd * (1 - cs)) as [number, number, number];
+    if (!commit) {
+      if (angle === 0 && !this._planeMoved) return;
+      this._planeMoved = true;
+      this._meshEdit.setMirrorPlane(d.meshId, d.modIndex, { normal }, { commit: false });
+    } else if (this._planeMoved || angle !== 0) {
+      this._meshEdit.setMirrorPlane(d.meshId, d.modIndex, { normal }, { commit: true });
+    }
+    this._scheduleRender();
   }
 
   // ── Picking API (sm.pickMeshEditElementAt3D) ────────────────────────────────
@@ -1218,30 +1458,27 @@ export class MeshEditPointerController {
 
   // ── Selection + drag ────────────────────────────────────────────────────────
 
-  /** Select the vertex / face / edge at canvas px (x, y) (mouse press, or a finger tap). */
-  private _selectAt(px: number, py: number, additive: boolean): void {
-    if (!this._meshId) return;
+  /** Select the vertex / face / edge at canvas px (x, y) (mouse press, or a finger tap). `toggle` (a RELEASE without a
+   *  drag): an additive pick of an already-selected element removes it instead. A pick on a mirror's copy side is
+   *  already its real partner (the pickers map it). */
+  private _selectAt(px: number, py: number, additive: boolean, toggle = false): void {
+    const meshId = this._meshId;
+    if (!meshId) return;
+    const off = additive && toggle;
+    let hit = false;
     if (this._mode === 'face') {
       const fi = this._pickFace(px, py);
-      if (fi >= 0) {
-        this._meshEdit.selectFace(this._meshId, fi, additive);
-        this._onSelectionChange?.();
-        this._scheduleRender();
-      }
+      if (fi >= 0) { hit = true; if (!(off && this._meshEdit.deselectFace(meshId, fi))) this._meshEdit.selectFace(meshId, fi, additive); }
     } else if (this._mode === 'vertex') {
       const vi = this._pickVertex(px, py);
-      if (vi >= 0) {
-        this._meshEdit.selectVertex(this._meshId, vi, additive);
-        this._onSelectionChange?.();
-        this._scheduleRender();
-      }
+      if (vi >= 0) { hit = true; if (!(off && this._meshEdit.deselectVertex(meshId, vi))) this._meshEdit.selectVertex(meshId, vi, additive); }
     } else if (this._mode === 'edge') {
       const hi = this._pickEdge(px, py);
-      if (hi >= 0) {
-        this._meshEdit.selectEdge(this._meshId, hi, additive);
-        this._onSelectionChange?.();
-        this._scheduleRender();
-      }
+      if (hi >= 0) { hit = true; if (!(off && this._meshEdit.deselectEdge(meshId, hi))) this._meshEdit.selectEdge(meshId, hi, additive); }
+    }
+    if (hit) {
+      this._onSelectionChange?.();
+      this._scheduleRender();
     }
   }
 
@@ -1258,7 +1495,14 @@ export class MeshEditPointerController {
     const mesh = this._getMesh();
     if (!this._canvas || !mesh?.editMesh || mesh instanceof SkinnedMesh3D) return;
     const v = mesh.editMesh.vertices[vi];
-    const w = this._objToWorld(v.x, v.y, v.z, mesh);
+    // picked on a mirror's copy side (the last pick): the drag runs at the IMAGE's depth, through its reflection
+    const planes = this._lastPickImg ? this._mirrorPlanes() : [];
+    const A = this._lastPickImg && planes.length ? imageAffine(planes, this._lastPickImg) : null;
+    this._dragImage = A;
+    const ix = A ? A[0] * v.x + A[3] * v.y + A[6] * v.z + A[9] : v.x;
+    const iy = A ? A[1] * v.x + A[4] * v.y + A[7] * v.z + A[10] : v.y;
+    const iz = A ? A[2] * v.x + A[5] * v.y + A[8] * v.z + A[11] : v.z;
+    const w = this._objToWorld(ix, iy, iz, mesh);
     const s = this._scene3d.projectWorldToScreen3D(w.x, w.y, w.z, this._canvas.width, this._canvas.height);
     this._dragging = true;
     this._dragVertexIdx = vi;
@@ -1289,7 +1533,13 @@ export class MeshEditPointerController {
     const wStart = this._scene3d.unprojectScreenToWorld3D(this._dragStartCanvasX, this._dragStartCanvasY, this._dragDepth, this._canvas.width, this._canvas.height);
 
     // Convert world-space delta to object-space delta via model matrix inverse
-    const delta = this._worldDeltaToObj(wNow.x - wStart.x, wNow.y - wStart.y, wNow.z - wStart.z, mesh);
+    let delta = this._worldDeltaToObj(wNow.x - wStart.x, wNow.y - wStart.y, wNow.z - wStart.z, mesh);
+    const A = this._dragImage;
+    if (A) {
+      // through the mirror's copy: image → real = Lᵀ (reflections are orthogonal)
+      const { x, y, z } = delta;
+      delta = { x: A[0] * x + A[1] * y + A[2] * z, y: A[3] * x + A[4] * y + A[5] * z, z: A[6] * x + A[7] * y + A[8] * z };
+    }
 
     const startVerts = this._dragStartVerts;
     const verts = mesh.editMesh.vertices;
@@ -1437,10 +1687,51 @@ export class MeshEditPointerController {
     if (!this._canvas || !this._meshId) return -1;
     const mesh = this._getMesh();
     const camera = this._scene3d.getCamera?.();
+    this._lastPickImg = 0;
+    const mirror = mesh?.editMesh ? this._facePickMirror(mesh) : null;
     if (mesh?.editMesh && camera && mesh.geometry) {
-      return this._facePicker.pick(mesh, camera, px, py, this._canvas.width, this._canvas.height);
+      return this._facePicker.pick(mesh, camera, px, py, this._canvas.width, this._canvas.height, mirror);
     }
-    return pickFaceFullScene(this._scene3d, this._meshId, mesh, px, py, this._canvas.width, this._canvas.height);
+    return pickFaceFullScene(this._scene3d, this._meshId, mesh, px, py, this._canvas.width, this._canvas.height, mirror);
+  }
+
+  /** Mirror support for a face pick: a hit on the copy side maps to the partner face (reflected back to the real side
+   *  — the last pick's image is remembered), and faces entirely on the discarded side can't be picked. Null = no plane
+   *  mirror. */
+  private _facePickMirror(mesh: Mesh3D): FacePickMirror | null {
+    const em = mesh.editMesh!;
+    const planes = mirrorPlanesOf(em);
+    if (planes.length === 0) return null;
+    const m = mesh.localMatrix as unknown as ArrayLike<number>;
+    const inv = mat4.invert(mat4.create(), mesh.localMatrix as unknown as mat4);
+    if (!inv) return null;
+    const skip = new Uint8Array(em.faces.length);
+    const pts: number[] = [];
+    for (let fi = 0; fi < em.faces.length; fi++) {
+      pts.length = 0;
+      for (const vi of em.getFaceVertices(fi)) { const v = em.vertices[vi]; pts.push(v.x, v.y, v.z); }
+      let any = false;
+      if (pts.length >= 9) forEachPolygonImage(planes, pts, () => { any = true; });
+      if (!any) skip[fi] = 1;
+    }
+    const mapHit = (hx: number, hy: number, hz: number): [number, number, number] => {
+      const ox = inv[0] * hx + inv[4] * hy + inv[8] * hz + inv[12];
+      const oy = inv[1] * hx + inv[5] * hy + inv[9] * hz + inv[13];
+      const oz = inv[2] * hx + inv[6] * hy + inv[10] * hz + inv[14];
+      const r = toRealSide(planes, ox, oy, oz);
+      this._lastPickImg = r.img;
+      return [
+        m[0] * r.x + m[4] * r.y + m[8] * r.z + m[12],
+        m[1] * r.x + m[5] * r.y + m[9] * r.z + m[13],
+        m[2] * r.x + m[6] * r.y + m[10] * r.z + m[14],
+      ];
+    };
+    return { mapHit, skip };
+  }
+
+  /** The edited mesh's plane mirrors (stack order; none = no bisect / face mirror). */
+  private _mirrorPlanes(): MirrorPlane[] {
+    return mirrorPlanesOf(this._getMesh()?.editMesh);
   }
 
   /** Object-space point → canvas px (null = behind the camera), with the model-view-projection composed ONCE per
@@ -1472,7 +1763,22 @@ export class MeshEditPointerController {
     const project = this._projector(mesh, this._canvas.width, this._canvas.height);
     const verts = mesh.editMesh.vertices;
 
-    let best = -1, bestDist = VERTEX_PICK_RADIUS_PX * this._pickScale;
+    let best = -1, bestDist = VERTEX_PICK_RADIUS_PX * this._pickScale, bestImg = 0;
+    const planes = mirrorPlanesOf(mesh.editMesh);
+    if (planes.length > 0) {
+      // a plane mirror: every vertex at its real place (if kept) and its reflections — a copy picks its partner
+      for (let vi = 0; vi < verts.length; vi++) {
+        const v = verts[vi];
+        forEachPointImage(planes, v.x, v.y, v.z, (x, y, z, img) => {
+          const s = project(x, y, z);
+          if (!s) return;
+          const d = Math.sqrt((s.x - px) ** 2 + (s.y - py) ** 2);
+          if (d < bestDist) { bestDist = d; best = vi; bestImg = img; }
+        });
+      }
+      this._lastPickImg = best >= 0 ? bestImg : 0;
+      return best;
+    }
     for (let vi = 0; vi < verts.length; vi++) {
       const v = verts[vi];
       const s = project(v.x, v.y, v.z);
@@ -1480,6 +1786,7 @@ export class MeshEditPointerController {
       const d = Math.sqrt((s.x - px) ** 2 + (s.y - py) ** 2);
       if (d < bestDist) { bestDist = d; best = vi; }
     }
+    this._lastPickImg = 0;
     return best;
   }
 
@@ -1490,18 +1797,31 @@ export class MeshEditPointerController {
     const em = mesh.editMesh;
     const project = this._projector(mesh, this._canvas.width, this._canvas.height);
 
-    let best = -1, bestDist = EDGE_PICK_RADIUS_PX * this._pickScale;
+    let best = -1, bestDist = EDGE_PICK_RADIUS_PX * this._pickScale, bestImg = 0;
+    const planes = mirrorPlanesOf(em);
     for (let hi = 0; hi < em.halfEdges.length; hi++) {
       const he = em.halfEdges[hi];
       // Skip one half of each pair (avoid duplicate checks)
       if (he.twin >= 0 && he.twin < hi) continue;
       const vTo   = em.vertices[he.vertex];
       const vFrom = em.vertices[em.halfEdges[he.prev].vertex];
+      if (planes.length > 0) {
+        // a plane mirror: the edge's real (clipped) part and its reflections — a copy picks its partner
+        const cur = hi;
+        forEachSegmentImage(planes, vFrom.x, vFrom.y, vFrom.z, vTo.x, vTo.y, vTo.z, (ax, ay, az, bx, by, bz, img) => {
+          const s = project((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
+          if (!s) return;
+          const d = Math.sqrt((s.x - px) ** 2 + (s.y - py) ** 2);
+          if (d < bestDist) { bestDist = d; best = cur; bestImg = img; }
+        });
+        continue;
+      }
       const s = project((vTo.x + vFrom.x) / 2, (vTo.y + vFrom.y) / 2, (vTo.z + vFrom.z) / 2);
       if (!s) continue;
       const d = Math.sqrt((s.x - px) ** 2 + (s.y - py) ** 2);
       if (d < bestDist) { bestDist = d; best = hi; }
     }
+    this._lastPickImg = best >= 0 ? bestImg : 0;
     return best;
   }
 
@@ -1545,6 +1865,11 @@ export class MeshEditPointerController {
   private _scheduleRender(): void {
     this._scheduleRenderFn();
   }
+}
+
+/** The edit mesh's plane mirrors ([] for none / a test double without the method). */
+function mirrorPlanesOf(em: EditMesh | null | undefined): MirrorPlane[] {
+  return em && typeof em.mirrorPlanes === 'function' ? em.mirrorPlanes() : [];
 }
 
 /** The world ray through canvas px (x, y) of a w × h canvas (near-plane origin, unit direction), or null. */

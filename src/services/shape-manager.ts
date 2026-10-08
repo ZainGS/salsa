@@ -933,6 +933,9 @@ class ShapeManager {
         this.scene3d.setMeshEditModeChecker(
             () => this.meshEdit.isEditing || this._uvSessions.size > 0,
         );
+        // Ctrl+Z / Ctrl+Y in Edit Mesh / Armature belong to the host's mode-scoped undo: the engine's 2D-object undo key
+        // stands down (it consumed the key whenever the 2D stack was non-empty, so the mode's undo never saw it).
+        this.interactionService.undoKeysOwnedByEditMode3D = () => this.meshEdit.isEditing || this.scene3d.isArmatureModeActive3D();
 
         // Supply live edit state to the mesh edit overlay renderer each frame.
         // Handles two independent modes:
@@ -962,8 +965,10 @@ class ShapeManager {
                     // the Chamfer / Bevel tool's dashed guide lines (null when it shows none)
                     // + the Knife path and the Loop Cut preview (the tool strip's tools)
                     guides: this._meshEditPointerController.guideLines(),
-                    // the transform gizmo on the selection's centroid (null when hidden)
+                    // the transform gizmo on the selection's centroid (null when hidden) — or the mirror plane's rings
                     gizmo: this._meshEditPointerController.gizmoDrawData(),
+                    // the mirror plane handle's quad (setMirrorPlaneHandle3D; null when hidden)
+                    mirrorPlane: this._meshEditPointerController.mirrorPlaneQuad(),
                 };
             }
 
@@ -7910,6 +7915,7 @@ class ShapeManager {
     public exitMeshEditMode3D(): void {
         this._meshEditPointerController.bevel.cancel();   // a Chamfer in progress puts the mesh back
         this._meshEditPointerController.elementTransformRouter().cancel();   // so does a G / R / S / gizmo drag
+        this._meshEditPointerController.setMirrorPlaneHandle(null, null);   // the mirror plane handle hides (a drag is put back)
         this.meshEdit.exitEditMode();
         this.scene3d.disableMeshEditOrbit();
     }
@@ -9281,6 +9287,59 @@ class ShapeManager {
     /** Add a mirror modifier. Returns the modifier index. */
     public addMirrorModifier3D(meshId: string, axis: 'x' | 'y' | 'z' = 'x', clipping = true): number {
         return this.meshEdit.addMirrorModifier(meshId, axis, clipping);
+    }
+
+    // ── Plane mirror (round 2: Use Face / Bisect Mesh) — edit-mesh-mirror.ts ──
+    // A mirror = a PLANE (point + normal, object space; the normal points toward the COPY side) + bisect: the output
+    // keeps only the real side of the mesh (faces crossing the plane are cut), adds the reflected copy, and welds the
+    // seam. The base mesh stays whole until Bake (applyModifier3D). In Edit Mesh the copy side is pickable: it selects
+    // (and drags) the partner element on the real side.
+
+    /** Add a plane mirror through face `faceIndex`'s centroid, normal = the face normal (the copy appears outward
+     *  from that face). One undo step. Returns the modifier index (-1 = no such mesh / face). */
+    public addMirrorFromFace3D(meshId: string, faceIndex: number): number {
+        const i = this.meshEdit.addMirrorFromFace(meshId, faceIndex);
+        this.scheduleRender();
+        return i;
+    }
+
+    /** Add a plane mirror through the centre of the mesh's bounds, normal = the object's local -X (copy on -X). One
+     *  undo step. Returns the modifier index (-1 = not editable). */
+    public addMirrorBisect3D(meshId: string): number {
+        const i = this.meshEdit.addMirrorBisect(meshId);
+        this.scheduleRender();
+        return i;
+    }
+
+    /** The mirror's plane (object space; the normal points toward the copy side). An old axis mirror reports mode
+     *  'axis' (through the origin, along its axis). Null when `modIndex` is not a mirror. */
+    public getMirrorPlane3D(meshId: string, modIndex: number): { mode: 'face' | 'bisect' | 'axis'; point: [number, number, number]; normal: [number, number, number] } | null {
+        return this.meshEdit.getMirrorPlane(meshId, modIndex);
+    }
+
+    /** Move / turn the mirror's plane (object space; the normal is normalised). commit:false = a live preview (no undo
+     *  step), commit:true (default) = one undo step from before the first preview. An old axis mirror becomes a bisect
+     *  mirror. False = not a mirror / an unusable plane. */
+    public setMirrorPlane3D(meshId: string, modIndex: number, plane: { point?: [number, number, number]; normal?: [number, number, number] }, opts?: { commit?: boolean }): boolean {
+        const ok = this.meshEdit.setMirrorPlane(meshId, modIndex, plane, opts);
+        if (ok) this.scheduleRender();
+        return ok;
+    }
+
+    /** Swap which side of the plane is real (the normal reversed). One undo step. */
+    public flipMirrorSide3D(meshId: string, modIndex: number): boolean {
+        const ok = this.meshEdit.flipMirrorSide(meshId, modIndex);
+        if (ok) this.scheduleRender();
+        return ok;
+    }
+
+    /** Draw mirror `modIndex`'s plane on the canvas (a translucent quad sized to the mesh + outline) with a rotation
+     *  handle (the rotate-gizmo rings at the plane's point): drag a ring to turn the plane about its point — live
+     *  preview, one undo step on release, Esc (cancelTransform3D) / a 2nd finger / pointercancel cancels. Touch + mouse.
+     *  Null hides it. One handle at a time (it replaces the selection gizmo while shown); hidden on leaving Edit Mesh. */
+    public setMirrorPlaneHandle3D(meshId: string, modIndex: number | null): void {
+        this._meshEditPointerController.setMirrorPlaneHandle(modIndex === null ? null : meshId, modIndex);
+        this.scheduleRender();
     }
 
     /** Add a subdivision (Catmull-Clark) modifier. Returns the modifier index. */
