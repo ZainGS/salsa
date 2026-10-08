@@ -5,6 +5,7 @@ import { PathNode, type PathAnchor } from "../../scene-graph/shapes/path-node";
 import { RGBA } from "../../types/rgba";
 import { InteractionService } from "../interaction-service";
 import { sampleCubic, penEdgeControls, type Pt } from "../../scene-graph/core/bezier";
+import { recordVectorCreation } from "../vector-object-undo";
 
 /**
  * Freeform polygon drawing service — with the PEN-TOOL curve gesture (docs/specs/vector-paths.md P0).
@@ -108,6 +109,17 @@ export class PolygonDrawingService {
         this.fillColor = fill;
         this.strokeColor = stroke;
         this.strokeWidth = strokeWidth;
+    }
+
+    /** The fill a committed polygon gets — ShapeManager.setShapeColor feeds the host's current (pen) colour here,
+     *  the same colour the rectangle / ellipse / triangle tools fill with. (A closed path renders fill only.) */
+    public setFillColor(fill: RGBA) {
+        this.fillColor = fill;
+    }
+
+    /** The fill the next committed polygon will get (a copy). */
+    public getFillColor(): RGBA {
+        return { ...this.fillColor };
     }
 
     public reinitializeEventListeners() {
@@ -404,14 +416,17 @@ export class PolygonDrawingService {
         // Remove all staging lines
         this.removeStagingLines();
 
+        // Copies: each polygon owns its colours (a later in-place recolour of one must not reach the others).
         const path = this.shapeFactory.createPath(
             anchors,
             true,
-            this.fillColor,
-            this.strokeColor,
+            { ...this.fillColor },
+            { ...this.strokeColor },
             this.strokeWidth,
         );
         this.sceneGraph.root.addChild(path);
+        // ONE 2D undo step: Ctrl+Z takes the polygon off again, redo puts the same instance back.
+        recordVectorCreation(this.interactionService.vectorUndo, this.sceneGraph.root, [path], 'Draw polygon');
 
         // Notify listeners
         this.onPolygonCommitted?.(path);

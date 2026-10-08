@@ -7,7 +7,7 @@ g.self ??= globalThis;
 g.crypto ??= webcrypto;
 (g.self as { crypto?: unknown }).crypto ??= webcrypto;
 
-import { Scene3DParticles } from './scene3d-particles';
+import { Scene3DParticles, DELETE_PARTICLE_EMITTER_UNDO } from './scene3d-particles';
 import { SceneGraph } from '../../scene-graph/core/scene-graph';
 import type { ManagerContext } from './manager-context';
 import type { InteractionService } from '../interaction-service';
@@ -101,6 +101,47 @@ describe('§5.1 Scene3DParticles (extracted subsystem)', () => {
     p2.registerRestored(emitter);
     expect(p2.get(id)).toBe(emitter);
     expect(fresh.preRenderCbs.size).toBe(1);
+  });
+
+  it('an emitter saves its visibility, and one restored from an older save (no visible) comes back visible', () => {
+    const id = particles.add(0, 0, 0);
+    const emitter = particles.get(id)!;
+    emitter.visible = false;
+    expect(emitter.toJSON().visible).toBe(false);
+
+    (emitter as { visible: unknown }).visible = undefined;   // what the loader assigns from a save without the field
+    const p2 = new Scene3DParticles(makeCtx().ctx);
+    p2.registerRestored(emitter);
+    expect(emitter.visible).toBe(true);
+  });
+
+  it('remove() with an undo stack records ONE step: undo brings the same emitter back (graph + tick), redo removes it again', () => {
+    const steps: Array<{ description: string; undo(): void; redo(): void }> = [];
+    const p = new Scene3DParticles(env.ctx, (cmd) => steps.push(cmd));
+    const id = p.add(1, 2, 3, { emitRate: 7 });
+    const emitter = p.get(id)!;
+    p.remove(id);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].description).toBe(DELETE_PARTICLE_EMITTER_UNDO);
+    expect(p.get(id)).toBeNull();
+    expect(env.preRenderCbs.size).toBe(0);
+
+    steps[0].undo();
+    expect(p.get(id)).toBe(emitter);
+    expect(env.sceneGraph.root.children).toContain(emitter);
+    expect(emitter.config.emitRate).toBe(7);
+    expect(env.preRenderCbs.size).toBe(1);
+
+    steps[0].redo();
+    expect(p.get(id)).toBeNull();
+    expect(env.sceneGraph.root.children).not.toContain(emitter);
+    expect(env.preRenderCbs.size).toBe(0);
+  });
+
+  it('remove() without an undo stack records nothing and still removes', () => {
+    const id = particles.add(0, 0, 0);
+    particles.remove(id);
+    expect(particles.get(id)).toBeNull();
   });
 
   it('dispose() stops the tick and drops all emitters', () => {

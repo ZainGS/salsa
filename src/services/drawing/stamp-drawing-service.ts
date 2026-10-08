@@ -5,6 +5,7 @@ import { ShapeFactory } from "../../scene-graph/core/shape-factory";
 import { Stamp } from "../../scene-graph/shapes/stamp";
 import { RGBA } from "../../types/rgba";
 import { InteractionService } from "../interaction-service";
+import { recordVectorCreation } from "../vector-object-undo";
 import { CacheService } from "../cache-service";
 import { TextureArrayAtlas } from "../../renderer/caches/texture-cache/texture-array-atlas";
 import cursorUrl from '../../assets/stamp.cur?url';
@@ -102,6 +103,7 @@ export class StampDrawingService {
     );
 
     this.sceneGraph.root.addChild(stamp);
+    recordVectorCreation(this.interactionService.vectorUndo, this.sceneGraph.root, [stamp], 'Place stamp');
     this.interactionService.onSceneGraphChanged.emit();
   }
 

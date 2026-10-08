@@ -37,6 +37,7 @@ import { sampleFramePixel, type SampledColor } from "./drawing/canvas-color-samp
 import { ScribbleDrawingService } from "./drawing/scribble-drawing-service";
 import { TextDrawingService } from "./drawing/text-drawing-service";
 import { hexToRgba } from "../utils/color";
+import { recordVectorCreation } from "./vector-object-undo";
 import { EraserService } from "./drawing/eraser-service";
 import { HighlightDrawingService } from "./drawing/highlight-drawing-service";
 import { PatternDrawingService } from "./drawing/pattern-drawing-service";
@@ -117,6 +118,11 @@ import { booleanMesh, type Tri, type BooleanOp } from '../scene-graph/shapes/mes
 import { simplifyGeometry } from '../scene-graph/shapes/mesh-simplify';
 import { deriveViewRules } from './managers/view-state';
 import { buildCreatureBlobs, buildCreatureSkeleton, creatureEyes } from './managers/creature-generator';
+import { cloneGeneratorRecord, normalizeGeneratorParams, type MeshGeneratorType } from '../scene-graph/shapes/mesh-generator';
+import { regenerateMeshFromGenerator } from './managers/mesh-generator-regen';
+
+/** A creature's eye spheres (createCreature3D, and their regenerate). */
+const CREATURE_EYE_MATERIAL: Partial<Material3D> = { diffuse: { r: 0.04, g: 0.04, b: 0.05, a: 1 }, roughness: 0.25 };
 
 // ── Domain-specific delegate managers ────────────────────────────────
 import { RasterManager } from './managers/raster-manager';
@@ -3071,15 +3077,30 @@ class ShapeManager {
         const node = this.sceneGraph.findNodeById(layerId) as Shape;
         if (!node) return;
 
+        // ONE "Change colour" step on the 2D object undo stack (the node instance is retained, like every 2D step).
+        const before = { ...this.getNodeFillColor(layerId) };
+        const after = { ...newColor };
+        this._applyNodeFillColor(node, newColor);
+        if (before.r !== after.r || before.g !== after.g || before.b !== after.b || before.a !== after.a) {
+            this.interactionService.vectorUndo.pushCommand({
+                description: 'Change colour',
+                undo: () => { this._applyNodeFillColor(node, { ...before }); this.scheduleRender(); },
+                redo: () => { this._applyNodeFillColor(node, { ...after }); this.scheduleRender(); },
+            });
+        }
+    }
+
+    private _applyNodeFillColor(node: Shape, color: RGBA): void {
         const type = node.getType?.();
         if (type === 'Scribble') {
-            (node as ColoredShape).strokeColor = newColor;
+            (node as ColoredShape).strokeColor = color;
         } else if (type === 'Sticky Note') {
             // single source of truth: use the class API
-            (node as unknown as StickyNote).setColor(newColor);  // updates bg + marks dirty
+            (node as unknown as StickyNote).setColor(color);  // updates bg + marks dirty
         } else {
-            (node as ColoredShape).fillColor = newColor;
+            (node as ColoredShape).fillColor = color;
         }
+        node.markDirty?.();
         this.emitSceneGraphChanged();
     }
 
@@ -3099,6 +3120,7 @@ class ShapeManager {
         const rectangle = this.shapeFactory.createRectangle(x, y, width, height, this.shapeColor, strokeColor, strokeWidth);
         this._stampVectorLayer(rectangle);
         this.sceneGraph.root.addChild(rectangle);
+        this._recordCreated([rectangle], 'Add shape');
         this.emitSceneGraphChanged();
         return rectangle;   // (was void) — return the node so authoring/AI callers get its id
     }
@@ -3109,6 +3131,7 @@ class ShapeManager {
         const circle = this.shapeFactory.createCircle(x, y, radius, this.shapeColor, strokeColor, strokeWidth);
         this._stampVectorLayer(circle);
         this.sceneGraph.root.addChild(circle);
+        this._recordCreated([circle], 'Add shape');
         this.emitSceneGraphChanged();
         return circle;
     }
@@ -3122,6 +3145,7 @@ class ShapeManager {
         const path = this.shapeFactory.createPath(anchors, closed, this.shapeColor, strokeColor, strokeWidth);
         this._stampVectorLayer(path);
         this.sceneGraph.root.addChild(path);
+        this._recordCreated([path], 'Add path');
         this.emitSceneGraphChanged();
         return path;
     }
@@ -3132,6 +3156,7 @@ class ShapeManager {
         const triangle = this.shapeFactory.createTriangle(x, y, width, height, this.shapeColor, strokeColor, strokeWidth);
         this._stampVectorLayer(triangle);
         this.sceneGraph.root.addChild(triangle);
+        this._recordCreated([triangle], 'Add shape');
         this.emitSceneGraphChanged();
         return triangle;
     }
@@ -3140,6 +3165,7 @@ class ShapeManager {
         const line = this.shapeFactory.createLine(x1, y1, x2, y2, strokeColor, strokeWidth);
         this._stampVectorLayer(line);
         this.sceneGraph.root.addChild(line);
+        this._recordCreated([line], 'Draw line');
         this.emitSceneGraphChanged();
         return line;
     }
@@ -3159,6 +3185,7 @@ class ShapeManager {
         line.markDirty();
         this._stampVectorLayer(line);
         this.sceneGraph.root.addChild(line);
+        this._recordCreated([line], 'Draw arrow');
         this.emitSceneGraphChanged();
         return line;
     }
@@ -3265,6 +3292,7 @@ class ShapeManager {
         const note = this.shapeFactory.createStickyNote(x, y, text, color ?? {r:1,g:.98,b:.65,a:1}, signatureText);
         this._stampVectorLayer(note);
         this.sceneGraph.root.addChild(note);
+        this._recordCreated([note], 'Add sticky note');
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(note);
         this.emitSceneGraphChanged();
@@ -3295,6 +3323,7 @@ class ShapeManager {
         const balloon = this.shapeFactory.createSpeechBalloon(x, y, options);
         this._stampVectorLayer(balloon);
         this.sceneGraph.root.addChild(balloon);
+        this._recordCreated([balloon], 'Add speech balloon');
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(balloon);
         this.emitSceneGraphChanged();
@@ -4029,14 +4058,14 @@ class ShapeManager {
      *  a smooth solid — vases, columns, goblets, bottles, finials, smooth tapered spikes. Exact at any radialSegments
      *  (the profile IS the shape). Persisted params-only (regenerates on load). */
     public createRevolve3D(x: number, y: number, z: number, profile: [number, number][], radialSegments = 24, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh3D(x, y, z, { primitive: 'revolve', profile, radialSegments, material });
+        return this._withGenerator(this.createMesh3D(x, y, z, { primitive: 'revolve', profile, radialSegments, material }), 'revolve', { profile, segments: radialSegments });
     }
 
     /** Tube / loft: sweep a circular cross-section of varying radius along a `path` spine ([x,y,z] points) — horns,
      *  tentacles, tree branches, pipes, cables. `radii` = the radius at each path point (single value = constant).
      *  Rotation-minimizing frames avoid twist. Persisted params-only (regenerates on load). */
     public createTube3D(x: number, y: number, z: number, path: [number, number, number][], radii: number[], radialSegments = 12, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh3D(x, y, z, { primitive: 'tube', path, radii, radialSegments, material });
+        return this._withGenerator(this.createMesh3D(x, y, z, { primitive: 'tube', path, radii, radialSegments, material }), 'tube', { path, radii, segments: radialSegments });
     }
 
     /** Metaballs / SDF: compose an ORGANIC blobby/branching surface from `blobs` (spheres/capsules/… that smoothly
@@ -4044,7 +4073,7 @@ class ShapeManager {
      *  cells (8..96; higher = smoother but O(res³)). Persisted params-only (regenerates on load). */
     public createMetaballMesh3D(x: number, y: number, z: number, blobs: import('../scene-graph/shapes/sdf-mesh').SdfBlob[], resolution = 48, material?: Partial<Material3D>, decimate?: number): Mesh3D {
         // decimate ∈ (0,1) = QEM-simplify to that fraction of triangles (leaner render/memory/save). Persisted.
-        return this.createMesh3D(x, y, z, { primitive: 'metaball', blobs, resolution, material, decimate });
+        return this._withGenerator(this.createMesh3D(x, y, z, { primitive: 'metaball', blobs, resolution, material, decimate }), 'metaball', { blobs, resolution, decimate: decimate ?? 1 });
     }
 
     /** Procedural CREATURE — a parametric quadruped/biped (dog/cat/horse/lizard/generic) built as smooth-fused
@@ -4062,10 +4091,14 @@ class ShapeManager {
         }
         // Eyes — small dark spheres on the head (a fused metaball body can't carry a second material). Separate
         // meshes; they don't follow a posed skeleton (v1). Default on; pass eyes:false to omit.
+        const eyeIds: string[] = [];
         if (params.eyes !== false) {
-            const eyeMat: Partial<Material3D> = { diffuse: { r: 0.04, g: 0.04, b: 0.05, a: 1 }, roughness: 0.25 };
-            for (const e of creatureEyes(params)) this.createSphere3D(x + e.pos[0], y + e.pos[1], z + e.pos[2], e.radius, 10, eyeMat);
+            for (const e of creatureEyes(params)) eyeIds.push(this.createSphere3D(x + e.pos[0], y + e.pos[1], z + e.pos[2], e.radius, 10, CREATURE_EYE_MATERIAL).id);
         }
+        // Live settings (mesh-generator.ts) — not for a rigged creature: the bind makes it a skinned mesh, which a
+        // regenerate would tear off its skeleton.
+        if (!params.rigged) this._withGenerator(mesh, 'creature', { ...params, resolution }, eyeIds);
+        else mesh.generator = null;
         if (params.rigged) {
             const skelId = this.createEmptySkeleton3D('creature');
             const joints = buildCreatureSkeleton(params);
@@ -4087,7 +4120,103 @@ class ShapeManager {
         // radius = BOTTOM radius; radiusTop (optional) = TOP radius. radiusTop:0 = a cone, radiusTop<radius = a
         // truncated cone / smooth taper (a proper tapered spike), omitted = a straight cylinder. The generator
         // (generateCylinder) is a surface of revolution, so this is exact at any radialSegments — no stepped extrudes.
-        return this.createMesh3D(x, y, z, { primitive: 'cylinder', radius, height, radialSegments, material, radiusTop });
+        return this._withGenerator(this.createMesh3D(x, y, z, { primitive: 'cylinder', radius, height, radialSegments, material, radiusTop }),
+            'cylinder', { radius, radiusTop: radiusTop ?? radius, height, segments: radialSegments });
+    }
+
+    /** Add Mesh live settings (mesh-generator.ts): the generator a parametric mesh was made by — Cylinder, Circle,
+     *  Polygon, Revolve, Tube, Metaballs, Creature — and its parameters, or null when it has none or they no longer
+     *  apply (the mesh was changed outside them: Edit Mesh, a UV unwrap, vertex colours, blend shapes, material slots,
+     *  a rig). A copy — change it with setMeshGenerator3D. */
+    public getMeshGenerator3D(meshId: string): { type: MeshGeneratorType; params: Record<string, unknown> } | null {
+        const m = this.scene3d?.getMesh(meshId);
+        if (!m?.generator || !m.generatorApplies) return null;
+        const g = cloneGeneratorRecord(m.generator);
+        return { type: g.type, params: g.params };
+    }
+
+    /** Regenerate a parametric mesh in place with changed settings (merged over its current ones, clamped). Keeps the
+     *  node — id, transform, material, keyframes — and replaces its geometry (a creature also re-places its eyes).
+     *  Works in Edit Mesh too: the edit topology is rebuilt from the new geometry and the element selection cleared.
+     *  ONE undo step per commit: `commit: false` is a live preview step (a slider drag) — the next commit (default)
+     *  records the change from the state before the first preview. False when getMeshGenerator3D would be null or the
+     *  params can't build a mesh. */
+    public setMeshGenerator3D(meshId: string, params: Record<string, unknown>, opts?: { commit?: boolean }): boolean {
+        const m = this.scene3d?.getMesh(meshId);
+        if (!m?.generator || !m.generatorApplies) return false;
+        const p = normalizeGeneratorParams(m.generator.type, { ...m.generator.params, ...params });
+        if (!p) return false;
+        const live = this._generatorLive;
+        const before = live && live.mesh === m ? live.before : cloneGeneratorRecord(m.generator);
+        this._regenerateFromRecord(m, { ...m.generator, params: p });
+        if (opts?.commit === false) { this._generatorLive = { mesh: m, before }; return true; }
+        this._generatorLive = null;
+        const after = cloneGeneratorRecord(m.generator);
+        if (JSON.stringify(before.params) === JSON.stringify(after.params)) return true;
+        this.scene3d.pushCommand3D({
+            description: 'Change settings',
+            // Only while the settings still describe the mesh (they always do in undo order; a guard all the same)
+            undo: () => { if (m.generatorApplies) this._regenerateFromRecord(m, before); },
+            redo: () => { if (m.generatorApplies) this._regenerateFromRecord(m, after); },
+        });
+        return true;
+    }
+
+    /** Bake the generator settings: the mesh keeps its geometry and stops offering them (one undo step brings them
+     *  back). False when the mesh has none. */
+    public bakeMeshGenerator3D(meshId: string): boolean {
+        const m = this.scene3d?.getMesh(meshId);
+        if (!m?.generator) return false;
+        const rec = m.generator;
+        if (this._generatorLive?.mesh === m) this._generatorLive = null;
+        m.generator = null;
+        m.stateDirty = true;
+        this.scene3d.pushCommand3D({
+            description: 'Bake settings',
+            undo: () => { m.generator = rec; m.stateDirty = true; },
+            redo: () => { m.generator = null; m.stateDirty = true; },
+        });
+        return true;
+    }
+
+    /** setMeshGenerator3D's live preview: the mesh + its settings before the first uncommitted step. */
+    private _generatorLive: { mesh: Mesh3D; before: import('../scene-graph/shapes/mesh-generator').MeshGeneratorRecord } | null = null;
+
+    /** Regenerate `m` from `rec`'s params (its parts stay the mesh's current ones) and stamp the result. */
+    private _regenerateFromRecord(m: Mesh3D, rec: import('../scene-graph/shapes/mesh-generator').MeshGeneratorRecord): void {
+        const parts = regenerateMeshFromGenerator(m, rec.type, rec.params, {
+            getMesh: (id) => this.scene3d.getMesh(id),
+            addEye: (ex, ey, ez, radius) => {
+                const eye = new Mesh3D(this.interactionService, ex, ey, ez, { primitive: 'sphere', radius, widthSegments: 10, heightSegments: 7, material: CREATURE_EYE_MATERIAL });
+                this.sceneGraph.root.addChild(eye);
+                this.emitSceneGraphChanged();
+                return eye;
+            },
+            // Silent (no undo step of its own: the settings change is the one step, and its undo re-creates them)
+            removeMesh: (id) => {
+                const eye = this.scene3d.getMesh(id);
+                if (!eye) return;
+                eye.parent?.removeChild(eye);
+                this.emitSceneGraphChanged();
+            },
+        });
+        const parts0 = m.generator?.parts;
+        m.generator = { type: rec.type, params: cloneGeneratorRecord(rec).params,
+            ...(parts ? { parts } : parts0?.length ? { parts: parts0 } : {}) };
+        m.stampGenerator();
+        // Under Edit Mesh: the edit topology follows the new geometry (the old element indices are gone)
+        if (this.meshEdit.activeMeshId === m.id) this.meshEdit.rebuildEditTopology(m.id);
+        this.scheduleRender();
+    }
+
+    /** Record `type` + `params` as `mesh`'s live generator settings; its current geometry is their output. */
+    private _withGenerator<M extends Mesh3D>(mesh: M, type: MeshGeneratorType, params: Record<string, unknown>, parts?: string[]): M {
+        const p = normalizeGeneratorParams(type, params);
+        if (p) {
+            mesh.generator = { type, params: p, ...(parts?.length ? { parts } : {}) };
+            mesh.stampGenerator();
+        }
+        return mesh;
     }
 
     /** Create a torus at (x, y, z). */
@@ -4562,7 +4691,7 @@ class ShapeManager {
      * The mesh starts with an EditMesh pre-attached — no makeEditable() needed.
      */
     public addPolygonMesh3D(x: number, y: number, z: number, points: [number, number][], height = 1, name?: string, material?: Partial<Material3D>): Mesh3D {
-        return this.scene3d.createPolygonMesh(x, y, z, points, height, name, material);
+        return this._withGenerator(this.scene3d.createPolygonMesh(x, y, z, points, height, name, material), 'polygon', { points, height });
     }
 
     /**
@@ -4570,7 +4699,7 @@ class ShapeManager {
      * Convenience wrapper around addPolygonMesh3D.
      */
     public addCircleMesh3D(x: number, y: number, z: number, radius = 0.5, segments = 8, height = 1, name?: string, material?: Partial<Material3D>): Mesh3D {
-        return this.scene3d.createCircleMesh(x, y, z, radius, segments, height, name, material);
+        return this._withGenerator(this.scene3d.createCircleMesh(x, y, z, radius, segments, height, name, material), 'circle', { radius, segments, height });
     }
 
     /** Create a mesh from custom geometry. */
@@ -12247,6 +12376,7 @@ class ShapeManager {
             this.sceneGraph.root.addChild(path);
             created.push(path);
         }
+        this._recordCreated(created, 'Import SVG');   // every subpath of the import = ONE step
         this.interactionService.onSceneGraphChanged.emit();
         this.scheduleRender();
         return created;
@@ -12313,6 +12443,7 @@ class ShapeManager {
             x, y, radius, sides, this.shapeColor, strokeColor, strokeWidth
         );
         this.sceneGraph.root.addChild(polygon);
+        this._recordCreated([polygon], 'Add shape');
         this.emitSceneGraphChanged();
     }
 
@@ -12328,6 +12459,7 @@ class ShapeManager {
             points, this.shapeColor, strokeColor, strokeWidth
         );
         this.sceneGraph.root.addChild(polygon);
+        this._recordCreated([polygon], 'Add shape');
         this.emitSceneGraphChanged();
     }
 
@@ -12348,6 +12480,7 @@ class ShapeManager {
             x, y, width, height, preset, this.shapeColor, strokeColor, strokeWidth
         );
         this.sceneGraph.root.addChild(polygon);
+        this._recordCreated([polygon], 'Add shape');
         this.emitSceneGraphChanged();
     }
 
@@ -12432,6 +12565,8 @@ class ShapeManager {
 
     public setShapeColor(color: string) {
         this.shapeColor = hexToRgba(color);
+        // The freeform polygon tool fills with it too, like the rectangle / ellipse / triangle tools (it drew a fixed grey).
+        this.polygonDrawingService?.setFillColor(this.shapeColor);
     }
 
     public setTextColor(color: string) {
@@ -15553,6 +15688,10 @@ class ShapeManager {
     private _stampVectorLayer(target: { layerId?: string }): void {
         const layerId = this._targetVectorLayerId();
         if (layerId) target.layerId = layerId;
+    }
+    /** A creation verb's nodes (already attached) = ONE step on the 2D object undo stack (vector-object-undo.ts). */
+    private _recordCreated(nodes: Node[], description: string): void {
+        recordVectorCreation(this.interactionService.vectorUndo, this.sceneGraph.root, nodes, description);
     }
     /** Assign the default vector layer to any TOP-LEVEL shape that has no layerId (legacy docs). Idempotent. */
     private _backfillUnassignedVectorLayers(): void {

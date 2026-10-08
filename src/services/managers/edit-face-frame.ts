@@ -2,8 +2,9 @@
  * Face-on framing for the edit camera (Edit Mesh's Frame with faces selected — next Edit Mesh batch 2026-10-08 §3).
  *
  * Given the selected faces as WORLD-space polygons, the camera turns to look straight at them (their area-weighted
- * normal toward the camera), centred, the ortho half-height fitted with a margin. The edit camera is a roll-free orbit
- * (azimuth / elevation around world up), so "no roll" holds by construction; the turn is the minimal one: the current
+ * normal toward the camera), centred, the ortho half-height fitted with a margin. The edit camera is a turntable orbit
+ * (azimuth / elevation around world up), so the turn adds no roll (a VIEW ROLL the user twisted in is kept, and the
+ * fit is measured on the rolled screen); the turn is the minimal one: the current
  * azimuth is kept when the normal points (nearly) straight up / down — where any azimuth is face-on — and the elevation
  * stays inside the orbit's limits. Faces whose normals don't mostly agree (|Σ area·n| / Σ area below `agree`) are not
  * turned to: null.
@@ -25,6 +26,8 @@ export interface FaceOnFramingOptions {
   maxElevation?: number;
   /** Agreement threshold (default {@link FACE_ON_AGREE}). */
   agree?: number;
+  /** The view's ROLL (radians, OrbitController.roll — kept by the turn): the fit is measured on the rolled screen. */
+  roll?: number;
 }
 
 export interface FaceOnFraming {
@@ -69,8 +72,12 @@ export function faceOnFraming(faces: ArrayLike<number>[], o: FaceOnFramingOption
   const f = [-d[0], -d[1], -d[2]];
   // right = forward × world up (the elevation never reaches ±90°, so it is never zero)
   const rl = Math.hypot(f[2], f[0]) || 1;
-  const rx = -f[2] / rl, ry = 0, rz = f[0] / rl;
-  const ux = ry * f[2] - rz * f[1], uy = rz * f[0] - rx * f[2], uz = rx * f[1] - ry * f[0];   // right × forward
+  const rx0 = -f[2] / rl, ry0 = 0, rz0 = f[0] / rl;
+  const ux0 = ry0 * f[2] - rz0 * f[1], uy0 = rz0 * f[0] - rx0 * f[2], uz0 = rx0 * f[1] - ry0 * f[0];   // right × forward
+  // the view keeps its roll through the turn: the screen axes are the turntable ones turned by it
+  const rc = Math.cos(o.roll ?? 0), rs = Math.sin(o.roll ?? 0);
+  const rx = rx0 * rc - ux0 * rs, ry = ry0 * rc - uy0 * rs, rz = rz0 * rc - uz0 * rs;
+  const ux = ux0 * rc + rx0 * rs, uy = uy0 * rc + ry0 * rs, uz = uz0 * rc + rz0 * rs;
   cx /= count; cy /= count; cz /= count;
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (const fc of faces) {

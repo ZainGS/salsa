@@ -2,6 +2,7 @@ import { RenderStrategy } from "../../renderer/render-strategies/render-strategy
 import { SceneGraph } from "../../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../../scene-graph/core/shape-factory";
 import { InteractionService } from "../interaction-service";
+import { recordVectorCreation } from "../vector-object-undo";
 import { RGBA } from "../../types/rgba";
 import { SDFText } from "../../scene-graph/shapes/sdf-text/sdf-text";
 import { SDFTextAtlas } from "../../scene-graph/shapes/sdf-text/sdf-text-atlas";
@@ -262,6 +263,9 @@ export class SdfTextDrawingService {
         if (this.activeText) {
             if (this.currentText.trim() === "") {
                 this.sceneGraph.root.removeChild(this.activeText);
+            } else {
+                // The typed text is ONE 2D undo step (an empty box was never kept, so it records nothing).
+                recordVectorCreation(this.interactionService.vectorUndo, this.sceneGraph.root, [this.activeText], 'Add text');
             }
             this.activeText.isTyping = false;
             this.activeText.endTyping();

@@ -371,6 +371,7 @@ export class ParticleEmitter3D extends Shape {
       scaleY: this.scaleY,
       scaleZ: this.scaleZ,
       name:   this.name,
+      visible: this.visible,   // the loader assigns data.visible: without it a reloaded emitter came back hidden
       config: this._cfg,
     };
   }

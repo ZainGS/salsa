@@ -4,7 +4,8 @@
  * Renders a small fixed-positioned 2D canvas anchored to a corner of the WebGPU
  * canvas, showing the live XYZ camera orientation.
  * - Drag anywhere on the widget to orbit the camera.
- * - Click an axis handle to snap to that standard view.
+ * - Click an axis handle to snap to that standard view — LEVEL (the view roll is reset to 0, like Blender's numpad
+ *   views); a drag keeps the roll.
  *
  * Visibility (2026-10-07, "the world gizmo stays on screen after leaving an illustration"): the overlay lives on
  * document.body, so it used to outlive its canvas — a host route change removed the WebGPU canvas and the gizmo kept
@@ -15,7 +16,7 @@
  */
 
 import { Camera3D } from './camera-3d';
-import { OrbitController } from './orbit-controller';
+import { OrbitController, unrollScreenDelta } from './orbit-controller';
 import { addZonelessListener, removeZonelessListener } from '../util/zoneless-listeners';
 import { RD } from './render-debug';
 
@@ -238,8 +239,10 @@ export class ViewGizmo {
         }
 
         if (this._hasMoved) {
-            this._orbit.azimuth   -= dx * this._orbit.orbitSpeed;
-            this._orbit.elevation += dy * this._orbit.orbitSpeed;
+            // Under a VIEW ROLL the drag is read on the rolled screen (like the orbit drag itself).
+            const [ux, uy] = unrollScreenDelta(dx, dy, this._orbit.effectiveRoll);
+            this._orbit.azimuth   -= ux * this._orbit.orbitSpeed;
+            this._orbit.elevation += uy * this._orbit.orbitSpeed;
             this._orbit.elevation  = Math.max(
                 this._orbit.minElevation,
                 Math.min(this._orbit.maxElevation, this._orbit.elevation),
@@ -258,6 +261,9 @@ export class ViewGizmo {
         if (!this._hasMoved) {
             const snap = this._hitSnap(e.offsetX, e.offsetY);
             if (snap) {
+                // An axis view is LEVEL (Blender's numpad views): the snap drops any VIEW ROLL. Dragging the gizmo
+                // (above) orbits and keeps the roll, like the canvas orbit.
+                this._orbit.setRoll(0);
                 this._orbit.setSpherical(snap[0], snap[1]);
                 this._onChanged();
                 this.draw();

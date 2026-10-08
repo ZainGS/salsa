@@ -41,6 +41,8 @@ export interface FramePose {
  *  Directions under `minElevation` (below the horizon / grazing) are lifted to `liftTo` radians of elevation. */
 export function framePose(b: Box3, dir: [number, number, number], opts: {
     mode: 'perspective' | 'orthographic'; fov: number; aspect: number; padding?: number; minElevation?: number; liftTo?: number;
+    /** The view's ROLL (radians, OrbitController.roll): the box is fitted on the rolled screen. Default 0. */
+    roll?: number;
 }): FramePose {
     const pad = opts.padding ?? 1.3;
     const cx = (b.minX + b.maxX) * 0.5, cy = (b.minY + b.maxY) * 0.5, cz = (b.minZ + b.maxZ) * 0.5;
@@ -72,11 +74,13 @@ export function framePose(b: Box3, dir: [number, number, number], opts: {
         let rx = -uz, rz = ux; const rl = Math.hypot(rx, rz);
         if (rl < 1e-6) { rx = 1; rz = 0; } else { rx /= rl; rz /= rl; }
         const upx = -(rz * uy), upy = rz * ux - rx * uz, upz = rx * uy;   // right × (−u)
+        const rc = Math.cos(opts.roll ?? 0), rs = Math.sin(opts.roll ?? 0);   // rolled screen: x' = x·c − y·s, y' = y·c + x·s
         dist = radius * 0.5;
         for (let c = 0; c < 8; c++) {
             const ox = (c & 1 ? b.maxX : b.minX) - cx, oy = (c & 2 ? b.maxY : b.minY) - cy, oz = (c & 4 ? b.maxZ : b.minZ) - cz;
             const along = ox * ux + oy * uy + oz * uz;        // toward the camera
-            const x = ox * rx + oz * rz, y = ox * upx + oy * upy + oz * upz;
+            const x0 = ox * rx + oz * rz, y0 = ox * upx + oy * upy + oz * upz;
+            const x = x0 * rc - y0 * rs, y = y0 * rc + x0 * rs;
             dist = Math.max(dist, Math.abs(x) / tanH + along, Math.abs(y) / tanV + along);
         }
     } else {

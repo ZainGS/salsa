@@ -397,23 +397,26 @@ export class SalsaViewerCore {
     }
 
     const swapTex = this.context.getCurrentTexture();
+    const swapView = swapTex.createView();
+    const depthView = this.depthTex.createView();
+    const keepDepth = this.renderer3D.bloomEnabled;   // the particle bloom capture depth-tests against it after the pass
     const encoder = this.device.createCommandEncoder();
 
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
-        view: swapTex.createView(),
+        view: swapView,
         clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1 },
         loadOp: 'clear',
         storeOp: 'store',
       }],
       depthStencilAttachment: {
-        view: this.depthTex.createView(),
+        view: depthView,
         depthClearValue: 1.0,
         depthLoadOp: 'clear',
-        depthStoreOp: 'discard',
+        depthStoreOp: keepDepth ? 'store' : 'discard',
         stencilClearValue: 0,
         stencilLoadOp: 'clear',
-        stencilStoreOp: 'discard',
+        stencilStoreOp: keepDepth ? 'store' : 'discard',
       },
     });
 
@@ -430,6 +433,7 @@ export class SalsaViewerCore {
     if (particles.length > 0) this.renderer3D.drawParticles(pass, particles, w, h);
 
     pass.end();
+    if (this.renderer3D.particleBloomPending) this.renderer3D.runParticleBloom(encoder, swapView, depthView);
     this.device.queue.submit([encoder.finish()]);
 
     if (this._preRenderCallbacks.length > 0) this.scheduleRender();

@@ -1,5 +1,6 @@
 // src/services/drawing/section-drawing-service.ts
 import { InteractionService } from "../interaction-service";
+import { recordVectorCreation } from "../vector-object-undo";
 import { SceneGraph } from "../../scene-graph/core/scene-graph";
 import { RenderStrategy } from "../../renderer/render-strategies/render-strategy";
 import { ShapeFactory } from "../../scene-graph/core/shape-factory";
@@ -117,6 +118,7 @@ export class SectionDrawingService {
 
     private finishDrawing() {
         this.isDrawing = false;
+        if (this.currentSection) recordVectorCreation(this.interactionService.vectorUndo, this.sceneGraph.root, [this.currentSection], 'Draw section');
         this.currentSection = null;
         this.interactionService.endInteractive();
         this.interactionService.onSceneGraphChanged.emit();

@@ -5,6 +5,7 @@ import { ShapeFactory } from "../../scene-graph/core/shape-factory";
 import { Pattern } from "../../scene-graph/shapes/pattern";
 import { RGBA } from "../../types/rgba";
 import { InteractionService } from "../interaction-service";
+import { recordVectorCreation } from "../vector-object-undo";
 import cursorUrl from '../../assets/washitape.cur?url';
 import { PatternAtlas } from "../../renderer/caches/texture-cache/pattern-atlas";
 import { CacheService } from "../cache-service";
@@ -135,6 +136,7 @@ export class PatternDrawingService {
 
   private finishDrawing() {
     this.isDrawing = false;
+    if (this.currentPattern) recordVectorCreation(this.interactionService.vectorUndo, this.sceneGraph.root, [this.currentPattern], 'Draw pattern');
     this.currentPattern = null;
     this.interactionService.endInteractive();
     this.interactionService.onSceneGraphChanged.emit();

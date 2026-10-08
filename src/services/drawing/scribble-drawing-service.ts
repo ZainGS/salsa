@@ -5,6 +5,7 @@ import { Scribble } from "../../scene-graph/shapes/scribble";
 import { RGBA } from "../../types/rgba";
 import { EraserService } from "./eraser-service";
 import { InteractionService } from "../interaction-service";
+import { recordVectorCreation } from "../vector-object-undo";
 import cursorUrl from '../../assets/drawing.cur?url';
 
 export class ScribbleDrawingService {
@@ -117,6 +118,7 @@ export class ScribbleDrawingService {
         this.isDrawing = false;
         if(this.currentScribble) {
             this.currentScribble!.isStaging = false;
+            recordVectorCreation(this.interactionService.vectorUndo, this.sceneGraph.root, [this.currentScribble], 'Draw stroke');
             this.currentScribble = null;
             this.interactionService.onSceneGraphChanged.emit();
         }

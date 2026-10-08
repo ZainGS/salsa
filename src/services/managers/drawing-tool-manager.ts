@@ -24,6 +24,7 @@ import type { SectionDrawingService } from '../drawing/section-drawing-service';
 import type { PolygonDrawingService } from '../drawing/polygon-drawing-service';
 import type { RasterLayerManager } from '../raster-layer-manager';
 import { hexToRgba } from '../../utils/color';
+import { recordVectorCreation } from '../vector-object-undo';
 import { RGBA } from '../../types/rgba';
 import { Shape } from '../../scene-graph/shapes/base/shape';
 import { Node } from '../../scene-graph/shapes/base/node';
@@ -96,7 +97,7 @@ export class DrawingToolManager {
 
     setStrokeColor(color: string): void { this._scribbleDrawingService.setStrokeColor(hexToRgba(color)); }
     setHighlightColor(color: string): void { this._highlightDrawingService.setStrokeColor(hexToRgba(color)); }
-    setShapeColor(color: string): void { this.shapeColor = hexToRgba(color); }
+    setShapeColor(color: string): void { this.shapeColor = hexToRgba(color); this._polygonDrawingService?.setFillColor(this.shapeColor); }
     getShapeColor(): RGBA { return this.shapeColor; }
     setTextColor(color: string): void { this._textDrawingService.setTextColor(hexToRgba(color)); }
     setStrokeWidth(width: number): void { this._scribbleDrawingService.setStrokeWidth(width * .005); }
@@ -107,27 +108,36 @@ export class DrawingToolManager {
 
     // ── Shape Creation ───────────────────────────────────────────────
 
+    /** Every creation here = ONE step on the 2D object undo stack (as ShapeManager's verbs). */
+    private _recordCreated(nodes: Node[]): void {
+        recordVectorCreation(this.ctx.interactionService.vectorUndo, this.ctx.sceneGraph.root, nodes, 'Add shape');
+    }
+
     createRectangle(x: number, y: number, w: number, h: number): void {
         const shape = this.ctx.shapeFactory.createRectangle(x, y, w, h, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1);
         this.ctx.sceneGraph.root.addChild(shape);
+        this._recordCreated([shape]);
         this.ctx.emitSceneGraphChanged();
     }
 
     createCircle(x: number, y: number, radius: number): void {
         const shape = this.ctx.shapeFactory.createCircle(x, y, radius, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1);
         this.ctx.sceneGraph.root.addChild(shape);
+        this._recordCreated([shape]);
         this.ctx.emitSceneGraphChanged();
     }
 
     createTriangle(x: number, y: number, w: number, h: number): void {
         const shape = this.ctx.shapeFactory.createTriangle(x, y, w, h, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1);
         this.ctx.sceneGraph.root.addChild(shape);
+        this._recordCreated([shape]);
         this.ctx.emitSceneGraphChanged();
     }
 
     createLine(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number) {
         const shape = this.ctx.shapeFactory.createLine(x1, y1, x2, y2, strokeColor, strokeWidth);
         this.ctx.sceneGraph.root.addChild(shape);
+        this._recordCreated([shape]);
         this.ctx.emitSceneGraphChanged();
         return shape;
     }
@@ -139,6 +149,7 @@ export class DrawingToolManager {
         line.arrowSize = arrowSize;
         line.markDirty();
         this.ctx.sceneGraph.root.addChild(line);
+        this._recordCreated([line]);
         this.ctx.emitSceneGraphChanged();
         return line;
     }
@@ -161,6 +172,7 @@ export class DrawingToolManager {
     createStickyNote(x: number, y: number, text = ''): void {
         const note = this.ctx.shapeFactory.createStickyNote(x, y, text);
         this.ctx.sceneGraph.root.addChild(note);
+        this._recordCreated([note]);
         this.ctx.emitSceneGraphChanged();
     }
 
@@ -168,6 +180,7 @@ export class DrawingToolManager {
         const scribble = this.ctx.shapeFactory.createScribble(x, y, strokeColor, strokeWidth);
         this._eraserService.scribbles.push(scribble);
         this.ctx.sceneGraph.root.addChild(scribble);
+        this._recordCreated([scribble]);
         this.ctx.emitSceneGraphChanged();
     }
 
@@ -175,24 +188,28 @@ export class DrawingToolManager {
         const highlight = this.ctx.shapeFactory.createHighlight(x, y, strokeColor, strokeWidth);
         this._eraserService.scribbles.push(highlight);
         this.ctx.sceneGraph.root.addChild(highlight);
+        this._recordCreated([highlight]);
         this.ctx.emitSceneGraphChanged();
     }
 
     createRegularPolygon(x: number, y: number, radius: number, sides: number, strokeColor: RGBA = { r: 0, g: 0, b: 0, a: 1 }, strokeWidth = 1): void {
         const polygon = this.ctx.shapeFactory.createRegularPolygon(x, y, radius, sides, this.shapeColor, strokeColor, strokeWidth);
         this.ctx.sceneGraph.root.addChild(polygon);
+        this._recordCreated([polygon]);
         this.ctx.emitSceneGraphChanged();
     }
 
     createPolygonFromPoints(points: { x: number; y: number }[], strokeColor: RGBA = { r: 0, g: 0, b: 0, a: 1 }, strokeWidth = 1): void {
         const polygon = this.ctx.shapeFactory.createPolygon(points, this.shapeColor, strokeColor, strokeWidth);
         this.ctx.sceneGraph.root.addChild(polygon);
+        this._recordCreated([polygon]);
         this.ctx.emitSceneGraphChanged();
     }
 
     createPresetPolygon(x: number, y: number, width: number, height: number, preset: PolygonPreset, strokeColor: RGBA = { r: 0, g: 0, b: 0, a: 1 }, strokeWidth = 1): void {
         const polygon = this.ctx.shapeFactory.createPresetPolygon(x, y, width, height, preset, this.shapeColor, strokeColor, strokeWidth);
         this.ctx.sceneGraph.root.addChild(polygon);
+        this._recordCreated([polygon]);
         this.ctx.emitSceneGraphChanged();
     }
 
@@ -238,9 +255,11 @@ export class DrawingToolManager {
 
     confirmPreviewShape(): void {
         if (this.currentPreviewShape) {
+            const placed = this.currentPreviewShape;
             this.currentPreviewShape.fillColor = this.shapeColor;
             this.currentPreviewShape.isPreview = false;
             this.currentPreviewShape = null;
+            this._recordCreated([placed]);
             this.ctx.endInteractive();
         }
         this.ctx.emitSceneGraphChanged();

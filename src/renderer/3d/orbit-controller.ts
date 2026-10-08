@@ -11,6 +11,9 @@
  *    freeLookNav = 1 finger free-look, 2 fingers pan + pinch dolly-through; altOrbitOnly = 1 finger left to the
  *    tool, 2 fingers orbit + pinch zoom, 3 fingers pan. `touchNavLock` makes 1 finger orbit in every scheme (and 2
  *    fingers pan + pinch). Double-tap → `onDoubleTap` (the host frames the tapped mesh / everything).
+ *  - VIEW ROLL: where the host allows it (`canRoll`: the edit views + 3D Free), the two-finger pan + pinch also
+ *    TWISTS — the change in the angle between the fingers rolls the view around its axis, snapping to level / ±90° /
+ *    180° with hysteresis (rollSnap). The orbit stays a turntable; drags are read on the rolled screen.
  *
  * Designed to be attached to a canvas and driven by pointer events.
  * Fully self-contained — no dependencies on the 2D renderer.
@@ -100,6 +103,49 @@ export function wheelSteps(st: { _wheelAcc: number }, deltaY: number, deltaMode 
   return n;
 }
 
+// ── VIEW ROLL (two-finger twist) ───────────────────────────────────
+// The orbit stays a TURNTABLE around world up (azimuth / elevation); the roll turns the view around its own axis on
+// top of it (the camera's up = the turntable up turned by `roll` toward the turntable right: up·cos + right·sin).
+// Positive roll tips the camera's head to the right, so the picture turns COUNTER-clockwise on screen.
+
+/** Wrap an angle to (−π, π]. */
+export function wrapAngle(a: number): number {
+  const TAU = Math.PI * 2;
+  let r = a % TAU;
+  if (r <= -Math.PI) r += TAU;
+  else if (r > Math.PI) r -= TAU;
+  return r === 0 ? 0 : r;   // (no −0)
+}
+
+/** Roll snap constants (radians). */
+export const OrbitControllerRoll = {
+  /** A free roll this close to 0° / ±90° / 180° snaps there. */
+  SNAP_IN: 5 * Math.PI / 180,
+  /** A snapped roll lets go once the twist is this far from the step. */
+  SNAP_OUT: 8 * Math.PI / 180,
+};
+
+/**
+ * Snap a twisting roll to level (0°) and the ±90° / 180° steps, with hysteresis. `raw` = the roll the twist alone would
+ * give; `snapped` = the step it is held at (null = free). A free roll within `snapIn` of a step snaps there; a held
+ * one stays until the twist goes past `snapOut` (> snapIn, so it doesn't jitter on the edge).
+ */
+export function rollSnap(raw: number, snapped: number | null, snapIn = OrbitControllerRoll.SNAP_IN, snapOut = OrbitControllerRoll.SNAP_OUT,
+    step = Math.PI / 2): { roll: number; snapped: number | null } {
+  if (snapped !== null && Math.abs(wrapAngle(raw - snapped)) <= snapOut) return { roll: snapped, snapped };
+  const k = wrapAngle(Math.round(raw / step) * step);
+  if (Math.abs(wrapAngle(raw - k)) <= snapIn) return { roll: k, snapped: k };
+  return { roll: wrapAngle(raw), snapped: null };
+}
+
+/** A screen drag (CSS px, x right, y down) on a view rolled by `roll`, expressed on the UNROLLED turntable screen — so
+ *  the turntable orbit / free-look turns the way the drag looks on the rolled screen. */
+export function unrollScreenDelta(dx: number, dy: number, roll: number): [number, number] {
+  if (!roll) return [dx, dy];   // (0 / unset)
+  const c = Math.cos(roll), s = Math.sin(roll);
+  return [dx * c - dy * s, dx * s + dy * c];
+}
+
 export class OrbitController {
   readonly camera: Camera3D;
 
@@ -187,6 +233,25 @@ export class OrbitController {
   private _navCand: { id: number; x: number; y: number; ev: object; touch: boolean } | null = null;
   /** The pointer of a pen nav drag this controller captured (released on its up). */
   private _navCaptured: number | null = null;
+
+  // ── VIEW ROLL (two-finger twist, 2026-10-08) ──
+  /** The view's roll around its own axis (radians, (−π, π]; see {@link wrapAngle}). Applied on top of the turntable
+   *  orbit only while {@link canRoll} says so (else the view stays level and this value just waits). Orbit, pan,
+   *  Frame and the pivot all keep it; it changes only by a two-finger TWIST ({@link twist}) or {@link setRoll} (the view gizmo's
+   *  axis click levels it: setRoll(0); a gizmo drag keeps it). */
+  roll = 0;
+  /** Live host check: this view may roll (the edit views + the 3D Free scene view). Absent / false = level: no twist,
+   *  the up vector stays world up (Play, City, the 2D illustration cameras). */
+  canRoll?: () => boolean;
+  /** The roll actually applied to the camera right now (0 while {@link canRoll} is off). */
+  get effectiveRoll(): number { return this.roll !== 0 && this.canRoll?.() ? this.roll : 0; }
+  /** The current twist: the roll without the snap, and the snap step it is held at (null = free). */
+  private _twistRaw = 0;
+  private _twistSnap: number | null = 0;
+  /** Fingers closer than this (CSS px) don't twist (their angle is noise). */
+  static TWIST_MIN_SPREAD_PX = 16;
+  /** Angle (screen, rad) of the line between the first two fingers at the last move. */
+  private _touchAng = 0;
 
   /** Movement (CSS px) under which a touch still counts as a TAP (double-tap detection). */
   static TAP_SLOP_PX = 10;
@@ -446,25 +511,61 @@ export class OrbitController {
     return 'orbit';
   }
 
-  /** Centroid of the active touches (+ the spread between the first two, for the pinch). */
-  private _touchCentroid(): { x: number; y: number; dist: number } {
+  /** Centroid of the active touches (+ the spread between the first two, for the pinch, and the screen angle of the
+   *  line from the first to the second, for the twist). */
+  private _touchCentroid(): { x: number; y: number; dist: number; ang: number } {
     let x = 0, y = 0, n = 0;
     let a: { x: number; y: number } | null = null, b: { x: number; y: number } | null = null;
     for (const p of this._touches.values()) {
       x += p.x; y += p.y; n++;
       if (!a) a = p; else if (!b) b = p;
     }
-    if (n === 0) return { x: 0, y: 0, dist: 0 };
-    return { x: x / n, y: y / n, dist: a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0 };
+    if (n === 0) return { x: 0, y: 0, dist: 0, ang: 0 };
+    return { x: x / n, y: y / n, dist: a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0, ang: a && b ? Math.atan2(b.y - a.y, b.x - a.x) : 0 };
   }
 
   /** (Re)start a multi-finger gesture from the current finger positions — no jump when a finger joins / leaves. */
   private _beginMultiTouch(): void {
     const c = this._touchCentroid();
-    this._touchMidX = c.x; this._touchMidY = c.y; this._touchDist = c.dist;
+    this._touchMidX = c.x; this._touchMidY = c.y; this._touchDist = c.dist; this._touchAng = c.ang;
     this._touchGesture = this._touches.size >= 3 ? 'three' : 'two';
     this._touchOne = null;
+    this._beginTwist();
     if (this._touchGesture === 'two' && this._twoFingerOrbits) this._beginOrbitGesture();
+  }
+
+  /** A twist starts from the current roll: held at its step when it sits exactly on one (0° / ±90° / 180°), so leaving
+   *  level needs the full {@link OrbitControllerRoll.SNAP_OUT} twist. */
+  private _beginTwist(): void {
+    this._twistRaw = this.roll;
+    const k = wrapAngle(Math.round(this.roll / (Math.PI / 2)) * (Math.PI / 2));
+    this._twistSnap = Math.abs(wrapAngle(this.roll - k)) < 1e-9 ? k : null;
+  }
+
+  /** The two-finger twist this view can roll with: two fingers that pan (not the tool modes' two-finger orbit). */
+  private get _twistRolls(): boolean { return this._touchGesture === 'two' && !this._twoFingerOrbits && !!this.canRoll?.(); }
+
+  /**
+   * One TWIST step: the line between the two fingers turned by `dAng` radians on screen (y down: + = clockwise). The
+   * picture turns with the fingers (around the screen centre, the view axis), snapping to level / ±90° / 180°
+   * ({@link rollSnap}). Public so hosts / tests can drive it; a no-op while {@link canRoll} is off.
+   */
+  twist(dAng: number): void {
+    if (!Number.isFinite(dAng) || dAng === 0 || !this.canRoll?.()) return;
+    this._twistRaw = wrapAngle(this._twistRaw - dAng);
+    const s = rollSnap(this._twistRaw, this._twistSnap);
+    this._twistSnap = s.snapped;
+    if (s.roll === this.roll) return;
+    this.roll = s.roll;
+    this.applySpherical();
+    this.onChange?.();
+  }
+
+  /** Set the roll directly (radians; wrapped) and apply it — e.g. a restored view. */
+  setRoll(roll: number): void {
+    this.roll = Number.isFinite(roll) ? wrapAngle(roll) : 0;
+    this._beginTwist();
+    this.applySpherical();
   }
 
   /** Two fingers ORBIT (altOrbitOnly tool modes outside the edit views); otherwise they pan. */
@@ -541,13 +642,15 @@ export class OrbitController {
     if (this._touchGesture !== 'two' && this._touchGesture !== 'three') return;
     const c = this._touchCentroid();
     const mdx = c.x - this._touchMidX, mdy = c.y - this._touchMidY;
-    const prevDist = this._touchDist;
-    this._touchMidX = c.x; this._touchMidY = c.y; this._touchDist = c.dist;
+    const prevDist = this._touchDist, prevAng = this._touchAng;
+    this._touchMidX = c.x; this._touchMidY = c.y; this._touchDist = c.dist; this._touchAng = c.ang;
     if (this._touchGesture === 'three') { this._touchPan(mdx, mdy); return; }
     // altOrbitOnly (tool modes): two fingers ORBIT (one finger is the tool's); otherwise two fingers PAN. Edit views
     // orbit with one finger off the selection, so there two fingers PAN.
     if (this._twoFingerOrbits) { if (mdx !== 0 || mdy !== 0) this.orbit(mdx, mdy); }
     else this._touchPan(mdx, mdy);
+    // …and TWIST (roll) in the same gesture: the change of the angle between the two fingers (no mode switch).
+    if (this._twistRolls && prevDist > OrbitController.TWIST_MIN_SPREAD_PX && c.dist > OrbitController.TWIST_MIN_SPREAD_PX) this.twist(wrapAngle(c.ang - prevAng));
     if (prevDist > 0 && c.dist > 0) this.pinch(c.dist / prevDist, c.x, c.y);
   }
 
@@ -605,8 +708,9 @@ export class OrbitController {
 
   /** FREE-LOOK: rotate the camera's look direction IN PLACE (yaw around world-up, pitch around its right axis) —
    *  the position stays put, the target swings. Re-syncs the orbit spherical state so a later Alt+LMB orbit is
-   *  consistent. freeLookNav only. */
+   *  consistent. freeLookNav only. Under a VIEW ROLL the drag is read on the rolled screen ({@link unrollScreenDelta}). */
   private lookAround(dx: number, dy: number): void {
+    [dx, dy] = unrollScreenDelta(dx, dy, this.effectiveRoll);
     const cam = this.camera;
     const px = cam.position[0], py = cam.position[1], pz = cam.position[2];
     let fx = cam.target[0] - px, fy = cam.target[1] - py, fz = cam.target[2] - pz;
@@ -671,9 +775,13 @@ export class OrbitController {
    *  ★ It used to only ADD the delta to the damping velocity and leave the turn to update() — and request no frame.
    *  On the on-demand renderer nothing drew while a slow pen drag ran (no frame → no update), the velocity piled up
    *  undecayed, and the first frame after the release (a tap / selection redraw) spun it all out at once, ×12.5
-   *  (1 / dampingFactor). With damping on, the movement is also recorded for the release fling ({@link _releaseOrbit}). */
+   *  (1 / dampingFactor). With damping on, the movement is also recorded for the release fling ({@link _releaseOrbit}).
+   *  VIEW ROLL: the drag is read on the ROLLED screen and handed to the turntable as the matching unrolled drag
+   *  ({@link unrollScreenDelta}) — dragging along the way world up looks on screen tilts, across it spins around world
+   *  up, so the picture follows the finger at any roll (and the fling, recorded unrolled, carries on the same way). */
   private orbit(dx: number, dy: number): void {
     if (dx === 0 && dy === 0) return;
+    [dx, dy] = unrollScreenDelta(dx, dy, this.effectiveRoll);
     this._turnTo(this.azimuth - dx * this.orbitSpeed, this.elevation + dy * this.orbitSpeed);
     this.applySpherical();
     this.onChange?.();
@@ -786,6 +894,18 @@ export class OrbitController {
       target[1] + this.radius * Math.sin(this.elevation),
       target[2] + this.radius * cosEl * Math.cos(this.azimuth),
     );
+    this._applyRollUp();
+  }
+
+  /** The camera's up vector for the current orbit + {@link effectiveRoll}: the turntable up (world up tilted with the
+   *  elevation) turned by the roll toward the turntable right. No roll = the camera's configured (world) up, exactly. */
+  private _applyRollUp(): void {
+    const r = this.effectiveRoll;
+    if (r === 0) { this.camera.resetUp(); return; }
+    const sa = Math.sin(this.azimuth), ca = Math.cos(this.azimuth), se = Math.sin(this.elevation), ce = Math.cos(this.elevation);
+    // turntable basis (eye at target + radius · (ce·sa, se, ce·ca)): right0 = (ca, 0, −sa), up0 = (−se·sa, ce, −se·ca)
+    const c = Math.cos(r), s = Math.sin(r);
+    this.camera.setUp(-se * sa * c + ca * s, ce * c, -se * ca * c - sa * s);
   }
 
   /** Zero damping velocities without changing the camera position. */
@@ -820,6 +940,7 @@ export class OrbitController {
     this.azimuth   = Math.atan2(dx, dz);
     this._azimuthVel   = 0;
     this._elevationVel = 0;
+    this._applyRollUp();   // the view keeps its roll (a lookAt — a Frame — set a level up)
   }
 
   toJSON() {
@@ -827,6 +948,7 @@ export class OrbitController {
       radius: this.radius,
       azimuth: this.azimuth,
       elevation: this.elevation,
+      roll: this.roll,
     };
   }
 }

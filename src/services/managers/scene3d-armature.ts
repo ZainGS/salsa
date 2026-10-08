@@ -128,6 +128,8 @@ export interface Scene3DArmatureHost {
     readonly cityModeActive: boolean;
     /** Round 8: 3D Play mode is running — every editor pointer path (hover pick, click-select, gizmo) is off. */
     readonly isPlaying: boolean;
+    /** The view state is 3D Free (free navigation) — the scene camera may VIEW ROLL there (two-finger twist). */
+    readonly freeView3D?: boolean;
     /** Grease Pencil draw / erase mode is on: the canvas press is the pencil's — no click-select / gizmo / hover. */
     readonly gpDrawActive?: boolean;
     readonly autoKey3D: boolean;
@@ -233,7 +235,7 @@ export class Scene3DArmature {
     /** The Edit Mesh / UV camera at its last exit — re-used when the same mesh's edit view is re-entered right away
      *  (a mode SWITCH: Edit Mesh ↔ UV editor exits one and enters the other in the same click), so switching modes
      *  keeps the user's camera instead of re-framing (UI review 2026-10-07 §3 #17). */
-    private _lastEditCam: { meshId: string; target: [number, number, number]; azimuth: number; elevation: number; radius: number; zoom: number; framedZoom: number; at: number } | null = null;
+    private _lastEditCam: { meshId: string; target: [number, number, number]; azimuth: number; elevation: number; roll?: number; radius: number; zoom: number; framedZoom: number; at: number } | null = null;
     /** The mode that owns the DECOUPLED edit camera (`_meshEditZoom`, the wheel interceptor, cameraOwnsView): Edit Mesh /
      *  UV ('meshEdit', enableMeshEditOrbit) or the Armature ('armature', enterArmatureMode3D / showBoneOverlay3D).
      *  The Armature used to follow the 2D zoom: framed on entry, then the next pan / zoom / Add Skeleton snapped the
@@ -742,6 +744,7 @@ export class Scene3DArmature {
         }
         this._orbitController?.detach();
         this._orbitController = undefined;
+        this.renderer3D?.getCamera?.()?.resetUp?.();   // no orbit, no view roll: whatever owns the camera next sees it level
     }
 
     /** Re-attach the 3D canvas input listeners to the CURRENT canvas after a canvas SWAP (the Shell↔illustration
@@ -784,6 +787,7 @@ export class Scene3DArmature {
             // A mode switch on the same mesh (Edit Mesh ↔ UV): the user's camera, exactly as they left it.
             cam.setTarget(kept.target[0], kept.target[1], kept.target[2]);
             this._orbitController.radius = kept.radius;
+            this._orbitController.roll = kept.roll ?? 0;   // the view roll too (applied by setSpherical)
             this._orbitController.setSpherical(kept.azimuth, kept.elevation);
             this._meshEditZoom = kept.zoom;
             this._editFramedZoom = kept.framedZoom;
@@ -844,7 +848,7 @@ export class Scene3DArmature {
         const oc = this._orbitController, camNow = this.renderer3D.getCamera();
         this._lastEditCam = this._meshEditCamMeshId && oc && this._meshEditZoom != null ? {
             meshId: this._meshEditCamMeshId, target: [camNow.target[0], camNow.target[1], camNow.target[2]],
-            azimuth: oc.azimuth, elevation: oc.elevation, radius: oc.radius, zoom: this._meshEditZoom,
+            azimuth: oc.azimuth, elevation: oc.elevation, roll: oc.roll, radius: oc.radius, zoom: this._meshEditZoom,
             framedZoom: this._editFramedZoom ?? this._meshEditZoom, at: nowMs(),
         } : null;
         this._meshEditCamMeshId = null;
@@ -1106,6 +1110,8 @@ export class Scene3DArmature {
         orb.isPanTool = () => this.isEditPanTool();
         // Edit views orbit around the selection's centre (else the subject's bounds centre); the scene: the target.
         orb.getOrbitPivot = () => this.getEditOrbitPivot();
+        // VIEW ROLL (two-finger twist): the edit views and the 3D Free scene view (see canViewRoll).
+        orb.canRoll = () => this.canViewRoll();
         // Ortho pinch: the decoupled creator view zooms `_meshEditZoom` (like its wheel interceptor); an illustration-
         // synced ortho view zooms the 2D view, which the per-frame sync turns into orthoSize.
         orb.onTouchZoom = (ratio, cx, cy) => {
@@ -1273,6 +1279,7 @@ export class Scene3DArmature {
         if (kept && this._orbitController) {
             cam.setTarget(kept.target[0], kept.target[1], kept.target[2]);
             this._orbitController.radius = kept.radius;
+            this._orbitController.roll = kept.roll ?? 0;   // the view roll too (applied by setSpherical)
             this._orbitController.setSpherical(kept.azimuth, kept.elevation);
             this._meshEditZoom = kept.zoom;
             this._editFramedZoom = kept.framedZoom;
@@ -1306,7 +1313,7 @@ export class Scene3DArmature {
         const oc = this._orbitController, cam = this.renderer3D.getCamera();
         this._lastEditCam = this._armCamMeshId && oc && this._meshEditZoom != null ? {
             meshId: this._armCamMeshId, target: [cam.target[0], cam.target[1], cam.target[2]],
-            azimuth: oc.azimuth, elevation: oc.elevation, radius: oc.radius, zoom: this._meshEditZoom,
+            azimuth: oc.azimuth, elevation: oc.elevation, roll: oc.roll, radius: oc.radius, zoom: this._meshEditZoom,
             framedZoom: this._editFramedZoom ?? this._meshEditZoom, at: nowMs(),
         } : null;
         this._editViewOwner = null;
@@ -1359,6 +1366,19 @@ export class Scene3DArmature {
         };
         const picked = this.getSelectedArmatureJoints().map(s => joints[s.jointIndex]);
         return (picked.length > 0 ? centre(picked) : null) ?? this.getMeshCenter(this._armCamMeshId) ?? centre(joints);
+    }
+
+    /**
+     * The view may ROLL (OrbitController.canRoll, the two-finger twist): the decoupled edit camera (Edit Mesh / UV /
+     * Armature) and the 3D Free scene view (perspective, the orbit owning the camera). Never in Play, City mode, the
+     * legacy illustration-welded armature / mesh views (their ortho offset is the 2D pan) or the 2D illustration
+     * cameras — there the camera stays level.
+     */
+    canViewRoll(): boolean {
+        if (this.host.isPlaying) return false;
+        if (this._editViewOwner !== null) return this._meshEditZoom != null;
+        if (this.host.cityModeActive || this._boneOverlayExplicit) return false;
+        return this.host.freeView3D === true && this._meshEditOrbitCenter !== null && this.renderer3D.getCamera().mode === 'perspective';
     }
 
     /** The host's Pan (hand) tool is on in an edit view (ShapeManager.enablePanningTool): a drag pans the edit camera

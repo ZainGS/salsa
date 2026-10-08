@@ -110,6 +110,21 @@ export class MeshEditManager {
     this._selection = null;
   }
 
+  /** The mesh's geometry was regenerated under Edit Mesh (its Add Mesh generator settings): rebuild the edit topology
+   *  from it when the regenerate dropped it, and clear the element selection and "adjust last operation" (their
+   *  indices belong to the old topology). */
+  rebuildEditTopology(meshId: string): void {
+    const mesh = this._getMesh(meshId);
+    if (!mesh) return;
+    if (!mesh.editMesh) this.makeEditable(meshId);
+    this._lastOp = null;
+    if (this._selection?.meshId === meshId) {
+      this._selection.vertices.clear();
+      this._selection.edges.clear();
+      this._selection.faces.clear();
+    }
+  }
+
   /**
    * Build the mesh's EditMesh from the geometry it renders (docs/specs/edit-mesh-topology.md §2): coincident vertices
    * WELDED (a cube = 8 vertices, so dragging a corner moves all 3 faces), triangle pairs merged into quads (a cube = 6
@@ -151,7 +166,11 @@ export class MeshEditManager {
       // them onto the recompiled geometry instead of collapsing faces to the origin.
       mesh.captureRestSkin();
     } else {
+      // Recompiling the unedited topology is still the generator's output: its live settings keep applying until an
+      // edit actually changes the mesh (mesh-generator.ts).
+      const generated = mesh.generatorApplies;
       mesh.syncFromEditMesh();
+      if (generated) mesh.stampGenerator();
     }
     return true;
   }

@@ -712,6 +712,13 @@ export class Renderer3D {
   // ── Bloom pass ─────────────────────────────────────────────────────────────
   private _bloomPass:            BloomPass | null = null;
   private _bloomCapturePipeline: PipelineHandle<GPURenderPipeline> | null = null;
+  // DEPTH-TESTED particle bloom (2026-10-08): drawParticles only records what to bloom; the host runs the capture /
+  // blur / composite (runParticleBloom) once the scene pass has ended, with that pass's depth loaded read-only.
+  private _bloomPendingN = 0;                                   // emitters to capture (0 = nothing pending)
+  private _bloomPendingW = 0;
+  private _bloomPendingH = 0;
+  private readonly _bloomPendingActive: ParticleEmitter3D[] = [];
+  private readonly _bloomPendingFirst: number[] = [];
 
   // ── Skinned mesh rendering ─────────────────────────────────────────────────
   // Per-mesh skinned vertex buffer (72-byte stride: standard 48 + joints + weights + pad).
@@ -3288,6 +3295,44 @@ export class Renderer3D {
     this._bloomPass?.destroy();
     this._bloomPass = null;
     this._bloomCapturePipeline = null;
+    this._clearBloomPending();
+  }
+
+  /** True when this frame's drawParticles left particle bloom to run: the host ends the scene pass, calls
+   *  runParticleBloom (or runLowResParticleBloom for the lo-res target), and resumes. */
+  get particleBloomPending(): boolean { return this._bloomPendingN > 0; }
+
+  /** Run the pending particle bloom into `encoder`: capture the particles depth-tested against `depthView` (the
+   *  scene pass's depth24plus-stencil8 attachment, read-only — so particles behind geometry don't glow through it),
+   *  blur, then composite additively onto `colorView` (the scene colour, this renderer's format). Both targets are the
+   *  size drawParticles was given. No-op when nothing is pending; always consumes the pending state. */
+  runParticleBloom(encoder: GPUCommandEncoder, colorView: GPUTextureView, depthView: GPUTextureView): void {
+    const n = this._bloomPendingN;
+    const bloom = this._bloomPass, pipe = this._bloomCapturePipeline?.get();
+    if (n > 0 && bloom && pipe && bloom.ready() && this._particleInstBuf && this._particleSceneUniBuf) {
+      bloom.ensureTextures(this._bloomPendingW, this._bloomPendingH);
+      bloom.captureAndBlur(
+        encoder, depthView, this.sceneDepthRangeMin(),
+        this._particleInstBuf, this._particleSceneUniBuf, this._particleBGL0!, this._particleBGL1!, pipe,
+        this._bloomPendingActive, this._bloomPendingFirst, this.pipeline.activeSampler,
+        this._atlasTexture ?? this.getDefaultWhiteTex(),
+      );
+      bloom.composite(encoder, colorView, this.pipeline.activeSampler);
+    }
+    this._clearBloomPending();
+  }
+
+  /** runParticleBloom for the lo-res / resolution-scaled scene target (call after its pass ends, before
+   *  endLowResScene). */
+  runLowResParticleBloom(encoder: GPUCommandEncoder): void {
+    const lf = this._loFiPass, tex = lf?.colorTexture, depth = lf?.depthView;
+    if (tex && depth) this.runParticleBloom(encoder, tex.createView(), depth);
+    else this._clearBloomPending();
+  }
+
+  private _clearBloomPending(): void {
+    this._bloomPendingN = 0;
+    this._bloomPendingActive.length = 0;   // drop the emitter references
   }
 
   /** The particle bloom's settings, or null when it's off (for persistence). */
@@ -5882,9 +5927,11 @@ export class Renderer3D {
    *
    * Pipeline is created lazily on first call. All emitters are packed into one GPU storage
    * buffer and issued as separate draw(6, count, 0, firstInstance) calls — one per emitter.
+   * With particle bloom on, the caller must end the pass afterwards and run runParticleBloom when
+   * particleBloomPending (the depth-tested capture needs the finished scene depth).
    */
   drawParticles(pass: GPURenderPassEncoder, emitters: ParticleEmitter3D[], canvasWidth: number, canvasHeight: number): void {
-    void canvasWidth; void canvasHeight; // reserved for future per-particle screen-space effects
+    this._clearBloomPending();   // only THIS frame's particles may bloom (canvasWidth / Height = the pass size, for it)
 
     // Build GPU data for every visible emitter, resolving animated texture layers.
     // Must happen after drawMeshes() so the atlas layer map is current.
@@ -5949,24 +5996,18 @@ export class Renderer3D {
     // P2: particle pipeline still compiling → no particles this frame (they appear when it lands).
     const particlePipe = this._particlePipeline!.get();
     if (!particlePipe) return;
-    // ── Bloom capture + blur (before main pass draws) ──────────────
-    this._bloomCapturePipeline ??= createBloomCapturePipeline(this.device, this._particleBGL0!, this._particleBGL1!);
-    const bloomCapturePipe = this._bloomPass ? this._bloomCapturePipeline.get() : null;
-    const bloomReady = !!(this._bloomPass && bloomCapturePipe && this._bloomPass.ready());   // P2: whole bloom skipped while compiling
-    if (this._bloomPass && bloomReady) {
-      this._bloomPass.ensureTextures(canvasWidth, canvasHeight);
-      const atlasTex = this._atlasTexture ?? this.getDefaultWhiteTex();
-      this._bloomPass.captureAndBlur(
-        this._particleInstBuf!,
-        this._particleSceneUniBuf!,
-        this._particleBGL0!,
-        this._particleBGL1!,
-        bloomCapturePipe!,
-        active,
-        firstInstances,
-        this.pipeline.activeSampler,
-        atlasTex,
-      );
+    // ── Particle bloom: recorded here, run by the host after the scene pass ends (runParticleBloom) ──
+    // The capture depth-tests against this pass's depth, which can't be read while the pass is open.
+    if (this._bloomPass) {
+      this._bloomCapturePipeline ??= createBloomCapturePipeline(this.device, this._particleBGL0!, this._particleBGL1!);
+      // P2: the whole bloom is skipped while its pipelines compile
+      if (this._bloomCapturePipeline.get() && this._bloomPass.ready()) {
+        const pa = this._bloomPendingActive, pf = this._bloomPendingFirst;
+        pa.length = 0; pf.length = 0;
+        for (let i = 0; i < active.length; i++) { pa.push(active[i]); pf.push(firstInstances[i]); }
+        this._bloomPendingN = pa.length;
+        this._bloomPendingW = canvasWidth; this._bloomPendingH = canvasHeight;
+      }
     }
 
     // ── Main pass draw ─────────────────────────────────────────────
@@ -5977,11 +6018,6 @@ export class Renderer3D {
     for (let i = 0; i < active.length; i++) {
       if (active[i].activeCount <= 0) continue;   // no live particles yet → skip; Dawn warns on a 0-instance draw
       pass.draw(6, active[i].activeCount, 0, firstInstances[i]);
-    }
-
-    // ── Bloom composite (additive, drawn after particles) ──────────
-    if (this._bloomPass && bloomReady) {
-      this._bloomPass.drawComposite(pass, this.pipeline.activeSampler);
     }
   }
 

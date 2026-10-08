@@ -178,6 +178,81 @@ describe('ViewGizmo — visibility follows its canvas', () => {
     });
 });
 
+// ── VIEW ROLL: an axis click gives a LEVEL view; a drag keeps the roll ──────────────────────────────────────────────
+const DEG = Math.PI / 180;
+function rolledGizmo(rollDeg: number) {
+    const cam = new Camera3D({ position: [0, 1, 6], target: [0, 0, 0] });
+    const orbit = new OrbitController(cam, { enableDamping: false });
+    orbit.canRoll = () => true;                         // an edit view / 3D Free
+    orbit.setRoll(rollDeg * DEG);
+    let changed = 0;
+    const g = new ViewGizmo(fakeEl() as unknown as HTMLCanvasElement, cam, orbit, () => { changed++; });
+    const el = g.element as unknown as FakeEl;
+    const fire = (type: string, x: number, y: number) => {
+        const e = new Event(type);
+        Object.assign(e, { pointerId: 1, clientX: x, clientY: y, offsetX: x, offsetY: y });
+        el.dispatchEvent(e);
+    };
+    /** Where the gizmo draws an axis handle right now (gizmo-local px; 60 px widget: centre 30, spoke 21). */
+    const handle = (dir: [number, number, number]): [number, number] => {
+        const p = (g as unknown as { _project(d: [number, number, number]): { sx: number; sy: number } })._project(dir);
+        return [30 + p.sx * 21, 30 + p.sy * 21];
+    };
+    /** Camera up in VIEW terms: how far it leans from world +Y (0 = level). */
+    const upLean = () => Math.acos(Math.max(-1, Math.min(1, cam.up[1] / Math.hypot(cam.up[0], cam.up[1], cam.up[2]))));
+    return { cam, orbit, g, fire, handle, upLean, changed: () => changed };
+}
+
+describe('ViewGizmo — axis click levels the view roll, a drag keeps it', () => {
+    it('clicking an axis (+X → right view) snaps there LEVEL: roll 0, camera up = world up', () => {
+        const t = rolledGizmo(40);
+        expect(t.upLean()).toBeGreaterThan(30 * DEG);   // rolled to start with
+        const [x, y] = t.handle([1, 0, 0]);
+        t.fire('pointerdown', x, y);
+        t.fire('pointerup', x, y);
+        expect(t.orbit.roll).toBe(0);
+        expect(t.orbit.azimuth).toBeCloseTo(Math.PI / 2, 6);
+        expect(t.orbit.elevation).toBeCloseTo(0, 6);
+        expect(Array.from(t.cam.up)).toEqual([0, 1, 0]);
+        expect(t.changed()).toBe(1);
+        // The level view stays level for the next orbit (the roll is gone, not just hidden).
+        t.orbit.setSpherical(0.3, 0.2);
+        expect(Array.from(t.cam.up)).toEqual([0, 1, 0]);
+    });
+
+    it('every axis handle (incl. -axis and the top / bottom views) levels the roll', () => {
+        for (const d of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]] as [number, number, number][]) {
+            const t = rolledGizmo(-90);
+            const [x, y] = t.handle(d);
+            t.fire('pointerdown', x, y);
+            t.fire('pointerup', x, y);
+            expect(t.orbit.roll, `axis ${d}`).toBe(0);
+            expect(t.orbit.effectiveRoll, `axis ${d}`).toBe(0);
+        }
+    });
+
+    it('DRAGGING the gizmo orbits and keeps the roll', () => {
+        const t = rolledGizmo(40);
+        const az0 = t.orbit.azimuth;
+        const [x, y] = t.handle([1, 0, 0]);             // a drag that starts ON a handle is still a drag
+        t.fire('pointerdown', x, y);
+        t.fire('pointermove', x + 10, y);
+        t.fire('pointermove', x + 20, y + 4);
+        t.fire('pointerup', x + 20, y + 4);
+        expect(t.orbit.roll).toBeCloseTo(40 * DEG, 9);
+        expect(t.orbit.azimuth).not.toBeCloseTo(az0, 3);
+        expect(t.upLean()).toBeGreaterThan(30 * DEG);
+    });
+
+    it('a click that misses every handle does nothing (roll kept)', () => {
+        const t = rolledGizmo(40);
+        t.fire('pointerdown', 1, 1);                    // the clipped corner: no handle there
+        t.fire('pointerup', 1, 1);
+        expect(t.orbit.roll).toBeCloseTo(40 * DEG, 9);
+        expect(t.changed()).toBe(0);
+    });
+});
+
 // ── Scene3DArmature ownership ───────────────────────────────────────────────────────────────────────────────────────
 function armature() {
     let canvas = fakeEl() as unknown as HTMLCanvasElement;

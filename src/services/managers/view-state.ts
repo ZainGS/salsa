@@ -16,7 +16,8 @@ export type CameraMode = 'ortho2D' | 'perspective2D' | 'free3D';
 /** Locked 2D camera pose (shared by ortho2D + perspective2D) — pan + zoom, no orbit. */
 export interface FlatCamPose { panX: number; panY: number; zoom: number; }
 /** Free 3D camera pose (free3D) — an orbit vantage that persists so returning restores where you were. */
-export interface FreeCamPose { target: [number, number, number]; radius: number; yaw: number; pitch: number; projection: 'orthographic' | 'perspective'; }
+/** `roll` = the VIEW ROLL (radians, the two-finger twist; OrbitController.roll). Optional: older saves have none → level. */
+export interface FreeCamPose { target: [number, number, number]; radius: number; yaw: number; pitch: number; roll?: number; projection: 'orthographic' | 'perspective'; }
 
 export interface ViewState {
   target: ViewTarget;

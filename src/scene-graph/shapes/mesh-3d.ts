@@ -19,6 +19,7 @@ import { RGBA } from '../../types/rgba';
 import type { Vec2 } from '../../types/interaction';
 import type { Mesh3DKeyframeTracks } from '../../types/keyframe-3d';
 import type { EditMesh } from './edit-mesh';
+import { cloneGeneratorRecord, type MeshGeneratorRecord } from './mesh-generator';
 
 /**
  * A submesh occupies a contiguous index range within the parent mesh's
@@ -422,6 +423,20 @@ export class Mesh3D extends Shape {
 
   /** EditMesh authoring structure. Present when this mesh was created via makeEditable(). */
   public editMesh: EditMesh | null = null;
+
+  /** The parametric generator this mesh came from (Add Mesh › Cylinder… / Circle… / Polygon… / …) — its live settings
+   *  regenerate it in place (ShapeManager.setMeshGenerator3D). Persisted. See mesh-generator.ts. */
+  public generator: MeshGeneratorRecord | null = null;
+  /** Bumped whenever the SOURCE geometry is replaced or rewritten (setGeometry, a primitive rebuild, the Edit Mesh drag
+   *  patch) — not by modifier-stack changes. The generator stamps it after each generation. */
+  public sourceGeometryVersion = 0;
+  /** sourceGeometryVersion right after the generator's last output (-1 = never stamped). */
+  private _generatorStamp = -1;
+  /** Fingerprint of the generator's last output (geometry + vertex colours): an undo that puts that exact geometry back
+   *  (undoing the first Edit Mesh change) makes the settings apply again. */
+  private _generatorFp: number | null = null;
+  private _fpVersion = -1;
+  private _fpValue = 0;
 
   /**
    * Forces a specific geometry pool key for this mesh, overriding the default derived key.
@@ -842,7 +857,7 @@ export class Mesh3D extends Shape {
     // without needing a separate GLB buffer.
     this._meshConfig.geometry = this._geometry;
     this._meshPrimitive = 'custom';
-    Mesh3D.geometryEpoch++; this.geometryVersion++;
+    Mesh3D.geometryEpoch++; this.geometryVersion++; this.sourceGeometryVersion++;
     this._modifiedGeom = null; // source changed — invalidate modifier cache
     this.gpuDirty = true;
     this.stateDirty = true;
@@ -871,7 +886,7 @@ export class Mesh3D extends Shape {
   patchFromEditMesh(): number[] | null {
     if (!this.editMesh || this.modifiers.length > 0 || this.baseVertices) return null;
     const spans = this.editMesh.patchCompiledPositions(this._geometry);
-    if (spans && spans.length > 0) { Mesh3D.geometryEpoch++; this.geometryVersion++; }
+    if (spans && spans.length > 0) { Mesh3D.geometryEpoch++; this.geometryVersion++; this.sourceGeometryVersion++; }
     return spans;
   }
 
@@ -879,6 +894,50 @@ export class Mesh3D extends Shape {
     this._meshPrimitive = primitive;
     if (config) Object.assign(this._meshConfig, config);
     this.rebuildGeometry();
+  }
+
+  /** Rebuild from scratch as the parametric `primitive` (a generator's live settings): drops the edit topology, any
+   *  custom geometry and the vertex colours, then generates from `config`. */
+  resetToPrimitive(primitive: Exclude<MeshPrimitive, 'custom'>, config: Partial<Mesh3DConfig>): void {
+    this.editMesh = null;
+    this.vertexColors = null;
+    delete this._meshConfig.geometry;
+    this.setPrimitive(primitive, config);
+  }
+
+  /** The generator settings still describe this mesh: it has a record and its geometry is still the generator's last
+   *  output — nothing else changed it (Edit Mesh, a UV unwrap, vertex colours …), or an undo put that output back; and
+   *  no blend shapes / material slots (they index the old triangles). */
+  get generatorApplies(): boolean {
+    const g = this.generator;
+    if (!g || g.edited === true || this.blendShapes.length > 0 || this.submeshes.length > 0) return false;
+    if (this._generatorStamp === this.sourceGeometryVersion) return true;
+    return this._generatorFp !== null && this._geometryFingerprint() === this._generatorFp;
+  }
+
+  /** The current geometry IS the generator's output (after generating, after a reload, or after a recompile that
+   *  changed nothing — entering Edit Mesh). */
+  stampGenerator(): void {
+    this._generatorStamp = this.sourceGeometryVersion;
+    this._generatorFp = this._geometryFingerprint();
+  }
+
+  /** FNV-1a over the source geometry's vertex / index bits + vertex colours (memoised per sourceGeometryVersion). */
+  private _geometryFingerprint(): number {
+    if (this._fpVersion === this.sourceGeometryVersion) return this._fpValue;
+    let h = 0x811c9dc5;
+    const mix = (a: ArrayLike<number>): void => {
+      h = Math.imul(h ^ a.length, 16777619);
+      for (let i = 0; i < a.length; i++) h = Math.imul(h ^ a[i], 16777619);
+    };
+    const bits = (f: Float32Array): Uint32Array => new Uint32Array(f.buffer, f.byteOffset, f.length);
+    const g = this._geometry;
+    if (g?.vertices) mix(g.vertices instanceof Float32Array ? bits(g.vertices) : g.vertices);
+    if (g?.indices) mix(g.indices);
+    if (this.vertexColors) mix(bits(this.vertexColors));
+    this._fpVersion = this.sourceGeometryVersion;
+    this._fpValue = h >>> 0;
+    return this._fpValue;
   }
 
   private rebuildGeometry(): void {
@@ -923,7 +982,7 @@ export class Mesh3D extends Shape {
         // Keep existing geometry
         break;
     }
-    Mesh3D.geometryEpoch++; this.geometryVersion++;
+    Mesh3D.geometryEpoch++; this.geometryVersion++; this.sourceGeometryVersion++;
     this._modifiedGeom = null; // source changed — invalidate modifier cache
     this.gpuDirty = true;
     this.stateDirty = true;
@@ -1124,6 +1183,8 @@ export class Mesh3D extends Shape {
       // sharp / seam flags. The saved geometry above is only its render mesh — re-deriving the topology from it on
       // reload would lose the n-gons and the seams. restoreMeshState rebuilds the EditMesh from this.
       ...(this.editMesh && this.persistsEditMesh() ? { editMesh: this.editMesh.toJSON() } : {}),
+      // Generator settings (mesh-generator.ts): `edited` freezes them for good once the geometry changed outside them.
+      ...(this.generator ? { generator: { ...cloneGeneratorRecord(this.generator), ...(this.generatorApplies ? {} : { edited: true }) } } : {}),
       ...(this.modifiers.length > 0 ? { modifiers: this.modifiers } : {}),
       // ATTACHED DECALS (P6, 2026-09-15): a decal container rides as a CHILD of its target mesh,
       // but Mesh3D.toJSON historically emitted no children at all — so attached decals never

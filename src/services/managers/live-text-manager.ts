@@ -2,6 +2,7 @@ import { markRasterCompositeDirty } from '../../renderer/raster/core/raster-comp
 import type { ManagerContext } from './manager-context';
 import { LiveTextNode, type LiveTextOptions } from '../../scene-graph/shapes/live-text';
 import { TextEffectEngine, type TextEffectConfig } from '../../renderer/raster/effects/text-effect-engine';
+import { recordVectorCreation } from '../vector-object-undo';
 
 /** Collaborators the LiveText subsystem needs that don't live on {@link ManagerContext}. */
 export interface LiveTextHost {
@@ -26,6 +27,12 @@ export class LiveTextManager {
     private _editingLiveTextId: string | null = null;
     /** The node ID of the LiveTextNode currently being edited, or null (for the facade's input-active checks). */
     get editingLiveTextId(): string | null { return this._editingLiveTextId; }
+
+    /** Nodes created empty whose creation is not on the 2D undo stack yet (see createLiveText). */
+    private readonly _unrecorded = new WeakSet<LiveTextNode>();
+    private _recordCreated(node: LiveTextNode): void {
+        recordVectorCreation(this.interactionService?.vectorUndo, this.sceneGraph.root, [node], 'Add text');
+    }
 
     // ── Bridges so the moved method bodies stay byte-for-byte identical ─
     private get shapeFactory() { return this.ctx.shapeFactory; }
@@ -87,6 +94,10 @@ export class LiveTextManager {
         const vecLayer = this._activeVectorLayerId ?? this.rasterLayerManager?.getDefaultVectorLayerId();
         if (vecLayer) node.layerId = vecLayer;
         this.sceneGraph.root.addChild(node);
+        // ONE 2D undo step for the new text. A node created EMPTY (the Text tool's click — typing follows) is
+        // recorded when its first editing session ends with text in it; left empty it is removed, recording nothing.
+        if (node.text.trim()) this._recordCreated(node);
+        else this._unrecorded.add(node);
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(node);
         this.emitSceneGraphChanged();
@@ -219,6 +230,7 @@ export class LiveTextManager {
             // Auto-remove a node left empty (clicked but never typed, or fully backspaced)
             // so the canvas doesn't accumulate invisible empty text boxes.
             if (!node.text.trim()) {
+                this._unrecorded.delete(node);
                 this.interactionService.deselectNode(node);
                 if (node.parent) node.parent.removeChild(node);
                 else this.sceneGraph.root.removeChild(node);
@@ -227,6 +239,7 @@ export class LiveTextManager {
                 this.scheduleRender();
                 return;
             }
+            if (this._unrecorded.delete(node)) this._recordCreated(node);   // the text it was created for is in
             // Deselect the node so Frogmarks' next click doesn't
             // mistake it for a hit-test result and re-enter editing
             // instead of creating a new node.

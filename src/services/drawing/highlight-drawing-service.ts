@@ -6,6 +6,7 @@ import { Highlight } from "../../scene-graph/shapes/highlight";
 import { RGBA } from "../../types/rgba";
 import { EraserService } from "./eraser-service";
 import { InteractionService } from "../interaction-service";
+import { recordVectorCreation } from "../vector-object-undo";
 import cursorUrl from '../../assets/highlighter.cur?url';
 
 export class HighlightDrawingService {
@@ -115,6 +116,7 @@ export class HighlightDrawingService {
         this.isDrawing = false;
         if(this.currentHighlight) {
             this.currentHighlight.isStaging = false;
+            recordVectorCreation(this.interactionService.vectorUndo, this.sceneGraph.root, [this.currentHighlight], 'Draw highlight');
             this.currentHighlight = null;
             this.interactionService.onSceneGraphChanged.emit();
         }

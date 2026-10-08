@@ -1,16 +1,15 @@
 /**
- * BloomPass — screen-space bloom for particle emitters.
+ * BloomPass — screen-space bloom for particle emitters ("Particles only" Bloom).
  *
- * Draw order (all submitted before the main render pass encoder):
- *   1. captureParticles() — renders particles into rgba16float bloom source
- *   2. runBlur()          — separable 9-tap Gaussian H then V
+ * Runs AFTER the scene pass that drew the particles has ended (the host splits / ends that pass), all recorded into
+ * the host's command encoder:
+ *   1. capture   — re-draws the particles into an rgba16float bloom source, DEPTH-TESTED against the scene depth
+ *                  (attached read-only), so particles hidden behind geometry don't glow through it
+ *   2. blur      — separable 9-tap Gaussian H then V
+ *   3. composite — fullscreen additive blend onto the scene colour (a load pass)
  *
- * Then inside the main render pass:
- *   3. drawComposite()    — fullscreen additive blend of the blurred result
- *
- * The host (Renderer3D) calls captureParticles+runBlur via a separate
- * GPUCommandEncoder that is queue.submit()'d before the main pass encoder,
- * so the GPU sees the blurred texture when the composite quad is drawn.
+ * (Before 2026-10-08 the capture ran on its own encoder submitted before the main pass, with no depth attachment —
+ * the current frame's depth didn't exist yet — so particles behind walls glowed through them.)
  */
 
 import { GPUPipelineCache, PIPELINE_PRIORITY, type PipelineHandle } from '../core/gpu-pipeline-cache';
@@ -116,10 +115,16 @@ export class BloomPass {
   }
 
   /**
-   * Submit bloom capture + blur as a separate command encoder (before main pass).
+   * Record the bloom capture + blur into `encoder` (after the scene pass that drew the particles has ended).
+   * `sceneDepthView` = that pass's depth (depth24plus-stencil8, same size as the bloom textures), loaded read-only so
+   * the capture depth-tests like the visible particles did; `depthRangeMin` = the scene viewport's minDepth (the
+   * ortho depth remap, Renderer3D.sceneDepthRangeMin — 0 = the plain [0, 1]).
    * Caller must have already filled particleInstBuf and particleSceneUniBuf.
    */
   captureAndBlur(
+    encoder:              GPUCommandEncoder,
+    sceneDepthView:       GPUTextureView,
+    depthRangeMin:        number,
     particleInstBuf:      GPUBuffer,
     particleSceneUniBuf:  GPUBuffer,
     particleBGL0:         GPUBindGroupLayout,
@@ -133,7 +138,6 @@ export class BloomPass {
     if (!this.sourceTexture || !this.pingTexture) return;
 
     const device = this.device;
-    const encoder = device.createCommandEncoder({ label: 'BloomCapture' });
 
     // ── 1. Capture particles into sourceTexture ──────────────────────
     // PERF (audit 5.8): rebuild bg0/bg1 only when the caller-owned resources
@@ -173,18 +177,22 @@ export class BloomPass {
     const bg1 = this._captureBG1;
 
     const capturePass = encoder.beginRenderPass({
+      label: 'BloomCapture',
       colorAttachments: [{
         view: this.sourceTexture.createView(),
         clearValue: { r: 0, g: 0, b: 0, a: 0 },
         loadOp: 'clear',
         storeOp: 'store',
       }],
+      // The scene depth, read-only: occluded particles fail the test exactly as they did in the scene pass.
+      depthStencilAttachment: { view: sceneDepthView, depthReadOnly: true, stencilReadOnly: true },
     });
+    if (depthRangeMin > 0) capturePass.setViewport(0, 0, this._w, this._h, depthRangeMin, 1);
     capturePass.setPipeline(capturePipeline);
     capturePass.setBindGroup(0, bg0);
     capturePass.setBindGroup(1, bg1);
     for (let i = 0; i < active.length; i++) {
-      capturePass.draw(6, active[i].activeCount, 0, firstInstances[i]);
+      if (active[i].activeCount > 0) capturePass.draw(6, active[i].activeCount, 0, firstInstances[i]);
     }
     capturePass.end();
 
@@ -208,11 +216,19 @@ export class BloomPass {
 
     // ── 3. V-blur: ping → source ──────────────────────────────────────
     this._runBlurPass(encoder, this._vBlurBG, this.sourceTexture);
-
-    device.queue.submit([encoder.finish()]);
   }
 
-  /** Draw the blurred bloom additively in the currently open main render pass. */
+  /** Composite the blurred bloom additively onto `colorView` (a load pass of its own; the host's format). */
+  composite(encoder: GPUCommandEncoder, colorView: GPUTextureView, nearestSampler: GPUSampler): void {
+    const pass = encoder.beginRenderPass({
+      label: 'BloomComposite',
+      colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
+    });
+    this.drawComposite(pass, nearestSampler);
+    pass.end();
+  }
+
+  /** Draw the blurred bloom additively in an open render pass (colour target only, the host's format). */
   private readonly _paramsScratch = new Float32Array(2);   // reused (was a fresh array every frame)
   drawComposite(pass: GPURenderPassEncoder, nearestSampler: GPUSampler): void {
     const composite = this._compositePipeline?.get();
@@ -354,6 +370,7 @@ export class BloomPass {
 /**
  * Build the bloom particle capture pipeline.
  * Separate from BloomPass constructor because it needs the caller's BGL0/BGL1.
+ * Depth-tests (no write) against the scene depth like the particle pipeline (depth24plus-stencil8, 'less').
  */
 export function createBloomCapturePipeline(
   device: GPUDevice,
@@ -380,6 +397,7 @@ export function createBloomCapturePipeline(
       }],
     },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'less' },
     label: 'BloomCapturePipeline',
-  }, undefined, 'bloom.capture');   // KEYED (D-R3): a bloom toggle reuses it
+  }, undefined, 'bloom.capture.depth');   // KEYED (D-R3): a bloom toggle reuses it
 }

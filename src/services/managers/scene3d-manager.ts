@@ -208,6 +208,7 @@ import { Scene3DCharacter, applyMatte } from './scene3d-character';
 import { Scene3DArmature } from './scene3d-armature';
 import type { GpPoint, GpStroke3D } from '../../types/grease-pencil-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
+import { cloneGeneratorRecord, readGeneratorRecord } from '../../scene-graph/shapes/mesh-generator';
 import { Modifier } from '../../scene-graph/shapes/modifiers';
 import { ArrayToolController, ArrayToolMode } from './array-tool-controller';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
@@ -725,7 +726,7 @@ export class Scene3DManager {
     constructor(ctx: ManagerContext) {
         this.ctx = ctx;
         this.playSettings.onChange = () => this._applyPlaySettingsLive();   // live eye height / auto-player toggle
-        this._particles = new Scene3DParticles(ctx);
+        this._particles = new Scene3DParticles(ctx, (cmd) => this._undoManager.push(cmd));   // emitter delete = one undo step
         this._gp = new Scene3DGreasePencil(ctx);
         this._blendShapes = new Scene3DBlendShapes(ctx, { getMesh: (id) => this.getMesh(id),
             patchVertices: (m, start, count) => this.patchMeshVertices3D(m, start, count) });   // Character v2 Phase 1.5
@@ -852,6 +853,7 @@ export class Scene3DManager {
             weightPaint: this._weightPaint,
             get cityModeActive() { return self._cityModeActive; },
             get isPlaying() { return self._playing; },
+            get freeView3D() { return self._viewState?.cameraMode === 'free3D'; },   // (= deriveViewRules().freeNavigation, no alloc per frame)
             get gpDrawActive() { return self._gpDrawActive; },
             get autoKey3D() { return self.autoKey3D; },
             flaRestTransforms: this._animation.flaRestTransforms,
@@ -1772,6 +1774,7 @@ export class Scene3DManager {
         const cam = this.renderer3D.getCamera();
         const f = faceOnFraming(faces, {
             azimuth: orb.azimuth, aspect: cam.aspect, padding, minHalf, minElevation: orb.minElevation, maxElevation: orb.maxElevation,
+            roll: orb.effectiveRoll,   // fit on the ROLLED screen (Frame keeps the roll)
         });
         if (!f) return false;
         return this._armature.animateEditView({ target: f.target, azimuth: f.azimuth, elevation: f.elevation, zoom: 1 / f.halfHeight }, ms);
@@ -2077,6 +2080,7 @@ export class Scene3DManager {
                 v.freeCam = {
                     target: [cam.target[0], cam.target[1], cam.target[2]],
                     radius: orbit.radius, yaw: orbit.azimuth, pitch: orbit.elevation,
+                    ...(orbit.roll !== 0 ? { roll: orbit.roll } : {}),   // the view roll (absent = level, as old saves)
                     projection: cam.mode === 'orthographic' ? 'orthographic' : 'perspective',
                 };
             }
@@ -4428,7 +4432,7 @@ export class Scene3DManager {
                 orbit.radius    = Math.max(orbit.minRadius, Math.min(orbit.maxRadius, f.radius));
                 orbit.azimuth   = f.yaw;
                 orbit.elevation = Math.max(orbit.minElevation, Math.min(orbit.maxElevation, f.pitch));
-                orbit.applySpherical();
+                orbit.setRoll(typeof f.roll === 'number' ? f.roll : 0);   // the view roll (old saves: none → level); applies
             } else {
                 orbit?.syncFromCamera();
                 this.frameAllMeshes(1.4);
@@ -5217,7 +5221,7 @@ export class Scene3DManager {
         const orbit = this._armature.getOrbitController();
         orbit?.stopDamping();
         const pose = framePose(b, [cam.position[0] - cam.target[0], cam.position[1] - cam.target[1], cam.position[2] - cam.target[2]],
-            { mode: cam.mode, fov: cam.fov, aspect: cam.aspect, padding: opts.padding ?? 1.1 });   // tight 8-corner box fit + 10% margin
+            { mode: cam.mode, fov: cam.fov, aspect: cam.aspect, padding: opts.padding ?? 1.1, roll: orbit?.effectiveRoll ?? 0 });   // tight 8-corner box fit + 10% margin
         cam.autoFar = true;
         cam.sceneRadius = Math.max(pose.radius, this._gridRadiusFloor());
         this._setDollyFloor(pose.radius);
@@ -5798,6 +5802,9 @@ export class Scene3DManager {
         if (state.keyframeTracks) mesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
         if (state.frameLinkAnimation3D) this.setFrameLinkAnimation3D(mesh.id, state.frameLinkAnimation3D);
         this._restoreSubmeshes(mesh, state.submeshes);
+        // Generator settings (Add Mesh › Cylinder… etc.): the restored geometry is what they last made, unless saved edited
+        mesh.generator = readGeneratorRecord(state.generator);
+        if (mesh.generator) mesh.stampGenerator();
 
         // Restore blend shapes
         if (state.blendShapes?.length > 0) {
@@ -8838,6 +8845,12 @@ export class Scene3DManager {
         // round-trip here serialized every track + submesh material per duplicate).
         copy.keyframeTracks = cloneKeyframeTracks(src.keyframeTracks);
         copy.submeshes = src.submeshes.map(cloneSubmesh3D);
+        // The copy keeps live generator settings while they still describe the source (its eye parts stay the source's)
+        if (src.generatorApplies && src.generator) {
+            const { parts: _parts, ...gen } = cloneGeneratorRecord(src.generator);
+            copy.generator = gen;
+            copy.stampGenerator();
+        }
 
         const parent = src.parent ?? this.ctx.sceneGraph.root;
         parent.addChild(copy);

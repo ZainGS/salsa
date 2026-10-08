@@ -113,7 +113,8 @@ export class EraserService {
         if (!this.isEnabled || this.isErasing || event.button !== 0) return;
 
         this.interactionService.updateWorldMatrix();
-        this.scribblesInView = this.scribbles.filter(s => s.visible);
+        // Attached only: a stroke taken off by Ctrl+Z stays registered (redo re-attaches the same instance) but can't be erased.
+        this.scribblesInView = this.scribbles.filter(s => s.visible && !!s.parent);
         //console.log("reference broken");
         this.isErasing = true;
         this.eraseIsTouch = event.pointerType === 'touch';

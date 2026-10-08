@@ -2287,7 +2287,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           }
         };
     
-        const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+        let passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);   // (let: split for particle bloom)
         
         // Render background
         //this.renderBackground(passEncoder);
@@ -2714,6 +2714,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           this.draw3DParticles(loResPass, aboveRasterNodes, lrW, lrH);
           this.draw3DGp(loResPass, aboveRasterNodes, lrW, lrH);
           loResPass.end();
+          if (r3d.particleBloomPending) r3d.runLowResParticleBloom(loResEncoder);   // depth-tested particle bloom
           r3d.endLowResScene(loResEncoder, this.canvas.width, this.canvas.height);   // temporal AA: un-jitter + velocity + resolve
           this.device.queue.submit([loResEncoder.finish()]);
           r3d.blitLowResToPass(passEncoder);
@@ -2729,6 +2730,26 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           this.draw3DMeshes(passEncoder, aboveRasterNodes, this.canvas.width, this.canvas.height, true);
           this.draw3DParticles(passEncoder, aboveRasterNodes);
           this.draw3DGp(passEncoder, aboveRasterNodes);
+          if (r3d.particleBloomPending) {
+            // PARTICLE BLOOM: its capture depth-tests against this pass's depth, which can't be read while the pass is
+            // open — end it, run the bloom (capture / blur / additive composite), and resume with load / load.
+            passEncoder.end();
+            r3d.runParticleBloom(commandEncoder, offscreenView, this.interactionService.depthTextureView);
+            passEncoder = commandEncoder.beginRenderPass({
+              label: 'MainPassAfterBloom',
+              colorAttachments: [{ view: offscreenView, loadOp: 'load', storeOp: 'store' }],
+              depthStencilAttachment: {
+                view: this.interactionService.depthTextureView,
+                depthLoadOp: 'load', depthStoreOp: 'store', stencilLoadOp: 'load', stencilStoreOp: 'store',
+              },
+            });
+            // Restore the state the rest of the main pass inherited: the scene depth range, and the artboard scissor
+            // the vector-only branch above set (the raster branch left the full canvas).
+            r3d.applySceneDepthRange(passEncoder, this.canvas.width, this.canvas.height);
+            if (artboard && !hidden2DUnder3D && !(this.renderMode === 'raster' && this.pipelineManager)) {
+              passEncoder.setScissorRect(artboard.x, artboard.y, artboard.w, artboard.h);
+            }
+          }
         }
         } // end scene3DVisible gate
 

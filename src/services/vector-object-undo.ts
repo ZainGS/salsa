@@ -60,6 +60,21 @@ export interface VectorUndoHooks {
     clearSelection?(): void;
 }
 
+/**
+ * Record vector objects that were just CREATED (already attached under `root`) as ONE undo step: undo detaches
+ * them, redo re-attaches the very same instances — so layer, style, z-order and ids all come back exactly. The
+ * one helper every creation path (shape tools, freeform polygon, text, balloons, notes, SVG import, …) goes
+ * through. Takes the stack structurally (begin + commit) so a host-less test stub works too; null = no stack.
+ * Returns whether a step was pushed (false when none of `nodes` is attached).
+ */
+export function recordVectorCreation(
+    undo: Pick<VectorObjectUndo, 'begin' | 'commit'> | null | undefined,
+    root: Node, nodes: Iterable<Node>, description: string,
+): boolean {
+    if (!undo) return false;
+    return undo.commit(undo.begin(root, []), description, nodes);
+}
+
 export class VectorObjectUndo {
     private readonly _mgr = new UndoManager3D(50);
 
@@ -178,21 +193,27 @@ export class VectorObjectUndo {
     }
 
     private _apply(root: Node, state: Map<string, { node: Node; snap: NodeSnap | null }>, keepSelection = false): void {
-        // Pass 1: detach everything absent in this state.
-        for (const { node, snap } of state.values()) {
-            if (snap === null && node.parent) node.parent.removeChild(node);
+        // Pass 1: detach everything absent in this state — the TOP of each absent subtree only: a child whose parent
+        // leaves too rides along inside it, so a compound shape (sticky note, speech balloon, group) keeps its own
+        // children in their order instead of being taken apart and re-assembled.
+        const gone = new Set<Node>();
+        for (const { node, snap } of state.values()) if (snap === null) gone.add(node);
+        for (const node of gone) {
+            if (node.parent && !gone.has(node.parent)) node.parent.removeChild(node);
         }
 
-        // Pass 2: attach + retransform, looping so parents attach before their children.
-        const pending = [...state.values()].filter((e) => e.snap !== null);
+        // Pass 2: attach + retransform, looping so parents attach before their children (in watch-set order, so
+        // siblings attach in document order).
+        let pending = [...state.values()].filter((e) => e.snap !== null);
         let guard = pending.length + 1;
         while (pending.length > 0 && guard-- > 0) {
-            for (let i = pending.length - 1; i >= 0; i--) {
-                const { node, snap } = pending[i];
+            const waiting: typeof pending = [];
+            for (const entry of pending) {
+                const { node, snap } = entry;
                 const parent = snap!.parentId === ''
                     ? root
                     : state.get(snap!.parentId)?.node ?? this._findById(root, snap!.parentId);
-                if (!parent || (parent !== root && !this._attached(root, parent))) continue;   // parent not placed yet
+                if (!parent || (parent !== root && !this._attached(root, parent))) { waiting.push(entry); continue; }   // parent not placed yet
                 if (node.parent !== parent) {
                     node.parent?.removeChild(node);
                     parent.addChild(node);
@@ -209,8 +230,8 @@ export class VectorObjectUndo {
                 }
                 node.updateLocalMatrix();
                 if (node instanceof Shape) node.markDirty();
-                pending.splice(i, 1);
             }
+            pending = waiting;
         }
 
         // Pass 3: restored Groups recompute bounds (deepest-first), then re-assert EVERY snapped

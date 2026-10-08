@@ -13,12 +13,17 @@
 
 import { ParticleEmitter3D, ParticleEmitterConfig, ParticlePreset } from '../../scene-graph/shapes/particle-emitter-3d';
 import type { ManagerContext } from './manager-context';
+import type { Command3D } from './undo-manager-3d';
+
+/** The 3D undo step a removed emitter records (hosts match it, e.g. an outliner Undo toast). */
+export const DELETE_PARTICLE_EMITTER_UNDO = 'Delete particle emitter';
 
 export class Scene3DParticles {
   private _emitters = new Map<string, ParticleEmitter3D>();
   private _tickCb: (() => boolean) | null = null;
 
-  constructor(private readonly ctx: ManagerContext) {}
+  /** `pushUndo` (the scene's 3D undo stack) makes remove() ONE undoable step, like a mesh delete. */
+  constructor(private readonly ctx: ManagerContext, private readonly pushUndo?: (cmd: Command3D) => void) {}
 
   /**
    * Add a CPU-simulated billboard particle emitter to the 3D scene. Returns the emitter's ID. Pass `preset`
@@ -45,7 +50,24 @@ export class Scene3DParticles {
   remove(id: string): void {
     const emitter = this._emitters.get(id);
     if (!emitter) return;
-    this._emitters.delete(id);
+    const parent = emitter.parent ?? this.ctx.sceneGraph.root;
+    this._detach(emitter);
+    this.pushUndo?.({
+      description: DELETE_PARTICLE_EMITTER_UNDO,
+      undo: () => {
+        this._emitters.set(emitter.id, emitter);
+        parent.addChild(emitter);
+        emitter.gpuDirty = true;
+        this.ctx.emitSceneGraphChanged();
+        this._ensureTick();
+        this.ctx.scheduleRender();
+      },
+      redo: () => { if (this._emitters.get(emitter.id) === emitter) this._detach(emitter); },
+    });
+  }
+
+  private _detach(emitter: ParticleEmitter3D): void {
+    this._emitters.delete(emitter.id);
     emitter.parent?.removeChild(emitter);
     this.ctx.emitSceneGraphChanged();
 
@@ -67,6 +89,8 @@ export class Scene3DParticles {
 
   /** Re-register a ParticleEmitter3D node that was restored from JSON. */
   registerRestored(emitter: ParticleEmitter3D): void {
+    // Saves from before toJSON wrote `visible` restore it as undefined (= hidden, never drawn or icon-picked)
+    if (typeof emitter.visible !== 'boolean') emitter.visible = true;
     this._emitters.set(emitter.id, emitter);
     this._ensureTick();
   }

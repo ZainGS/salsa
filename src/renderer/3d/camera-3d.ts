@@ -37,6 +37,8 @@ export class Camera3D {
   private _position: vec3;
   private _target: vec3;
   private _up: vec3;
+  /** The configured up (world +Y by default): {@link lookAt} and {@link resetUp} return to it. */
+  private _baseUp: vec3;
   private _fov: number;
   private _near: number;
   private _far: number;
@@ -61,6 +63,7 @@ export class Camera3D {
     this._position = vec3.fromValues(...(config.position ?? [0, 0, 3]));
     this._target = vec3.fromValues(...(config.target ?? [0, 0, 0]));
     this._up = vec3.fromValues(...(config.up ?? [0, 1, 0]));
+    this._baseUp = vec3.clone(this._up);
     this._fov = config.fov ?? (Math.PI / 4);        // 45°
     this._near = config.near ?? 0.01;
     this._far = config.far ?? 100;
@@ -146,12 +149,27 @@ export class Camera3D {
     this.markViewDirty();
   }
 
+  /** An UPRIGHT look from eye to target: the up vector returns to the configured one (world +Y). VIEW ROLL belongs to
+   *  the orbit controller (it sets a rolled up with {@link setUp} on every applySpherical / syncFromCamera), so every
+   *  other camera owner that places the camera with lookAt (Play, the 2D illustration sync, look-through, the city
+   *  framings) gets a level view, never a roll left over from the orbit. */
   lookAt(eyeX: number, eyeY: number, eyeZ: number,
          tgtX: number, tgtY: number, tgtZ: number): void {
     vec3.set(this._position, eyeX, eyeY, eyeZ);
     vec3.set(this._target, tgtX, tgtY, tgtZ);
+    vec3.copy(this._up, this._baseUp);
     this.markViewDirty();
   }
+
+  /** Set the up vector (the orbit controller's VIEW ROLL). An unchanged value doesn't dirty the view. */
+  setUp(x: number, y: number, z: number): void {
+    if (this._up[0] === x && this._up[1] === y && this._up[2] === z) return;
+    vec3.set(this._up, x, y, z);
+    this.markViewDirty();
+  }
+
+  /** Back to the configured (unrolled) up vector. */
+  resetUp(): void { this.setUp(this._baseUp[0], this._baseUp[1], this._baseUp[2]); }
 
   // ── Matrix computation ─────────────────────────────────────────
 
