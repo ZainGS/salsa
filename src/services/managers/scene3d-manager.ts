@@ -198,6 +198,9 @@ import { Scene3DAnimation, IDLE_JOINTS, type LegIdleMode as _LegIdleMode } from 
 import type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta } from '../../types/kitbash-3d';
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import { Scene3DGreasePencil } from './scene3d-grease-pencil';
+import { GpDrawGesture, type GpGestureSample } from './gp-draw-gesture';
+import { GpSurfacePlacer, type GpSurfaceHit } from './gp-surface-placer';
+import { claimPointerEvent } from '../../renderer/util/pointer-claims';
 import { Scene3DBlendShapes } from './scene3d-blend-shapes';
 import { Scene3DCloth } from './scene3d-cloth';
 import { Scene3DRibbons } from './scene3d-ribbons';
@@ -553,7 +556,16 @@ export class Scene3DManager {
     private _gpDrawActive = false;
     private _gpDrawGpId: string | null = null;
     private _gpDrawLayerId: string | null = null;
-    private _gpDrawPointerDown = false;
+    /** The draw / erase pointer state machine while draw mode is on (gp-draw-gesture.ts). */
+    private _gpGesture: GpDrawGesture | null = null;
+    /** The gesture in progress: what it edits and the stroke list before it (its undo step). */
+    private _gpGestureEdit: {
+        gpId: string; layerId: string; frame: number | undefined; erase: boolean; before: GpStroke3D[];
+        /** Surface placement: projects this stroke's samples onto its target mesh. */
+        placer?: GpSurfacePlacer;
+        /** Partial erase: the previous eraser sample (client px) — the path between samples is erased too. */
+        lastErase?: { x: number; y: number };
+    } | null = null;
     private _gpDrawListenerCleanup?: () => void;
     private _gpDrawColor: { r: number; g: number; b: number; a: number } = { r: 0, g: 0, b: 0, a: 1 };
     private _gpDrawBaseWidth = 0.02;
@@ -564,6 +576,13 @@ export class Scene3DManager {
     private _gpDrawEraseRadius = 0.1;
     private _gpDrawDepth = 0.5;
     private _gpDrawDepthMode: 'surface' | 'fixed' = 'surface';
+    /** Where a stroke goes: ONTO the mesh under the pen ('surface', default) or on the flat sheet in front of the
+     *  tapped face ('sheet'). */
+    private _gpDrawPlacement: 'surface' | 'sheet' = 'surface';
+    /** Surface placement: how far (world units) points are lifted off the surface along its normal. */
+    private _gpSurfaceOffset = 0.01;
+    /** The eraser: 'partial' cuts away only what is under it (strokes split), 'stroke' removes whole strokes. */
+    private _gpDrawEraseMode: 'partial' | 'stroke' = 'partial';
     private _gpDrawLastDepth = 0.5;
     private _gpDrawSavedGizmoMode: GizmoMode | undefined;
 
@@ -833,6 +852,7 @@ export class Scene3DManager {
             weightPaint: this._weightPaint,
             get cityModeActive() { return self._cityModeActive; },
             get isPlaying() { return self._playing; },
+            get gpDrawActive() { return self._gpDrawActive; },
             get autoKey3D() { return self.autoKey3D; },
             flaRestTransforms: this._animation.flaRestTransforms,
             getMesh: (id) => this.getMesh(id),
@@ -7279,9 +7299,16 @@ export class Scene3DManager {
         return this._gp.createObject(name, skeletonId);
     }
 
-    /** Remove a GpObject3D from the scene. */
+    /** Remove a GpObject3D from the scene (one 3D undo step puts it back with all its drawings). */
     removeGpObject(gpId: string): void {
-        this._gp.removeObject(gpId);
+        if (this._gpDrawGpId === gpId) this.exitGpDrawMode();
+        const node = this._gp.removeObject(gpId);
+        if (!node) return;
+        this._undoManager.push({
+            description: 'Delete Grease Pencil object',
+            undo: () => this._gp.reattachObject(node),
+            redo: () => { this._gp.removeObject(node.id); },
+        });
     }
 
     getGpObject(gpId: string): GpObject3D | null {
@@ -7297,9 +7324,16 @@ export class Scene3DManager {
         return this._gp.addLayer(gpId, name);
     }
 
-    /** Remove a layer from a GpObject3D. */
+    /** Remove a layer from a GpObject3D (one 3D undo step puts it back). */
     removeGpLayer(gpId: string, layerId: string): void {
-        this._gp.removeLayer(gpId, layerId);
+        if (this._gpDrawGpId === gpId && this._gpDrawLayerId === layerId) this.exitGpDrawMode();
+        const removed = this._gp.removeLayer(gpId, layerId);
+        if (!removed) return;
+        this._undoManager.push({
+            description: 'Delete Grease Pencil layer',
+            undo: () => this._gp.restoreLayer(gpId, removed.layer, removed.index),
+            redo: () => { this._gp.removeLayer(gpId, layerId); },
+        });
     }
 
     /**
@@ -7321,9 +7355,14 @@ export class Scene3DManager {
         this._gp.addPoint(x, y, z, pressure, opacity);
     }
 
-    /** Finalize the active GP stroke. Strokes with < 2 points are discarded. */
-    endGpStroke(): void {
-        this._gp.endStroke();
+    /** Finalize the active GP stroke. Strokes with < 2 points are discarded. Returns whether the stroke was kept. */
+    endGpStroke(): boolean {
+        return this._gp.endStroke();
+    }
+
+    /** Abandon the active GP stroke (removed as if never drawn). */
+    cancelGpStroke(): void {
+        this._gp.cancelStroke();
     }
 
     /**
@@ -7332,6 +7371,11 @@ export class Scene3DManager {
      */
     eraseGpStrokes(gpId: string, layerId: string, worldPos: [number, number, number], radius: number, frame?: number): void {
         this._gp.eraseStrokes(gpId, layerId, worldPos, radius, frame);
+    }
+
+    /** Whether a GP layer has a keyframe at `frame`. */
+    hasGpKeyframe(gpId: string, layerId: string, frame: number): boolean {
+        return this._gp.hasKeyframe(gpId, layerId, frame);
     }
 
     /** Snapshot the current base strokes of a layer as a keyframe. */
@@ -7411,60 +7455,92 @@ export class Scene3DManager {
             }
         };
 
-        const onClick = (e: PointerEvent) => {
-            if (e.button !== 0) return;
-            const rect = canvas.getBoundingClientRect();
-            const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
-            if (!hit) {
-                this._gpDrawPlane = null;
-                this._pushGpOverlay();
-                this.ctx.scheduleRender();
-                return;
+        // The face is picked on a TAP — press + release within GP_FACE_TAP_SLOP_PX, one pointer, plain left / pen tip /
+        // finger — never on the press: a drag that starts on the mesh (an orbit, a pinch's first finger, an Alt-orbit)
+        // used to lock a plane where it began.
+        let press: { id: number; x: number; y: number; multi: boolean } | null = null;
+        const touchesDown = new Set<number>();
+        const onDown = (e: PointerEvent) => {
+            if (e.pointerType === 'touch') {
+                touchesDown.add(e.pointerId);
+                if (touchesDown.size > 1) { if (press) press.multi = true; return; }
             }
-            const [px, py, pz] = hit.hitPoint;
-            const [nx, ny, nz] = hit.faceNormal;
-            // Compute face radius: max distance from centroid to any triangle vertex.
-            const mesh = this.getMesh(hit.meshId);
-            let faceRadius = 0.1;
-            if (mesh?.geometry) {
-                const geom = mesh.geometry;
-                const stride = 12; // FLOATS_PER_VERT
-                const idx3 = hit.triangleIndex * 3;
-                for (let k = 0; k < 3; k++) {
-                    const vi = geom.indices[idx3 + k] * stride;
-                    // Transform vertex to world space
-                    const lx = geom.vertices[vi], ly = geom.vertices[vi+1], lz = geom.vertices[vi+2];
-                    const m = mesh.localMatrix as Float32Array;
-                    const wx = m[0]*lx + m[4]*ly + m[8]*lz  + m[12];
-                    const wy = m[1]*lx + m[5]*ly + m[9]*lz  + m[13];
-                    const wz = m[2]*lx + m[6]*ly + m[10]*lz + m[14];
-                    const dx = wx - px, dy = wy - py, dz = wz - pz;
-                    faceRadius = Math.max(faceRadius, Math.sqrt(dx*dx + dy*dy + dz*dz));
-                }
-            }
-            // Default offset scales with the face so strokes clear the surface on
-            // meshes of any size — a fixed 0.003 z-fought / hid behind the surface on
-            // larger meshes. Reuse the user's tuned offset if a plane was already locked.
-            const offset = this._gpDrawPlane?.offset ?? Math.max(0.012, faceRadius * 0.08);
-            this._gpDrawPlane = {
-                faceCenter:    [px, py, pz],
-                point:         [px + nx * offset, py + ny * offset, pz + nz * offset],
-                normal:        [nx, ny, nz],
-                meshId:        hit.meshId,
-                triangleIndex: hit.triangleIndex,
-                faceRadius,
-                offset,
-            };
-            this._pushGpOverlay();
-            this.ctx.scheduleRender();
+            if (e.button !== 0 || e.altKey || e.isPrimary === false) { press = null; return; }
+            press = { id: e.pointerId, x: e.clientX, y: e.clientY, multi: false };
+        };
+        const onUp = (e: PointerEvent) => {
+            if (e.pointerType === 'touch') touchesDown.delete(e.pointerId);
+            const p = press;
+            if (!p || p.id !== e.pointerId) return;
+            press = null;
+            if (p.multi || Math.hypot(e.clientX - p.x, e.clientY - p.y) > Scene3DManager.GP_FACE_TAP_SLOP_PX) return;
+            this._lockGpPlaneAt(e.clientX, e.clientY, canvas.getBoundingClientRect());
+        };
+        const onCancel = (e: PointerEvent) => {
+            if (e.pointerType === 'touch') touchesDown.delete(e.pointerId);
+            if (press?.id === e.pointerId) press = null;
         };
 
         addZonelessListener(canvas, 'pointermove', onMove);
-        addZonelessListener(canvas, 'pointerdown', onClick, { capture: true });
+        addZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
+        addZonelessListener(canvas, 'pointerup', onUp, { capture: true });
+        addZonelessListener(canvas, 'pointercancel', onCancel, { capture: true });
         this._gpFaceSelectCleanup = () => {
             removeZonelessListener(canvas, 'pointermove', onMove);
-            removeZonelessListener(canvas, 'pointerdown', onClick, { capture: true });
+            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
+            removeZonelessListener(canvas, 'pointerup', onUp, { capture: true });
+            removeZonelessListener(canvas, 'pointercancel', onCancel, { capture: true });
         };
+    }
+
+    /** Movement (CSS px) under which a face-select press still counts as a tap. */
+    static GP_FACE_TAP_SLOP_PX = 8;
+
+    /** Face-select: lock the drawing plane on the mesh face under a client point (a miss clears it). */
+    private _lockGpPlaneAt(clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }): void {
+        const hit = this.pickFromClient3D(clientX, clientY, rect);
+        if (!hit) {
+            this._gpDrawPlane = null;
+            this._pushGpOverlay();
+            this.ctx.scheduleRender();
+            return;
+        }
+        const [px, py, pz] = hit.hitPoint;
+        const [nx, ny, nz] = hit.faceNormal;
+        // Compute face radius: max distance from centroid to any triangle vertex.
+        const mesh = this.getMesh(hit.meshId);
+        let faceRadius = 0.1;
+        if (mesh?.geometry) {
+            const geom = mesh.geometry;
+            const stride = 12; // FLOATS_PER_VERT
+            const idx3 = hit.triangleIndex * 3;
+            for (let k = 0; k < 3; k++) {
+                const vi = geom.indices[idx3 + k] * stride;
+                // Transform vertex to world space
+                const lx = geom.vertices[vi], ly = geom.vertices[vi+1], lz = geom.vertices[vi+2];
+                const m = mesh.localMatrix as Float32Array;
+                const wx = m[0]*lx + m[4]*ly + m[8]*lz  + m[12];
+                const wy = m[1]*lx + m[5]*ly + m[9]*lz  + m[13];
+                const wz = m[2]*lx + m[6]*ly + m[10]*lz + m[14];
+                const dx = wx - px, dy = wy - py, dz = wz - pz;
+                faceRadius = Math.max(faceRadius, Math.sqrt(dx*dx + dy*dy + dz*dz));
+            }
+        }
+        // Default offset scales with the face so strokes clear the surface on
+        // meshes of any size — a fixed 0.003 z-fought / hid behind the surface on
+        // larger meshes. Reuse the user's tuned offset if a plane was already locked.
+        const offset = this._gpDrawPlane?.offset ?? Math.max(0.012, faceRadius * 0.08);
+        this._gpDrawPlane = {
+            faceCenter:    [px, py, pz],
+            point:         [px + nx * offset, py + ny * offset, pz + nz * offset],
+            normal:        [nx, ny, nz],
+            meshId:        hit.meshId,
+            triangleIndex: hit.triangleIndex,
+            faceRadius,
+            offset,
+        };
+        this._pushGpOverlay();
+        this.ctx.scheduleRender();
     }
 
     /** Exit face-select mode (does NOT clear the locked plane). */
@@ -7540,7 +7616,7 @@ export class Scene3DManager {
             fillColor:   [number, number, number, number];
             borderColor: [number, number, number, number];
         } | null = null;
-        if (this._gpDrawPlane) {
+        if (this._gpDrawPlane && this._gpDrawPlacement === 'sheet') {
             const p = this._gpDrawPlane;
             const [nx, ny, nz] = p.normal;
             // Build two orthonormal basis vectors in the plane
@@ -7586,6 +7662,9 @@ export class Scene3DManager {
             eraseRadius?: number;
             depth?: number;
             depthMode?: 'surface' | 'fixed';
+            placement?: 'surface' | 'sheet';
+            surfaceOffset?: number;
+            eraseMode?: 'partial' | 'stroke';
         },
     ): void {
         this.exitGpDrawMode();
@@ -7609,11 +7688,9 @@ export class Scene3DManager {
     /** Exit GP draw mode and clean up canvas listeners. */
     exitGpDrawMode(): void {
         if (!this._gpDrawActive) return;
-        // Finalise any open stroke.
-        if (this._gpDrawPointerDown) {
-            this.endGpStroke();
-            this._gpDrawPointerDown = false;
-        }
+        // Finalise any open stroke (kept, with its undo step).
+        this._gpGesture?.reset();
+        this._gpGesture = null;
         this._gpDrawListenerCleanup?.();
         this._gpDrawListenerCleanup = undefined;
         this._gpDrawActive = false;
@@ -7900,13 +7977,16 @@ export class Scene3DManager {
         eraseRadius?: number;
         depth?: number;
         depthMode?: 'surface' | 'fixed';
+        placement?: 'surface' | 'sheet';
+        surfaceOffset?: number;
+        eraseMode?: 'partial' | 'stroke';
     }): void {
         this._applyGpDrawOpts(opts);
     }
 
     private static readonly _GP_DRAW_OPT_KEYS = new Set([
         'mode', 'color', 'baseWidth', 'fillColor', 'parentJoint',
-        'closed', 'eraseRadius', 'depth', 'depthMode',
+        'closed', 'eraseRadius', 'depth', 'depthMode', 'placement', 'surfaceOffset', 'eraseMode',
     ]);
 
     private _applyGpDrawOpts(opts: {
@@ -7919,6 +7999,9 @@ export class Scene3DManager {
         eraseRadius?: number;
         depth?: number;
         depthMode?: 'surface' | 'fixed';
+        placement?: 'surface' | 'sheet';
+        surfaceOffset?: number;
+        eraseMode?: 'partial' | 'stroke';
     }): void {
         for (const k of Object.keys(opts)) {
             if (!Scene3DManager._GP_DRAW_OPT_KEYS.has(k)) {
@@ -7934,37 +8017,83 @@ export class Scene3DManager {
         if (opts.eraseRadius     !== undefined) this._gpDrawEraseRadius = opts.eraseRadius;
         if (opts.depth           !== undefined) this._gpDrawDepth = opts.depth;
         if (opts.depthMode       !== undefined) this._gpDrawDepthMode = opts.depthMode;
+        if (opts.surfaceOffset   !== undefined && Number.isFinite(opts.surfaceOffset)) this._gpSurfaceOffset = Math.max(0, opts.surfaceOffset);
+        if (opts.eraseMode === 'partial' || opts.eraseMode === 'stroke') this._gpDrawEraseMode = opts.eraseMode;
+        if ((opts.placement === 'surface' || opts.placement === 'sheet') && opts.placement !== this._gpDrawPlacement) {
+            this._gpDrawPlacement = opts.placement;
+            this._pushGpOverlay();                       // the flat sheet's tint shows only in Flat-sheet placement
+            this.ctx.scheduleRender();
+        }
     }
 
-    private _gpDrawUnproject(e: PointerEvent, canvas: HTMLCanvasElement): [number, number, number] {
+    /** The placement / eraser modes and the surface offset now in force (for UI and tests). */
+    getGpDrawModes(): { placement: 'surface' | 'sheet'; eraseMode: 'partial' | 'stroke'; surfaceOffset: number } {
+        return { placement: this._gpDrawPlacement, eraseMode: this._gpDrawEraseMode, surfaceOffset: this._gpSurfaceOffset };
+    }
+
+    /** The view ray through a client point (world origin + unit direction). */
+    private _gpRayAt(clientX: number, clientY: number, canvas: HTMLCanvasElement): { origin: [number, number, number]; dir: [number, number, number] } {
         const rect = canvas.getBoundingClientRect();
-        const sx = (e.clientX - rect.left) * (canvas.width  / rect.width);
-        const sy = (e.clientY - rect.top)  * (canvas.height / rect.height);
+        const sx = (clientX - rect.left) * (canvas.width  / (rect.width || 1));
+        const sy = (clientY - rect.top)  * (canvas.height / (rect.height || 1));
+        const camera = this.renderer3D.getCamera();
+        const { origin, dir } = this._picker.castRay(sx, sy, canvas.width, canvas.height, camera);
+        const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+        return { origin: [origin[0], origin[1], origin[2]], dir: [dir[0] / len, dir[1] / len, dir[2] / len] };
+    }
 
-        // When a drawing plane is locked, project via ray-plane intersection.
+    /**
+     * Where a client point draws: the cursor ray meets the locked drawing plane (face-select). Without a plane, a plane
+     * facing the camera through its target (the orbit pivot) — never the old fixed mid-depth unproject, which in
+     * perspective sits right at the near plane. Null when the ray misses (parallel to / pointing away from the plane).
+     */
+    private _gpDrawPointAt(clientX: number, clientY: number, canvas: HTMLCanvasElement): [number, number, number] | null {
+        const { origin, dir } = this._gpRayAt(clientX, clientY, canvas);
+        let point: ArrayLike<number>, normal: ArrayLike<number>;
         if (this._gpDrawPlane) {
-            const plane = this._gpDrawPlane;
-            const camera = this.renderer3D.getCamera();
-            const { origin, dir } = this._picker.castRay(sx, sy, canvas.width, canvas.height, camera);
-            const [nx, ny, nz] = plane.normal;
-            const denom = dir[0]*nx + dir[1]*ny + dir[2]*nz;
-            if (Math.abs(denom) > 1e-6) {
-                const t = ((plane.point[0] - origin[0])*nx +
-                           (plane.point[1] - origin[1])*ny +
-                           (plane.point[2] - origin[2])*nz) / denom;
-                if (t > 0) {
-                    return [
-                        origin[0] + dir[0] * t,
-                        origin[1] + dir[1] * t,
-                        origin[2] + dir[2] * t,
-                    ];
-                }
-            }
+            point = this._gpDrawPlane.point; normal = this._gpDrawPlane.normal;
+        } else {
+            const cam = this.renderer3D.getCamera();
+            const t = cam.target, pos = cam.position;
+            const fx = t[0] - pos[0], fy = t[1] - pos[1], fz = t[2] - pos[2];
+            const fl = Math.hypot(fx, fy, fz) || 1;
+            point = t; normal = [fx / fl, fy / fl, fz / fl];
         }
+        const [nx, ny, nz] = [normal[0], normal[1], normal[2]];
+        const denom = dir[0]*nx + dir[1]*ny + dir[2]*nz;
+        if (Math.abs(denom) <= 1e-6) return null;
+        const tHit = ((point[0] - origin[0])*nx + (point[1] - origin[1])*ny + (point[2] - origin[2])*nz) / denom;
+        if (!(tHit > 0)) return null;
+        return [origin[0] + dir[0] * tHit, origin[1] + dir[1] * tHit, origin[2] + dir[2] * tHit];
+    }
 
-        // Fallback (no plane): mid-depth unproject.
-        const w = this.unprojectScreenToWorld3D(sx, sy, 0.5, canvas.width, canvas.height);
-        return [w.x, w.y, w.z];
+    /**
+     * Surface placement: the raycast a stroke starting at this client point uses — against the SELECTED mesh(es) (the
+     * pencil opens on a selected mesh; no face tap needed), or, with nothing selected, the mesh under the press (that
+     * one mesh for the whole stroke). Null when there is no target under the press.
+     */
+    private _gpSurfaceRaycast(clientX: number, clientY: number, canvas: HTMLCanvasElement): ((x: number, y: number) => GpSurfaceHit | null) | null {
+        let targets: Mesh3D[] = [];
+        for (const id of this.renderer3D.getSelectedMeshIds()) {
+            const m = this.getMesh(id);
+            if (m && m.visible) targets.push(m);
+        }
+        if (targets.length === 0) {
+            const { origin, dir } = this._gpRayAt(clientX, clientY, canvas);
+            const hit = this._picker.raycastWorld(origin as unknown as vec3, dir as unknown as vec3, this.getAllMeshes(), false);
+            if (!hit) return null;
+            targets = [hit.mesh];
+        }
+        return (x, y) => {
+            const { origin, dir } = this._gpRayAt(x, y, canvas);
+            const hit = this._picker.raycastWorld(origin as unknown as vec3, dir as unknown as vec3, targets, true);
+            return hit ? { point: hit.hitPoint, normal: hit.faceNormal, rayDir: dir } : null;
+        };
+    }
+
+    /** The animation timeline's frame — the one the GP pass shows (and a stroke on a keyframed layer edits). */
+    private _gpCurrentFrame(): number {
+        return this.ctx.rasterLayerManager?.getTimeline?.()?.getCurrentFrame?.() ?? 0;
     }
 
     private _setupGpDrawListeners(): void {
@@ -7973,66 +8102,134 @@ export class Scene3DManager {
         if (!canvas) return;
         canvas.style.cursor = 'crosshair';
 
-        const onPointerDown = (e: PointerEvent) => {
-            if (e.button !== 0 || !this._gpDrawActive) return;
-            e.stopImmediatePropagation();
-            e.preventDefault();
-            canvas.setPointerCapture(e.pointerId);
-            this._gpDrawPointerDown = true;
+        const gesture = new GpDrawGesture({
+            capture: (id) => { try { canvas.setPointerCapture(id); } catch { /* pointer already gone */ } },
+            release: (id) => { try { if (canvas.hasPointerCapture?.(id)) canvas.releasePointerCapture(id); } catch { /* gone */ } },
+            claim: (e) => claimPointerEvent(e),
+        }, () => (this._gpDrawActive ? handlers : undefined));
+        this._gpGesture = gesture;
 
-            if (this._gpDrawMode === 'draw') {
-                const gpId    = this._gpDrawGpId!;
-                const layerId = this._gpDrawLayerId!;
-                this.beginGpStroke(gpId, layerId, this._gpDrawColor, this._gpDrawBaseWidth, {
+        type Edit = NonNullable<Scene3DManager['_gpGestureEdit']>;
+        const eraseAt = (clientX: number, clientY: number, g: Edit) => {
+            const { origin, dir } = this._gpRayAt(clientX, clientY, canvas);
+            if (this._gpDrawEraseMode === 'partial') this._gp.eraseStrokesNearRayPartial(g.gpId, g.layerId, origin, dir, this._gpDrawEraseRadius, g.frame);
+            else this._gp.eraseStrokesNearRay(g.gpId, g.layerId, origin, dir, this._gpDrawEraseRadius, g.frame);
+        };
+        const sampleErase = (s: GpGestureSample, g: Edit) => {
+            // Partial: the path between two samples is erased too (a fast drag would otherwise leave dashes behind).
+            const last = g.lastErase;
+            if (this._gpDrawEraseMode === 'partial' && last) {
+                const n = Math.min(32, Math.floor(Math.hypot(s.clientX - last.x, s.clientY - last.y) / 4));
+                for (let i = 1; i < n; i++) eraseAt(last.x + (s.clientX - last.x) * i / n, last.y + (s.clientY - last.y) * i / n, g);
+            }
+            eraseAt(s.clientX, s.clientY, g);
+            g.lastErase = { x: s.clientX, y: s.clientY };
+        };
+        const style = () => ({
+            color:       this._gpDrawColor,
+            baseWidth:   this._gpDrawBaseWidth,
+            fillColor:   this._gpDrawFillColor ?? undefined,
+            parentJoint: this._gpDrawParentJoint ?? undefined,
+            closed:      this._gpDrawClosed,
+        });
+        const handlers = {
+            begin: (s: GpGestureSample, eraserTip: boolean): boolean => {
+                const gpId = this._gpDrawGpId, layerId = this._gpDrawLayerId;
+                if (!gpId || !layerId) return false;
+                if (s.pointerType === 'touch' && this.getTouchNavigate3D()) return false;   // Navigate lock: fingers are the camera's
+                const erase = eraserTip || this._gpDrawMode === 'erase';
+                const f = this._gpCurrentFrame();
+                const frame = this._gp.hasKeyframe(gpId, layerId, f) ? f : undefined;   // a keyframe there: edit what shows
+                const list = this._gp.getStrokeList(gpId, layerId, frame);
+                if (!list) return false;
+                if (erase) {
+                    const g: Edit = { gpId, layerId, frame, erase, before: list.slice() };
+                    this._gpGestureEdit = g;
+                    sampleErase(s, g);
+                    return true;
+                }
+                if (this._gpDrawPlacement === 'surface') {
+                    const cast = this._gpSurfaceRaycast(s.clientX, s.clientY, canvas);
+                    if (!cast) return false;                         // nothing under the press → leave it to the camera
+                    const placer = new GpSurfacePlacer(cast, this._gpSurfaceOffset);
+                    const events = placer.sample(s.clientX, s.clientY, s.pressure);
+                    if (!placer.onSurface) return false;
+                    this._gpGestureEdit = { gpId, layerId, frame, erase, before: list.slice(), placer };
+                    this._gp.applyPlacedEvents(gpId, layerId, frame, style(), events);
+                    return true;
+                }
+                const pt = this._gpDrawPointAt(s.clientX, s.clientY, canvas);
+                if (!pt) return false;                               // missed the plane → leave the press to the camera
+                this._gpGestureEdit = { gpId, layerId, frame, erase, before: list.slice() };
+                this._gp.beginStroke(gpId, layerId, this._gpDrawColor, this._gpDrawBaseWidth, {
                     fillColor:   this._gpDrawFillColor ?? undefined,
                     parentJoint: this._gpDrawParentJoint ?? undefined,
                     closed:      this._gpDrawClosed,
+                    frame,
                 });
-                const pt = this._gpDrawUnproject(e, canvas);
-                this.addGpPoint(pt[0], pt[1], pt[2], e.pressure || 1, 1);
-            } else {
-                // Erase mode: erase on down too.
-                const pt = this._gpDrawUnproject(e, canvas);
-                this.eraseGpStrokes(this._gpDrawGpId!, this._gpDrawLayerId!, pt, this._gpDrawEraseRadius);
-            }
+                this._gp.addPoint(pt[0], pt[1], pt[2], s.pressure, 1);
+                return true;
+            },
+            move: (s: GpGestureSample): void => {
+                const g = this._gpGestureEdit;
+                if (!g) return;
+                if (g.erase) { sampleErase(s, g); return; }
+                if (g.placer) {
+                    this._gp.applyPlacedEvents(g.gpId, g.layerId, g.frame, style(), g.placer.sample(s.clientX, s.clientY, s.pressure));
+                    return;
+                }
+                const pt = this._gpDrawPointAt(s.clientX, s.clientY, canvas);
+                if (pt) this._gp.addPoint(pt[0], pt[1], pt[2], s.pressure, 1);
+            },
+            end: (): void => {
+                const g = this._gpGestureEdit;
+                this._gpGestureEdit = null;
+                if (!g) return;
+                // Finish the open stroke (a dot, < 2 points, is dropped). A Surface stroke may be several pieces.
+                if (g.placer) this._gp.endSurfaceStroke(g.gpId, g.layerId, g.frame, g.before);
+                else if (!g.erase) this._gp.endStroke();
+                const after = this._gp.getStrokeList(g.gpId, g.layerId, g.frame);
+                if (!after) return;
+                const afterCopy = after.slice();
+                // Nothing kept / the eraser touched nothing: no undo step. One step covers the whole drag (every piece
+                // of a Surface stroke, every cut of a partial erase).
+                if (Scene3DGreasePencil.sameStrokes(afterCopy, g.before)) return;
+                const before = g.before;
+                this._undoManager.push({
+                    description: g.erase ? 'Grease Pencil erase' : 'Grease Pencil stroke',
+                    undo: () => this._gp.setStrokeList(g.gpId, g.layerId, g.frame, before.slice()),
+                    redo: () => this._gp.setStrokeList(g.gpId, g.layerId, g.frame, afterCopy.slice()),
+                });
+            },
+            cancel: (): void => {
+                const g = this._gpGestureEdit;
+                this._gpGestureEdit = null;
+                if (!g) return;
+                if (!g.erase) this._gp.cancelStroke();
+                // Anything this gesture already changed (a Surface stroke's earlier pieces, an erase) goes back too.
+                const now = this._gp.getStrokeList(g.gpId, g.layerId, g.frame);
+                if (now && !Scene3DGreasePencil.sameStrokes(now, g.before)) this._gp.setStrokeList(g.gpId, g.layerId, g.frame, g.before.slice());
+            },
         };
 
-        const onPointerMove = (e: PointerEvent) => {
-            if (!this._gpDrawPointerDown || !this._gpDrawActive) return;
-            e.stopImmediatePropagation();
-            if (this._gpDrawMode === 'draw') {
-                const pt = this._gpDrawUnproject(e, canvas);
-                this.addGpPoint(pt[0], pt[1], pt[2], e.pressure || 1, 1);
-            } else {
-                const pt = this._gpDrawUnproject(e, canvas);
-                this.eraseGpStrokes(this._gpDrawGpId!, this._gpDrawLayerId!, pt, this._gpDrawEraseRadius);
-            }
-        };
+        const onDown = (e: PointerEvent) => gesture.down(e);
+        const onMove = (e: PointerEvent) => gesture.move(e);
+        const onUp = (e: PointerEvent) => gesture.up(e);
+        const onCancel = (e: PointerEvent) => gesture.cancel(e);
+        const onLost = (e: PointerEvent) => gesture.lostCapture(e);
 
-        const onPointerUp = (e: PointerEvent) => {
-            if (!this._gpDrawPointerDown) return;
-            this._gpDrawPointerDown = false;
-            canvas.releasePointerCapture(e.pointerId);
-            if (this._gpDrawMode === 'draw') this.endGpStroke();
-        };
-
-        const onPointerLeave = () => {
-            if (this._gpDrawPointerDown) {
-                this._gpDrawPointerDown = false;
-                if (this._gpDrawMode === 'draw') this.endGpStroke();
-            }
-        };
-
-        addZonelessListener(canvas, 'pointerdown',  onPointerDown,  { capture: true });
-        addZonelessListener(canvas, 'pointermove',  onPointerMove,  { capture: true });
-        addZonelessListener(canvas, 'pointerup',    onPointerUp,    { capture: true });
-        addZonelessListener(canvas, 'pointerleave', onPointerLeave);
+        addZonelessListener(canvas, 'pointerdown',   onDown,   { capture: true });
+        addZonelessListener(canvas, 'pointermove',   onMove,   { capture: true });
+        addZonelessListener(canvas, 'pointerup',     onUp,     { capture: true });
+        addZonelessListener(canvas, 'pointercancel', onCancel, { capture: true });
+        addZonelessListener(canvas, 'lostpointercapture', onLost, { capture: true });
 
         this._gpDrawListenerCleanup = () => {
-            removeZonelessListener(canvas, 'pointerdown',  onPointerDown,  { capture: true });
-            removeZonelessListener(canvas, 'pointermove',  onPointerMove,  { capture: true });
-            removeZonelessListener(canvas, 'pointerup',    onPointerUp,    { capture: true });
-            removeZonelessListener(canvas, 'pointerleave', onPointerLeave);
+            removeZonelessListener(canvas, 'pointerdown',   onDown,   { capture: true });
+            removeZonelessListener(canvas, 'pointermove',   onMove,   { capture: true });
+            removeZonelessListener(canvas, 'pointerup',     onUp,     { capture: true });
+            removeZonelessListener(canvas, 'pointercancel', onCancel, { capture: true });
+            removeZonelessListener(canvas, 'lostpointercapture', onLost, { capture: true });
             canvas.style.cursor = '';
         };
     }

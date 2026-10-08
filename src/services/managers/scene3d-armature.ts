@@ -128,6 +128,8 @@ export interface Scene3DArmatureHost {
     readonly cityModeActive: boolean;
     /** Round 8: 3D Play mode is running — every editor pointer path (hover pick, click-select, gizmo) is off. */
     readonly isPlaying: boolean;
+    /** Grease Pencil draw / erase mode is on: the canvas press is the pencil's — no click-select / gizmo / hover. */
+    readonly gpDrawActive?: boolean;
     readonly autoKey3D: boolean;
     readonly flaRestTransforms: Map<string, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>;
 
@@ -1977,7 +1979,7 @@ export class Scene3DArmature {
             isBoneOverlayActive: () => this._boneOverlayExplicit,
             isAdditiveSelect: () => this.ctx.interactionService.additiveSelect3D === true,
             isSnapLatched: () => this.ctx.interactionService.snapLatch3D === true,
-            isInputSuppressed: () => this.host.isPlaying,
+            isInputSuppressed: () => this.host.isPlaying || this.host.gpDrawActive === true,
             // Per-mesh click-select suppression (Package-Creator paint target — see InteractionService).
             isPickSuppressed: (meshId: string) => this.ctx.interactionService.pickSuppressed3D?.(meshId) ?? false,
             getArrayGizmoData: () => this.renderer3D.getArrayGizmoData(),

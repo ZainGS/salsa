@@ -23,7 +23,7 @@ import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cach
 import {
   GP_STROKE_VERTEX, GP_STROKE_FRAGMENT,
   GP_FILL_VERTEX, GP_FILL_FRAGMENT,
-  GP_VERTEX_BYTES, GP_STROKE_UNIFORM_BYTES, GP_FILL_UNIFORM_BYTES,
+  GP_VERTEX_BYTES, GP_STROKE_UNIFORM_BYTES, GP_FILL_UNIFORM_BYTES, GP_MIN_HALF_WIDTH_PX,
 } from './shaders/gp-shaders';
 import type { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import type { GpStroke3D, GpPoint } from '../../types/grease-pencil-3d';
@@ -124,6 +124,31 @@ function projectTo2D(pts: GpPoint[]): { x: number; y: number }[] {
   return pts.map(p => ({ x: p.x * ux + p.y * uy + p.z * uz, y: p.x * vx + p.y * vy + p.z * vz }));
 }
 
+// ── Stroke uniforms (CPU side of GpStrokeUniforms, gp-shaders.ts) ─────────
+
+/**
+ * Fill one stroke's uniform block: viewProjection (16 f32) | color rgba (a × layer opacity) | baseWidth | jointIndex
+ * (i32 bits) | target w | target h | projScaleY | minHalfPx | pad pad. `projScaleY` is the camera projection's [1][1]
+ * (the world → NDC scale the shader turns the world-unit half-width into pixels with). Exported for tests.
+ */
+export function packGpStrokeUniforms(
+  f32: Float32Array, i32: Int32Array, vp: ArrayLike<number>,
+  color: { r: number; g: number; b: number; a: number }, layerOpacity: number,
+  baseWidth: number, jointIndex: number, targetW: number, targetH: number, projScaleY: number,
+): void {
+  for (let i = 0; i < 16; i++) f32[i] = vp[i];
+  f32[16] = color.r; f32[17] = color.g; f32[18] = color.b; f32[19] = color.a * layerOpacity;
+  f32[20] = baseWidth;
+  i32[21] = jointIndex;
+  f32[22] = targetW; f32[23] = targetH;
+  f32[24] = projScaleY; f32[25] = GP_MIN_HALF_WIDTH_PX; f32[26] = 0; f32[27] = 0;
+}
+
+/** The pixel half-width the stroke shader draws at clip-space `w` (CPU mirror of vsMain's width, for tests). */
+export function gpStrokeHalfWidthPx(baseWidth: number, pressure: number, projScaleY: number, targetH: number, clipW: number): number {
+  return Math.max(baseWidth * pressure * projScaleY * (targetH * 0.5) / Math.max(clipW, 1e-6), GP_MIN_HALF_WIDTH_PX);
+}
+
 // ── GpRenderer3D ─────────────────────────────────────────────────────────
 
 export class GpRenderer3D {
@@ -166,6 +191,8 @@ export class GpRenderer3D {
   private readonly _strokeUDataI32 = new Int32Array(this._strokeUData.buffer);
   private readonly _fillUData = new Float32Array(GP_FILL_UNIFORM_BYTES / 4);
   private readonly _fillUDataI32 = new Int32Array(this._fillUData.buffer);
+  /** This frame's camera projection[1][1] (draw() sets it before the strokes). */
+  private _projScaleY = 1;
 
   // Overlay pipelines: face hover highlight + drawing plane visualization
   private _overlayTriPipeline:  GPURenderPipeline | null = null;
@@ -176,8 +203,10 @@ export class GpRenderer3D {
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this._device = device;
     this._format = format;
-    this._buildPipelines();
+    // The dummy skin buffer FIRST: _buildPipelines makes its bind group only when the buffer exists. In the other
+    // order every stroke without a bone drew with no group-1 bind group — a validation error that dropped the frame.
     this._buildDummySkin();
+    this._buildPipelines();
   }
 
   // ── Public draw interface ─────────────────────────────────────────────
@@ -205,6 +234,7 @@ export class GpRenderer3D {
     if (!this._strokePipeline || !this._fillPipeline) return;
     this._strokeSlotN = 0; this._fillSlotN = 0;   // reuse pooled per-draw buffers from slot 0 this frame
     const vp = this._getViewProjection(camera, canvasW, canvasH);
+    this._projScaleY = (camera.getProjectionMatrix() as unknown as Float32Array)[5];
 
     // Sort ascending so lower renderOrder objects are drawn first (behind).
     const sorted = [...gpObjects].filter(o => o.visible).sort((a, b) => a.renderOrder - b.renderOrder);
@@ -289,25 +319,26 @@ export class GpRenderer3D {
       triVerts.push(...c0,...fc, ...c2,...fc, ...c3,...fc);
     }
 
-    const totalVerts = Math.max(lineVerts.length, triVerts.length);
-    if (totalVerts === 0) return;
+    if (lineVerts.length + triVerts.length === 0) return;
 
-    // Upload fill first (drawn behind lines)
-    if (triVerts.length > 0) {
-      this._uploadAndDrawOverlay(new Float32Array(triVerts), this._overlayTriPipeline!, bg, passEncoder, triVerts.length / 7);
-    }
-    if (lineVerts.length > 0) {
-      this._uploadAndDrawOverlay(new Float32Array(lineVerts), this._overlayLinePipeline!, bg, passEncoder, lineVerts.length / 7);
-    }
+    // ONE upload, fill vertices first then the lines, drawn as two ranges of the same buffer. (Two writeBuffer calls
+    // to offset 0 in one frame both land before the pass executes, so the fill used to draw with the LINE data.)
+    const triN = triVerts.length / 7, lineN = lineVerts.length / 7;
+    const data = new Float32Array(triVerts.length + lineVerts.length);
+    data.set(triVerts, 0);
+    data.set(lineVerts, triVerts.length);
+    this._uploadOverlay(data);
+    const drawRange = (pipeline: GPURenderPipeline, count: number, first: number): void => {
+      passEncoder.setPipeline(pipeline);
+      passEncoder.setBindGroup(0, bg);
+      passEncoder.setVertexBuffer(0, this._overlayVB!);
+      passEncoder.draw(count, 1, first, 0);
+    };
+    if (triN > 0) drawRange(this._overlayTriPipeline!, triN, 0);        // fill behind the lines
+    if (lineN > 0) drawRange(this._overlayLinePipeline!, lineN, triN);
   }
 
-  private _uploadAndDrawOverlay(
-    data: Float32Array,
-    pipeline: GPURenderPipeline,
-    bg: GPUBindGroup,
-    enc: GPURenderPassEncoder,
-    vertCount: number,
-  ): void {
+  private _uploadOverlay(data: Float32Array): void {
     const byteSize = Math.ceil(data.byteLength / 4) * 4;
     // Grow the vertex buffer as needed.
     if (!this._overlayVB || this._overlayVB.size < byteSize) {
@@ -319,10 +350,6 @@ export class GpRenderer3D {
       });
     }
     this._device.queue.writeBuffer(this._overlayVB, 0, data);
-    enc.setPipeline(pipeline);
-    enc.setBindGroup(0, bg);
-    enc.setVertexBuffer(0, this._overlayVB);
-    enc.draw(vertCount);
   }
 
   // ── Private: stroke draw ──────────────────────────────────────────────
@@ -375,14 +402,8 @@ export class GpRenderer3D {
 
     // ── Uniforms (reused CPU array; writeBuffer copies synchronously) ──
     const uData = this._strokeUData;
-    uData.set(vp, 0); // viewProjection mat4 at offset 0 (16 floats)
-    const c = stroke.color;
-    uData[16] = c.r; uData[17] = c.g; uData[18] = c.b; uData[19] = c.a * layerOpacity;
-    uData[20] = stroke.baseWidth;
-    // jointIndex (i32) at byte 84 → float index 21 (write as int bits)
     const jointIndex = this._resolveJointIndex(stroke, skeleton);
-    this._strokeUDataI32[21] = jointIndex;
-    uData[22] = canvasW; uData[23] = canvasH;
+    packGpStrokeUniforms(uData, this._strokeUDataI32, vp, stroke.color, layerOpacity, stroke.baseWidth, jointIndex, canvasW, canvasH, this._projScaleY);
     device.queue.writeBuffer(slot.uni, 0, uData);
 
     // ── Bind groups (bg0 cached per slot — recreated only when the point buffer grew) ──

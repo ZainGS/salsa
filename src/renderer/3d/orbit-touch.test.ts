@@ -5,6 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import { OrbitController } from './orbit-controller';
 import { Camera3D } from './camera-3d';
+import { claimPointerEvent } from '../util/pointer-claims';
 
 type Init = Partial<{ pointerId: number; pointerType: string; button: number; clientX: number; clientY: number; altKey: boolean; isPrimary: boolean }>;
 
@@ -222,3 +223,53 @@ describe('OrbitController — touch gestures per scheme', () => {
         expect(taps.length).toBe(1);
     });
 });
+
+describe('OrbitController — a finger a tool CLAIMED (Grease Pencil / surface paint stroke)', () => {
+    /** A capture-phase tool registered before the controller: it claims every touch press (pointer-claims). */
+    function claimedSetup(cfg: ConstructorParameters<typeof OrbitController>[1] = {}) {
+        const cam = new Camera3D({ position: [0, 0, 5], target: [0, 0, 0], sceneRadius: 10 });
+        const orb = new OrbitController(cam, { enableDamping: false, ...cfg });
+        const { el } = fakeCanvas();
+        el.addEventListener('pointerdown', (e) => { if ((e as unknown as PointerEvent).pointerType === 'touch') claimPointerEvent(e); });
+        orb.attach(el);
+        return { cam, orb, el };
+    }
+
+    for (const scheme of [{}, { freeLookNav: true }] as const) {
+        it(`one claimed finger neither orbits nor looks (${'freeLookNav' in scheme ? 'freeLookNav' : 'classic'}), and never double-taps`, () => {
+            const { orb, el, cam } = claimedSetup(scheme);
+            const taps: number[] = [];
+            orb.onDoubleTap = () => taps.push(1);
+            const az0 = orb.azimuth, p0 = pos(cam);
+            touch(el, 'pointerdown', 1, 100, 100);
+            touch(el, 'pointermove', 1, 160, 130);
+            touch(el, 'pointerup', 1, 160, 130);
+            expect(orb.azimuth).toBe(az0);
+            expect(pos(cam)).toEqual(p0);
+            touch(el, 'pointerdown', 1, 100, 100); touch(el, 'pointerup', 1, 100, 100);
+            touch(el, 'pointerdown', 1, 101, 100); touch(el, 'pointerup', 1, 101, 100);
+            expect(taps).toEqual([]);
+        });
+    }
+
+    it('a second finger still pinches / pans (two fingers navigate while the pencil is out)', () => {
+        const { orb, el, cam } = claimedSetup();
+        touch(el, 'pointerdown', 1, 100, 100);
+        touch(el, 'pointerdown', 2, 200, 100);
+        expect(orb.isTouchGesturing).toBe(true);
+        const t0 = tgt(cam);
+        touch(el, 'pointermove', 1, 130, 100);
+        touch(el, 'pointermove', 2, 230, 100);
+        expect(tgt(cam)).not.toEqual(t0);
+    });
+
+    it('the Navigate lock still orbits with one finger', () => {
+        const { orb, el } = claimedSetup();
+        orb.touchNavLock = true;
+        const az0 = orb.azimuth;
+        touch(el, 'pointerdown', 1, 100, 100);
+        touch(el, 'pointermove', 1, 140, 100);
+        expect(orb.azimuth).not.toBe(az0);
+    });
+});
+

@@ -3245,7 +3245,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             if (n instanceof Skeleton3D) all.set(n.id, n);
           });
         }
-        const frame = (this.interactionService as any).currentFrame ?? 0;
+        // The animation timeline's frame picks each layer's keyframe (GpObject3D.getActiveStrokesAllLayers). It read
+        // interactionService.currentFrame, which doesn't exist → always frame 0, so a keyframe never showed.
+        const frame = this.rasterLayerManager?.getTimeline?.()?.getCurrentFrame?.() ?? 0;
         this._gpRenderer3D.draw(gpObjs, skeletons, camera, passEncoder, w, h, frame);
       }
 

@@ -7872,6 +7872,9 @@ class ShapeManager {
             eraseRadius?: number;
             depth?: number;
             depthMode?: 'surface' | 'fixed';
+            placement?: 'surface' | 'sheet';
+            surfaceOffset?: number;
+            eraseMode?: 'partial' | 'stroke';
         },
     ): void {
         this.scene3d.enterGpDrawMode(gpId, layerId, opts);
@@ -7912,6 +7915,12 @@ class ShapeManager {
     /**
      * Update stroke settings while in GP draw mode (e.g. on color/width slider change).
      * Safe to call before entering draw mode — values persist until overwritten.
+     *
+     * - `placement`: `'surface'` (default) puts every point ONTO the mesh under the pen (the selected mesh, else the
+     *   mesh under the press), lifted `surfaceOffset` world units along the surface normal; the stroke breaks where the
+     *   pen leaves the mesh. `'sheet'` draws on the flat sheet in front of the tapped face (face-select).
+     * - `eraseMode`: `'partial'` (default) erases only what is under the eraser and splits cut strokes; `'stroke'`
+     *   removes every stroke the eraser touches. The pen's eraser end uses it too.
      */
     public setGpDrawSettings3D(opts: {
         mode?: 'draw' | 'erase';
@@ -7923,8 +7932,16 @@ class ShapeManager {
         eraseRadius?: number;
         depth?: number;
         depthMode?: 'surface' | 'fixed';
+        placement?: 'surface' | 'sheet';
+        surfaceOffset?: number;
+        eraseMode?: 'partial' | 'stroke';
     }): void {
         this.scene3d.setGpDrawSettings(opts);
+    }
+
+    /** The GP placement / eraser modes and the Surface offset now in force. */
+    public getGpDrawModes3D(): { placement: 'surface' | 'sheet'; eraseMode: 'partial' | 'stroke'; surfaceOffset: number } {
+        return this.scene3d.getGpDrawModes();
     }
 
     // ── EditMesh — Phase 2 modeling API ───────────────────────────────────────
@@ -12562,7 +12579,9 @@ class ShapeManager {
         const scene: any = this.sceneGraph.toJSON();
         // Runtime-only nodes (the Play auto default player: body, skeleton, face decal, hair, garments) never reach a
         // document, even when a save lands mid-Play (they're only in the graph while playing).
-        dropRuntimeNodesFromSceneJSON(scene.root, new Set(this.scene3d.autoPlayer.runtimeNodeIds()));
+        // Grease Pencil objects too: they persist in scene3dJSON.gpObjects (every stroke point) — this copy doubled
+        // the drawing's save size and only ever restored as an empty placeholder node.
+        dropRuntimeNodesFromSceneJSON(scene.root, new Set([...this.scene3d.autoPlayer.runtimeNodeIds(), ...this.scene3d.getAllGpObjects().map(g => g.id)]));
         const strip = (n: any): void => {
             if (n?.type === 'SkinnedMesh3D') {
                 if (n.config) delete n.config.geometry;

@@ -306,7 +306,9 @@ export function recreateNode(data: any, deps: Shape2DRestoreDeps): Node | null {
     // (restoreMeshState / restoreSkeletonState rebuild them with GPU state). Their sceneGraphJSON copies
     // used to fall into the default case below as empty placeholder Nodes — one more per save/reload
     // cycle for any doc with a hand-bound skinned mesh (found by the C2 round-trip drive, 2026-09-11).
-    if (data?.type === 'SkinnedMesh3D' || data?.type === 'Skeleton3D') return null;
+    // GpObject3D too: Grease Pencil persists in scene3dJSON.gpObjects (restoreGpStates) — its scene-graph copy fell
+    // into the default case as one more empty placeholder Node per save/reload cycle.
+    if (data?.type === 'SkinnedMesh3D' || data?.type === 'Skeleton3D' || data?.type === 'GpObject3D') return null;
     const twoD = recreate2DShape(data, deps);
     let node: Node;
     if (twoD) {

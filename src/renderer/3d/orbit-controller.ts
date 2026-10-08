@@ -448,6 +448,10 @@ export class OrbitController {
         this._navCand = { id, x: e.clientX, y: e.clientY, ev: e, touch: true };
         return;
       }
+      // A finger a TOOL claimed (pointer-claims: a Grease Pencil / surface-paint stroke) is the tool's: no one-finger
+      // orbit / free-look under the stroke, and no tap (two quick dots must not double-tap-frame). It is still tracked,
+      // so a second finger makes the usual pinch / pan.
+      if (!this.touchNavLock && isPointerEventClaimed(e)) { this._tap = null; this._touchOne = null; this._touchGesture = 'none'; return; }
       this._touchOne = this._oneFingerAction();
       this._touchGesture = this._touchOne ? 'one' : 'none';
       return;

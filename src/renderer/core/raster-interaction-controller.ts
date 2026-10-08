@@ -36,6 +36,7 @@ import { OverlayDotManager, DotInstance } from "../../services/drawing/overlay-d
 import { ConnectorService } from "../../services/connector-service";
 import { StampDrawingService } from "../../services/drawing/stamp-drawing-service";
 import { PolygonDrawingService } from "../../services/drawing/polygon-drawing-service";
+import { isPointerEventClaimed } from "../util/pointer-claims";
 import panningCursorUrl from '../../assets/grabbing.cur?url';
 import drawingCursorUrl from '../../assets/drawing.cur?url';
 import grabbingCursorUrl from '../../assets/grabbing.cur?url';
@@ -338,6 +339,9 @@ export class RasterInteractionController {
         this._beginPinch();
         return;
       }
+      // A finger a canvas tool claimed (pointer-claims: a Grease Pencil / surface-paint stroke) is the tool's: tracked
+      // (a second finger still pinches / pans) but it starts no select / drag / marquee / pan of its own.
+      if (isPointerEventClaimed(event)) { this._primaryTouchId = null; return; }
       this._primaryTouchId = event.pointerId ?? 0;
     }
 
