@@ -235,7 +235,9 @@ export class SalsaViewerCore {
       try {
         const results = await parseGLB(glbBuf);
         if (results.length === 0) continue;
-        const r = results[0];
+        // The mesh's own entry of a multi-mesh GLB (its import order); older states without an index: the first.
+        const gi = typeof state.glbMeshIndex === 'number' ? state.glbMeshIndex : 0;
+        const r = results[gi] ?? results[0];
         mesh.setGeometry(r.geometry);
 
         // Apply embedded diffuse texture if the mesh has no library texture

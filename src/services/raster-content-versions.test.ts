@@ -135,7 +135,10 @@ describe('RasterLayerManager.getContentVersions (host cloud-upload dirtiness)', 
     rlm.setLayerAnimated(ink, true);
     const c2 = rlm.addCelAtFrame(ink, 2);
     expect(c2).toBeTruthy();
+    rlm.selectLayer(ink);
+    rlm.getTimeline().setCurrentFrame(2);   // (perf audit D1: a blank cel gets its texture as the paint target)
     const v = rlm.getContentVersions();
+    expect(v.cels[c2!]).toBe('none');       // …and is versioned as blank until something is written
     const celIds = Object.keys(v.cels);
     expect(celIds.length).toBeGreaterThanOrEqual(2);
     const cel2Tex = rlm.getTimeline().getCels(ink).find((c) => c.id === c2)!.texture!;

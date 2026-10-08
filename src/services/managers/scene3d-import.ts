@@ -120,6 +120,7 @@ export class Scene3DImport {
       mesh.gpuDirty = true;
       mesh.glbMeshIndex = 0;
       if (rawBuffer.byteLength > 0) modelStore.set(mesh.id, rawBuffer);
+      mesh.stampImportedGeometry();   // perf audit C5: saved as a GLB reference while its geometry is unchanged
 
       const root = this.ctx.sceneGraph.root;
       root.addChild(mesh);
@@ -181,6 +182,7 @@ export class Scene3DImport {
       mesh.gpuDirty = true;
       mesh.glbMeshIndex = i;
       if (rawBuffer.byteLength > 0) modelStore.set(mesh.id, rawBuffer);
+      mesh.stampImportedGeometry();   // perf audit C5 (see the single-mesh import)
       group.addChild(mesh);
       created.push(mesh);
     }

@@ -5452,6 +5452,7 @@ export class Scene3DManager {
             this._blendShapes.applyMorphTargets(mesh, r.morphTargets);
             mesh.gpuDirty = true;
             if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
+            mesh.stampImportedGeometry();   // perf audit C5: saved as a GLB reference while unchanged
 
             root.addChild(mesh);
             meshes.push(mesh);
@@ -5527,6 +5528,11 @@ export class Scene3DManager {
      */
     async restoreMeshState(state: any, glbBuffer?: ArrayBuffer): Promise<Mesh3D | null> {
         let mesh: Mesh3D | null = null;
+        // Perf audit C5: an imported mesh saved as a GLB REFERENCE has no inline geometry — only the GLB has it. Without
+        // the GLB it can't be rebuilt: fail loudly (the caller records the issue and blocks saving, so the copy on disk
+        // isn't overwritten without it) instead of returning nothing.
+        const glbRef = state?.geometryRef === 'glb' && !state.config?.geometry;
+        if (glbRef && !glbBuffer) throw new Error(`the model file (${state.glbMeshId ?? '?'}.glb) that holds this mesh's geometry is missing`);
 
         // ── ClothMesh3D ──────────────────────────────────────────────────────
         if (state.type === '3DClothMesh' && state.clothConfig) {
@@ -5624,6 +5630,8 @@ export class Scene3DManager {
             skinnedMesh.skinDirty = true;
 
             if (state.glbMeshId) this._modelStore.set(skinnedMesh.id, glbBuffer);
+            // The geometry came from the GLB (inline geometry is never read here): saved as a reference while unchanged (C5).
+            skinnedMesh.stampImportedGeometry();
 
             this._restoreOutline(skinnedMesh, state);   // characters' outlines never came back (these branches returned first)
             this.ctx.sceneGraph.root.addChild(skinnedMesh);
@@ -5700,12 +5708,40 @@ export class Scene3DManager {
         }
 
         if (glbBuffer) {
-            if (state.config?.geometry?.vertices?.length) {
+            if (glbRef) {
+                // Perf audit C5: rebuild the geometry from the GLB (the mesh at glbMeshIndex — the import's own order).
+                const results = await this._parseGlbCached(glbBuffer);
+                const idx = state.glbMeshIndex ?? -1;
+                const r = idx >= 0 && idx < results.length ? results[idx] : undefined;
+                if (!r) throw new Error(`mesh ${idx} is not in its model file (${state.glbMeshId ?? '?'}.glb, ${results.length} meshes)`);
+                // Own copies: the parse result is cached per buffer, and two meshes must never share vertex arrays.
+                const geom = { ...r.geometry, vertices: r.geometry.vertices.slice(), indices: r.geometry.indices.slice() };
+                const existing = state.id ? this.getMesh(state.id) : null;
+                if (existing) { mesh = existing; mesh.setGeometry(geom); }
+                else {
+                    mesh = this.createCustomMesh(state.x, state.y, state.z, geom, state.material);
+                    if (mesh && state.id) mesh.setId(state.id);
+                }
+                if (mesh) {
+                    this._modelStore.set(mesh.id, glbBuffer);
+                    const device = this.ctx.webgpuRenderer.getDevice();
+                    if (device) this._applyGltfTextures(mesh, r, device);
+                    mesh.stampImportedGeometry();   // still the GLB's: the next save writes the reference again
+                }
+            } else if (state.config?.geometry?.vertices?.length) {
                 // If the scene-graph restore already created this mesh (same id), update it
                 // in place rather than creating a second copy outside its group.
                 const existing = state.id ? this.getMesh(state.id) : null;
                 if (existing) {
                     mesh = existing;
+                    // A GLB-referenced placeholder from scene.json (C5) has no geometry of its own: take the saved one.
+                    if (!existing.geometry?.vertices?.length) {
+                        existing.setGeometry({
+                            vertices: Float32Array.from(state.config.geometry.vertices),
+                            indices:  Uint32Array.from(state.config.geometry.indices ?? []),
+                            format: '12float' as const,
+                        });
+                    }
                 } else {
                     // Geometry was serialized inline — restore the individual mesh directly
                     // without re-parsing the GLB (which would create a new auto-group).
@@ -5726,12 +5762,7 @@ export class Scene3DManager {
                     const device = this.ctx.webgpuRenderer.getDevice();
                     if (device) {
                         try {
-                            let parsePromise = this._glbParseCache.get(glbBuffer);
-                            if (!parsePromise) {
-                                parsePromise = parseGLB(glbBuffer);
-                                this._glbParseCache.set(glbBuffer, parsePromise);
-                            }
-                            const results = await parsePromise;
+                            const results = await this._parseGlbCached(glbBuffer);
                             const idx = state.glbMeshIndex ?? -1;
                             const r = (idx >= 0 && idx < results.length)
                                 ? results[idx]
@@ -5910,6 +5941,11 @@ export class Scene3DManager {
     /** Parse cache: avoids re-parsing the same GLB ArrayBuffer N times during a restore
      *  when N child meshes all reference the same buffer. Keyed by buffer identity. */
     private _glbParseCache = new WeakMap<ArrayBuffer, Promise<GltfMeshResult[]>>();
+    private _parseGlbCached(buf: ArrayBuffer): Promise<GltfMeshResult[]> {
+        let p = this._glbParseCache.get(buf);
+        if (!p) { p = parseGLB(buf); this._glbParseCache.set(buf, p); }
+        return p;
+    }
 
     /** Returns all stored model buffers as { meshId → ArrayBuffer }. */
     getModelStore(): Map<string, ArrayBuffer> { return this._modelStore; }

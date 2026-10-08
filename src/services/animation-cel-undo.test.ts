@@ -82,7 +82,7 @@ describe('A1 — splitting a hold: one texture per cel', () => {
     expect(rest.texture).not.toBe(base);
     expect(rest.texture).not.toBe(c5.texture);
     expect(same(cpu(rest.texture).data, pattern(1))).toBe(true);   // the held drawing, copied
-    expect(cpu(c5.texture).data.every(v => v === 0)).toBe(true);   // the new cel is blank
+    expect(c5.texture).toBeNull();                                  // the new cel is blank: no texture (D1)
 
     tl.setCurrentFrame(6);
     stroke(rlm.getLayerTexture(id)!, 200);
@@ -118,7 +118,7 @@ describe('A1 — splitting a hold: one texture per cel', () => {
     expect(rlm.getLayerTexture(id)).toBe(base);
     expect(cpu(base).destroyed).toBe(false);
     expect(same(cpu(base).data, pattern(1))).toBe(true);
-    expect(cpu(c5.texture).destroyed).toBe(true);
+    expect(c5.texture).toBeNull();   // (blank: never had a texture — D1)
     expect(cpu(rest.texture).destroyed).toBe(true);
   });
 
@@ -323,8 +323,8 @@ describe('A3 — undo on cels acts on the active cel', () => {
 
     tl.setCurrentFrame(3);
     expect(rlm.getLayerTexture('L')).toBe(c2.texture);
-    await mgr.pushStrokePatch(c2.texture, stroke(c2.texture, 222));
-    fill(c2.texture, 44);
+    await mgr.pushStrokePatch(c2.texture!, stroke(c2.texture!, 222));
+    fill(c2.texture!, 44);
     await mgr.pushSnapshot({ noCoalesce: true });
     expect(await rlm.undoForLayer('L')).toBe(true);
     expect(await rlm.undoForLayer('L')).toBe(true);
@@ -362,9 +362,238 @@ describe('A4 — exact cel restore for host imports (restoreCelsWithPixels)', ()
     ]);
     expect(new Set(cels.map(x => x.texture)).size).toBe(3);
     expect(same(cpu(cels[0].texture).data, a)).toBe(true);
-    expect(cpu(cels[1].texture).data.every(v => v === 0)).toBe(true);
+    expect(cels[1].texture).toBeNull();   // no pixels: a blank cel owns no texture (D1)
     expect(same(cpu(cels[2].texture).data, c)).toBe(true);
     expect(rlm.getTimeline().getFrameCount()).toBe(29);
     expect(rlm.getLayerTexture(id)).toBe(cels[0].texture);   // frame 1 shown
+  });
+});
+
+// ── D1: lazy cel textures ───────────────────────────────────────────────────────────────────────────────────────────
+
+/** A new document (blank Background) with the Background animated over 24 frames. */
+function blankAnimatedDoc() {
+  const gpu = createCpuDevice();
+  const rlm = new RLM(gpu.device, W, H);
+  const id = rlm.getLayers()[0].id;
+  rlm.selectLayer(id);
+  rlm.setAnimationEnabled(true);
+  rlm.setLayerAnimated(id, true);
+  return { gpu, rlm, id, mgr: rlm.getSelectedLayerManager()!, tl: rlm.getTimeline() };
+}
+
+const celOf = (rlm: InstanceType<typeof RLM>, layerId: string, celId: string) =>
+  rlm.getTimeline().getCels(layerId).find(c => c.id === celId)!;
+
+describe('D1 — a blank cel owns no texture', () => {
+  it('new cels are blank; the selected layer\'s shown blank cel gets one (the paint target), given back unwritten', async () => {
+    const { rlm, id, tl } = blankAnimatedDoc();
+    const c5 = rlm.addCelAtFrame(id, 5)!;
+    expect(celOf(rlm, id, c5).texture).toBeNull();
+    tl.setCurrentFrame(5);
+    const t5 = celOf(rlm, id, c5).texture;
+    expect(t5).not.toBeNull();
+    expect(rlm.getLayerTexture(id)).toBe(t5);
+    expect(rlm.getSelectedLayerTexture()).toBe(t5);
+    expect(rlm.getCelMemoryStats().provisional).toBe(1);
+    // still blank: not saved, versioned 'none', no blob
+    expect(rlm.getPixelSources().cels.map(c => c.celId)).not.toContain(c5);
+    expect(rlm.getContentVersions().cels[c5]).toBe('none');
+    expect(await rlm.exportCelToBlob(c5)).toBeNull();
+    expect((await rlm.exportCelPixels()).map(c => c.celId)).not.toContain(c5);
+
+    tl.setCurrentFrame(1);
+    expect(celOf(rlm, id, c5).texture).toBeNull();
+    const st = rlm.getCelMemoryStats();
+    expect(st.provisional).toBe(0);
+    expect(st.spare).toBe(true);
+    tl.setCurrentFrame(5);
+    expect(celOf(rlm, id, c5).texture).toBe(t5);   // the spare is reused (no allocation churn while scrubbing)
+  });
+
+  it('the first stroke makes the texture the cel\'s own; undo / redo on it work; it is saved', async () => {
+    const { rlm, id, mgr, tl } = blankAnimatedDoc();
+    const c5 = rlm.addCelAtFrame(id, 5)!;
+    tl.setCurrentFrame(5);
+    const t5 = rlm.getLayerTexture(id)!;
+    await mgr.pushStrokePatch(t5, stroke(t5, 90));
+    tl.setCurrentFrame(1);
+    expect(celOf(rlm, id, c5).texture).toBe(t5);   // kept: drawn on
+    expect(rlm.getPixelSources().cels.map(c => c.celId)).toContain(c5);
+    expect(rlm.getContentVersions().cels[c5]).not.toBe('none');
+    const saved = (await rlm.exportCelPixels()).find(c => c.celId === c5)!;
+    expect(new Uint8Array(saved.pixelData).some(v => v === 90)).toBe(true);
+
+    tl.setCurrentFrame(5);
+    expect(await rlm.undoForLayer(id)).toBe(true);
+    expect(cpu(t5).data.every(v => v === 0)).toBe(true);
+    expect(await rlm.redoForLayer(id)).toBe(true);
+    expect(cpu(t5).data.some(v => v === 90)).toBe(true);
+    // undone back to blank: it has redo history, so it keeps its texture
+    expect(await rlm.undoForLayer(id)).toBe(true);
+    tl.setCurrentFrame(2);
+    expect(celOf(rlm, id, c5).texture).toBe(t5);
+  });
+
+  it('only the selected layer gets a provisional texture; other layers\' blank cels composite as nothing', () => {
+    const { rlm, id, tl } = blankAnimatedDoc();
+    const b = rlm.addLayer('B').id;
+    rlm.setLayerAnimated(b, true);
+    rlm.addCelAtFrame(b, 5);
+    rlm.addCelAtFrame(id, 5);
+    tl.setCurrentFrame(5);
+    const comp = rlm.getTextureForComposition();
+    expect(comp.find(e => e.id === b)!.texture).toBeUndefined();     // skipped by the compositor
+    expect(comp.find(e => e.id === id)!.texture).toBeDefined();      // the paint target
+    rlm.selectLayer(b);                                              // the target moves: A's goes back, B's is made
+    const after = rlm.getTextureForComposition();
+    expect(after.find(e => e.id === id)!.texture).toBeUndefined();
+    expect(after.find(e => e.id === b)!.texture).toBeDefined();
+    expect(rlm.getCelMemoryStats().provisional).toBe(1);
+    // onion skin / export frame read: blank cels give null
+    expect(rlm.getLayerTexturesAtFrame(5).get(id)).toBeNull();
+  });
+
+  it('playback: no texture is made for blank cels (the layer shows nothing); stopping makes the paint target again', () => {
+    g.requestAnimationFrame ??= () => 0;
+    g.cancelAnimationFrame ??= () => { /* */ };
+    const { rlm, id, tl } = blankAnimatedDoc();
+    const c5 = rlm.addCelAtFrame(id, 5)!;
+    tl.setCurrentFrame(5);
+    expect(celOf(rlm, id, c5).texture).not.toBeNull();
+    tl.play();
+    expect(celOf(rlm, id, c5).texture).toBeNull();
+    expect(rlm.getLayerTexture(id)).toBeNull();
+    tl.pause();
+    expect(celOf(rlm, id, c5).texture).not.toBeNull();
+    expect(rlm.getLayerTexture(id)).toBe(celOf(rlm, id, c5).texture);
+  });
+
+  it('split / duplicate of a blank cel stays blank (no copy); a drawn hold is still copied', async () => {
+    const { gpu, rlm, id, mgr, tl } = blankAnimatedDoc();
+    // cel 1 = the fresh layer's own texture, provably blank → splitting its hold copies nothing
+    const copies0 = gpu.counters.copyTexels;
+    const c3 = rlm.addCelAtFrame(id, 3)!;
+    const cels = tl.getCels(id);
+    expect(cels.map(c => [c.startFrame, c.duration])).toEqual([[1, 2], [3, 1], [4, 21]]);
+    expect(cels[2].texture).toBeNull();
+    expect(gpu.counters.copyTexels).toBe(copies0);
+    // a provisional (still blank) hold split while shown → the rest stays blank
+    tl.setCelDuration(id, c3, 10);              // 3..12
+    tl.setCurrentFrame(4);                       // inside c3's hold → provisional texture
+    expect(celOf(rlm, id, c3).texture).not.toBeNull();
+    rlm.addCelAtFrame(id, 8);
+    const rest = tl.getCels(id).find(c => c.startFrame === 9)!;
+    expect(rest.texture).toBeNull();
+    expect(gpu.counters.copyTexels).toBe(copies0);
+    // duplicate a blank cel → blank
+    const dup = rlm.duplicateCel(id, c3, 30)!;
+    expect(celOf(rlm, id, dup).texture).toBeNull();
+    // a drawn cel: split copies it
+    tl.setCurrentFrame(3);
+    const t3 = rlm.getLayerTexture(id)!;
+    await mgr.pushStrokePatch(t3, stroke(t3, 123));
+    rlm.addCelAtFrame(id, 5);
+    const rest3 = tl.getCels(id).find(c => c.startFrame === 6)!;
+    expect(rest3.texture).not.toBeNull();
+    expect(rest3.texture).not.toBe(t3);
+    expect(cpu(rest3.texture).data.some(v => v === 123)).toBe(true);
+    const dup3 = rlm.duplicateCel(id, c3, 40)!;
+    expect(cpu(celOf(rlm, id, dup3).texture).data.some(v => v === 123)).toBe(true);
+  });
+
+  it('deleting a blank / provisional cel is safe; static again with a blank first cel gives a blank layer', async () => {
+    const { rlm, id, mgr, tl } = blankAnimatedDoc();
+    const base = mgr.getTexture()!;
+    cpu(base).data.set(pattern(3));
+    markRasterCompositeDirty(null, base);
+    const c2 = rlm.addCelAtFrame(id, 2)!;
+    tl.setCurrentFrame(2);                       // provisional
+    expect(rlm.deleteCel(id, c2)).toBe(true);
+    await flush();
+    expect(rlm.getCelMemoryStats().provisional).toBe(0);
+    // delete every other cel (cel 1 = the layer's own texture, kept by the layer); the first cel left is blank →
+    // static = blank
+    const c4 = rlm.addCelAtFrame(id, 4)!;
+    for (const c of [...tl.getCels(id)]) if (c.id !== c4) expect(rlm.deleteCel(id, c.id)).toBe(true);
+    expect(tl.getCels(id).map(c => c.id)).toEqual([c4]);
+    tl.setCurrentFrame(1);
+    expect(rlm.setLayerAnimated(id, false)).toBe(true);
+    expect(rlm.getLayerTexture(id)).toBe(base);
+    expect(cpu(base).destroyed).toBe(false);
+    expect(cpu(base).data.every(v => v === 0)).toBe(true);
+  });
+
+  it('resize: a provisional cel is remade at the new size; cel 1 follows the layer\'s reallocated texture', () => {
+    const { rlm, id, mgr, tl } = blankAnimatedDoc();
+    const c5 = rlm.addCelAtFrame(id, 5)!;
+    tl.setCurrentFrame(5);
+    rlm.setSize(W * 2, H * 2);
+    const t5 = celOf(rlm, id, c5).texture!;
+    expect([t5.width, t5.height]).toEqual([W * 2, H * 2]);
+    expect(rlm.getLayerTexture(id)).toBe(t5);
+    expect(tl.getCels(id)[0].texture).toBe(mgr.getTexture());   // (pointed at the destroyed old texture before)
+    tl.setCurrentFrame(1);
+    expect(rlm.getLayerTexture(id)).toBe(mgr.getTexture());
+  });
+
+  it('autosave / load: blank cels are not saved; a zero upload keeps a cel blank, real pixels make its texture', () => {
+    const gpu = createCpuDevice();
+    const rlm = new RLM(gpu.device, W, H);
+    rlm.clearAllLayers();
+    rlm.addLayerWithId('L', 'Anim');
+    rlm.selectLayer('L');
+    rlm.setAnimationEnabled(true);
+    rlm.setLayerAnimated('L', true);
+    rlm.restoreLayerCels('L', [
+      { celId: 'a', startFrame: 1, duration: 1, celType: 'key' },
+      { celId: 'b', startFrame: 2, duration: 1, celType: 'key' },
+      { celId: 'z', startFrame: 3, duration: 1, celType: 'key' },
+      { celId: 'e', startFrame: 4, duration: 1, celType: 'key' },
+    ]);
+    expect(rlm.uploadPixelsToCel('L', 'b', pattern(8).buffer)).toBe(true);
+    expect(rlm.uploadPixelsToCel('L', 'z', new ArrayBuffer(W * H * 4))).toBe(true);   // (an old save's zero file)
+    rlm.forceFrameSync();
+    expect(celOf(rlm, 'L', 'b').texture).not.toBeNull();
+    expect(celOf(rlm, 'L', 'z').texture).toBeNull();
+    expect(celOf(rlm, 'L', 'e').texture).toBeNull();
+    expect(rlm.getPixelSources().cels.map(c => c.celId).sort()).toEqual(['a', 'b']);
+    // an upload to the SHOWN blank cel shows it at once
+    rlm.getTimeline().setCurrentFrame(4);   // 'e' shown → provisional
+    rlm.getTimeline().setCurrentFrame(3);   // 'z' shown → provisional; 'e' given back
+    expect(rlm.uploadPixelsToCel('L', 'z', pattern(2).buffer)).toBe(true);
+    expect(rlm.getLayerTexture('L')).toBe(celOf(rlm, 'L', 'z').texture);
+    rlm.getTimeline().setCurrentFrame(1);
+    expect(celOf(rlm, 'L', 'z').texture).not.toBeNull();   // real pixels: kept
+    expect(same(cpu(celOf(rlm, 'L', 'z').texture).data, pattern(2))).toBe(true);
+  });
+
+  it('memory: 2 animated layers × 48 frames at 1080p with 3 painted cels each', async () => {
+    const FW = 1920, FH = 1080, FRAME = FW * FH * 4;
+    const gpu = createCpuDevice();
+    const rlm = new RLM(gpu.device, FW, FH);
+    const a = rlm.getLayers()[0].id;
+    const b = rlm.addLayer('B').id;
+    rlm.setAnimationEnabled(true);
+    rlm.getTimeline().setFrameCount(48);
+    for (const id of [a, b]) {
+      rlm.selectLayer(id);
+      rlm.setLayerAnimated(id, true);
+      for (let f = 2; f <= 48; f++) rlm.addCelAtFrame(id, f);
+      const mgr = rlm.getSelectedLayerManager()!;
+      for (const f of [6, 20, 40]) {
+        rlm.getTimeline().setCurrentFrame(f);
+        const t = rlm.getLayerTexture(id)!;
+        await mgr.pushStrokePatch(t, stroke(t, 200, 10, 10, 4, 4));
+      }
+    }
+    rlm.getTimeline().setCurrentFrame(1);
+    const st = rlm.getCelMemoryStats();
+    expect(st.cels).toBe(96);
+    expect(st.withTexture).toBe(2 + 6);   // the layers' own (cel 1) + the painted ones
+    const before = (st.cels - 2) * FRAME;   // every cel but cel 1 used to own a full-canvas texture
+    expect(st.spare).toBe(false);                 // (nothing was given back: every cel shown was painted)
+    expect(st.textureBytes).toBe(6 * FRAME);      // the painted cels only: ~50 MB instead of ~780 MB
+    expect(before / st.textureBytes).toBeGreaterThan(15);
   });
 });

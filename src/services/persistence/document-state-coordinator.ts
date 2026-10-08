@@ -34,6 +34,8 @@ import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D } from '../../scene-graph/shapes/array-group-3d';
 import { defaultDitherConfig } from '../../renderer/raster/effects/dither-engine';
 import { DEFAULT_CANVAS_GRID, EMPTY_EPHEMERA_JSON } from './blank-document';
+import { JsonPartCache, JsonPartCollector, round6Replacer, type JsonPartMode } from '../../scene-graph/core/json-parts';
+import type { DocumentMeshStateOptions } from './document-mesh-json';
 
 /**
  * Everything a save reads BACK from the GPU (no CPU copy exists): raster layer + cel pixels, UV-paint / decal textures
@@ -116,7 +118,8 @@ export interface DocumentStatePrivate {
     /** Reset the decal registry on document load — stale in-session records block marker re-adoption. */
     clearDecalRecords(): void;
     procMeshKey(meshId: string): string | null;
-    buildMeshState(m: Mesh3D): unknown;
+    /** A mesh's scene3d.json state; `doc` = the document save's GLB references (perf audit C5). */
+    buildMeshState(m: Mesh3D, doc?: DocumentMeshStateOptions): unknown;
     disposeAllUvPaintTextures(): void;
     restoreClothingTextures(blobs: Map<string, ArrayBuffer>): Promise<void>;
     restoreProceduralMeshTextures(map: Map<string, ArrayBuffer>): Promise<void>;
@@ -244,6 +247,8 @@ export class DocumentStateCoordinator {
         const models3d: Record<string, ArrayBuffer> = {};
         let textureLibrary: { entries: any[] } | null = null;
         let _onWriteComplete: (() => void) | undefined;
+        const glbRefs = new Set<string>();
+        let parts3d: JsonPartCollector | null = null;
 
         // Snapshot (id, version) of the dirty meshes BEFORE serializing: the write below is async, and only these —
         // untouched since — may be marked clean when it completes (P5).
@@ -278,12 +283,17 @@ export class DocumentStateCoordinator {
                 }
                 return false;
             };
-            const nodes = this.sm.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument && !underSkipWrapper(m)).map(m => this.priv.buildMeshState(m));
+            const docMeshes = this.sm.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument && !underSkipWrapper(m));
+            // Perf audit C5: unchanged imported meshes are written as GLB references (glbRefs → scene.json strips them too).
+            // Perf audit C4: serialized inside a JSON-part collection — the vertex arrays come from the cache when unchanged.
+            const buildNodes = (): unknown[] => { glbRefs.clear(); return docMeshes.map(m => this.priv.buildMeshState(m, { glbRefs })); };
+            parts3d = this._jsonParts('r6', !!opts.reusePixels);
+            const nodes = parts3d ? parts3d.collect(buildNodes) : buildNodes();
             const skeletons = this.sm.scene3d.getAllSkeletons().filter(s => !s.excludeFromDocument).map(s => this.sm.scene3d!.serializeSkeletonForSave(s));   // runtime-only rigs (Play auto player) never save
             // Round floats to 6 decimals as we serialize — skeleton inverse-bind matrices + rotations carry ~15
             // digits of noise ("0.916000000012") that bloat the JSON and gzip poorly. 6 decimals is visually
             // lossless for matrices/quaternions/positions. Guard ≥1e9 (timestamps etc.) so *1e6 can't overflow 2^53.
-            const round6 = (_k: string, v: any) => (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) < 1e9) ? Math.round(v * 1e6) / 1e6 : v;
+            // (json-parts.ts round6Replacer — the cached array parts round with the same function.)
             // Packaging registry (params-only, like characters/buildings): the box NODES persist via
             // the scene graph; this re-binds them to the PackagingManager on load (restoreFromJSON) so
             // a reloaded document's packages are editable again instead of orphaned (and enterCreatorMode
@@ -293,7 +303,8 @@ export class DocumentStateCoordinator {
             // were only ever written by the .frogmarks path — OPFS autosave dropped the catalog entirely (audit P4).
             const characters = this.sm.scene3d.getScene3DCharacterStates();
             const gpObjects = this.sm.scene3d.getScene3DGpStates();
-            scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, attachments, bakedPartMetas, characters, gpObjects, ...(packaging.length ? { packaging } : {}) }, round6);
+            const text3d = (n: unknown[]): string => JSON.stringify({ nodes: n, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, attachments, bakedPartMetas, characters, gpObjects, ...(packaging.length ? { packaging } : {}) }, round6Replacer);
+            scene3dJSON = this._resolveParts(parts3d, text3d(nodes), () => text3d(buildNodes()));
             if (has3DChanges) {
                 for (const [id, buf] of this.sm.scene3d.getModelStore().entries()) models3d[id] = buf;
                 textureLibrary = this.sm.scene3d.getTextureLibraryData() ?? null;
@@ -306,7 +317,8 @@ export class DocumentStateCoordinator {
 
         return {
             manifest,
-            sceneGraphJSON: this.sm.getSceneGraphJSONForDocument(),   // 3D-mesh geometry stripped (lives in scene3dJSON) — was duplicating ~MBs/character
+            // 3D-mesh geometry stripped (lives in scene3dJSON) — was duplicating ~MBs/character; GLB-referenced meshes too (C5)
+            sceneGraphJSON: this.sm.getSceneGraphJSONForDocument({ glbRefIds: glbRefs, parts: this._jsonParts('raw', !!opts.reusePixels) }),
             brushPresetsJSON: this.sm.exportAllBrushPresets(),
             layers,
             cels,
@@ -326,6 +338,31 @@ export class DocumentStateCoordinator {
             pixelContentKeys,
             _onWriteComplete,
         };
+    }
+
+    // ── Perf audit C4: cached JSON parts (scene-graph/core/json-parts.ts) ──
+    /** The serialized heavy typed-array sections (vertex / index arrays, base64 skinning + blend shapes) of earlier
+     *  gathers, reused while their content is unchanged. The output is byte-identical with it on or off. */
+    private readonly _jsonPartCache = new JsonPartCache();
+    /** Off = serialize every gather the plain way (the A/B and test reference). */
+    public jsonPartCacheEnabled = true;
+    /** Parts built / reused so far (tests, diagnostics). */
+    get jsonPartStats(): Readonly<{ built: number; reused: number }> { return this._jsonPartCache.stats; }
+
+    /** A collection for one output file. `reuse` (the incremental autosave) serves unchanged parts from the cache;
+     *  without it (exports, explicit saves) every part is built fresh — and refreshes the cache. */
+    private _jsonParts(mode: JsonPartMode, reuse: boolean): JsonPartCollector | null {
+        return this.jsonPartCacheEnabled ? new JsonPartCollector(this._jsonPartCache, mode, reuse) : null;
+    }
+
+    /** Resolve `text`'s parts; a placeholder that can't be substituted re-serializes the plain way (same text). */
+    private _resolveParts(parts: JsonPartCollector | null, text: string, plain: () => string): string {
+        if (!parts) return text;
+        try { return parts.resolve(text); }
+        catch (e) {
+            console.warn('[Salsa][save] cached JSON parts could not be substituted — serializing scene3d.json the plain way', e);
+            return plain();
+        }
     }
 
     /** Serializes GPU read-backs: a save and the shadow refresh share RasterLayerManager's one read-back buffer. */

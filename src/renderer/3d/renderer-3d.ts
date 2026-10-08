@@ -1851,18 +1851,60 @@ export class Renderer3D {
    * if all effects are disabled (caller keeps using srcTex unchanged).
    */
   runPostProcess(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number): GPUTexture | null {
-    // ANTI-ALIASING (persona-polish A1) runs FIRST, so bloom sees clean edges and film grain is never smeared. Only on
-    // frames that actually drew 3D (a pure 2D doc keeps its own crisp vector AA) and never in the lo-res PS1 mode
-    // (its chunky pixels are the look).
+    const r = this._postChain(encoder, srcTex, w, h, null);
+    return r === 'target' ? null : r;   // (never 'target' without one)
+  }
+
+  /**
+   * runPostProcess, but the LAST pass of the chain (FXAA, bloom composite or grade / vignette / film — all render
+   * passes, no storage writes) renders straight into `target`: the canvas texture view (this renderer's format, w×h).
+   * Perf audit C2: no intermediate output + full-screen copy. 'target' = the processed frame is in `target`; a texture
+   * = it is in that texture (copy it, as runPostProcess); null = nothing ran (copy srcTex).
+   */
+  runPostProcessTo(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number, target: GPUTextureView): GPUTexture | 'target' | null {
+    return this._postChain(encoder, srcTex, w, h, target);
+  }
+
+  /** Perf audit C1: COULD the post chain run this frame? Asked BEFORE the scene draws (the host then keeps the frame in
+   *  a sampleable texture); conservative — `may3D` = this frame may draw 3D meshes (the FXAA gate), the effects count
+   *  when switched on even while their pipelines compile. A frame drawn straight into the canvas calls
+   *  skipPostProcess instead. */
+  postProcessMayRun(w: number, h: number, may3D: boolean): boolean {
+    return this._fxaaGate(w, h, may3D, false) || (!(RD.on && RD.f.noPost) && !!this._postProcessPass?.mayRun());
+  }
+
+  /** The frame went straight into the canvas texture (nothing to sample): consume the per-frame AA state as
+   *  runPostProcess would. True = the chain WOULD have drawn (a misprediction of postProcessMayRun — re-render). */
+  skipPostProcess(w: number, h: number): boolean {
+    const drew3D = this._drew3DThisFrame; this._drew3DThisFrame = false;
+    const taaDone = this._taaOn && !!this._taa?.resolvedThisFrame;
+    return this._fxaaGate(w, h, drew3D, taaDone) || (!(RD.on && RD.f.noPost) && !!this._postProcessPass?.willRun());
+  }
+
+  /** FXAA runs on this frame (pipeline readiness aside). */
+  private _fxaaGate(w: number, h: number, drew3D: boolean, taaDone: boolean): boolean {
+    // Only on frames that actually drew 3D (a pure 2D doc keeps its own crisp vector AA) and never in the lo-res PS1
+    // mode (its chunky pixels are the look). Temporal AA replaces FXAA on the frames it resolved; a capture that
+    // bypassed TAA gets FXAA in its place. Resolution scaling keeps FXAA (render debug: noFxaa skips it).
+    return (this._aa.mode === 'fxaa' || this._taaBypassFxaa) && !taaDone && drew3D && (!this.getLoResSize(w, h) || this.loResIsDynamic()) && !(RD.on && RD.f.noFxaa);
+  }
+
+  private _postChain(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number, target: GPUTextureView | null): GPUTexture | 'target' | null {
+    // ANTI-ALIASING (persona-polish A1) runs FIRST, so bloom sees clean edges and film grain is never smeared.
     let src = srcTex;
     const drew3D = this._drew3DThisFrame; this._drew3DThisFrame = false;
-    // Temporal AA replaces FXAA on the frames it resolved; a capture that bypassed TAA gets FXAA in its place.
     const taaDone = this._taaOn && !!this._taa?.resolvedThisFrame;
-    if ((this._aa.mode === 'fxaa' || this._taaBypassFxaa) && !taaDone && drew3D && (!this.getLoResSize(w, h) || this.loResIsDynamic()) && !(RD.on && RD.f.noFxaa)) {   // resolution scaling keeps FXAA (render debug: noFxaa skips it)
+    const pp = RD.on && RD.f.noPost ? null : this._postProcessPass ?? null;   // render debug: noPost skips it
+    if (this._fxaaGate(w, h, drew3D, taaDone)) {
       this._fxaaPass ??= new FxaaPass(this.device, this._swapChainFormat);
-      src = this._fxaaPass.run(encoder, srcTex, w, h, this._aa.quality);
+      // FXAA is the last pass when no effect will run after it: straight into the target.
+      if (target && !pp?.willRun()) { if (this._fxaaPass.runInto(encoder, srcTex, w, h, this._aa.quality, target)) return 'target'; }
+      else src = this._fxaaPass.run(encoder, srcTex, w, h, this._aa.quality);
     }
-    const out = RD.on && RD.f.noPost ? null : this._postProcessPass?.run(encoder, src, w, h, this._worldTimeSec() % 3600) ?? null;   // time → film grain (render debug: noPost skips it)
+    if (!pp) return src !== srcTex ? src : null;
+    const time = this._worldTimeSec() % 3600;   // → film grain
+    if (target && pp.runTo(encoder, src, w, h, time, target)) return 'target';
+    const out = target ? null : pp.run(encoder, src, w, h, time);
     return out ?? (src !== srcTex ? src : null);
   }
 

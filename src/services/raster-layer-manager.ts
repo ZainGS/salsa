@@ -2,12 +2,22 @@ import { RasterTextureManager } from '../renderer/raster/raster-texture-manager'
 import { RasterCanvas } from '../renderer/raster/raster-canvas';
 import { LayerBlendMode } from '../renderer/raster/core/raster-compositor';
 import { DitherConfig } from '../renderer/raster/effects/dither-engine';
-import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation } from '../animation';
+import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation, type AnimationCel } from '../animation';
 import { EventEmitter } from '../renderer/util/event-emitter';
 import { bumpGpuPixelEpoch } from '../renderer/raster/gpu-pixel-epoch';
-import { rasterTextureVersion } from '../renderer/raster/raster-content-version';
+import { rasterTextureVersion, rasterContentSeq, rasterTextureWrittenAt } from '../renderer/raster/raster-content-version';
 
 function makeId() { return 'r_' + Math.random().toString(36).slice(2,9); }
+
+/** All bytes zero (a fully transparent, never-drawn cel's pixels). */
+function isAllZeroBytes(buf: ArrayBuffer): boolean {
+  const n4 = buf.byteLength >>> 2;
+  const words = new Uint32Array(buf, 0, n4);
+  for (let i = 0; i < n4; i++) if (words[i] !== 0) return false;
+  const tail = new Uint8Array(buf, n4 << 2);
+  for (let i = 0; i < tail.length; i++) if (tail[i] !== 0) return false;
+  return true;
+}
 
 /** Tightly packed RGBA8 → an image Blob (the same encode RasterTextureManager.exportToBlob does). */
 async function encodeRgbaToBlob(rgba: Uint8ClampedArray<ArrayBuffer>, w: number, h: number, type: 'image/webp' | 'image/png'): Promise<Blob> {
@@ -110,6 +120,12 @@ export class RasterLayerManager {
   // ── Animation ───────────────────────────────────────────────────
   private timeline: AnimationTimeline;
   private animationEnabled = false;
+  /** D1 (lazy cel textures): textures made for a BLANK cel only because the selected layer shows it (the paint
+   *  target), with the content-version seq at creation. Given back while nothing has written them. */
+  private _provisionalCels = new Map<GPUTexture, { layerId: string; celId: string; seq: number }>();
+  /** D1: one provably blank canvas-size texture kept from a given-back cel, reused by the next blank cel shown (no
+   *  allocation churn while scrubbing / exporting over blank cels). */
+  private _spareCel: { tex: GPUTexture; seq: number } | null = null;
 
   constructor(device: GPUDevice, width = 1024, height = 768, compositionCallback?: (list: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>) => void, selectionCallback?: (layerTexture: GPUTexture | null, layerManager: RasterTextureManager | null) => void) {
     this.device = device;
@@ -123,8 +139,11 @@ export class RasterLayerManager {
     this.timeline.on((event) => {
       if (event.type === 'frame-changed') {
         this.onFrameChanged();
-      } else if (event.type === 'playback-state-changed' && !this.timeline.isPlaying()) {
-        this.syncHistoryTargets();   // A3: playback stopped on a cel — seed its undo history now (skipped while playing)
+      } else if (event.type === 'playback-state-changed') {
+        // D1: playback started → a blank cel's provisional texture is given back; stopped on a blank cel → it gets one
+        // (the paint target). A3: playback stopped on a cel — seed its undo history now (skipped while playing).
+        if (this.animationEnabled) this.onFrameChanged();
+        else if (!this.timeline.isPlaying()) this.syncHistoryTargets();
       }
     });
 
@@ -138,6 +157,8 @@ export class RasterLayerManager {
 
   public setSize(w: number, h: number) {
     this.width = w; this.height = h;
+    this.releaseProvisionalCels();   // D1: still-blank provisional cel textures are at the old size (remade below)
+    if (this._spareCel && (this._spareCel.tex.width !== w || this._spareCel.tex.height !== h)) this.dropSpareCel();
     // resize all existing layer textures
     for (const layer of this.layers) {
       if (!layer.manager) continue; // skip 3D dividers and folders (no texture)
@@ -145,8 +166,13 @@ export class RasterLayerManager {
       layer.texture = layer.manager.ensureTexture(w, h);
       // reallocated: a history that is only the blank seed re-seeds at the new size (a new document is created at
       // the window size, then sized — its first undo used to restore the window-size seed)
-      if (before && layer.texture !== before) void layer.manager.reseedPristineHistory?.();
+      if (before && layer.texture !== before) {
+        void layer.manager.reseedPristineHistory?.();
+        // an animated layer's cel showing the layer's own texture follows it (it pointed at the destroyed old one)
+        this.timeline.replaceBaseTexture(layer.id, before, layer.texture);
+      }
     }
+    if (this.animationEnabled) { this.syncLazyCels(); this.applyFrameTextures(); }   // animated layers show their cels
     this.syncHistoryTargets();   // A3: undo follows the textures the layers now show
     this.notifyCompositionChanged();
     // A size change recreates each layer's GPUTexture (ensureTexture allocates a
@@ -240,6 +266,7 @@ export class RasterLayerManager {
       if (l.manager) l.manager.destroy();
       if ((l.type ?? 'layer') === 'layer') this.timeline.unregisterLayer(l.id);
     }
+    this._provisionalCels.clear();   // (their textures went with the layers' cels)
     this.layers = [];
     this.selectedLayerId = null;
     this.notifyCompositionChanged();
@@ -260,6 +287,7 @@ export class RasterLayerManager {
     } else {
       removed.manager.destroy();
       this.timeline.unregisterLayer(id);
+      for (const [tex, p] of this._provisionalCels) if (p.layerId === id) this._provisionalCels.delete(tex);
     }
   this.notifyCompositionChanged();
     return true;
@@ -274,6 +302,8 @@ export class RasterLayerManager {
     if (!l) return false;
     if (l.type === 'vector' || l.type === 'ephemera' || l.type === 'folder') return false;
     this.selectedLayerId = id;
+    // D1: the newly selected layer's blank cel gets its texture (the paint target); the previous one's is given back
+    if (this.syncLazyCels()) { if (this.animationEnabled) this.applyFrameTextures(); this.notifyCompositionChanged(); }
     this.syncHistoryTarget(l);   // A3: an animated layer's undo acts on the cel it shows
     // Notify renderer so it can point the paint engine at this layer's texture
     this.selectionCallback?.(l.texture ?? null, l.manager);
@@ -1001,21 +1031,29 @@ export class RasterLayerManager {
    * showing whatever cel the current frame had — a texture the conversion then destroyed (or none on a blank frame).
    */
   private makeLayerStatic(layer: RasterLayer): boolean {
+    this.releaseProvisionalCels();   // D1: a still-blank provisional cel counts as blank
     const base = layer.manager?.getTexture?.() ?? null;
     const first = this.timeline.getCels(layer.id)[0];
-    const copied = !!(base && first && first.texture !== base);
+    const firstTex = first?.texture ?? null;
+    const copied = !!(base && first && firstTex && firstTex !== base);
+    const cleared = !!(base && first && !firstTex);   // D1: a BLANK first cel → the static layer is blank
     if (copied) {
-      const w = Math.min(base!.width, first!.texture.width), h = Math.min(base!.height, first!.texture.height);
+      const w = Math.min(base!.width, firstTex!.width), h = Math.min(base!.height, firstTex!.height);
       const enc = this.device.createCommandEncoder();
-      enc.copyTextureToTexture({ texture: first!.texture }, { texture: base! }, { width: w, height: h });
+      enc.copyTextureToTexture({ texture: firstTex! }, { texture: base! }, { width: w, height: h });
       this.device.queue.submit([enc.finish()]);
       bumpGpuPixelEpoch('full', base!);   // GPU-only pixels changed (BRUSH-5 dirty, device-lost shadow, autosave)
+    } else if (cleared) {
+      const enc = this.device.createCommandEncoder();
+      enc.beginRenderPass({ colorAttachments: [{ view: base!.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }] }).end();
+      this.device.queue.submit([enc.finish()]);
+      bumpGpuPixelEpoch('full', base!);
     }
     this.timeline.setLayerAnimationType(layer.id, 'static');   // destroys the other cels' textures
-    if (copied) this.timeline.setCelTexture(layer.id, first!.id, base!);   // …and the first one's (now in `base`)
+    if (copied || cleared) this.timeline.setCelTexture(layer.id, first!.id, base!);   // …and the first one's (now in `base`)
     if (base) layer.texture = base;
     layer.manager?.setHistoryTarget?.(null);
-    if (copied) void layer.manager?.pushSnapshot?.();   // the static pixels = one undo entry on the layer's history
+    if (copied || cleared) void layer.manager?.pushSnapshot?.();   // the static pixels = one undo entry on the layer's history
     if (this.selectedLayerId === layer.id) this.selectionCallback?.(layer.texture ?? null, layer.manager);
     this.notifyCompositionChanged();
     return true;
@@ -1039,17 +1077,18 @@ export class RasterLayerManager {
    * is.) Splitting a hold gives the rest of the hold its own copy of the drawing (AnimationTimeline.addCel).
    */
   public addCelAtFrame(layerId: string, frame: number): string | null {
-    const prior = new Set(this.timeline.getCels(layerId).map(c => c.id));
+    this.releaseProvisionalCels();   // D1: splitting a hold whose drawing is still blank leaves the rest blank (no copy)
     const cel = this.timeline.addCel(
       layerId,
       frame,
       this.device,
       this.width,
       this.height,
+      'key',
+      (t) => this.isTextureBlank(layerId, t),   // D1: the rest of a still-blank hold stays blank (no copy)
     );
     if (cel) {
-      // B3/A3: a NEW cel is blank — its undo history starts as a blank seed (no read-back)
-      if (!prior.has(cel.id)) this.layers.find(l => l.id === layerId)?.manager?.seedBlankHistory?.(cel.texture);
+      // D1: a NEW cel is blank and owns no texture; shown on the selected layer it gets one (blank undo seed, B3/A3)
       this.onFrameChanged(); // update displayed texture
       return cel.id;
     }
@@ -1058,6 +1097,7 @@ export class RasterLayerManager {
 
   /** Delete a cel from an animated layer. */
   public deleteCel(layerId: string, celId: string): boolean {
+    this.releaseProvisionalCels();   // (D1: a blank one's texture becomes the spare)
     const result = this.timeline.deleteCel(layerId, celId);
     if (result) this.onFrameChanged();
     return result;
@@ -1070,17 +1110,8 @@ export class RasterLayerManager {
    */
   public forceFrameSync(): void {
     if (!this.animationEnabled) return;
-    const frame = this.timeline.getCurrentFrame();
-
-    for (const layer of this.layers) {
-      const celTexture = this.timeline.getTextureAtFrame(layer.id, frame);
-      if (celTexture === undefined) continue; // static layer
-      if (celTexture === null) {
-        layer.texture = undefined;
-      } else {
-        layer.texture = celTexture;
-      }
-    }
+    this.syncLazyCels();          // D1: the selected layer's blank cel gets its texture (the paint target)
+    this.applyFrameTextures();
     this.syncHistoryTargets();   // A3: undo follows the cels now shown
 
     // Update selected layer paint target
@@ -1101,25 +1132,10 @@ export class RasterLayerManager {
   private onFrameChanged(): void {
     if (!this.animationEnabled) return;
 
-    const frame = this.timeline.getCurrentFrame();
-
-    for (const layer of this.layers) {
-      const celTexture = this.timeline.getTextureAtFrame(layer.id, frame);
-
-      if (celTexture === undefined) {
-        // Static layer — keep the existing texture (no change needed)
-        continue;
-      }
-
-      if (celTexture === null) {
-        // Blank frame — hide the layer for this frame by setting texture to undefined
-        // (the compositor skips layers without textures)
-        layer.texture = undefined;
-      } else {
-        // Animated frame — swap to the cel's texture
-        layer.texture = celTexture;
-      }
-    }
+    // D1: the selected layer's blank cel gets its texture (the paint target); a provisional one left behind that
+    // nothing wrote is given back (playing: none is made)
+    this.syncLazyCels();
+    this.applyFrameTextures();
     this.syncHistoryTargets();   // A3: undo follows the cels now shown (seeded only when not playing)
 
     // Update the selected layer's paint target if it's animated
@@ -1131,6 +1147,140 @@ export class RasterLayerManager {
     }
 
     this.notifyCompositionChanged();
+  }
+
+  /** Animated layers show the cel of the current frame: its texture, or none (a blank frame / a BLANK cel — the
+   *  compositor skips a layer without a texture). Static layers keep theirs. */
+  private applyFrameTextures(): void {
+    const frame = this.timeline.getCurrentFrame();
+    for (const layer of this.layers) {
+      const celTexture = this.timeline.getTextureAtFrame(layer.id, frame);
+      if (celTexture === undefined) continue;   // static layer
+      layer.texture = celTexture ?? undefined;
+    }
+  }
+
+  // ── D1: lazy cel textures ─────────────────────────────────────────
+  //
+  // A blank cel owns no texture. Every pixel writer (brush, fill, paste, transform, text, filters, undo / redo) writes
+  // the SELECTED layer's shown texture — the paint target handed out by selectionCallback — so the blank cel the
+  // selected layer shows (playback stopped) gets a texture: PROVISIONAL, with a blank undo seed and the content-version
+  // seq at creation. When the paint target moves on (frame change, another layer selected, playback, a cel operation,
+  // a resize) a provisional texture nothing has written since (raster-content-version: no write reported to it, and
+  // no unattributed one) and whose history holds only its seed is given back: the cel is blank again and the texture is
+  // kept as the one spare. A written one simply becomes the cel's own. Other writes to a blank cel (a load / import
+  // upload) make its texture directly. Readers (compositor, onion skin, export, autosave, versions) treat a blank cel —
+  // or a provisional one still blank — as transparent / absent.
+
+  /** A canvas-size blank texture for a cel: the spare when still provably blank, else a new one (WebGPU zero-fills). */
+  private newBlankCelTexture(): GPUTexture {
+    const spare = this._spareCel;
+    this._spareCel = null;
+    if (spare && spare.tex.width === this.width && spare.tex.height === this.height && rasterTextureWrittenAt(spare.tex) <= spare.seq) return spare.tex;
+    if (spare) this.destroyLater(spare.tex);
+    return this.device.createTexture({
+      size: [this.width, this.height],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC |
+             GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+  }
+
+  /** Destroy once the GPU has drained (a previous frame's composite may still reference it). */
+  private destroyLater(tex: GPUTexture): void {
+    this.device.queue.onSubmittedWorkDone().then(() => tex.destroy()).catch(() => { /* device lost */ });
+  }
+
+  private dropSpareCel(): void {
+    if (this._spareCel) this.destroyLater(this._spareCel.tex);
+    this._spareCel = null;
+  }
+
+  /** Give a cel of `layer` its first texture (blank, with a blank undo seed). Provisional = made for the paint target. */
+  private materializeCel(layer: RasterLayer, celId: string, provisional: boolean): GPUTexture | null {
+    const tex = this.newBlankCelTexture();
+    if (!this.timeline.setCelTexture(layer.id, celId, tex)) { this._spareCel = { tex, seq: rasterContentSeq() }; return null; }
+    layer.manager?.seedBlankHistory?.(tex);
+    if (provisional) this._provisionalCels.set(tex, { layerId: layer.id, celId, seq: rasterContentSeq() });
+    return tex;
+  }
+
+  /** A provisional cel texture still exactly blank (nothing written, history only its seed). */
+  private isProvisionalBlank(tex: GPUTexture | null | undefined): boolean {
+    const p = tex ? this._provisionalCels.get(tex) : undefined;
+    if (!p) return false;
+    const layer = this.layers.find(l => l.id === p.layerId);
+    return rasterTextureWrittenAt(tex!) <= p.seq && (layer?.manager?.isHistoryPristine?.(tex!) ?? true);
+  }
+
+  /** D1: `tex` (a cel's of `layerId`) is provably blank: a provisional one nothing wrote, or the layer's own texture
+   *  untouched since its blank seed (cel 1 of a fresh layer made animated). */
+  private isTextureBlank(layerId: string, tex: GPUTexture): boolean {
+    if (this.isProvisionalBlank(tex)) return true;
+    return !!this.layers.find(l => l.id === layerId)?.manager?.isTextureProvablyBlank?.(tex);
+  }
+
+  /** The texture holding a cel's pixels, or null when it is blank (no texture, or a provisional one still blank). */
+  private celPixels(cel: AnimationCel): GPUTexture | null {
+    return cel.texture && !this.isProvisionalBlank(cel.texture) ? cel.texture : null;
+  }
+
+  /** Give back every provisional cel texture nothing has written (except `keep`); written ones become their cels' own.
+   *  True when a cel went blank again. */
+  private releaseProvisionalCels(keep: GPUTexture | null = null): boolean {
+    let changed = false;
+    for (const [tex, p] of [...this._provisionalCels]) {
+      if (tex === keep) continue;
+      const blank = this.isProvisionalBlank(tex);
+      this._provisionalCels.delete(tex);
+      if (!blank) continue;   // drawn on: a real cel texture now
+      const cel = this.timeline.getCels(p.layerId).find(c => c.id === p.celId);
+      if (!cel || cel.texture !== tex) continue;   // deleted / re-pointed meanwhile (the timeline released it)
+      if (this.timeline.takeCelTexture(p.layerId, p.celId) !== tex) continue;
+      const layer = this.layers.find(l => l.id === p.layerId);
+      layer?.manager?.dropHistory?.(tex);
+      if (layer && layer.texture === tex) layer.texture = undefined;
+      if (this._spareCel) this.destroyLater(tex);
+      else this._spareCel = { tex, seq: p.seq };
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** The selected animated layer (playback stopped) gets a texture for the blank cel it shows; every other provisional
+   *  texture still blank is given back. True when a cel's texture changed (re-apply the frame textures). */
+  private syncLazyCels(): boolean {
+    let target: { layer: RasterLayer; cel: AnimationCel } | null = null;
+    const sel = this.selectedLayerId ? this.layers.find(l => l.id === this.selectedLayerId) : undefined;
+    if (sel && (sel.type ?? 'layer') === 'layer' && sel.manager && this.animationEnabled && !this.timeline.isPlaying()
+        && this.timeline.isLayerAnimated(sel.id)) {
+      const cel = this.timeline.getCelAtFrame(sel.id, this.timeline.getCurrentFrame());
+      if (cel) target = { layer: sel, cel };
+    }
+    let changed = this.releaseProvisionalCels(target?.cel.texture ?? null);
+    if (target && !target.cel.texture && this.width > 0 && this.height > 0) {
+      changed = !!this.materializeCel(target.layer, target.cel.id, true) || changed;
+    }
+    return changed;
+  }
+
+  /** D1 diagnostics / tests: cels with a texture vs blank, the provisional ones, the spare, and the GPU bytes the cel
+   *  textures hold (a layer's own texture — cel 1 — not counted: the layer has it anyway). */
+  public getCelMemoryStats(): { cels: number; withTexture: number; blank: number; provisional: number; spare: boolean; textureBytes: number } {
+    let cels = 0, withTexture = 0, bytes = 0;
+    const seen = new Set<GPUTexture>();
+    for (const l of this.layers) {
+      if ((l.type ?? 'layer') !== 'layer') continue;
+      const own = l.manager?.getTexture?.() ?? null;
+      for (const c of this.timeline.getCels(l.id)) {
+        cels++;
+        if (!c.texture) continue;
+        withTexture++;
+        if (c.texture !== own && !seen.has(c.texture)) { seen.add(c.texture); bytes += c.texture.width * c.texture.height * 4; }
+      }
+    }
+    if (this._spareCel) bytes += this._spareCel.tex.width * this._spareCel.tex.height * 4;
+    return { cels, withTexture, blank: cels - withTexture, provisional: this._provisionalCels.size, spare: !!this._spareCel, textureBytes: bytes };
   }
 
   /**
@@ -1168,7 +1318,8 @@ export class RasterLayerManager {
    * Returns the new cel id, or null.
    */
   public duplicateCel(layerId: string, celId: string, targetFrame: number): string | null {
-    const cel = this.timeline.duplicateCel(layerId, celId, targetFrame, this.device);
+    this.releaseProvisionalCels();   // D1: duplicating a still-blank cel makes a blank one (no copy)
+    const cel = this.timeline.duplicateCel(layerId, celId, targetFrame, this.device, (t) => this.isTextureBlank(layerId, t));
     if (cel) {
       this.onFrameChanged();
       return cel.id;
@@ -1302,8 +1453,10 @@ export class RasterLayerManager {
    *  on the new device so the layer stack stays valid; the document restore that follows re-uploads the pixels. */
   public recreateTexturesForNewDevice(): void {
     this._readbackBuf = null; this._readbackBufSize = 0;
+    this._provisionalCels.clear(); this._spareCel = null;   // (D1: died with the device; the restore remakes the cels)
     for (const l of this.layers) {
-      if (!l.texture || !l.manager) continue;
+      // (an animated layer showing a blank cel / frame has no texture now — D1 — but its manager's died too)
+      if (!l.manager || (!l.texture && !this.timeline.isLayerAnimated(l.id))) continue;
       l.manager.resetForNewDevice();
       l.texture = l.manager.ensureTexture(this.width, this.height);
     }
@@ -1334,8 +1487,9 @@ export class RasterLayerManager {
     for (const layer of this.layers) {
       const cels = this.timeline.getCels(layer.id);
       for (const cel of cels) {
-        if (!cel.texture) continue;
-        const pixels = await this.readTexturePixels(cel.texture);
+        const tex = this.celPixels(cel);   // D1: a blank cel has no pixels (absent = blank on load)
+        if (!tex) continue;
+        const pixels = await this.readTexturePixels(tex);
         out.push({ celId: cel.id, pixelData: pixels });
       }
     }
@@ -1352,7 +1506,10 @@ export class RasterLayerManager {
     const cels: Array<{ celId: string; texture: GPUTexture }> = [];
     for (const l of this.layers) if (l.texture) layers.push({ id: l.id, texture: l.texture });
     for (const layer of this.layers) {
-      for (const cel of this.timeline.getCels(layer.id)) if (cel.texture) cels.push({ celId: cel.id, texture: cel.texture });
+      for (const cel of this.timeline.getCels(layer.id)) {
+        const tex = this.celPixels(cel);   // D1: blank cels are not listed (absent = blank on load)
+        if (tex) cels.push({ celId: cel.id, texture: tex });
+      }
     }
     return { layers, cels };
   }
@@ -1376,7 +1533,7 @@ export class RasterLayerManager {
         const own = rasterTextureVersion(l.texture);
         layers[l.id] = managed && managed !== l.texture ? own + '|' + rasterTextureVersion(managed) : own;
       }
-      for (const cel of this.timeline.getCels(l.id)) cels[cel.id] = rasterTextureVersion(cel.texture);
+      for (const cel of this.timeline.getCels(l.id)) cels[cel.id] = rasterTextureVersion(this.celPixels(cel));   // blank = 'none'
     }
     return { layers, cels };
   }
@@ -1401,11 +1558,12 @@ export class RasterLayerManager {
       if ((l.type ?? 'layer') !== 'layer') continue;
       const cel = this.timeline.getCels(l.id).find(c => c.id === celId);
       if (!cel) continue;
-      if (!cel.texture) return null;
+      const tex = this.celPixels(cel);   // D1: a blank cel has no pixels
+      if (!tex) return null;
       try {
-        const w = cel.texture.width, h = cel.texture.height;
+        const w = tex.width, h = tex.height;
         if (!w || !h) return null;
-        const pixels = await this.readTexturePixels(cel.texture);
+        const pixels = await this.readTexturePixels(tex);
         return await encodeRgbaToBlob(new Uint8ClampedArray(pixels), w, h, type);
       } catch (e) {
         console.warn('exportCelToBlob failed for cel', celId, e);
@@ -1459,18 +1617,33 @@ export class RasterLayerManager {
   public uploadPixelsToCel(layerId: string, celId: string, pixels: ArrayBuffer): boolean {
     const cels = this.timeline.getCels(layerId);
     const cel = cels.find(c => c.id === celId);
-    if (!cel?.texture) return false;
-    const w = cel.texture.width;
-    const h = cel.texture.height;
-    bumpGpuPixelEpoch('full', cel.texture);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: this cel)
+    if (!cel) return false;
+    const layer = this.layers.find(l => l.id === layerId);
+    if (!cel.texture) {
+      // D1: all-zero pixels on a blank cel → it stays blank (no texture); otherwise this write makes its texture
+      if (pixels.byteLength === this.width * this.height * 4 && isAllZeroBytes(pixels)) return true;
+      if (!layer || !this.materializeCel(layer, celId, false)) return false;
+    }
+    const tex = cel.texture!;
+    this._provisionalCels.delete(tex);   // (written: the cel's own now)
+    const w = tex.width;
+    const h = tex.height;
+    bumpGpuPixelEpoch('full', tex);   // GPU-only pixels changed (device-lost shadow accuracy; autosave: this cel)
     this.device.queue.writeTexture(
-      { texture: cel.texture },
+      { texture: tex },
       pixels,
       { bytesPerRow: w * 4 },
       { width: w, height: h },
     );
     // A2/A3: the cel's undo history starts from exactly these bytes (no read-back)
-    this.layers.find(l => l.id === layerId)?.manager?.seedHistoryFromPixels?.(cel.texture, pixels);
+    layer?.manager?.seedHistoryFromPixels?.(tex, pixels);
+    if (layer && this.animationEnabled && layer.texture !== tex
+        && this.timeline.getCelAtFrame(layerId, this.timeline.getCurrentFrame()) === cel) {
+      layer.texture = tex;   // shown now (it was blank)
+      this.syncHistoryTarget(layer);
+      if (this.selectedLayerId === layerId) this.selectionCallback?.(tex, layer.manager);
+      this.notifyCompositionChanged();
+    }
     return true;
   }
 
@@ -1482,13 +1655,14 @@ export class RasterLayerManager {
    * Perf audit A3: the earliest cel shows the layer's OWN texture (cleared), as cel 1 of a layer animated in-session
    * does — clearing the default cel used to DESTROY that texture while the layer's texture manager (its undo
    * history, resize, export) kept using it. Every cel starts blank with a blank undo seed; uploadPixelsToCel re-seeds
-   * the ones that have pixels.
+   * the ones that have pixels. D1: the other cels own no texture until their pixels are uploaded (or drawn).
    */
   public restoreLayerCels(
     layerId: string,
     celMetas: Array<{ celId: string; startFrame: number; duration: number; celType: 'key' | 'inbetween' }>,
   ): string[] {
     // First, clear the auto-created default cel from setLayerAnimated (the timeline never destroys the layer's texture)
+    this.releaseProvisionalCels();
     const existingCels = this.timeline.getCels(layerId);
     for (const c of [...existingCels]) {
       this.timeline.deleteCel(layerId, c.id);
@@ -1503,32 +1677,21 @@ export class RasterLayerManager {
     // Create each cel with the saved ID and timing
     const created: string[] = [];
     for (const meta of celMetas) {
-      let texture: GPUTexture;
+      let texture: GPUTexture | null = null;   // D1: blank (no texture) until pixels are uploaded / drawn
       if (base && meta === first) {
         texture = base;
         const enc = this.device.createCommandEncoder();
         enc.beginRenderPass({ colorAttachments: [{ view: base.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }] }).end();
         this.device.queue.submit([enc.finish()]);
         bumpGpuPixelEpoch('full', base);   // (cleared: it held the layer-level pixels of the save)
-      } else {
-        texture = this.device.createTexture({
-          size: [this.width, this.height],
-          format: 'rgba8unorm',
-          usage:
-            GPUTextureUsage.TEXTURE_BINDING |
-            GPUTextureUsage.STORAGE_BINDING |
-            GPUTextureUsage.COPY_SRC |
-            GPUTextureUsage.COPY_DST |
-            GPUTextureUsage.RENDER_ATTACHMENT,
-        });
       }
       const cel = this.timeline.addCelWithId(
         layerId, meta.celId, meta.startFrame, meta.duration, meta.celType, texture,
       );
       if (cel) {
         created.push(cel.id);
-        layer?.manager?.seedBlankHistory?.(texture);   // B3: blank until its pixels are uploaded
-      } else if (texture !== base) texture.destroy();
+        if (texture) layer?.manager?.seedBlankHistory?.(texture);   // B3: blank until its pixels are uploaded
+      }
     }
     return created;
   }

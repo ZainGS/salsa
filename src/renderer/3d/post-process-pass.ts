@@ -13,7 +13,8 @@
  *
  * Source texture:  the swap-chain format (lastFrameTex, requires TEXTURE_BINDING usage)
  * Bloom textures:  rgba16float (intermediate, for HDR bloom accumulation)
- * Output textures: the swap-chain format (ping-pong pair, caller copies result to swapchain)
+ * Output textures: the swap-chain format (ping-pong pair, caller copies result to swapchain) — or, with runTo(),
+ *                  the LAST pass renders straight into the canvas texture view (perf audit C2: no copy)
  */
 
 import { PP_BLOOM_DOWN_FS, PP_BLOOM_UP_FS } from './shaders/post-process-shaders';
@@ -320,14 +321,45 @@ export class PostProcessPass {
    * The caller should copy the returned texture to the swapchain (instead of lastFrameTex).
    */
   run(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number, timeSec = 0): GPUTexture | null {
+    return this._chain(encoder, srcTex, w, h, timeSec, null) as GPUTexture | null;
+  }
+
+  /** run(), but the LAST pass renders straight into `target` (the canvas texture view: the swap-chain format, w×h —
+   *  perf audit C2: no ping/pong output + copy). True when anything ran (the frame is in `target`); false = every
+   *  effect off / still compiling (nothing was drawn). */
+  runTo(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number, timeSec: number, target: GPUTextureView): boolean {
+    return this._chain(encoder, srcTex, w, h, timeSec, target) === true;
+  }
+
+  /** Any effect switched on in the config (pipelines may still be compiling) — a superset of willRun(). */
+  mayRun(): boolean {
+    const c = this.config;
+    return c.bloom.enabled || c.colorGrade.enabled || c.vignette.enabled || c.film.enabled;
+  }
+
+  /** Exactly whether run() / runTo() would draw anything right now (also requests pending compiles, like run()). */
+  willRun(): boolean {
+    const g = this._gates();
+    return g.bloomOn || g.gradeOn || g.vigOn || g.filmOn;
+  }
+
+  private _gates(): { bloomOn: boolean; gradeOn: boolean; vigOn: boolean; filmOn: boolean } {
     // P2: an effect runs only once its pipelines have compiled (each get() also requests a pending compile).
     const bloomReady = !this.config.bloom.enabled ? false
       : [this._bloomExtractPipeline.get(), this._blurPipeline.get(), this._bloomCompositePipeline.get()].every(Boolean);
     const gradeReady = !!this._gradeVigPipeline.get();
-    const bloomOn = this.config.bloom.enabled && bloomReady;
-    const gradeOn = this.config.colorGrade.enabled && gradeReady;
-    const vigOn   = this.config.vignette.enabled && gradeReady;
-    const filmOn  = this.config.film.enabled && gradeReady;
+    return {
+      bloomOn: this.config.bloom.enabled && bloomReady,
+      gradeOn: this.config.colorGrade.enabled && gradeReady,
+      vigOn:   this.config.vignette.enabled && gradeReady,
+      filmOn:  this.config.film.enabled && gradeReady,
+    };
+  }
+
+  /** The chain: into the ping/pong pair (returns the output texture), or with `target` the last pass into it
+   *  (returns true). Null = nothing ran. */
+  private _chain(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number, timeSec: number, target: GPUTextureView | null): GPUTexture | true | null {
+    const { bloomOn, gradeOn, vigOn, filmOn } = this._gates();
 
     if (!bloomOn && !gradeOn && !vigOn && !filmOn) return null;
 
@@ -352,16 +384,19 @@ export class PostProcessPass {
       // WIDE glow: mip chain down + additive up, landing on the blurred halo (composite reads it unchanged).
       if ((this.config.bloom.wide ?? 0) > 0) this._runWideBloom(encoder, sampler, w, h);
 
-      // Composite scene + blurred bloom → output ping-pong tex
+      // Composite scene + blurred bloom → output ping-pong tex (or the target, when it is the last pass)
+      const grades = gradeOn || vigOn || filmOn;
+      if (target && !grades) { this._runBloomComposite(encoder, currentSrc, this._bloomExtractTex!, target, sampler); return true; }
       const dst = pingIdx === 0 ? this._pingTex! : this._pongTex!;
-      this._runBloomComposite(encoder, currentSrc, this._bloomExtractTex!, dst, sampler);
+      this._runBloomComposite(encoder, currentSrc, this._bloomExtractTex!, dst.createView(), sampler);
       currentSrc = dst;
       pingIdx++;
     }
 
     if (gradeOn || vigOn || filmOn) {   // film (grain / fringing) rides the grade+vignette pass
+      if (target) { this._runGradeVig(encoder, currentSrc, target, sampler); return true; }
       const dst = pingIdx === 0 ? this._pingTex! : this._pongTex!;
-      this._runGradeVig(encoder, currentSrc, dst, sampler);
+      this._runGradeVig(encoder, currentSrc, dst.createView(), sampler);
       currentSrc = dst;
       pingIdx++;
     }
@@ -580,7 +615,7 @@ export class PostProcessPass {
     encoder: GPUCommandEncoder,
     sceneTex: GPUTexture,
     bloomTex: GPUTexture,
-    dst: GPUTexture,
+    dstView: GPUTextureView,
     sampler: GPUSampler,
   ): void {
     if (!this._compositeBG || this._compositeBGSrc !== sceneTex || this._compositeBGBloom !== bloomTex) {
@@ -599,7 +634,7 @@ export class PostProcessPass {
 
     const pass = encoder.beginRenderPass({
       label: 'PPBloomCompositePass',
-      colorAttachments: [{ view: dst.createView(), loadOp: 'clear', clearValue: { r:0,g:0,b:0,a:0 }, storeOp: 'store' }],
+      colorAttachments: [{ view: dstView, loadOp: 'clear', clearValue: { r:0,g:0,b:0,a:0 }, storeOp: 'store' }],
     });
     pass.setPipeline(this._bloomCompositePipeline.get()!);   // gated by run()
     pass.setBindGroup(0, this._compositeBG);
@@ -610,7 +645,7 @@ export class PostProcessPass {
   private _runGradeVig(
     encoder: GPUCommandEncoder,
     srcTex: GPUTexture,
-    dst: GPUTexture,
+    dstView: GPUTextureView,
     sampler: GPUSampler,
   ): void {
     if (!this._gradeVigBG || this._gradeVigBGSrc !== srcTex) {
@@ -627,7 +662,7 @@ export class PostProcessPass {
 
     const pass = encoder.beginRenderPass({
       label: 'PPGradeVigPass',
-      colorAttachments: [{ view: dst.createView(), loadOp: 'clear', clearValue: { r:0,g:0,b:0,a:0 }, storeOp: 'store' }],
+      colorAttachments: [{ view: dstView, loadOp: 'clear', clearValue: { r:0,g:0,b:0,a:0 }, storeOp: 'store' }],
     });
     pass.setPipeline(this._gradeVigPipeline.get()!);   // gated by run()
     pass.setBindGroup(0, this._gradeVigBG);

@@ -23,8 +23,10 @@ export interface AnimationCel {
   startFrame: number;
   /** Number of frames this cel is held for (1 = single frame, >1 = hold). */
   duration: number;
-  /** The GPU texture containing this cel's pixel data. */
-  texture: GPUTexture;
+  /** The GPU texture containing this cel's pixel data. null = BLANK: a cel never drawn on owns no texture (perf audit
+   *  D1, 2026-10-09) — it is made on the first write (RasterLayerManager materialises it when the cel becomes the
+   *  paint target, and frees it again while nothing was written). Readers treat null as fully transparent. */
+  texture: GPUTexture | null;
   /** Whether this is a key drawing or an inbetween. */
   celType: 'key' | 'inbetween';
 }

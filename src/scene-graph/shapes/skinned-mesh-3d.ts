@@ -1,6 +1,7 @@
 import { Mesh3D, type Mesh3DConfig } from './mesh-3d';
 import type { Skeleton3D } from './skeleton-3d';
 import type { InteractionService } from '../../services/interaction-service';
+import { jsonBase64 } from '../core/json-parts';
 
 /**
  * SkinnedMesh3D — Mesh3D with per-vertex joint weights for LBS skinning.
@@ -119,8 +120,9 @@ export class SkinnedMesh3D extends Mesh3D {
       ...super.toJSON(),
       type: 'SkinnedMesh3D',
       skeletonId: this.skeletonId,
-      jointIndicesB64: toBase64(this.jointIndices.buffer as ArrayBuffer),
-      jointWeightsB64: toBase64(this.jointWeights.buffer as ArrayBuffer),
+      // jsonBase64 = the encode, or (inside a document save's collection) a cached JSON part (perf audit C4).
+      jointIndicesB64: ((b) => jsonBase64(b, () => toBase64(b)))(this.jointIndices.buffer as ArrayBuffer),
+      jointWeightsB64: ((b) => jsonBase64(b, () => toBase64(b)))(this.jointWeights.buffer as ArrayBuffer),
       // Procedural-character flags — must persist so a MOVED character reloads correctly (the body's
       // transform drives the skeleton; without these it would render via localMatrix while the parts
       // rebuild at the origin). See docs/specs/character-transform-on-skeleton.md.

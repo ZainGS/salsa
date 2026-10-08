@@ -20,9 +20,14 @@
  *  • BORROWED ({@link RasterSnapshotManager.initializeFromPixels}, audit A2): the bytes a document load already
  *    holds; never written in place (copied first if trimming folds into it).
  * Both are FULL entries everywhere else (getStats kinds, the entry-0 rule).
+ *
+ * Perf audit C3 (2026-10-09): every stack registers with the SHARED undo memory budget (raster-undo-budget.ts). Each
+ * entry carries a global stamp; over budget, the oldest undo steps across ALL stacks are folded away
+ * ({@link RasterSnapshotManager.trimOldestStep}) — never the current state.
  */
 
 import { bumpGpuPixelEpoch } from '../gpu-pixel-epoch';
+import { enforceRasterUndoBudget, nextUndoStamp, registerUndoHistory, unregisterUndoHistory, type BudgetedHistory } from './raster-undo-budget';
 
 /** A rect undo patch: `before`/`after` are tightly packed RGBA rows of the rect (rw*rh*4 bytes) on a w×h texture. */
 export interface RasterRectPatch {
@@ -35,8 +40,8 @@ export interface RasterRectPatch {
 }
 
 /** A full state. `data` null = BLANK (all zeros, nothing held); `borrowed` = the caller's bytes (never mutate). */
-type FullSnap = { kind: 'full'; w: number; h: number; data: Uint8Array | null; borrowed?: boolean };
-type RectSnap = { kind: 'rect' } & RasterRectPatch;
+type FullSnap = { kind: 'full'; w: number; h: number; data: Uint8Array | null; borrowed?: boolean; stamp: number };
+type RectSnap = { kind: 'rect'; stamp: number } & RasterRectPatch;
 type Snap = FullSnap | RectSnap;
 
 /** Diagnostics / tests (audit B3): GPU read-backs the undo stacks submitted, and their bytes. */
@@ -53,7 +58,7 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-export class RasterSnapshotManager {
+export class RasterSnapshotManager implements BudgetedHistory {
   private device: GPUDevice;
   private snapshots: Snap[] = [];
   private snapIndex = -1;
@@ -72,6 +77,64 @@ export class RasterSnapshotManager {
   constructor(device: GPUDevice, maxSnapshots = 10) {
     this.device = device;
     this.maxSnapshots = maxSnapshots;
+    registerUndoHistory(this);   // C3: the shared undo memory budget
+  }
+
+  // ── Shared memory budget (C3, raster-undo-budget.ts) ──────────────
+
+  /** Bytes this stack really holds: full pixels (a borrowed load seed too — the stack keeps it alive) + patches. */
+  public heldBytes(): number {
+    let bytes = 0;
+    for (const s of this.snapshots) bytes += s.kind === 'full' ? (s.data ? s.data.length : 0) : s.before.length + s.after.length;
+    return bytes;
+  }
+
+  /** Undo steps below the current state. */
+  public undoSteps(): number {
+    return this.snapIndex > 0 ? this.snapIndex : 0;
+  }
+
+  /** The stamp of the oldest undo step (entry 1); Infinity when there is none. */
+  public oldestStepStamp(): number {
+    return this.snapIndex >= 1 && this.snapshots[1] ? this.snapshots[1].stamp : Infinity;
+  }
+
+  /** Bytes trimming down to `keepSteps` undo steps would free (≤ 0: nothing to gain — e.g. a BLANK seed followed by
+   *  stroke patches: folding them materialises a whole frame). Exact: the new seed is the kept entry itself when FULL,
+   *  else a full frame (the fold). */
+  public trimGain(keepSteps: number): number {
+    const seedIdx = this.snapIndex - Math.max(0, keepSteps);
+    if (seedIdx <= 0) return 0;
+    let after = 0;
+    for (let i = seedIdx; i < this.snapshots.length; i++) {
+      const s = this.snapshots[i];
+      if (i === seedIdx && s.kind === 'rect') after += s.w * s.h * 4;
+      else after += s.kind === 'full' ? (s.data ? s.data.length : 0) : s.before.length + s.after.length;
+    }
+    return this.heldBytes() - after;
+  }
+
+  /** Drop the oldest undo step: entry 1 becomes the seed (a rect folded into the old seed's pixels). Never the
+   *  current state. False when there is no undo step. */
+  public trimOldestStep(): boolean {
+    if (this.snapIndex < 1 || this.snapshots.length < 2) return false;
+    this.dropOldest();
+    this.snapIndex--;
+    return true;
+  }
+
+  /** Remove entry 0, folding entry 1 into a FULL entry when it is a rect (entry 0 must stay full). */
+  private dropOldest(): void {
+    const oldest = this.snapshots[0];
+    const next = this.snapshots[1];
+    if (next && next.kind === 'rect' && oldest.kind === 'full' && oldest.w === next.w && oldest.h === next.h) {
+      // Fold the rect into the dropped full frame (in place — it is being discarded) so entry 0 stays full. A BLANK
+      // seed materialises its zeros here; BORROWED bytes are copied first (the caller still owns them).
+      const data = !oldest.data ? new Uint8Array(oldest.w * oldest.h * 4) : oldest.borrowed ? oldest.data.slice() : oldest.data;
+      RasterSnapshotManager.applyRegion(data, oldest.w, next.x, next.y, next.rw, next.rh, next.after);
+      this.snapshots[1] = { kind: 'full', w: oldest.w, h: oldest.h, data, stamp: next.stamp };
+    }
+    this.snapshots.shift();
   }
 
   /** Diagnostics / tests: entry kinds, the current index, and the bytes the stack holds. */
@@ -136,7 +199,7 @@ export class RasterSnapshotManager {
     }
     this.lastSnapshotMs = Date.now();
     this.append({ kind: 'rect', w, h, x: patch.x, y: patch.y, rw: patch.rw, rh: patch.rh,
-                  before: patch.before, after: patch.after });
+                  before: patch.before, after: patch.after, stamp: nextUndoStamp() });
   }
 
   private async _push(texture: GPUTexture, dirtyRect?: { x: number; y: number; w: number; h: number }): Promise<void> {
@@ -185,7 +248,7 @@ export class RasterSnapshotManager {
           if (this.debug) console.log('RasterSnapshotManager: skipped identical (rect)');
           return;
         }
-        this.append({ kind: 'rect', w, h, x: rx, y: ry, rw, rh, before, after });
+        this.append({ kind: 'rect', w, h, x: rx, y: ry, rw, rh, before, after, stamp: nextUndoStamp() });
         if (this.debug) console.log('RasterSnapshotManager: pushed (rect', rx, ry, rw, rh, '), idx=', this.snapIndex);
         return;
       }
@@ -239,29 +302,20 @@ export class RasterSnapshotManager {
       }
     }
 
-    this.append({ kind: 'full', w, h, data: out });
+    this.append({ kind: 'full', w, h, data: out, stamp: nextUndoStamp() });
     if (this.debug) console.log('RasterSnapshotManager: pushed, idx=', this.snapIndex, 'len=', this.snapshots.length);
   }
 
-  /** Truncate redo history, append, trim to maxSnapshots (keeping entry 0 FULL), point at the new top. */
+  /** Truncate redo history, append, trim to maxSnapshots (keeping entry 0 FULL), point at the new top; then the
+   *  shared budget (C3) may trim the oldest steps of any stack (this one keeps its newest step). */
   private append(entry: Snap): void {
     if (this.snapIndex + 1 < this.snapshots.length) {
       this.snapshots.length = this.snapIndex + 1;
     }
     this.snapshots.push(entry);
-    while (this.snapshots.length > this.maxSnapshots) {
-      const oldest = this.snapshots[0];
-      const next = this.snapshots[1];
-      if (next && next.kind === 'rect' && oldest.kind === 'full' && oldest.w === next.w && oldest.h === next.h) {
-        // Fold the rect into the dropped full frame (in place — it is being discarded) so entry 0 stays full. A BLANK
-        // seed materialises its zeros here; BORROWED bytes are copied first (the caller still owns them).
-        const data = !oldest.data ? new Uint8Array(oldest.w * oldest.h * 4) : oldest.borrowed ? oldest.data.slice() : oldest.data;
-        RasterSnapshotManager.applyRegion(data, oldest.w, next.x, next.y, next.rw, next.rh, next.after);
-        this.snapshots[1] = { kind: 'full', w: oldest.w, h: oldest.h, data };
-      }
-      this.snapshots.shift();
-    }
+    while (this.snapshots.length > this.maxSnapshots) this.dropOldest();
     this.snapIndex = this.snapshots.length - 1;
+    enforceRasterUndoBudget(this);
   }
 
   // ── State reconstruction ──────────────────────────────────────────
@@ -362,7 +416,7 @@ export class RasterSnapshotManager {
   /** Audit B3: seed (replacing any history) with "w×h, fully transparent" — no read-back, no bytes held. The caller
    *  guarantees the texture IS blank (just created / cleared, nothing written since). */
   public initializeBlank(w: number, h: number): void {
-    this.snapshots = [{ kind: 'full', w, h, data: null }];
+    this.snapshots = [{ kind: 'full', w, h, data: null, stamp: nextUndoStamp() }];
     this.snapIndex = 0;
     this.lastSnapshotMs = 0;
   }
@@ -372,9 +426,10 @@ export class RasterSnapshotManager {
    *  the stack BORROWS the bytes (never writes them; the caller must not change them either). */
   public initializeFromPixels(w: number, h: number, data: Uint8Array): void {
     if (data.length !== w * h * 4) throw new Error('RasterSnapshotManager.initializeFromPixels: size mismatch');
-    this.snapshots = [{ kind: 'full', w, h, data, borrowed: true }];
+    this.snapshots = [{ kind: 'full', w, h, data, borrowed: true, stamp: nextUndoStamp() }];
     this.snapIndex = 0;
     this.lastSnapshotMs = 0;
+    enforceRasterUndoBudget(this);   // (the seed's bytes count: other stacks' oldest steps may go)
   }
 
   /** True while the history holds at most its seed (nothing pushed since). */
@@ -482,5 +537,7 @@ export class RasterSnapshotManager {
   public destroy(): void {
     this.stagingBuffer?.destroy();
     this.snapshots.length = 0;
+    this.snapIndex = -1;
+    unregisterUndoHistory(this);
   }
 }

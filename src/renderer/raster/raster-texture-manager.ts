@@ -72,6 +72,7 @@ export class RasterTextureManager {
   resetForNewDevice(): void {
     this.texture = undefined; this.width = 0; this.height = 0;
     this.stagingBuffer = undefined; this.stagingSize = 0;
+    this.snapshotMgr?.destroy();   // (C3: out of the undo budget; its staging buffer died with the device)
     this.snapshotMgr = undefined; this.legacyBrush = undefined;
     this._paneReadBuf = undefined; this._paneReadBufSize = 0; this._paneReadBusy = false;
     this.historyTex = null; this.celHistories = new WeakMap(); this.blankSince = null;
@@ -125,6 +126,12 @@ export class RasterTextureManager {
     return !!b && b.tex === this.texture && rasterTextureWrittenAt(b.tex) <= b.seq;
   }
 
+  /** D1: `tex` is this manager's texture and provably still blank (see isProvablyBlank) — e.g. cel 1 of a fresh layer
+   *  made animated: splitting its hold needs no copy. */
+  public isTextureProvablyBlank(tex: GPUTexture | null | undefined): boolean {
+    return !!tex && tex === this.texture && this.isProvablyBlank();
+  }
+
   // Initialize with a blank snapshot - call this after creating the texture
   public async initializeWithBlankSnapshot(): Promise<void> {
     if (!this.texture) return;
@@ -174,7 +181,8 @@ export class RasterTextureManager {
     if (prev && !prev.ready && !prev.mgr.isPristine()) return false;
     const mgr = new RasterSnapshotManager(this.device);
     mgr.initializeFromPixels(w, h, bytes);
-    this.celHistories.set(tex, { mgr, ready: null });   // (a read-back seed still in flight lands in the dropped one)
+    prev?.mgr.destroy();   // (C3: stops counting in the undo budget; a read-back seed still in flight lands in it)
+    this.celHistories.set(tex, { mgr, ready: null });
     return true;
   }
 
@@ -191,7 +199,24 @@ export class RasterTextureManager {
     }
     const mgr = new RasterSnapshotManager(this.device);
     mgr.initializeBlank(tex.width, tex.height);
+    this.celHistories.get(tex)?.mgr.destroy();   // (C3: the replaced history stops counting in the undo budget)
     this.celHistories.set(tex, { mgr, ready: null });
+  }
+
+  /** D1: forget `tex`'s history (an animation cel texture made blank again — its texture is freed / reused as a spare).
+   *  Never this manager's own texture. */
+  public dropHistory(tex: GPUTexture): void {
+    if (tex === this.texture) return;
+    this.celHistories.get(tex)?.mgr.destroy();
+    this.celHistories.delete(tex);
+    if (this.historyTex === tex) this.historyTex = null;
+  }
+
+  /** D1: `tex` (a cel's) has no history beyond its seed — nothing was pushed (no undo / redo state to keep). */
+  public isHistoryPristine(tex: GPUTexture): boolean {
+    if (tex === this.texture) return !this.snapshotMgr || this.snapshotMgr.isPristine();
+    const h = this.celHistories.get(tex);
+    return !h || (!h.ready && h.mgr.isPristine());
   }
 
   /**

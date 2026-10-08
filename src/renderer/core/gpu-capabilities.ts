@@ -42,6 +42,9 @@ export interface GpuCaps {
   /** SHADER SPLIT key cap (shader-split.md §4.5): distinct exact mesh fragment keys compiled per device before new
    *  keys are widened to broader shared ones (MeshFsPipelines.maxKeys). Bounds compile work, not memory. */
   shaderSplitMaxKeys: number;
+  /** ONE byte budget for ALL raster undo history, across layers and animation cels (perf audit C3;
+   *  raster-undo-budget.ts — over it the oldest steps are trimmed). sm.setUndoMemoryBudget overrides it. */
+  undoMemoryBytes: number;
 }
 
 /** Today's engine defaults: desktop behaviour is unchanged. */
@@ -50,15 +53,17 @@ export const DESKTOP_CAPS: Readonly<GpuCaps> = Object.freeze({
   maxDpr: Infinity, maxCanvasPixels: Infinity, warmConcurrency: 2,
   shadows: true, ssao: true, ssr: true, taa: true,
   animatedFocusBg: true, shaderSplitMaxKeys: 96,
+  undoMemoryBytes: 768 * 1024 * 1024,
 });
 
 /** Phones / tablets: the CPU draw path, no HTML-in-canvas, DPR ≤ 1.5 and ≤ 2.5 MP, one compile at a time, a smaller
- *  shader-split key cap, a still (frozen 'wavy') focus background. */
+ *  shader-split key cap, a still (frozen 'wavy') focus background, 256 MB of raster undo history (desktop 768 MB). */
 export const MOBILE_CAPS: Readonly<GpuCaps> = Object.freeze({
   ...DESKTOP_CAPS,
   gpuDriven: false, htmlInCanvas: false,
   maxDpr: 1.5, maxCanvasPixels: 2_500_000, warmConcurrency: 1,
   animatedFocusBg: false, shaderSplitMaxKeys: 40,
+  undoMemoryBytes: 256 * 1024 * 1024,
 });
 
 /** Safe mode (crash loop / ?salsaSafe=1): the mobile caps plus shadows / SSAO / SSR / TAA off. */

@@ -173,7 +173,6 @@ import { stallGarpPool, stallSkinKey } from '../world/stall';
 import { posterGarpPool, posterSkinKey } from '../world/poster';
 import { warningGarpPool, warningSkinKey } from '../world/road-sign';
 import { cityMetresPerUnit as worldMetresPerUnit } from '../world/types';
-import { dropRuntimeNodesFromSceneJSON } from './managers/play-auto-player';
 import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 import type { FoliageParams, FoliageMeta } from '../world/foliage';
 import type { FaceBlinkConfig, LegIdleMode } from './managers/scene3d-manager';
@@ -235,7 +234,9 @@ import {
 import { runStrokePredictionSelfTest as _runStrokePredictionSelfTest, type StrokePredictionSelfTestReport } from '../renderer/raster/brushes/stroke-prediction-selftest';
 import { markRasterCompositeDirty as _markRasterCompositeDirty } from '../renderer/raster/core/raster-composite-dirty';
 import { rasterContentSeq as _rasterContentSeq } from '../renderer/raster/raster-content-version';
+import { setRasterUndoBudget as _setRasterUndoBudget, getRasterUndoMemoryStats as _getRasterUndoMemoryStats } from '../renderer/raster/core/raster-undo-budget';
 import { vectorSceneObject as _vectorSceneObject } from './persistence/vector-scene-json';
+import { buildDocumentMeshState as _buildDocumentMeshState, buildDocumentSceneJSON as _buildDocumentSceneJSON } from './persistence/document-mesh-json';
 import { computeArtboardFit, type ArtboardFitInsets } from './artboard-fit';
 import {
     setRenderDebug as _setRenderDebug, getRenderDebug as _getRenderDebug, encodeRealFramePNG as _encodeRealFramePNG,
@@ -12748,25 +12749,10 @@ class ShapeManager {
      * This keeps the lightweight node stub (id/type/transform/name/flags) so the tree + 2D content restore
      * identically. Plain '3DMesh' nodes are left intact — their geometry IS used by recreateNode + isn't the bloat.
      */
-    public getSceneGraphJSONForDocument(): string {
-        const scene: any = this.sceneGraph.toJSON();
-        // Runtime-only nodes (the Play auto default player: body, skeleton, face decal, hair, garments) never reach a
-        // document, even when a save lands mid-Play (they're only in the graph while playing).
-        // Grease Pencil objects too: they persist in scene3dJSON.gpObjects (every stroke point) — this copy doubled
-        // the drawing's save size and only ever restored as an empty placeholder node.
-        dropRuntimeNodesFromSceneJSON(scene.root, new Set([...this.scene3d.autoPlayer.runtimeNodeIds(), ...this.scene3d.getAllGpObjects().map(g => g.id)]));
-        const strip = (n: any): void => {
-            if (n?.type === 'SkinnedMesh3D') {
-                if (n.config) delete n.config.geometry;
-                delete n.jointIndicesB64; delete n.jointWeightsB64;
-                delete n.blendShapes; delete n.baseVerticesB64; delete n.blendWeights;
-            }
-            if (n?.children) for (const c of n.children) strip(c);
-        };
-        if (scene.root) strip(scene.root);
-        const texLibData = this.scene3d.getTextureLibraryData();
-        if (texLibData && texLibData.entries.length > 0) scene.textureLibrary = texLibData;
-        return JSON.stringify(scene);
+    public getSceneGraphJSONForDocument(opts?: import('./persistence/document-mesh-json').DocumentSceneJSONOptions): string {
+        // Body: persistence/document-mesh-json.ts (testable without a GPU). `opts` = the document save's GLB references
+        // + cached JSON parts (perf audit C4 / C5); without it, exactly the old output.
+        return _buildDocumentSceneJSON(this.sceneGraph, this.scene3d, opts);
     }
 
     /**
@@ -13814,6 +13800,22 @@ class ShapeManager {
     }
 
     /**
+     * Perf audit C3: ONE memory budget (bytes) for ALL raster undo history — every layer's and every animation cel's.
+     * Over it, the OLDEST undo steps across all histories are dropped (each history keeps its newest step when it can;
+     * the current pixels are never dropped). Default = the device tier's (768 MB desktop, 256 MB mobile / safe);
+     * null = back to that default.
+     */
+    public setUndoMemoryBudget(bytes: number | null): void {
+        _setRasterUndoBudget(bytes);
+    }
+
+    /** Raster undo memory: bytes held by all histories, the budget in force, the history count, steps trimmed so far.
+     *  D1: and the animation cels' GPU textures (blank cels own none). */
+    public getUndoMemoryStats(): ReturnType<typeof _getRasterUndoMemoryStats> & { cels: ReturnType<RasterLayerManager['getCelMemoryStats']> | null } {
+        return { ..._getRasterUndoMemoryStats(), cels: this.rasterLayerManager?.getCelMemoryStats() ?? null };
+    }
+
+    /**
      * Export ALL raster layers as Blobs (ordered back-to-front).
      * Convenience method for batch upload to backend.
      *
@@ -14746,11 +14748,14 @@ class ShapeManager {
      *  and `unnotedChanges` (non-zero = some pixel writer did not report its write; caught by the verification read). */
     public getAutoSaveStats(): {
         pixels: { readbacks: number; reused: number; meshExports: number; meshReused: number; unnotedChanges: number };
+        /** Perf audit C4: heavy JSON parts (vertex arrays, base64 skinning) serialized vs reused from the cache. */
+        jsonParts: { built: number; reused: number };
         writes: { writes: number; unchanged: number; filesWritten: number; filesSkipped: number } | null;
         lastWrittenFiles: string[];
     } {
         return {
             pixels: { ...this.docState.pixelReadStats },
+            jsonParts: { ...this.docState.jsonPartStats },
             writes: this.persistence ? { ...this.persistence.writeStats } : null,
             lastWrittenFiles: this.persistence?.lastWrittenFiles.slice() ?? [],
         };
@@ -14822,31 +14827,9 @@ class ShapeManager {
         return this._buildMeshState(m);
     }
 
-    private _buildMeshState(m: import('../scene-graph/shapes/mesh-3d').Mesh3D): any {
-        const store = this.scene3d!.getModelStore();
-        // If this mesh's own buffer is missing (e.g. degraded save cycle), fall back to a
-        // sibling mesh in the same MeshGroup3D that does have a buffer stored.  The restore
-        // path uses the same GLB source for all group members.
-        const glbMeshId = store.has(m.id) ? m.id : this.scene3d!.findGroupMemberGlbId(m.id);
-        const s: any = {
-            ...m.toJSON(),
-            glbMeshId,
-            ribbonData:           this.scene3d!.getRibbonData3D(m.id) ?? undefined,
-            frameLinkAnimation3D: this.scene3d!.getFrameLinkAnimation3D(m.id) ?? undefined,
-        };
-        // A PROCEDURAL BODY is fully regenerable from its bodyParams (a handful of numbers) — so DON'T persist the
-        // large baked geometry + skinning (~1–2 MB of JSON float arrays per character). Store just the params and
-        // rebuild on load (restoreMeshState → generateBodyResult). Shrinks each character from ~MB to ~KB.
-        if (m.isProceduralBody) {
-            const bp = this.scene3d!.getBodyParams(m.id);
-            if (bp) {
-                s.bodyParams = bp;
-                if (s.config) delete s.config.geometry;
-                delete s.jointIndicesB64;
-                delete s.jointWeightsB64;
-            }
-        }
-        return s;
+    private _buildMeshState(m: import('../scene-graph/shapes/mesh-3d').Mesh3D, doc?: import('./persistence/document-mesh-json').DocumentMeshStateOptions): any {
+        // Body: persistence/document-mesh-json.ts. `doc` = the document save's GLB references (perf audit C5).
+        return _buildDocumentMeshState(this.scene3d!, m, doc);
     }
 
     /**
@@ -15412,7 +15395,7 @@ class ShapeManager {
             packagingIfCreated: () => this._packaging,
             clearDecalRecords: () => this._decalMgr.clearForDocumentLoad(),
             procMeshKey: (id) => this._procMeshKey(id),
-            buildMeshState: (m) => this._buildMeshState(m),
+            buildMeshState: (m, doc) => this._buildMeshState(m, doc),
             disposeAllUvPaintTextures: () => this._disposeAllUvPaintTextures(),
             restoreClothingTextures: (b) => this._restoreClothingTextures(b),
             restoreProceduralMeshTextures: (m) => this._restoreProceduralMeshTextures(m),

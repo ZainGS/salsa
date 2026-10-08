@@ -81,6 +81,7 @@ import { RasterPaintEngine } from "../raster/core/raster-paint-engine";
 import { RasterCompositor, LayerBlendMode } from "../raster/core/raster-compositor";
 import type { CompositorLayerInfo } from "../raster/core/raster-compositor";
 import { onRasterCompositeDirty } from "../raster/core/raster-composite-dirty";
+import { setRasterUndoTierBudget } from "../raster/core/raster-undo-budget";
 import type { FrameLinkAnimation } from '../../animation';
 import { RasterSelectionEngine } from "../raster/selection/raster-selection-engine";
 import { SelectionOverlayRenderer } from "../raster/selection/selection-overlay-renderer";
@@ -599,10 +600,22 @@ export class WebGPURenderer {
   private _gpuTimer: GpuFrameTimer | null = null;
   private _gpuMs: number | null = null;       // smoothed GPU frame time while timing runs
   private _gpuTimingLease = 0;                // performance.now() until which a stats readout keeps timing on
-  /** Frames forced to full resolution (snapshots / thumbnails / video export wait on a settled frame). */
+  /** Frames forced to full resolution (snapshots / thumbnails / video export wait on a settled frame). Also forces
+   *  the frame into lastFrameTex (perf audit C1: no direct-to-canvas frame while a read-back waits on it). */
   private _fullResHold = 0;
   private _frameScaled = false;      // this frame renders below native (set per frame before the 3D pass)
   private _submittedScaled = false;  // ... as of the last submitted frame (waitForFrameSettled skips such frames)
+  /** Perf audit C1: the last submitted frame went straight into the canvas texture (lastFrameTex not written —
+   *  waitForFrameSettled skips such frames, like scaled ones). */
+  private _submittedDirect = false;
+  /** A direct frame mispredicted the post chain (FXAA / effects would have run): the next frame renders offscreen. */
+  private _forceOffscreenNext = false;
+  /**
+   * Perf audit C1 + C2: frames that need nothing from lastFrameTex render straight into the canvas texture, and the
+   * last post / FXAA pass writes straight into it (no full-screen copy either way). false = the original path: every
+   * frame into lastFrameTex, then (post-processed and) copied to the canvas. Session-wide kill switch.
+   */
+  public static directPresent = true;
   static readonly RES_SCALE_PREF_KEY = 'salsa.viewport.resolutionScale';
   private _resPrefLoaded = false;
   private _loadResolutionPref(): void {
@@ -1269,6 +1282,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     rc.shadows = c.shadows; rc.ssao = c.ssao; rc.ssr = c.ssr; rc.taa = c.taa; rc.animatedFocusBg = c.animatedFocusBg !== false;
     if (Number.isFinite(c.shaderSplitMaxKeys) && c.shaderSplitMaxKeys > 0) rc.shaderSplitMaxKeys = MeshFsPipelines.maxKeys = Math.floor(c.shaderSplitMaxKeys);
     TextEffectEngine.htmlInCanvasAllowed = c.htmlInCanvas;
+    setRasterUndoTierBudget(c.undoMemoryBytes);   // C3: the shared raster undo budget (sm.setUndoMemoryBudget overrides)
     GPUPipelineCache.defaultMaxConcurrentWarm = Math.max(1, Math.floor(c.warmConcurrency));
     const pc = this.device ? GPUPipelineCache.peek(this.device) : null;
     if (pc) pc.maxConcurrentWarm = GPUPipelineCache.defaultMaxConcurrentWarm;
@@ -1633,6 +1647,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       if (selectedId) {
         const selTex = textures.get(selectedId);
         if (selTex) return selTex;
+        // a BLANK frame / blank cel of the selected animated layer (perf audit D1: a blank cel owns no texture) has no
+        // ghost — not some other layer's drawing (the static background used to be ghosted there)
+        if (timeline.isLayerAnimated(selectedId)) return null;
       }
       // Fallback: first non-null texture
       for (const [, tex] of textures) {
@@ -2257,35 +2274,52 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // Register the grab (or none → the 3D renderer's 1×1 default) — the setter dedups; also covers a 3D renderer
         // created after the grab texture.
         this._renderer3D?.setSceneColorGrabTexture(this.sceneColorGrabTex ?? null);
+        // RENDER DEBUG directToSwapchain: draw straight into the canvas texture (no lastFrameTex, no copy, no post).
+        const rdDirect = RD.on && RD.f.directToSwapchain && !this._captureMode;
+        // GRAB PRIMING (perf audit C1): a reader JUST turned on but the grab is stale and lastFrameTex does not hold the
+        // last on-screen frame to refresh it from (that frame went straight to the canvas, or a capture came in between).
+        // This frame then renders OFFSCREEN without being presented (the canvas keeps showing the last frame), with no
+        // modal scrim, and its scene-only grab copy feeds the next frame — which is presented. Only on the rising edge:
+        // a resize with a reader already on (grab + lastFrameTex both fresh textures) presents as before, so a resize
+        // drag never leaves the canvas without frames.
+        const primeGrab = grabNeeded && !this._grabNeededPrev && !this._grabFresh && !rdDirect && !!this.sceneColorGrabTex && !(RD.on && RD.f.noSceneGrab);
+        if (primeGrab) this._uiScrimFrame = null;   // (its grab must hold the clean scene, like the refresh source)
         if (!this._captureMode) {
             // A reader just turned on: this frame still samples the refreshed PREVIOUS frame (overlays included) —
-            // one follow-up frame lets it see this frame's scene-only grab.
-            if (grabNeeded && !this._grabNeededPrev) this.scheduleRender();
+            // one follow-up frame lets it see this frame's scene-only grab. (A priming frame always needs its follow-up.)
+            if ((grabNeeded && !this._grabNeededPrev) || primeGrab) this.scheduleRender();
             this._grabNeededPrev = grabNeeded;
         }
-        if (uiWorldBlur && this.sceneColorGrabTex) {
+        if (uiWorldBlur && this.sceneColorGrabTex && !primeGrab) {
             this.prepareUIWorldBlur();
         }
 
-        // For thumbnail:
-        // Basically, I render to offscreenView which writes the image onto lastFrameTex 
-        // so that i have a persistent copy for the thumbnail generation. 
-        // Then, right before submission to the device, I copy lastFrameText to the backTex, 
-        // which is the WebGPU context, so the backTex texture is what gets drawn onto the screen?
         if (rdCanvasAlphaMode() !== this._contextAlpha) {   // render debug forceOpaqueAlpha toggled: re-configure the canvas
           try { this.context.configure({ device: unwrapDevice(this.device), format: this.swapChainFormat, usage: this._contextUsage(), alphaMode: this._contextAlphaMode() }); }
           catch (e) { console.warn('[Salsa][render-debug] canvas alphaMode change failed', e); this._contextAlpha = rdCanvasAlphaMode(); }
         }
-        const backTex = this.context.getCurrentTexture(); 
-        // RENDER DEBUG directToSwapchain: draw straight into the canvas texture (no lastFrameTex, no copy, no post).
-        const rdDirect = RD.on && RD.f.directToSwapchain && !this._captureMode;
+        // PRESENT: an on-screen frame acquires the canvas texture; a capture or a priming frame never touches it (an
+        // acquired canvas texture is presented even when nothing is drawn into it).
+        const present = !this._captureMode && !primeGrab;
+        const backTex: GPUTexture | null = present || rdDirect ? this.context.getCurrentTexture() : null;
+        // DIRECT TO THE CANVAS (perf audit C1): draw the frame straight into the canvas texture — no lastFrameTex, no
+        // full-screen copy — unless something needs it in lastFrameTex: a snapshot / thumbnail / export hold, the grab
+        // copy (a reader), the post chain or FXAA (they sample the frame), or a real screenshot of a canvas texture
+        // without COPY_SRC. The canvas texture must take the frame's pipelines (format) and render attachments.
+        // (Off: the WebGPURenderer.directPresent kill switch, or render debug noDirectPresent — on a device, no code.)
+        const canvasTarget = !!backTex && WebGPURenderer.directPresent && !(RD.on && RD.f.noDirectPresent) && backTex.format === this.swapChainFormat &&
+          (typeof backTex.usage !== 'number' || (backTex.usage & GPUTextureUsage.RENDER_ATTACHMENT) !== 0);
+        const realShotPending = this._realShotWaiters.length > 0 && present;
+        const direct = rdDirect || (present && canvasTarget && this._fullResHold === 0 && !grabNeeded && !this._forceOffscreenNext &&
+          !(realShotPending && !this._swapchainCopySrc) && !this._postMayRun());
+        this._forceOffscreenNext = false;
         // Overlays in the main pass (no reloading OverlayPass) whenever nothing samples the scene grab (B1); render
         // debug inlineOverlays forces it even with a reader on (the overlays then show in reflections / refraction).
         const inlineOverlays = !grabNeeded || (RD.on && RD.f.inlineOverlays);
-        const offscreenView = rdDirect ? backTex.createView() : this.lastFrameTex!.createView();
+        const offscreenView = direct ? backTex!.createView() : this.lastFrameTex!.createView();
         let artboard = this.getArtboardScissor();
-        // NOTE: render to the OFFSCREEN view, not the swapchain.
-        // That way we can persist the texture for the thumbnail.
+        // The main pass renders into lastFrameTex (kept for thumbnails / snapshots / the grab, copied or post-processed
+        // to the canvas below) — or, on a direct frame, straight into the canvas texture.
         const renderPassDescriptor: GPURenderPassDescriptor = {
           colorAttachments: [{
             view: offscreenView,
@@ -2945,55 +2979,71 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           overlayPass.end();
         }
 
-        // Run scene post-processing (bloom / color grade / vignette) if any effects are active.
-        // Returns the processed output texture, or null when all effects are disabled.
-        // (Render debug directToSwapchain: the frame is already in the canvas texture, which cannot be sampled.)
-        const ppOutput = rdDirect ? null : this._renderer3D?.runPostProcess(
-          commandEncoder, this.lastFrameTex!, this.canvas.width, this.canvas.height,
-        ) ?? null;
+        // Run scene post-processing (FXAA / bloom / color grade / vignette / film) if any effects are active: a
+        // processed output texture (copied to the canvas), 'target' (perf audit C2: the LAST pass rendered straight
+        // into the canvas texture — no copy), or null when nothing ran (lastFrameTex is copied as is).
+        // A direct frame is already in the canvas texture, which cannot be sampled: no post (postProcessMayRun said
+        // none would run; a misprediction gets one offscreen re-render). A priming frame is never shown: no post.
+        const W = this.canvas.width, H = this.canvas.height;
+        let ppOutput: GPUTexture | null = null, ppInCanvas = false;
+        if (direct || primeGrab) {
+          if (this._renderer3D?.skipPostProcess(W, H) && direct && !rdDirect) { this._forceOffscreenNext = true; this.scheduleRender(); }
+        } else if (this._renderer3D) {
+          // Into the canvas unless the frame is not presented, or a real screenshot has to read the post output
+          // (a canvas texture without COPY_SRC).
+          const toCanvas = present && canvasTarget && !(realShotPending && (typeof backTex!.usage === 'number' && (backTex!.usage & GPUTextureUsage.COPY_SRC) === 0));
+          if (toCanvas) {
+            const r = this._renderer3D.runPostProcessTo(commandEncoder, this.lastFrameTex!, W, H, backTex!.createView());
+            if (r === 'target') ppInCanvas = true; else ppOutput = r;
+          } else {
+            ppOutput = this._renderer3D.runPostProcess(commandEncoder, this.lastFrameTex!, W, H);
+          }
+        }
 
-        // Copy OFFSCREEN to SWAPCHAIN using the COMMAND ENCODER
-        // Use the post-processed output when available; otherwise use lastFrameTex directly.
-        // lastFrameTex is always preserved unchanged for thumbnail snapshots.
+        // Present an offscreen frame: copy the post output (or lastFrameTex) to the canvas — unless the post chain
+        // already drew into it. lastFrameTex is always preserved unchanged for thumbnail snapshots.
         // A capture renders into lastFrameTex only (for readback) and must NOT present, so the on-screen frame
-        // is left untouched (no flicker) — the caller re-renders normally afterwards.
-        if (!this._captureMode && !rdDirect) {
-          commandEncoder.copyTextureToTexture(
-            { texture: ppOutput ?? this.lastFrameTex! },
-            { texture: backTex },
-            { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
-          );
+        // is left untouched (no flicker) — the caller re-renders normally afterwards. Nor does a priming frame.
+        if (present && !direct) {
+          if (!ppInCanvas) {
+            commandEncoder.copyTextureToTexture(
+              { texture: ppOutput ?? this.lastFrameTex! },
+              { texture: backTex! },
+              { width: W, height: H, depthOrArrayLayers: 1 }
+            );
+          }
           // A focus background (armature / mesh edit) is editor UI: put its unprocessed pixels back so the scene's
           // post effects don't grade it (a light pattern used to wash out to white). Before drawPostOverlays, which
           // clears the depth this reads.
           // (Skipped in the lo-res PS1 mode: its 3D depth lives in the lo-res target, so the main depth is empty and
           // the whole frame would lose its post look.)
-          if (ppOutput && this._renderer3D && (!this._renderer3D.getLoResSize(this.canvas.width, this.canvas.height) || this._renderer3D.loResIsDynamic())) this._renderer3D.restoreFocusBgAfterPost(commandEncoder, this.lastFrameTex!, backTex.createView(), this.interactionService.depthTextureView);
+          if ((ppOutput || ppInCanvas) && this._renderer3D && (!this._renderer3D.getLoResSize(W, H) || this._renderer3D.loResIsDynamic())) this._renderer3D.restoreFocusBgAfterPost(commandEncoder, this.lastFrameTex!, backTex!.createView(), this.interactionService.depthTextureView);
         }
 
         // POST-PROCESS-IMMUNE overlays (the landmark info card): drawn directly onto the FINAL swapchain image,
         // AFTER post-processing and the copy — so the card bypasses bloom / colour-grade / vignette and reads the
         // same day & night. lastFrameTex stays untouched (thumbnails don't capture the transient hover card).
-        if (this._renderer3D?.hasPostOverlays()) {
+        if (backTex && this._renderer3D?.hasPostOverlays()) {
           this._renderer3D.drawPostOverlays(commandEncoder, backTex.createView(), this.interactionService.depthTextureView);
         }
 
         // UI KIT overlay: last, on the swapchain at native size (post-process immune; skipped in captures).
         let uiKitMore = false;
-        if (this._uiKitDrawer && !this._captureMode) {
+        if (this._uiKitDrawer && present) {
           try {
-            uiKitMore = this._uiKitDrawer(this.device, commandEncoder, backTex.createView(), this.canvas.width, this.canvas.height,
+            uiKitMore = this._uiKitDrawer(this.device, commandEncoder, backTex!.createView(), this.canvas.width, this.canvas.height,
               this.swapChainFormat, this.canvas.width / Math.max(1, this.canvas.clientWidth || this.canvas.width), this.deviceGeneration);
           } catch (e) { console.warn('[ui-kit] overlay draw failed', e); }
         }
 
         // RENDER DEBUG real screenshot (captureRealFrame): read back the finished canvas texture in this encoder.
-        const realShot = this._realShotWaiters.length > 0 && !this._captureMode
-          ? this._encodeRealShot(commandEncoder, backTex, ppOutput ?? this.lastFrameTex!, rdDirect) : null;
+        const realShot = realShotPending
+          ? this._encodeRealShot(commandEncoder, backTex!, ppOutput ?? this.lastFrameTex!, direct || ppInCanvas) : null;
         this.device.queue.submit([commandEncoder.finish()]);
         // lastFrameTex now holds an on-screen frame (a stale-grab refresh may copy it) — not after a capture (its
-        // transparent / no-3D image) or a directToSwapchain frame (lastFrameTex untouched).
-        this._lastFrameLive = !this._captureMode && !rdDirect;
+        // transparent / no-3D image) or a direct frame (lastFrameTex untouched).
+        this._lastFrameLive = !this._captureMode && !direct;
+        this._submittedDirect = direct;
         if (realShot) void this._finishRealShot(realShot);
         if (uiKitMore) this.scheduleRender();
         this._gpuTimer?.endFrame();   // resolution scaling: resolve this frame's GPU timestamps
@@ -4366,7 +4416,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // wait until this renderer actually submitted a frame (notifyFrameSubmitted() right after queue.submit())
         await this.waitForFrameSubmitted();
         // A frame that STARTED before the hold (still scaled) does not count: wait for the next one (bounded).
-        if (this._submittedScaled && scaledSkips++ < 3) { pass--; continue; }
+        // (Nor does one drawn straight into the canvas: lastFrameTex was not written.)
+        if ((this._submittedScaled || this._submittedDirect) && scaledSkips++ < 3) { pass--; continue; }
 
         // wait until GPU work is done
         await this.device.queue.onSubmittedWorkDone();
@@ -4521,6 +4572,20 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       const r3d = this._renderer3D;
       if (!r3d || !this.scene3DVisible || this._captureMode?.skip3D) return false;
       return r3d.ssrEnabled || r3d.glassRefraction;
+    }
+
+    /** Perf audit C1: could this frame's post chain (FXAA / bloom / grade / film) run? Decided BEFORE the frame draws
+     *  (a direct frame cannot be sampled afterwards), so conservative: FXAA counts when the frame MAY draw a 3D mesh —
+     *  any visible one in the cached 3D list (or the list is about to be re-walked, or no split list / 3D renderer yet). */
+    private _postMayRun(): boolean {
+      const w = this.canvas.width, h = this.canvas.height;
+      let may3D = false;
+      if (this.scene3DVisible && !this._captureMode?.skip3D) {
+        if (!this._rlSplit || this._flatShapesDirty) may3D = true;
+        else { const m = this._rl3DMeshes; for (let i = 0; i < m.length; i++) if (m[i].visible) { may3D = true; break; } }
+      }
+      const r3d = this._renderer3D;
+      return r3d ? r3d.postProcessMayRun(w, h, may3D) : may3D;
     }
 
     /** A reader is on this frame: allocate the grab if needed, and when it is STALE (no copy last frame) fill it from

@@ -20,6 +20,7 @@ import type { Vec2 } from '../../types/interaction';
 import type { Mesh3DKeyframeTracks } from '../../types/keyframe-3d';
 import type { EditMesh } from './edit-mesh';
 import { cloneGeneratorRecord, type MeshGeneratorRecord } from './mesh-generator';
+import { jsonBase64, jsonNumberArray, saveContentHash } from '../core/json-parts';
 
 /**
  * A submesh occupies a contiguous index range within the parent mesh's
@@ -437,6 +438,9 @@ export class Mesh3D extends Shape {
   private _generatorFp: number | null = null;
   private _fpVersion = -1;
   private _fpValue = 0;
+  /** Perf audit C5: content hash of the source geometry exactly as a GLB import (or a reload from the GLB) produced it.
+   *  null = not stamped (not imported, or a .gltf with no stored GLB). See {@link importedGeometryUnchanged}. */
+  private _importGeomHash: string | null = null;
 
   /**
    * Forces a specific geometry pool key for this mesh, overriding the default derived key.
@@ -922,6 +926,30 @@ export class Mesh3D extends Shape {
     this._generatorFp = this._geometryFingerprint();
   }
 
+  /** The current source geometry IS the GLB's (Scene3DImport / the skinned import, and a reload that rebuilt it from the
+   *  GLB). Perf audit C5. */
+  stampImportedGeometry(): void { this._importGeomHash = this._savedGeometryHash(); }
+
+  /**
+   * Perf audit C5: the geometry toJSON would write is still exactly what the GLB import produced, and nothing saved with
+   * it depends on it — no Edit Mesh topology, no blend shapes (they write the morphed vertices in place) — so the
+   * document save can store a REFERENCE to the GLB mesh instead of the vertex arrays and rebuild it from the GLB on load.
+   * Content-hashed (not version-checked): an in-place write that bumps no version still counts as an edit. An undo that
+   * puts the imported geometry back makes it apply again. Modifiers don't matter (they're re-applied on top, not baked).
+   */
+  get importedGeometryUnchanged(): boolean {
+    if (this._importGeomHash === null || this.editMesh || this.blendShapes.length > 0 || this.baseVertices) return false;
+    if (this._meshPrimitive !== 'custom' || !this._meshConfig.geometry) return false;
+    return this._savedGeometryHash() === this._importGeomHash;
+  }
+
+  /** contentHash of the saved source geometry (vertices + indices + vertex colours); null when it isn't typed arrays. */
+  private _savedGeometryHash(): string | null {
+    const g = this._meshConfig.geometry;
+    if (!g || !ArrayBuffer.isView(g.vertices) || !ArrayBuffer.isView(g.indices)) return null;
+    return `${saveContentHash(g.vertices)}|${saveContentHash(g.indices)}|${this.vertexColors ? saveContentHash(this.vertexColors) : '-'}`;
+  }
+
   /** FNV-1a over the source geometry's vertex / index bits + vertex colours (memoised per sourceGeometryVersion). */
   private _geometryFingerprint(): number {
     if (this._fpVersion === this.sourceGeometryVersion) return this._fpValue;
@@ -1134,9 +1162,10 @@ export class Mesh3D extends Shape {
     // config copy, the live material (Object.assign load paths can re-add them) and the submesh slots.
     if (config.material) config.material = withoutRemovedMaterialFields(config.material);
     if (config.geometry) {
+      // jsonNumberArray = Array.from, or (inside a document save's collection) a cached JSON part (perf audit C4).
       config.geometry = {
-        vertices: Array.from(this._meshConfig.geometry!.vertices),
-        indices:  Array.from(this._meshConfig.geometry!.indices),
+        vertices: jsonNumberArray(this._meshConfig.geometry!.vertices),
+        indices:  jsonNumberArray(this._meshConfig.geometry!.indices),
       };
     } else if (this.editMesh && this._geometry?.vertices?.length) {
       // The mesh has been made editable (e.g. UV-unwrapped + painted), so its parametric
@@ -1146,8 +1175,8 @@ export class Mesh3D extends Shape {
       // with default UVs and the painted texture maps to the wrong places — the paint
       // appears lost. (Seams aren't persisted; re-unwrapping after reload re-derives them.)
       config.geometry = {
-        vertices: Array.from(this._geometry.vertices),
-        indices:  Array.from(this._geometry.indices),
+        vertices: jsonNumberArray(this._geometry.vertices),
+        indices:  jsonNumberArray(this._geometry.indices),
       };
     }
 
@@ -1198,10 +1227,10 @@ export class Mesh3D extends Shape {
       ...(this.blendShapes.length > 0 ? {
         blendShapes: this.blendShapes.map(s => ({
           name: s.name,
-          deltaVerticesB64: float32ToBase64(s.deltaVertices),
+          deltaVerticesB64: jsonBase64(s.deltaVertices, () => float32ToBase64(s.deltaVertices)),
         })),
         blendWeights: Array.from(this.blendWeights),
-        baseVerticesB64: this.baseVertices ? float32ToBase64(this.baseVertices) : undefined,
+        baseVerticesB64: ((bv) => bv ? jsonBase64(bv, () => float32ToBase64(bv)) : undefined)(this.baseVertices),
       } : {}),
     };
   }

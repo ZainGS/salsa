@@ -4,7 +4,7 @@
  * pass (same order) and no grab is copied — or even allocated. Drives the REAL WebGPURenderer.render() on a minimal
  * host with a mocked device that records render passes, texture copies and submits.
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { webcrypto } from 'node:crypto';
 
 const gg = globalThis as Record<string, unknown>;
@@ -16,8 +16,14 @@ gg.GPUBufferUsage ??= { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, IND
 type Tex = { id: string; width: number; height: number; destroyed: boolean; destroy(): void; createView(): object; format: string };
 type Frame = { passes: string[]; copies: string[]; submits: number; log: string[] };
 
-let WebGPURendererCls: { prototype: object };
-beforeAll(async () => { WebGPURendererCls = (await import('./webgpu-renderer')).WebGPURenderer as unknown as { prototype: object }; });
+let WebGPURendererCls: { prototype: object; directPresent: boolean };
+// These cover the grab / OverlayPass logic on the OFFSCREEN path (every frame into lastFrameTex, then copied to the
+// canvas); the direct-to-canvas path (perf audit C1 + C2) and its grab priming are covered by direct-present.test.ts.
+beforeAll(async () => {
+  WebGPURendererCls = (await import('./webgpu-renderer')).WebGPURenderer as unknown as { prototype: object; directPresent: boolean };
+  WebGPURendererCls.directPresent = false;
+});
+afterAll(() => { WebGPURendererCls.directPresent = true; });
 
 /** A no-op GPURenderPassEncoder that logs its label on end(). */
 function fakePass(label: string, frame: Frame): object {
@@ -48,6 +54,7 @@ function makeHost(opts: { scene3D: boolean }) {
     setSceneColorGrabTexture(t: unknown) { this.grabSet.push(t); },
     focusBgCoversCanvas: () => false, getLoResSize: () => null, drawArmatureBg: () => undefined, meshEditHidesContent: () => false,
     runPostProcess: () => null, hasPostOverlays: () => false, noteCullCpuMs: () => undefined,
+    skipPostProcess: () => false, postProcessMayRun: () => false, runPostProcessTo: () => null,
   };
   let scheduled = 0;
   const host: Record<string, any> = Object.assign(Object.create(WebGPURendererCls.prototype), {

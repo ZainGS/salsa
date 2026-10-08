@@ -43,6 +43,9 @@ export type RenderDebugFlags = {
   /** Draw the frame straight into the canvas (swap-chain) texture: no lastFrameTex, no copy. Implies no post, no FXAA,
    *  no grab; thumbnails taken from live frames go stale while it is on. */
   directToSwapchain: boolean;
+  /** Turn OFF the automatic direct present (perf audit C1 + C2, WebGPURenderer.directPresent): every frame renders into
+   *  lastFrameTex and is copied (or post-processed into its own texture and copied) to the canvas — the old path. */
+  noDirectPresent: boolean;
   /** Force the resolution scale to 1 and TAA off: 3D renders at native resolution, so no lo-res target, upscale blit or
    *  depth upsample (resolution scaling incl. its auto mode, TAA and the PS1 lo-res look are bypassed). */
   forceFullRes: boolean;
@@ -144,6 +147,7 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'noGrid', label: 'No grid' },
   { key: 'inlineOverlays', label: 'Overlays in the main pass' },
   { key: 'directToSwapchain', label: 'Draw straight to the canvas' },
+  { key: 'noDirectPresent', label: 'Present via offscreen copy (old path)' },
   { key: 'clearDepthStencilLoads', label: 'Clear depth/stencil loads' },
   { key: 'clearColorLoads', label: 'Clear colour loads (breaks picture)' },
 ];

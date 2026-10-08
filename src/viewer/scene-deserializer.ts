@@ -86,6 +86,9 @@ export class ViewerSceneDeserializer {
             meshConfig.primitive = 'box';
             delete meshConfig.geometry;
           }
+        } else if (meshConfig.primitive === 'custom' && data.geometryRef === 'glb') {
+          // Perf audit C5: geometry only in the GLB (models3d) — an empty placeholder until _restoreGltfMeshes sets it.
+          meshConfig.geometry = { vertices: new Float32Array(0), indices: new Uint32Array(0), format: '12float' };
         }
         const mesh = new Mesh3D(this._stub, data.x ?? 0, data.y ?? 0, data.z ?? 0, meshConfig);
         if (data.rotationX  != null) mesh.rotationX  = data.rotationX;

@@ -18,8 +18,11 @@ import type { DocumentSavePayload } from './document-persistence';
  * v1 — everything saved before versioning existed (manifest has no `schemaVersion`).
  * v2 — 2026-09-28 audit pass: garp.json + ui.json on disk, kitbash `characters` + `gpObjects` in scene3dJSON,
  *      `submeshes` on mesh nodes, manifest-last commit. (All additive — v1 docs load unchanged.)
+ * v3 — 2026-10-08 perf audit C5: an unchanged imported mesh is saved as a GLB REFERENCE (`geometryRef: 'glb'`, no inline
+ *      geometry in scene3d.json / scene.json; rebuilt from models3d/ on load). An older build would misread that (it
+ *      re-imports the whole GLB per mesh), so it must open v3 docs read-only. v2 docs load unchanged.
  */
-export const DOCUMENT_SCHEMA_VERSION = 2;
+export const DOCUMENT_SCHEMA_VERSION = 3;
 
 /** The schema version a manifest was written with (absent = v1). */
 export function schemaVersionOf(manifest: { schemaVersion?: number } | null | undefined): number {
@@ -40,6 +43,7 @@ type Migration = { from: number; describe: string; migrate: (p: DocumentSavePayl
  *  pattern and to prove the runner advances versions correctly. */
 const MIGRATIONS: Migration[] = [
   { from: 1, describe: 'v1 → v2: additive (garp/ui files, catalog/GP, submeshes) — nothing to rewrite', migrate: (p) => p },
+  { from: 2, describe: 'v2 → v3: GLB-referenced mesh geometry (older docs keep their inline geometry) — nothing to rewrite', migrate: (p) => p },
 ];
 
 /**

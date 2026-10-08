@@ -11,6 +11,12 @@
  * texture manager's, shown by cel 1) belongs to the layer and is never destroyed here. Every destroy goes through
  * releaseTexture(), which also skips a texture another cel still shows. Splitting a hold used to leave the rest of the
  * hold SHARING the original's texture: painting one frame changed the other, and deleting either destroyed both.
+ *
+ * Lazy cel textures (perf audit D1, 2026-10-09): a BLANK cel owns no texture (`texture: null`). addCel makes blank
+ * cels; splitting a blank hold / duplicating a blank cel stays blank (a drawn one is still copied). The texture is made
+ * on the first write — RasterLayerManager materialises the cel its selected layer shows (setCelTexture) and frees it
+ * again while nothing was written (takeCelTexture). 2 animated layers × 48 cels at 1080p used to cost ~800 MB of GPU
+ * memory for full-canvas blank textures.
  */
 
 import {
@@ -374,7 +380,7 @@ export class AnimationTimeline {
 
   /** Destroy a cel texture the timeline owns — unless it is a layer's own texture (baseTexture) or another cel still
    *  shows it. Call AFTER removing the cel from its layer's list. */
-  private releaseTexture(tex: GPUTexture | undefined): void {
+  private releaseTexture(tex: GPUTexture | null | undefined): void {
     if (!tex) return;
     for (const [, ls] of this.layerStates) {
       if (ls.baseTexture === tex) return;
@@ -465,9 +471,10 @@ export class AnimationTimeline {
     layerId: string,
     frame: number,
     device: GPUDevice,
-    width: number,
-    height: number,
+    _width: number,
+    _height: number,
     celType: 'key' | 'inbetween' = 'key',
+    isBlank?: (tex: GPUTexture) => boolean,
   ): AnimationCel | null {
     const ls = this.layerStates.get(layerId);
     if (!ls || ls.type !== 'animated') return null;
@@ -484,13 +491,9 @@ export class AnimationTimeline {
       const holdEnd = existing.startFrame + existing.duration;
       existing.duration = frame - existing.startFrame;
       // The remaining hold after the new cel gets its OWN copy of the drawing (A1: it used to share the texture —
-      // painting one changed both, deleting one destroyed both)
+      // painting one changed both, deleting one destroyed both). A blank hold's rest stays blank (D1: no texture).
       if (holdEnd > frame + 1) {
-        const src = existing.texture;
-        const copy = device.createTexture({ size: [src.width, src.height], format: 'rgba8unorm', usage: CEL_TEXTURE_USAGE() });
-        const enc = device.createCommandEncoder();
-        enc.copyTextureToTexture({ texture: src }, { texture: copy }, { width: src.width, height: src.height });
-        device.queue.submit([enc.finish()]);
+        const copy = this.copyTexture(existing.texture, device, isBlank);
         const remainCel: AnimationCel = {
           id: makeCelId(),
           startFrame: frame + 1,
@@ -502,31 +505,13 @@ export class AnimationTimeline {
       }
     }
 
-    // Create a blank texture for the new cel
-    const texture = device.createTexture({
-      size: [width, height],
-      format: 'rgba8unorm',
-      usage: CEL_TEXTURE_USAGE(),
-    });
-
-    // Clear to transparent
-    const encoder = device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: texture.createView(),
-        loadOp: 'clear',
-        storeOp: 'store',
-        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-      }],
-    });
-    pass.end();
-    device.queue.submit([encoder.finish()]);
-
+    // D1: the new cel is BLANK — no texture until something is drawn on it (the layer manager makes it on first write;
+    // `_width` / `_height` are kept for callers — the texture it makes is the canvas size then)
     const cel: AnimationCel = {
       id: makeCelId(),
       startFrame: frame,
       duration: 1,
-      texture,
+      texture: null,
       celType,
     };
 
@@ -555,7 +540,7 @@ export class AnimationTimeline {
     startFrame: number,
     duration: number,
     celType: 'key' | 'inbetween',
-    texture: GPUTexture,
+    texture: GPUTexture | null,
   ): AnimationCel | null {
     const ls = this.layerStates.get(layerId);
     if (!ls || ls.type !== 'animated') return null;
@@ -585,15 +570,47 @@ export class AnimationTimeline {
     return true;
   }
 
-  /** Point a cel at another texture (e.g. the layer's own after its pixels were copied there); the old one is
-   *  released (destroyed unless the layer owns it or another cel shows it). */
-  public setCelTexture(layerId: string, celId: string, texture: GPUTexture): boolean {
+  /** Point a cel at another texture (e.g. the layer's own after its pixels were copied there, or a blank cel's first
+   *  texture — D1); the old one is released (destroyed unless the layer owns it or another cel shows it). null makes
+   *  the cel blank. */
+  public setCelTexture(layerId: string, celId: string, texture: GPUTexture | null): boolean {
     const cel = this.layerStates.get(layerId)?.cels.find(c => c.id === celId);
     if (!cel) return false;
     const old = cel.texture;
     cel.texture = texture;
     if (old !== texture) this.releaseTexture(old);
     return true;
+  }
+
+  /** D1: make a cel BLANK again and hand its texture to the caller WITHOUT destroying it (the caller owns it now —
+   *  e.g. keeps it as a spare blank texture). Null when the cel is unknown / already blank / shows a layer's own
+   *  texture (that one stays with its cel). */
+  public takeCelTexture(layerId: string, celId: string): GPUTexture | null {
+    const ls = this.layerStates.get(layerId);
+    const cel = ls?.cels.find(c => c.id === celId);
+    const tex = cel?.texture ?? null;
+    if (!cel || !tex || tex === ls!.baseTexture) return null;
+    cel.texture = null;
+    return tex;
+  }
+
+  /** The layer's own texture was reallocated (a document resize): its cel(s) and `baseTexture` follow the new one
+   *  (they pointed at the old, destroyed one). Nothing is destroyed here. */
+  public replaceBaseTexture(layerId: string, oldTex: GPUTexture, newTex: GPUTexture): void {
+    const ls = this.layerStates.get(layerId);
+    if (!ls || ls.baseTexture !== oldTex) return;
+    ls.baseTexture = newTex;
+    for (const c of ls.cels) if (c.texture === oldTex) c.texture = newTex;
+  }
+
+  /** A full copy of `src` (null — or a texture `isBlank` vouches is still blank — gives a blank cel, D1). */
+  private copyTexture(src: GPUTexture | null, device: GPUDevice, isBlank?: (tex: GPUTexture) => boolean): GPUTexture | null {
+    if (!src || isBlank?.(src)) return null;
+    const copy = device.createTexture({ size: [src.width, src.height], format: 'rgba8unorm', usage: CEL_TEXTURE_USAGE() });
+    const enc = device.createCommandEncoder();
+    enc.copyTextureToTexture({ texture: src }, { texture: copy }, { width: src.width, height: src.height });
+    device.queue.submit([enc.finish()]);
+    return copy;
   }
 
   /** Set the hold duration for a cel. */
@@ -634,29 +651,15 @@ export class AnimationTimeline {
     celId: string,
     targetFrame: number,
     device: GPUDevice,
+    isBlank?: (tex: GPUTexture) => boolean,
   ): AnimationCel | null {
     const ls = this.layerStates.get(layerId);
     if (!ls || ls.type !== 'animated') return null;
     const src = ls.cels.find(c => c.id === celId);
     if (!src) return null;
 
-    // Create a new texture with the same dimensions
-    const w = src.texture.width;
-    const h = src.texture.height;
-    const texture = device.createTexture({
-      size: [w, h],
-      format: 'rgba8unorm',
-      usage: CEL_TEXTURE_USAGE(),
-    });
-
-    // Copy pixels from source to new texture
-    const enc = device.createCommandEncoder();
-    enc.copyTextureToTexture(
-      { texture: src.texture },
-      { texture },
-      { width: w, height: h },
-    );
-    device.queue.submit([enc.finish()]);
+    // A copy of the source's pixels (a blank source makes a blank cel — D1)
+    const texture = this.copyTexture(src.texture, device, isBlank);
 
     const cel: AnimationCel = {
       id: makeCelId(),
@@ -800,7 +803,7 @@ export class AnimationTimeline {
     this.stop();
     const owned = new Set<GPUTexture>();
     for (const [, ls] of this.layerStates) {
-      for (const cel of ls.cels) if (cel.texture !== ls.baseTexture) owned.add(cel.texture);
+      for (const cel of ls.cels) if (cel.texture && cel.texture !== ls.baseTexture) owned.add(cel.texture);
     }
     for (const [, ls] of this.layerStates) if (ls.baseTexture) owned.delete(ls.baseTexture);
     for (const t of owned) t.destroy();   // once each (a layer's own texture is its texture manager's)

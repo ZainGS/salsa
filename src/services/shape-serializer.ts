@@ -349,6 +349,11 @@ export function recreateNode(data: any, deps: Shape2DRestoreDeps): Node | null {
                     meshConfig.primitive = 'box';
                     delete meshConfig.geometry;
                 }
+            } else if (meshConfig.primitive === 'custom' && data.geometryRef === 'glb') {
+                // Perf audit C5: an imported mesh saved as a GLB reference — its geometry is only in the GLB, and the 3D
+                // pass (restoreMeshState) rebuilds the mesh from it. This EMPTY placeholder keeps the node (id, group
+                // membership) until then.
+                meshConfig.geometry = { vertices: new Float32Array(0), indices: new Uint32Array(0), format: '12float' };
             }
             const mesh3d = new Mesh3D(deps.interactionService, data.x ?? 0, data.y ?? 0, data.z ?? 0, meshConfig);
             // Preserve the saved ID so restoreMeshState can find and update this mesh

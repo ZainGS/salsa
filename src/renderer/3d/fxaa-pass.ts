@@ -182,6 +182,20 @@ export class FxaaPass {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
       this._key = '';
     }
+    this._draw(encoder, pipeline, src, w, h, quality, this._out.createView());
+    return this._out;
+  }
+
+  /** The LAST pass of the frame (perf audit C2): FXAA straight into `target` (the canvas texture view, this pass's
+   *  format, w×h) — no FXAAOut + copy. False (nothing drawn) while the pipeline is still compiling (P2). */
+  runInto(encoder: GPUCommandEncoder, src: GPUTexture, w: number, h: number, quality: AntiAliasingQuality, target: GPUTextureView): boolean {
+    const pipeline = this._pipeline.get();
+    if (!pipeline) return false;
+    this._draw(encoder, pipeline, src, w, h, quality, target);
+    return true;
+  }
+
+  private _draw(encoder: GPUCommandEncoder, pipeline: GPURenderPipeline, src: GPUTexture, w: number, h: number, quality: AntiAliasingQuality, view: GPUTextureView): void {
     const key = `${w}x${h}:${quality}`;
     if (key !== this._key) { this.device.queue.writeBuffer(this._buf, 0, packFxaaParams(this._params, w, h, quality)); this._key = key; }
     if (!this._bg || this._bgSrc !== src) {
@@ -190,12 +204,11 @@ export class FxaaPass {
       ] });
       this._bgSrc = src;
     }
-    const pass = encoder.beginRenderPass({ label: 'FXAAPass', colorAttachments: [{ view: this._out.createView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
+    const pass = encoder.beginRenderPass({ label: 'FXAAPass', colorAttachments: [{ view, loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }] });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, this._bg);
     pass.draw(3);
     pass.end();
-    return this._out;
   }
 
   destroy(): void { this._out?.destroy(); this._out = null; this._buf.destroy(); }
