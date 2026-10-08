@@ -9,8 +9,8 @@
  *
  * The parallel constraint pass (vs the old serial single-thread approach) uses graph coloring
  * so constraints in the same color group have no shared vertices — each thread writes to
- * distinct memory, no atomics needed. The simulator dispatches one compute pass per
- * (iteration, color group) pair using dynamic uniform offsets.
+ * distinct memory, no atomics needed. The simulator issues one dispatch per (iteration, color
+ * group) pair using dynamic uniform offsets — all inside ONE compute pass per step() call.
  *
  * The pose pass eliminates the GPU→CPU→GPU readback roundtrip for live rendering.
  * After each step(), simulated positions and recomputed normals are written directly
@@ -337,20 +337,24 @@ export class ClothSimulator {
     if (!this._ready) throw new Error('ClothSimulator: call init() before step()');
     if (!this._pipesReady()) return;   // P2: pipelines still compiling → hold this frame
 
+    // Integrate params: the same for every sub-step of this call → written ONCE (queue writes land before the submit).
+    this._writeStepIntegrateParams(dt);
     const enc = this.device.createCommandEncoder();
-
+    // B4 (perf audit 2026-10-09): ONE compute pass for every dispatch of every sub-step + the pose pass (was one pass
+    // per iteration × colour group, ~1,450 per frame while converging). Each dispatch is its own usage scope and its
+    // storage writes are visible to the next dispatch in the same pass, so the results are identical.
+    const pass = enc.beginComputePass({ label: 'ClothStep' });
     for (let s = 0; s < stepCount; s++) {
-      this._encodePasses(enc, dt);
+      this._encodeStep(pass);
     }
 
     // Pose pass: write positions + normals to the STORAGE|VERTEX buffer
     if (this.poseVertexBuf && this.poseBG) {
-      const pass = enc.beginComputePass();
       pass.setPipeline(this.posePipeline!);
       pass.setBindGroup(0, this.poseBG);
       pass.dispatchWorkgroups(Math.ceil(this._vertexCount / WG));
-      pass.end();
     }
+    pass.end();
 
     this.device.queue.submit([enc.finish()]);
   }
@@ -398,10 +402,13 @@ export class ClothSimulator {
     while (total < maxSteps) {
       const batch = Math.min(stepsPerBatch, maxSteps - total);
 
+      this._writeStepIntegrateParams(dt);
       const enc = this.device.createCommandEncoder();
+      const pass = enc.beginComputePass({ label: 'ClothBake' });   // one pass per batch (see step())
       for (let s = 0; s < batch; s++) {
-        this._encodePasses(enc, dt);
+        this._encodeStep(pass);
       }
+      pass.end();
       this.device.queue.submit([enc.finish()]);
 
       const cur = await this.readPositions();
@@ -442,55 +449,54 @@ export class ClothSimulator {
 
   // ── Private helpers ────────────────────────────────────────────────────────
 
+  /** Scratch for the per-step() integrate params upload (no allocation per call). */
+  private _intParamsScratch = new Float32Array(INTEGRATE_PARAMS_SIZE / 4);
+
+  /** Upload the integrate params for this step() / bake batch: identical for all of its sub-steps, so once. */
+  private _writeStepIntegrateParams(dt: number): void {
+    if (!this._physics) return;
+    const p = this._intParamsScratch;
+    const ph = this._physics;
+    p[0] = dt;
+    p[1] = ph.gravity;
+    p[2] = ph.damping;
+    p[3] = ph.wind?.x ?? 0;
+    p[4] = ph.wind?.y ?? 0;
+    p[5] = ph.wind?.z ?? 0;
+    p[6] = this._vertexCount;
+    p[7] = 0;
+    this.device.queue.writeBuffer(this.intParamsBuf!, 0, p);
+  }
+
   /**
-   * Encode integrate → constrain (per-color parallel) → collide passes.
-   * Called once per simulation step. Pose pass is NOT included here so
-   * runToConvergence can call multiple steps before issuing it.
+   * Encode one simulation step — integrate → constrain (per-color parallel) → collide — as dispatches in the
+   * caller's compute pass (dispatches in one pass run in order, each seeing the previous one's storage writes).
+   * The pose dispatch is NOT included here so runToConvergence can run multiple steps before issuing it.
    */
-  private _encodePasses(enc: GPUCommandEncoder, dt: number): void {
-    // Integrate params (same for all steps in a batch — safe to overwrite repeatedly)
-    if (this._physics) {
-      const p = new Float32Array(INTEGRATE_PARAMS_SIZE / 4);
-      const ph = this._physics;
-      p[0] = dt;
-      p[1] = ph.gravity;
-      p[2] = ph.damping;
-      p[3] = ph.wind?.x ?? 0;
-      p[4] = ph.wind?.y ?? 0;
-      p[5] = ph.wind?.z ?? 0;
-      p[6] = this._vertexCount;
-      this.device.queue.writeBuffer(this.intParamsBuf!, 0, p);
-    }
-
+  private _encodeStep(pass: GPUComputePassEncoder): void {
     // 1. Integrate
-    { const pass = enc.beginComputePass();
-      pass.setPipeline(this.integratePipeline!);
-      pass.setBindGroup(0, this.integrateBG!);
-      pass.dispatchWorkgroups(Math.ceil(this._vertexCount / WG));
-      pass.end(); }
+    pass.setPipeline(this.integratePipeline!);
+    pass.setBindGroup(0, this.integrateBG!);
+    pass.dispatchWorkgroups(Math.ceil(this._vertexCount / WG));
 
-    // 2. Constrain — parallel per-color-group, for stiffness iterations
+    // 2. Constrain — parallel per-color-group, for stiffness iterations (the group's params via the dynamic offset)
     const stiffness = this._physics?.stiffness ?? 30;
+    pass.setPipeline(this.constrainPipeline!);
     for (let iter = 0; iter < stiffness; iter++) {
       for (let gi = 0; gi < this._colorRanges.length; gi++) {
         const { start, end } = this._colorRanges[gi];
         const groupSize = end - start;
         if (groupSize === 0) continue;
-        const pass = enc.beginComputePass();
-        pass.setPipeline(this.constrainPipeline!);
         pass.setBindGroup(0, this.constrainBG!, [gi * CON_PARAM_STRIDE]);
         pass.dispatchWorkgroups(Math.ceil(groupSize / WG));
-        pass.end();
       }
     }
 
     // 3. Collide
     if (this._proxy.type !== 'none') {
-      const pass = enc.beginComputePass();
       pass.setPipeline(this.collidePipeline!);
       pass.setBindGroup(0, this.collideBG!);
       pass.dispatchWorkgroups(Math.ceil(this._vertexCount / WG));
-      pass.end();
     }
   }
 

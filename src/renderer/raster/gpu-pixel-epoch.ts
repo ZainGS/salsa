@@ -33,5 +33,5 @@ export function gpuPixelEpoch(): number { return epoch; }
 export function bumpGpuPixelEpoch(dirty: DirtyTexelRect | 'full' | 'none' = 'full', target?: object | ReadonlyArray<object | null | undefined> | null): void {
   epoch++;
   if (dirty !== 'none') markRasterCompositeDirty(dirty === 'full' ? null : dirty, target);
-  else noteRasterContentWrite(target);
+  else noteRasterContentWrite(target, 'reported');   // (the texels were reported by the writer itself)
 }

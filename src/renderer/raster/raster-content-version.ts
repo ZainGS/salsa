@@ -28,20 +28,80 @@ const writtenAt = new WeakMap<object, number>();
 /** Diagnostics / tests. */
 export const rasterContentStats = { notes: 0, unattributed: 0 };
 
-/** Record a write to GPU-only pixels: `target` = the texture(s) written; omitted / null / empty = unknown (all). */
-export function noteRasterContentWrite(target?: object | ReadonlyArray<object | null | undefined> | null): void {
+/** Texels, max-exclusive (the same shape as raster-composite-dirty's DirtyTexelRect). */
+export interface ContentTexelRect { x0: number; y0: number; x1: number; y1: number }
+
+/**
+ * The texels each write touched, for consumers that keep a DERIVED copy of a texture and want to redo only the
+ * changed part (the per-layer dither cache, layer-dither-cache.ts). One entry per note, newest last, bounded: a
+ * consumer that fell behind the oldest kept entry redoes everything. `targets` null = not attributed (every
+ * texture); `rect` null = unknown (the whole texture); 'reported' = the texels were already reported by an earlier
+ * note (bumpGpuPixelEpoch('none'): a brush stroke's undo patch, whose dabs the brush pipeline reported).
+ */
+interface ContentLogEntry { seq: number; targets: readonly object[] | null; rect: ContentTexelRect | null | 'reported' }
+const CONTENT_LOG_MAX = 1024;
+const contentLog: ContentLogEntry[] = [];
+let contentLogFloor = 0;   // entries with seq <= this were dropped
+
+/**
+ * Record a write to GPU-only pixels: `target` = the texture(s) written; omitted / null / empty = unknown (all).
+ * `rect`: the texels written (max-exclusive); omitted / null = unknown (the whole texture, always safe); 'reported' =
+ * the texels were reported by an earlier note (only the version moves). Only the per-texture dirty-rect query
+ * (rasterTextureDirtySince) reads it — the versions are the same either way.
+ */
+export function noteRasterContentWrite(
+  target?: object | ReadonlyArray<object | null | undefined> | null,
+  rect?: ContentTexelRect | null | 'reported',
+): void {
   seq++;
   rasterContentStats.notes++;
+  let targets: object[] | null = null;
   if (target && Array.isArray(target)) {
-    let any = false;
-    for (const t of target) if (t) { writtenAt.set(t, seq); any = true; }
-    if (any) return;
+    for (const t of target) if (t) { writtenAt.set(t, seq); (targets ??= []).push(t); }
   } else if (target) {
     writtenAt.set(target as object, seq);
-    return;
+    targets = [target as object];
   }
+  let r: ContentTexelRect | null | 'reported' = rect ?? null;
+  if (r && r !== 'reported') {
+    const ok = Number.isFinite(r.x0) && Number.isFinite(r.y0) && Number.isFinite(r.x1) && Number.isFinite(r.y1);
+    r = !ok ? null : (r.x1 > r.x0 && r.y1 > r.y0) ? { x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 } : 'reported';   // empty = nothing written
+  }
+  contentLog.push({ seq, targets, rect: r });
+  if (contentLog.length > CONTENT_LOG_MAX) {
+    const drop = contentLog.length - (CONTENT_LOG_MAX >> 1);
+    contentLogFloor = contentLog[drop - 1].seq;
+    contentLog.splice(0, drop);
+  }
+  if (targets) return;
   unattributedAt = seq;
   rasterContentStats.unattributed++;
+}
+
+/**
+ * The texels of `tex` written by every note AFTER `sinceSeq` (a rasterContentSeq() value the caller captured when
+ * its copy was last brought up to date): null = none (no write, or only 'reported' ones), 'full' = unknown (a write
+ * with no rect, or the log no longer reaches back that far), else the union rect — integer texels, rounded outward,
+ * NOT clipped to the texture. Unattributed writes count for every texture.
+ */
+export function rasterTextureDirtySince(tex: object, sinceSeq: number): ContentTexelRect | 'full' | null {
+  if (rasterTextureWrittenAt(tex) <= sinceSeq) return null;
+  if (sinceSeq < contentLogFloor) return 'full';
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let i = contentLog.length - 1; i >= 0; i--) {
+    const e = contentLog[i];
+    if (e.seq <= sinceSeq) break;
+    if (e.targets && !e.targets.includes(tex)) continue;
+    const r = e.rect;
+    if (r === 'reported') continue;
+    if (!r) return 'full';
+    if (r.x0 < x0) x0 = r.x0;
+    if (r.y0 < y0) y0 = r.y0;
+    if (r.x1 > x1) x1 = r.x1;
+    if (r.y1 > y1) y1 = r.y1;
+  }
+  if (!(x1 > x0 && y1 > y0)) return null;
+  return { x0: Math.floor(x0), y0: Math.floor(y0), x1: Math.ceil(x1), y1: Math.ceil(y1) };
 }
 
 /** The current write count (capture it BEFORE a read-back is submitted; the read-back reflects at least this). */

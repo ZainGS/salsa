@@ -12,6 +12,7 @@
  */
 
 import { markRasterCompositeDirty } from '../core/raster-composite-dirty';
+import { noteRasterStrokeBegin, noteRasterStrokeEnd } from '../raster-stroke-activity';
 
 export interface StampParams {
   /** Center X in texel coords. */
@@ -566,11 +567,13 @@ export class BrushStampPipeline {
     this.strokeOutputDirty = null;
     this.strokeTouched = null;
     this.strokeDirectWrites = false;
+    if (this.strokeActive && this.strokeTarget) noteRasterStrokeEnd(this.strokeTarget);   // (a stroke that never ended)
     this.strokeTarget = texture;
     this.strokeAccumDirty = null;
     this.strokeAccumUsed = false;
     this.strokeAccumRewritten = false;
     this.strokeActive = true;
+    noteRasterStrokeBegin(texture);   // per-layer error-diffusion dither waits for the end (raster-stroke-activity.ts)
     this.cachedBindGroup = null; // invalidate — textures changed
     this.cachedCompositeKey = null; this.cachedCompositeBG = null;
     this.cachedBleedBGs = null; this.cachedBleedAccum = null;
@@ -614,6 +617,7 @@ export class BrushStampPipeline {
       }
       if (effect) this.compositeStrokeEnd();
     }
+    if (this.strokeActive && this.strokeTarget) noteRasterStrokeEnd(this.strokeTarget);
     this.strokeActive = false;
   }
 
@@ -638,6 +642,7 @@ export class BrushStampPipeline {
     this.pendingOutput = null;
     const wasActive = this.strokeActive;
     this.strokeActive = false;
+    if (wasActive && out) noteRasterStrokeEnd(out);
     if (!wasActive || !r || !out || !base || !accum || out.width !== this.strokeTexW || out.height !== this.strokeTexH) return false;
     const x0 = Math.max(0, Math.floor(r.x0)), y0 = Math.max(0, Math.floor(r.y0));
     const x1 = Math.min(out.width, Math.ceil(r.x1)), y1 = Math.min(out.height, Math.ceil(r.y1));

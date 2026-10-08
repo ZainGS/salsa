@@ -12,6 +12,14 @@
  * Entry 0 is always FULL: trimming the oldest entry folds the next rect entry into it. A full state is only
  * rebuilt (nearest full + later rect AFTERs) when undo lands on a rect entry from a full one, or to dedup a full
  * push against a rect top.
+ *
+ * Perf audit B3 (2026-10-09): a seed costs no read-back when its pixels are already known —
+ *  • BLANK ({@link RasterSnapshotManager.initializeBlank}): "w×h transparent", no bytes held; zeros are materialised
+ *    only when undo lands on it or trimming folds a rect into it. A new layer / the Background's resize reseed used
+ *    to read back the whole canvas and keep a full RAM copy (64 MB at 4096²) just to remember "empty".
+ *  • BORROWED ({@link RasterSnapshotManager.initializeFromPixels}, audit A2): the bytes a document load already
+ *    holds; never written in place (copied first if trimming folds into it).
+ * Both are FULL entries everywhere else (getStats kinds, the entry-0 rule).
  */
 
 import { bumpGpuPixelEpoch } from '../gpu-pixel-epoch';
@@ -26,9 +34,18 @@ export interface RasterRectPatch {
   after: Uint8Array;
 }
 
-type FullSnap = { kind: 'full'; w: number; h: number; data: Uint8Array };
+/** A full state. `data` null = BLANK (all zeros, nothing held); `borrowed` = the caller's bytes (never mutate). */
+type FullSnap = { kind: 'full'; w: number; h: number; data: Uint8Array | null; borrowed?: boolean };
 type RectSnap = { kind: 'rect' } & RasterRectPatch;
 type Snap = FullSnap | RectSnap;
+
+/** Diagnostics / tests (audit B3): GPU read-backs the undo stacks submitted, and their bytes. */
+export const rasterSnapshotStats = { readbacks: 0, readbackBytes: 0 };
+
+function isAllZero(a: Uint8Array): boolean {
+  for (let i = 0; i < a.length; i++) if (a[i] !== 0) return false;
+  return true;
+}
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -60,7 +77,7 @@ export class RasterSnapshotManager {
   /** Diagnostics / tests: entry kinds, the current index, and the bytes the stack holds. */
   public getStats(): { kinds: Array<'full' | 'rect'>; index: number; bytes: number } {
     let bytes = 0;
-    for (const s of this.snapshots) bytes += s.kind === 'full' ? s.data.length : s.before.length + s.after.length;
+    for (const s of this.snapshots) bytes += s.kind === 'full' ? (s.data && !s.borrowed ? s.data.length : 0) : s.before.length + s.after.length;
     return { kinds: this.snapshots.map(s => s.kind), index: this.snapIndex, bytes };
   }
 
@@ -149,6 +166,7 @@ export class RasterSnapshotManager {
         const rectRow = rw * bytesPerPixel;
         const rectPadded = Math.ceil(rectRow / 256) * 256;
         const rBuf = this.device.createBuffer({ size: rectPadded * rh, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        rasterSnapshotStats.readbacks++; rasterSnapshotStats.readbackBytes += rectPadded * rh;
         const rEnc = this.device.createCommandEncoder();
         rEnc.copyTextureToBuffer(
           { texture, origin: { x: rx, y: ry } },
@@ -180,6 +198,7 @@ export class RasterSnapshotManager {
       size: total,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
+    rasterSnapshotStats.readbacks++; rasterSnapshotStats.readbackBytes += total;
 
     const enc = this.device.createCommandEncoder();
     enc.copyTextureToBuffer(
@@ -210,8 +229,10 @@ export class RasterSnapshotManager {
     if (this.snapIndex >= 0 && this.snapshots.length > 0) {
       const current = this.snapshots[this.snapIndex];
       if (current && current.w === w && current.h === h) {
-        const curData = this.stateData(this.snapIndex);
-        if (curData.length === out.length && RasterSnapshotManager._buffersEqual(curData, out)) {
+        const same = current.kind === 'full' && !current.data
+          ? isAllZero(out)   // a BLANK state: no zeros materialised to compare against
+          : RasterSnapshotManager._buffersEqualLen(this.stateData(this.snapIndex), out);
+        if (same) {
           if (this.debug) console.log('RasterSnapshotManager: skipped identical');
           return;
         }
@@ -232,9 +253,11 @@ export class RasterSnapshotManager {
       const oldest = this.snapshots[0];
       const next = this.snapshots[1];
       if (next && next.kind === 'rect' && oldest.kind === 'full' && oldest.w === next.w && oldest.h === next.h) {
-        // Fold the rect into the dropped full frame (in place — it is being discarded) so entry 0 stays full.
-        RasterSnapshotManager.applyRegion(oldest.data, oldest.w, next.x, next.y, next.rw, next.rh, next.after);
-        this.snapshots[1] = { kind: 'full', w: oldest.w, h: oldest.h, data: oldest.data };
+        // Fold the rect into the dropped full frame (in place — it is being discarded) so entry 0 stays full. A BLANK
+        // seed materialises its zeros here; BORROWED bytes are copied first (the caller still owns them).
+        const data = !oldest.data ? new Uint8Array(oldest.w * oldest.h * 4) : oldest.borrowed ? oldest.data.slice() : oldest.data;
+        RasterSnapshotManager.applyRegion(data, oldest.w, next.x, next.y, next.rw, next.rh, next.after);
+        this.snapshots[1] = { kind: 'full', w: oldest.w, h: oldest.h, data };
       }
       this.snapshots.shift();
     }
@@ -247,12 +270,12 @@ export class RasterSnapshotManager {
    *  to i — for a RECT entry). Treat the result as read-only. */
   private stateData(i: number): Uint8Array {
     const s = this.snapshots[i];
-    if (s.kind === 'full') return s.data;
+    if (s.kind === 'full') return s.data ?? new Uint8Array(s.w * s.h * 4);   // BLANK: zeros, made only now
     let j = i;
     while (j >= 0 && this.snapshots[j].kind !== 'full') j--;
     if (j < 0) throw new Error('RasterSnapshotManager: no full base for a rect entry');
     const base = this.snapshots[j] as FullSnap;
-    const data = base.data.slice();
+    const data = base.data ? base.data.slice() : new Uint8Array(base.w * base.h * 4);
     for (let k = j + 1; k <= i; k++) {
       const r = this.snapshots[k] as RectSnap;
       RasterSnapshotManager.applyRegion(data, base.w, r.x, r.y, r.rw, r.rh, r.after);
@@ -267,10 +290,11 @@ export class RasterSnapshotManager {
     if (j < 0) throw new Error('RasterSnapshotManager: no full base for a rect entry');
     const base = this.snapshots[j] as FullSnap;
     const W = base.w, row = rw * 4;
-    const out = new Uint8Array(row * rh);
-    for (let r = 0; r < rh; r++) {
+    const out = new Uint8Array(row * rh);   // (a BLANK base: these zeros are its pixels)
+    const baseData = base.data;
+    if (baseData) for (let r = 0; r < rh; r++) {
       const off = ((y + r) * W + x) * 4;
-      out.set(base.data.subarray(off, off + row), r * row);
+      out.set(baseData.subarray(off, off + row), r * row);
     }
     for (let k = j + 1; k <= i; k++) {
       const p = this.snapshots[k] as RectSnap;
@@ -332,6 +356,37 @@ export class RasterSnapshotManager {
   public async initialize(texture: GPUTexture): Promise<void> {
     await this._push(texture);   // seeding the stack is not an edit (no epoch bump)
     if (this.snapshots.length > 0) this.snapIndex = 0;
+    this.lastSnapshotMs = 0;     // …nor coalesces the first edit after it away (a lazily seeded cel, A3)
+  }
+
+  /** Audit B3: seed (replacing any history) with "w×h, fully transparent" — no read-back, no bytes held. The caller
+   *  guarantees the texture IS blank (just created / cleared, nothing written since). */
+  public initializeBlank(w: number, h: number): void {
+    this.snapshots = [{ kind: 'full', w, h, data: null }];
+    this.snapIndex = 0;
+    this.lastSnapshotMs = 0;
+  }
+
+  /** Audit A2: seed (replacing any history) with pixels the caller already holds — tightly packed RGBA8, w*h*4
+   *  bytes, exactly what the texture now contains (a document load's uploaded layer / cel). No read-back, no copy:
+   *  the stack BORROWS the bytes (never writes them; the caller must not change them either). */
+  public initializeFromPixels(w: number, h: number, data: Uint8Array): void {
+    if (data.length !== w * h * 4) throw new Error('RasterSnapshotManager.initializeFromPixels: size mismatch');
+    this.snapshots = [{ kind: 'full', w, h, data, borrowed: true }];
+    this.snapIndex = 0;
+    this.lastSnapshotMs = 0;
+  }
+
+  /** True while the history holds at most its seed (nothing pushed since). */
+  public isPristine(): boolean {
+    return this.snapshots.length <= 1;
+  }
+
+  /** The seed entry: 'blank' (no bytes held), 'pixels' (full bytes held) or null (no history yet). */
+  public seedKind(): 'blank' | 'pixels' | null {
+    const s = this.snapshots[0];
+    if (!s || s.kind !== 'full') return null;
+    return s.data ? 'pixels' : 'blank';
   }
 
   // ── Restore ───────────────────────────────────────────────────────
@@ -386,6 +441,10 @@ export class RasterSnapshotManager {
       { width: w, height: h, depthOrArrayLayers: 1 },
     );
     this.device.queue.submit([enc.finish()]);
+  }
+
+  private static _buffersEqualLen(a: Uint8Array, b: Uint8Array): boolean {
+    return a.length === b.length && RasterSnapshotManager._buffersEqual(a, b);
   }
 
   /** Exact equality of two equal-length byte buffers, compared 8 bytes at a time (Float64 bit patterns;

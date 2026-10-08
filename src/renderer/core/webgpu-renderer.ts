@@ -455,7 +455,17 @@ export class WebGPURenderer {
     // any stale rasterForegroundList from a previous 3D-divider split would otherwise
     // stay and composite on top of 3D meshes, hiding them.
     this.rasterForegroundList = undefined;
+    this.retainLayerDitherCaches();
     this.scheduleRender();
+  }
+
+  /** Free the per-layer dither caches of layers that are no longer listed (deleted / replaced on a document load). */
+  private retainLayerDitherCaches(): void {
+    if (!this._rasterCompositor) return;
+    const ids = new Set<string>();
+    for (const l of this.rasterCompositionList ?? []) ids.add(l.id);
+    for (const l of this.rasterForegroundList ?? []) ids.add(l.id);
+    this._rasterCompositor.retainLayerDitherCaches(ids);
   }
 
   /** Set the split composition lists (background + foreground) for 3D divider support. */
@@ -465,6 +475,7 @@ export class WebGPURenderer {
   ) {
     this.rasterCompositionList = background;
     this.rasterForegroundList = foreground.length > 0 ? foreground : undefined;
+    this.retainLayerDitherCaches();
     this.scheduleRender();
   }
 
@@ -938,6 +949,10 @@ export class WebGPURenderer {
     // Create the compositor for multi-layer blending
     if (!this._rasterCompositor) {
       this._rasterCompositor = new RasterCompositor(this.device);
+      // An error-diffusion layer dither landed / a deferred global one can run: composite again (weak: never keeps
+      // the renderer alive).
+      const selfR = new WeakRef(this);
+      this._rasterCompositor.requestRender = () => selfR.deref()?.scheduleRender();
     }
     // BRUSH-5: a layer write reported AFTER the frame that would have shown it still gets a frame (only while the
     // incremental composite is on — off, nothing about scheduling changes). Weak: never keeps the renderer alive.
@@ -2203,9 +2218,6 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         if (needsAnotherFrame) this.scheduleRender();
 
         this.ensureLastFrameTex();
-        // Register the refraction grab with the 3D renderer (no-op after the first — the setter dedups) in case
-        // the renderer was created after the grab texture (ensureLastFrameTex only recreates it on resize).
-        if (this.sceneColorGrabTex) this._renderer3D?.setSceneColorGrabTexture(this.sceneColorGrabTex);
         /* When the current visible nodes are sent to beginFrame(), we collect the staged scribbles, highlights,
         and lines into separate arrays. These staged shapes (e.g., an in-progress scribble) are rendered at the end of this render() 
         method so they appear visually on top of all other content.
@@ -2234,7 +2246,24 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         // (scene-only, pre-post-process) in its own encoder — submitted before the main pass, so the scrim can
         // composite it. One-frame lag is invisible for a static world behind a modal.
         this._uiScrimFrame = this._uiScrimProvider?.() ?? null;
-        if (this._uiScrimFrame && this._uiScrimFrame.blur > 0.001 && this.sceneColorGrabTex) {
+        const uiWorldBlur = !!this._uiScrimFrame && this._uiScrimFrame.blur > 0.001;
+
+        // SCENE-COLOUR GRAB (perf audit B1 + B2): only kept up to date while something samples it — SSR (inline trace
+        // + deferred resolve), glass refraction (the CD kit) or the modal world blur above. Otherwise no grab copy and
+        // the overlays draw at the end of the main pass instead of in their own load/store OverlayPass.
+        const grabReaders = uiWorldBlur || this._sceneGrab3DReaders();
+        const grabNeeded = grabReaders && !this._captureMode;   // (a capture never copies: it would poison the grab)
+        if (grabReaders) this._prepareSceneColorGrab();   // lazy texture + refresh a stale grab from the last frame
+        // Register the grab (or none → the 3D renderer's 1×1 default) — the setter dedups; also covers a 3D renderer
+        // created after the grab texture.
+        this._renderer3D?.setSceneColorGrabTexture(this.sceneColorGrabTex ?? null);
+        if (!this._captureMode) {
+            // A reader just turned on: this frame still samples the refreshed PREVIOUS frame (overlays included) —
+            // one follow-up frame lets it see this frame's scene-only grab.
+            if (grabNeeded && !this._grabNeededPrev) this.scheduleRender();
+            this._grabNeededPrev = grabNeeded;
+        }
+        if (uiWorldBlur && this.sceneColorGrabTex) {
             this.prepareUIWorldBlur();
         }
 
@@ -2250,7 +2279,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         const backTex = this.context.getCurrentTexture(); 
         // RENDER DEBUG directToSwapchain: draw straight into the canvas texture (no lastFrameTex, no copy, no post).
         const rdDirect = RD.on && RD.f.directToSwapchain && !this._captureMode;
-        const rdInline = RD.on && RD.f.inlineOverlays;   // render debug: overlays in the main pass (no reloading pass)
+        // Overlays in the main pass (no reloading OverlayPass) whenever nothing samples the scene grab (B1); render
+        // debug inlineOverlays forces it even with a reader on (the overlays then show in reflections / refraction).
+        const inlineOverlays = !grabNeeded || (RD.on && RD.f.inlineOverlays);
         const offscreenView = rdDirect ? backTex.createView() : this.lastFrameTex!.createView();
         let artboard = this.getArtboardScissor();
         // NOTE: render to the OFFSCREEN view, not the swapchain.
@@ -2323,6 +2354,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
                   clipped: l.clipped ?? false,
                   visible: l.visible ?? true,
                   ditherConfig: l.ditherConfig,
+                  cacheKey: l.id,   // the layer's own dither cache
                   frameLinkAnimation: l.frameLinkAnimation,
                 }));
               // Check if any layer or global dither uses error diffusion (requires async WASM)
@@ -2726,7 +2758,8 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           // Normal full-resolution path.
           r3d.drawArmatureBg(passEncoder, this.canvas.width, this.canvas.height);
           // deferOverlays: gizmos/grid/handles draw in the post-grab overlay pass, so reflections/refraction
-          // (which sample the scene-colour grab) never show them.
+          // (which sample the scene-colour grab) never show them. With no grab reader they still defer — to the END
+          // of this pass (inlineOverlays), so they stay above particles / GP / 2D content exactly as before.
           this.draw3DMeshes(passEncoder, aboveRasterNodes, this.canvas.width, this.canvas.height, true);
           this.draw3DParticles(passEncoder, aboveRasterNodes);
           this.draw3DGp(passEncoder, aboveRasterNodes);
@@ -2773,7 +2806,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             .map(l => ({
               texture: l.texture!, blendMode: l.blendMode ?? LayerBlendMode.Normal,
               opacity: l.opacity ?? 1.0, clipped: l.clipped ?? false,
-              visible: l.visible ?? true, ditherConfig: l.ditherConfig,
+              visible: l.visible ?? true, ditherConfig: l.ditherConfig, cacheKey: l.id,
               frameLinkAnimation: l.frameLinkAnimation,
             }));
           if (fgLayers.length > 0) {
@@ -2855,24 +2888,29 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
         // Editing-only overlays (selection highlights, connection-port dots, carets, the 2D grid) are UI aids, not
         // content — skip them all during a capture so exports/previews show just the artwork.
-        if (rdInline) {
-          // Render debug inlineOverlays: the overlay set in THIS pass (same order), so no second pass loads the targets.
+        if (inlineOverlays) {
+          // The overlay set in THIS pass, last (same order as the OverlayPass), so no second pass loads the targets.
+          // Reset the state a fresh pass would start with (the earlier draws may have changed it).
           passEncoder.setViewport(0, 0, this.canvas.width, this.canvas.height, 0, 1);
+          passEncoder.setScissorRect(0, 0, this.canvas.width, this.canvas.height);
+          passEncoder.setStencilReference(0);
           this._drawOverlaySet(passEncoder, visibleNodes);
         }
         passEncoder.end();
 
-        // -- SSR / glass-refraction grab: SCENE ONLY --
+        // -- SSR / glass-refraction / modal-blur grab: SCENE ONLY --
         // Copied BEFORE the overlay pass below, so gizmos / grids / selection UI / carets never appear in
         // reflections or refraction. Also PRE-post-process now: a reflection that baked in vignette/bloom
         // darkened its corners with the screen's grade -- the raw scene image is the correct source.
-        // Skipped during captures (the capture frame is transparent/no-3D -- it would poison the next frame).
-        if (this.sceneColorGrabTex && !this._captureMode && !(RD.on && (RD.f.noSceneGrab || RD.f.directToSwapchain))) {
+        // Only while a reader is on (grabNeeded — never in a capture: it is transparent/no-3D and would poison the
+        // next frame).
+        if (grabNeeded && this.sceneColorGrabTex && !(RD.on && (RD.f.noSceneGrab || RD.f.directToSwapchain))) {
           commandEncoder.copyTextureToTexture(
             { texture: this.lastFrameTex! },
             { texture: this.sceneColorGrabTex },
             { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
           );
+          this._grabFresh = true;
           // SSR SETTLING: reflections sample the PREVIOUS frame's grab. On this render-on-demand loop, the last
           // frame of an interaction would otherwise freeze on screen showing a reflection of the SECOND-TO-LAST
           // (mid-orbit) frame -- and, recursively, the chain of frames before it (a trail of stale ghost copies
@@ -2884,12 +2922,15 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           } else {
             this._ssrSettleFrame = false;
           }
+        } else if (!this._captureMode) {
+          this._grabFresh = false;   // the grab no longer holds the latest frame (refreshed when a reader turns on)
+          this._ssrSettleFrame = false;
         }
 
         // -- Overlay pass (EXCLUDED from the grab): 3D gizmos/grid/handles + 2D selection UI --
         // Same colour/depth targets with load/load -- the on-screen result is identical to drawing these in
-        // the main pass; only the grab above no longer sees them.
-        if (!rdInline && (this._overlays3DPending || !this._captureMode)) {
+        // the main pass; only the grab above no longer sees them. Only while the grab is copied (else inline, above).
+        if (!inlineOverlays) {
           const overlayPass = commandEncoder.beginRenderPass({
             label: 'OverlayPass',
             // (load / load / load; render debug clearColorLoads / clearDepthStencilLoads turn them into clears)
@@ -2950,6 +2991,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         const realShot = this._realShotWaiters.length > 0 && !this._captureMode
           ? this._encodeRealShot(commandEncoder, backTex, ppOutput ?? this.lastFrameTex!, rdDirect) : null;
         this.device.queue.submit([commandEncoder.finish()]);
+        // lastFrameTex now holds an on-screen frame (a stale-grab refresh may copy it) — not after a capture (its
+        // transparent / no-3D image) or a directToSwapchain frame (lastFrameTex untouched).
+        this._lastFrameLive = !this._captureMode && !rdDirect;
         if (realShot) void this._finishRealShot(realShot);
         if (uiKitMore) this.scheduleRender();
         this._gpuTimer?.endFrame();   // resolution scaling: resolve this frame's GPU timestamps
@@ -4434,13 +4478,22 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
     private lastFrameTex?: GPUTexture;
     private lastFrameSize = { w: 0, h: 0 };
-    /** Previous-frame color GRAB for glass refraction — the mesh FS samples this (holding last frame's final image)
-     *  while the current frame renders into lastFrameTex, so there's no read-while-write on one texture. */
+    /** Previous-frame SCENE colour GRAB (scene only, pre-post) for SSR, glass refraction and the UI modal world blur —
+     *  the mesh FS samples this (holding last frame's image) while the current frame renders into lastFrameTex, so
+     *  there's no read-while-write on one texture. Allocated LAZILY, the first frame a reader is on (B2); dropped on
+     *  a resize and re-allocated when next needed. */
     private sceneColorGrabTex?: GPUTexture;
     /** True while the one SSR settle frame (scheduled after the grab copy) is pending — see the grab-copy site. */
     private _ssrSettleFrame = false;
     /** True when draw3DMeshes deferred its overlay set to the post-grab overlay pass this frame. */
     private _overlays3DPending = false;
+    /** The grab holds the latest on-screen frame (copied at the end of it). False after a live frame that skipped the
+     *  copy (no reader on) — the frame a reader turns on refreshes it from lastFrameTex first. */
+    private _grabFresh = false;
+    /** lastFrameTex holds a finished on-screen frame (not a capture / a fresh texture / a directToSwapchain frame). */
+    private _lastFrameLive = false;
+    /** The previous live frame needed the grab (a false → true change schedules one follow-up frame). */
+    private _grabNeededPrev = false;
     /** Physical pixel size of the last captured frame (lastFrameTex) — the source region for snapshotRegionToBlob. */
     public getLastFrameSize(): { w: number; h: number } { return { ...this.lastFrameSize }; }
     private ensureLastFrameTex() {
@@ -4452,15 +4505,48 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           format: this.swapChainFormat,
           usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING,
         });
+        // The grab is re-allocated at the new size the next time a reader needs it (_prepareSceneColorGrab).
         this.sceneColorGrabTex?.destroy();
+        this.sceneColorGrabTex = undefined;
+        this._renderer3D?.setSceneColorGrabTexture(null);
+        this._grabFresh = false;
+        this._lastFrameLive = false;
+        this.lastFrameSize = { w, h };
+      }
+    }
+
+    /** Does the 3D scene sample the grab this frame? SSR (inline trace / deferred resolve) or glass refraction, and
+     *  only when the 3D pass runs at all. */
+    private _sceneGrab3DReaders(): boolean {
+      const r3d = this._renderer3D;
+      if (!r3d || !this.scene3DVisible || this._captureMode?.skip3D) return false;
+      return r3d.ssrEnabled || r3d.glassRefraction;
+    }
+
+    /** A reader is on this frame: allocate the grab if needed, and when it is STALE (no copy last frame) fill it from
+     *  the last on-screen frame — the readers sample the PREVIOUS frame's grab, which would otherwise be black (a new
+     *  texture) or an old frame. Own encoder, submitted now: before the UI blur / lo-res / SSR-resolve submissions
+     *  that sample it. (That one frame includes its overlays; this frame's own grab copy is scene only.) */
+    private _prepareSceneColorGrab(): void {
+      const w = this.canvas.width, h = this.canvas.height;
+      if (!this.sceneColorGrabTex) {
         this.sceneColorGrabTex = this.device.createTexture({
           size: [w, h],
           format: this.swapChainFormat,
           usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+          label: 'SceneColorGrab',
         });
-        this._renderer3D?.setSceneColorGrabTexture(this.sceneColorGrabTex);
-        this.lastFrameSize = { w, h };
+        this._grabFresh = false;
       }
+      if (this._grabFresh || !this._lastFrameLive || !this.lastFrameTex) return;
+      if (RD.on && (RD.f.noSceneGrab || RD.f.directToSwapchain)) return;
+      const enc = this.device.createCommandEncoder({ label: 'SceneGrabRefresh' });
+      enc.copyTextureToTexture(
+        { texture: this.lastFrameTex }, { texture: this.sceneColorGrabTex },
+        { width: w, height: h, depthOrArrayLayers: 1 },
+      );
+      this.device.queue.submit([enc.finish()]);
+      this._grabFresh = true;
     }
 
     /** End one full-resolution hold; the last one re-renders the (scaled) on-screen view. */

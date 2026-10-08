@@ -37,7 +37,8 @@ export type RenderDebugFlags = {
   noPost: boolean;
   /** Skip FXAA. */
   noFxaa: boolean;
-  /** Skip the scene-colour grab copy (refraction / SSR source); meshes sample a 1x1 dummy instead. */
+  /** Skip the scene-colour grab copy (refraction / SSR / modal-blur source); meshes sample a 1x1 dummy instead. (With no
+   *  reader on, the grab is already skipped automatically — perf audit B2.) */
   noSceneGrab: boolean;
   /** Draw the frame straight into the canvas (swap-chain) texture: no lastFrameTex, no copy. Implies no post, no FXAA,
    *  no grab; thumbnails taken from live frames go stale while it is on. */
@@ -54,7 +55,8 @@ export type RenderDebugFlags = {
   /** Mesh fragment shader: clamp the texture-array layer indices (diffuse, normal map, GARP) to the bound layer count. */
   clampTexLayers: boolean;
   /** Draw the overlay set (gizmos, grid, handles, 2D selection UI) inside the main pass, so no second pass loads the
-   *  colour / depth / stencil attachments. */
+   *  colour / depth / stencil attachments. Automatic whenever no grab reader (SSR / glass / modal blur) is on (perf
+   *  audit B1); this flag forces it even with one on (the overlays then show in reflections / refraction). */
   inlineOverlays: boolean;
   /** Mesh fragment shader: no lighting (base colour x texture only; no shadows, IBL, SSAO, fog). */
   noLighting: boolean;

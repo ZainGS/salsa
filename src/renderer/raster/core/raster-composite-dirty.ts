@@ -42,7 +42,7 @@ export const rasterDirtyStats = { marks: 0, fullMarks: 0 };
  * layer / cel / painted texture is (the safe default — never pass a target you are not sure of).
  */
 export function markRasterCompositeDirty(rect?: DirtyTexelRect | null, target?: object | ReadonlyArray<object | null | undefined> | null): void {
-  noteRasterContentWrite(target);   // before the empty-rect early-out: over-reporting is always safe
+  noteRasterContentWrite(target, rect ?? null);   // before the empty-rect early-out: over-reporting is always safe
   if (rect) {
     if (!(rect.x1 > rect.x0 && rect.y1 > rect.y0)) {
       // NaN or empty: a NaN rect is "unknown", an empty one is "nothing"

@@ -5,6 +5,12 @@
  * which cels are visible on which frames and handles playback timing.
  *
  * The RasterLayerManager uses this to swap textures per frame.
+ *
+ * Texture ownership (perf audit A1, 2026-10-09): every cel has its OWN texture. The timeline owns the textures it
+ * creates (addCel / duplicateCel / a hold split) and the ones handed to addCelWithId; a layer's `baseTexture` (its
+ * texture manager's, shown by cel 1) belongs to the layer and is never destroyed here. Every destroy goes through
+ * releaseTexture(), which also skips a texture another cel still shows. Splitting a hold used to leave the rest of the
+ * hold SHARING the original's texture: painting one frame changed the other, and deleting either destroyed both.
  */
 
 import {
@@ -22,6 +28,13 @@ import {
 function makeCelId(): string {
   return 'cel_' + Math.random().toString(36).slice(2, 9);
 }
+
+const CEL_TEXTURE_USAGE = () =>
+  GPUTextureUsage.TEXTURE_BINDING |
+  GPUTextureUsage.STORAGE_BINDING |
+  GPUTextureUsage.COPY_SRC |
+  GPUTextureUsage.COPY_DST |
+  GPUTextureUsage.RENDER_ATTACHMENT;
 
 export class AnimationTimeline {
   private state: TimelineState;
@@ -171,13 +184,13 @@ export class AnimationTimeline {
           cel.duration -= 1;
         }
       }
-      // Remove dead cels — destroy their GPU textures to avoid leaks
-      for (const id of toRemove) {
-        const cel = ls.cels.find(c => c.id === id);
-        cel?.texture.destroy();
-        this.emit({ type: 'cel-removed', layerId, celId: id });
-      }
+      // Remove dead cels — destroy their GPU textures to avoid leaks (never a layer's own / a still-shown one)
+      const dead = ls.cels.filter(c => toRemove.includes(c.id));
       ls.cels = ls.cels.filter(c => !toRemove.includes(c.id));
+      for (const cel of dead) {
+        this.releaseTexture(cel.texture);
+        this.emit({ type: 'cel-removed', layerId, celId: cel.id });
+      }
       // Shift cels after deleted frame
       for (const cel of ls.cels) {
         if (cel.startFrame > pos) {
@@ -353,11 +366,21 @@ export class AnimationTimeline {
   public unregisterLayer(layerId: string): void {
     const ls = this.layerStates.get(layerId);
     if (ls) {
-      for (const cel of ls.cels) {
-        cel.texture.destroy();
-      }
       this.layerStates.delete(layerId);
+      // (the layer's own baseTexture is the layer's to destroy — its texture manager does)
+      for (const cel of ls.cels) if (cel.texture !== ls.baseTexture) this.releaseTexture(cel.texture);
     }
+  }
+
+  /** Destroy a cel texture the timeline owns — unless it is a layer's own texture (baseTexture) or another cel still
+   *  shows it. Call AFTER removing the cel from its layer's list. */
+  private releaseTexture(tex: GPUTexture | undefined): void {
+    if (!tex) return;
+    for (const [, ls] of this.layerStates) {
+      if (ls.baseTexture === tex) return;
+      for (const c of ls.cels) if (c.texture === tex) return;
+    }
+    tex.destroy();
   }
 
   /**
@@ -378,7 +401,9 @@ export class AnimationTimeline {
     if (ls.type === type) return;
 
     if (type === 'animated' && existingTexture) {
-      // The existing static texture becomes the first cel
+      // The existing static texture becomes the first cel (the layer keeps owning it)
+      const dropped = ls.cels;
+      ls.baseTexture = existingTexture;
       ls.cels = [{
         id: makeCelId(),
         startFrame: 1,
@@ -386,12 +411,12 @@ export class AnimationTimeline {
         texture: existingTexture,
         celType: 'key',
       }];
+      for (const c of dropped) this.releaseTexture(c.texture);   // (a static layer's leftover first cel)
     } else if (type === 'static') {
       // Destroy all cel textures except the first (which becomes the static texture)
-      for (let i = 1; i < ls.cels.length; i++) {
-        ls.cels[i].texture.destroy();
-      }
+      const removed = ls.cels.slice(1);
       ls.cels = ls.cels.length > 0 ? [ls.cels[0]] : [];
+      for (const c of removed) this.releaseTexture(c.texture);
     }
 
     ls.type = type;
@@ -458,15 +483,19 @@ export class AnimationTimeline {
     if (existing) {
       const holdEnd = existing.startFrame + existing.duration;
       existing.duration = frame - existing.startFrame;
-      // The remaining hold after the new cel
+      // The remaining hold after the new cel gets its OWN copy of the drawing (A1: it used to share the texture —
+      // painting one changed both, deleting one destroyed both)
       if (holdEnd > frame + 1) {
-        // We need to clone the existing texture for the remaining hold
-        // For now, the remaining hold shares the texture (will be duplicated on draw)
+        const src = existing.texture;
+        const copy = device.createTexture({ size: [src.width, src.height], format: 'rgba8unorm', usage: CEL_TEXTURE_USAGE() });
+        const enc = device.createCommandEncoder();
+        enc.copyTextureToTexture({ texture: src }, { texture: copy }, { width: src.width, height: src.height });
+        device.queue.submit([enc.finish()]);
         const remainCel: AnimationCel = {
           id: makeCelId(),
           startFrame: frame + 1,
           duration: holdEnd - frame - 1,
-          texture: existing.texture, // shared — will be duped when drawn on
+          texture: copy,
           celType: 'inbetween',
         };
         ls.cels.push(remainCel);
@@ -477,12 +506,7 @@ export class AnimationTimeline {
     const texture = device.createTexture({
       size: [width, height],
       format: 'rgba8unorm',
-      usage:
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.STORAGE_BINDING |
-        GPUTextureUsage.COPY_SRC |
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: CEL_TEXTURE_USAGE(),
     });
 
     // Clear to transparent
@@ -556,8 +580,19 @@ export class AnimationTimeline {
     const idx = ls.cels.findIndex(c => c.id === celId);
     if (idx < 0) return false;
     const [removed] = ls.cels.splice(idx, 1);
-    removed.texture.destroy();
+    this.releaseTexture(removed.texture);   // (never the layer's own texture)
     this.emit({ type: 'cel-removed', layerId, celId });
+    return true;
+  }
+
+  /** Point a cel at another texture (e.g. the layer's own after its pixels were copied there); the old one is
+   *  released (destroyed unless the layer owns it or another cel shows it). */
+  public setCelTexture(layerId: string, celId: string, texture: GPUTexture): boolean {
+    const cel = this.layerStates.get(layerId)?.cels.find(c => c.id === celId);
+    if (!cel) return false;
+    const old = cel.texture;
+    cel.texture = texture;
+    if (old !== texture) this.releaseTexture(old);
     return true;
   }
 
@@ -611,12 +646,7 @@ export class AnimationTimeline {
     const texture = device.createTexture({
       size: [w, h],
       format: 'rgba8unorm',
-      usage:
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.STORAGE_BINDING |
-        GPUTextureUsage.COPY_SRC |
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: CEL_TEXTURE_USAGE(),
     });
 
     // Copy pixels from source to new texture
@@ -640,7 +670,7 @@ export class AnimationTimeline {
     const existingIdx = ls.cels.findIndex(c => c.startFrame === targetFrame);
     if (existingIdx >= 0) {
       const [old] = ls.cels.splice(existingIdx, 1);
-      old.texture.destroy();
+      this.releaseTexture(old.texture);
     }
 
     ls.cels.push(cel);
@@ -768,11 +798,12 @@ export class AnimationTimeline {
 
   public destroy(): void {
     this.stop();
+    const owned = new Set<GPUTexture>();
     for (const [, ls] of this.layerStates) {
-      for (const cel of ls.cels) {
-        cel.texture.destroy();
-      }
+      for (const cel of ls.cels) if (cel.texture !== ls.baseTexture) owned.add(cel.texture);
     }
+    for (const [, ls] of this.layerStates) if (ls.baseTexture) owned.delete(ls.baseTexture);
+    for (const t of owned) t.destroy();   // once each (a layer's own texture is its texture manager's)
     this.layerStates.clear();
     this.listeners = [];
   }

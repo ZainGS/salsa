@@ -408,3 +408,212 @@ describe('incremental autosave — an edit is never skipped', () => {
     expect({ afterStroke, idle, full }).toEqual({ afterStroke: 1, idle: 0, full: 5 });
   });
 });
+
+// ── perf audit 2026-10-09 B5: leaving a document / Ctrl+S = saveNow({ incremental: true }) ──
+describe('incremental explicit save (saveNow({ incremental: true }))', () => {
+  it('writes only what changed — the stroke, the vector change — and leaves every other file on disk', async () => {
+    const { rlm, p } = await fiveLayerDoc();
+    const before = { A: file(root, 'salsa-documents/doc/layers/A.bin')!.data, E: file(root, 'salsa-documents/doc/layers/E.bin')!.data };
+    rlm.paint(rlm.texOf('C'), 201);
+    sceneJSON = '{"root":{"children":[{"id":"s9","type":"Rect"}]}}';
+    expect(await p.saveNow({ incremental: true })).toBe(true);
+    expect(rlm.reads).toEqual(['C']);                                     // one read-back (a full saveNow: 5)
+    expect(p.lastWrittenFiles).toEqual(['scene.json', 'layers/C.bin', 'manifest.json']);
+    expect((await bytes(root, 'salsa-documents/doc/layers/C.bin'))[0]).toBe(201);
+    expect(root.list('salsa-documents/doc/layers')).toEqual(['A.bin', 'B.bin', 'C.bin', 'D.bin', 'E.bin']);
+    expect(file(root, 'salsa-documents/doc/layers/A.bin')!.data).toBe(before.A);
+    expect(file(root, 'salsa-documents/doc/layers/E.bin')!.data).toBe(before.E);
+  });
+
+  it('a leave-flush right after edits (no automatic save ran) loses nothing: layers, cels, deletions, blanks, new layers', async () => {
+    const rlm = new FakeRlm();
+    rlm.add('BG', 5); rlm.add('X', 6); rlm.add('Y', 7);
+    const cels = rlm.addAnimated('anim', [30, 31, 32]);
+    const coord = coordinatorFor(rlm);
+    const p = persistenceFor(coord);
+    await p.triggerSave();
+    rlm.reads = [];
+    rlm.paint(rlm.texOf('BG'), 90);                                      // a stroke
+    rlm.paint(cels[2], 91);                                              // a cel edit
+    const y = rlm.texOf('Y'); y.data.fill(0); markRasterCompositeDirty(null, y);   // cleared → blank
+    rlm.layers = rlm.layers.filter((l) => l.id !== 'X');                 // deleted
+    rlm.add('Z', 92);                                                    // new
+    expect(await p.saveNow({ incremental: true })).toBe(true);
+    expect(rlm.reads.sort()).toEqual(['BG', 'Y', 'Z', 'anim-c3']);
+    expect((await bytes(root, 'salsa-documents/doc/layers/BG.bin'))[0]).toBe(90);
+    expect((await bytes(root, 'salsa-documents/doc/cels/anim-c3.bin'))[0]).toBe(91);
+    expect((await bytes(root, 'salsa-documents/doc/layers/Z.bin'))[0]).toBe(92);
+    expect(root.list('salsa-documents/doc/layers')).not.toContain('Y.bin');
+    const manifest = JSON.parse(await (file(root, 'salsa-documents/doc/manifest.json')!.data.text()));
+    expect(manifest.layers.map((l: { id: string }) => l.id)).toEqual(['BG', 'Y', 'anim', 'Z']);
+    // …and a fresh load of what the flush wrote reads back the document on screen
+    const loaded = (await persistenceFor(coordinatorFor(new FakeRlm())).loadDocument('doc')) as DocumentSavePayload;
+    const px = (id: string) => new Uint8Array(loaded.layers.find((l) => l.id === id)!.pixelData)[0];
+    expect(px('BG')).toBe(90);
+    expect(px('Z')).toBe(92);
+    expect(loaded.layers.some((l) => l.id === 'X' || l.id === 'Y')).toBe(false);
+    expect(new Uint8Array(loaded.cels!.find((c) => c.celId === 'anim-c3')!.pixelData)[0]).toBe(91);
+  });
+
+  it('nothing changed: reads and writes nothing, still reports "Saving…" / "Saved" (the user pressed Save)', async () => {
+    const { rlm, p } = await fiveLayerDoc();
+    const onStart = vi.fn(), onDone = vi.fn();
+    p.setSaveCallbacks(onStart, onDone);
+    const manifest = file(root, 'salsa-documents/doc/manifest.json')!.data;
+    expect(await p.saveNow({ incremental: true })).toBe(true);
+    expect(rlm.reads).toEqual([]);
+    expect(file(root, 'salsa-documents/doc/manifest.json')!.data).toBe(manifest);
+    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(onDone).toHaveBeenCalledWith(true);
+  });
+
+  it('another writer changed the document on disk → every file is written again (the record is not trusted)', async () => {
+    const { rlm, p } = await fiveLayerDoc();
+    const f = file(root, 'salsa-documents/doc/manifest.json')!;
+    const m = JSON.parse(await f.data.text());
+    m.savedAt = '2099-01-01T00:00:00Z';
+    f.data = new Blob([JSON.stringify(m)]);
+    await p.saveNow({ incremental: true });
+    expect(p.lastWrittenFiles).toEqual(expect.arrayContaining(['layers/A.bin', 'layers/E.bin', 'scene.json', 'manifest.json']));
+  });
+
+  it('a first save with no record (a fresh instance, nothing loaded) writes everything', async () => {
+    const rlm = new FakeRlm();
+    for (const id of ['A', 'B']) rlm.add(id, 3);
+    const p = persistenceFor(coordinatorFor(rlm));
+    await p.saveNow({ incremental: true });
+    expect(p.lastWrittenFiles).toEqual(expect.arrayContaining(['layers/A.bin', 'layers/B.bin', 'scene.json', 'manifest.json']));
+  });
+
+  it('busy (Play) → deferred like any explicit save, and still incremental once it runs; a full request sharing it wins', async () => {
+    const { rlm, p } = await fiveLayerDoc();
+    let busy = true;
+    p.setBusyPredicate(() => busy);
+    rlm.paint(rlm.texOf('B'), 66);
+    const pending = p.saveNow({ incremental: true });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(rlm.reads).toEqual([]);
+    busy = false;
+    expect(await pending).toBe(true);
+    expect(rlm.reads).toEqual(['B']);
+    expect(p.lastWrittenFiles).toEqual(['layers/B.bin', 'manifest.json']);
+    rlm.reads = [];
+    busy = true;
+    const a = p.saveNow({ incremental: true });
+    const b = p.saveNow();
+    busy = false;
+    await Promise.all([a, b]);
+    expect(rlm.reads.length).toBe(5);                                     // the shared deferred save ran full
+  });
+
+  it('read-back count when leaving a 5-layer document after 1 stroke: incremental 1, full 5', async () => {
+    const { rlm, p } = await fiveLayerDoc();
+    rlm.paint(rlm.texOf('D'), 12);
+    await p.saveNow({ incremental: true });
+    const incremental = rlm.reads.length;
+    rlm.reads = [];
+    rlm.paint(rlm.texOf('D'), 13);
+    await p.saveNow();
+    expect({ incremental, full: rlm.reads.length }).toEqual({ incremental: 1, full: 5 });
+  });
+});
+
+// ── Change-debounced autosave: any scene-graph change saves ~1.5 s later (not only the 30 s interval) ──
+describe('document changes schedule the incremental autosave (notifyDocumentChanged)', () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const until = async (cond: () => boolean, ms = 5000) => { const t0 = Date.now(); while (!cond() && Date.now() - t0 < ms) await sleep(10); };
+  const started = (rlm: FakeRlm, config: Record<string, number> = {}) => {
+    const p = persistenceFor(coordinatorFor(rlm));
+    p.setConfig(config);
+    p.startAutoSave();
+    return p;
+  };
+
+  it('draw vector shapes in a NEW local document, refresh 2 s later → the shapes are on disk', async () => {
+    const rlm = new FakeRlm();
+    rlm.add('Background', 255);
+    const p = started(rlm);                          // the default debounce (1.5 s)
+    const coord = coordinatorFor(rlm);
+    let gatheredAt = 0;
+    p.setStateProvider((o) => { gatheredAt = Date.now(); return coord.gather(false, { reusePixels: !o?.explicit }); });
+    sceneJSON = '{"root":{"children":[{"id":"s1","type":"Rectangle"},{"id":"s2","type":"Ellipse"}]}}';
+    const t0 = Date.now();
+    p.notifyDocumentChanged();                       // ShapeManager: onSceneGraphChanged → notifyDocumentChanged
+    await sleep(1000);
+    expect(gatheredAt).toBe(0);                      // still debouncing
+    await until(() => p.writeStats.writes > 0);
+    expect(gatheredAt - t0).toBeGreaterThanOrEqual(1400);
+    expect(gatheredAt - t0).toBeLessThan(2000);      // the save started before a refresh at 2 s
+    // "refresh": a new instance loads what is on disk
+    const loaded = await persistenceFor(coordinatorFor(new FakeRlm())).loadDocument('doc');
+    expect(loaded?.sceneGraphJSON).toBe(sceneJSON);
+    expect(loaded?.layers.map((l) => l.id)).toEqual(['Background']);
+  });
+
+  it('a later move / restyle after the first save is saved incrementally (scene.json + manifest only)', async () => {
+    const rlm = new FakeRlm();
+    rlm.add('Background', 255);
+    const p = started(rlm, { changeDebounceMs: 30 });
+    p.notifyDocumentChanged();
+    await until(() => p.writeStats.writes === 1);
+    rlm.reads = [];
+    sceneJSON = '{"root":{"children":[{"id":"s1","type":"Rectangle","x":40}]}}';
+    p.notifyDocumentChanged();
+    await until(() => p.writeStats.writes === 2);
+    expect(rlm.reads).toEqual([]);
+    expect(p.lastWrittenFiles).toEqual(['scene.json', 'manifest.json']);
+  });
+
+  it('a run of changes with no pause still saves after changeMaxWaitMs, not only at the interval', async () => {
+    const rlm = new FakeRlm();
+    rlm.add('A', 1);
+    const p = started(rlm, { changeDebounceMs: 100, changeMaxWaitMs: 300 });
+    for (let i = 0; i < 20; i++) {                   // a drag: a change every 40 ms for 800 ms
+      sceneJSON = `{"root":{"children":[{"id":"s1","x":${i}}]}}`;
+      p.notifyDocumentChanged();
+      await sleep(40);
+    }
+    expect(p.writeStats.writes).toBeGreaterThanOrEqual(1);
+  });
+
+  it('a stroke pause and edits in the same burst save once', async () => {
+    const rlm = new FakeRlm();
+    rlm.add('A', 1);
+    const p = started(rlm, { strokeDebounceMs: 100, changeDebounceMs: 100 });
+    p.notifyStrokeEnd();
+    await sleep(30);
+    p.notifyDocumentChanged();
+    await sleep(30);
+    p.notifyDocumentChanged();
+    await sleep(400);
+    expect(p.writeStats.writes).toBe(1);
+  });
+
+  it('never schedules a save while autosave is off (before start, after stop — a host that left the document)', async () => {
+    const rlm = new FakeRlm();
+    rlm.add('A', 1);
+    const p = persistenceFor(coordinatorFor(rlm));
+    p.setConfig({ changeDebounceMs: 20 });
+    p.notifyDocumentChanged();                       // never started
+    await sleep(80);
+    p.startAutoSave();
+    p.stopAutoSave();
+    p.notifyDocumentChanged();                       // stopped
+    await sleep(80);
+    expect(p.writeStats.writes).toBe(0);
+    p.startAutoSave();
+    p.notifyDocumentChanged();
+    p.cancelPendingSaves();                          // left the document with a change pending → dropped
+    await sleep(80);
+    expect(p.writeStats.writes).toBe(0);
+  });
+
+  it('changeDebounceMs: 0 turns it off', async () => {
+    const rlm = new FakeRlm();
+    rlm.add('A', 1);
+    const p = started(rlm, { changeDebounceMs: 0 });
+    p.notifyDocumentChanged();
+    await sleep(100);
+    expect(p.writeStats.writes).toBe(0);
+  });
+});

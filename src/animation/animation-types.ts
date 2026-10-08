@@ -38,6 +38,9 @@ export interface AnimationLayerState {
   type: LayerAnimationType;
   /** Ordered array of cels (only used when type === 'animated'). */
   cels: AnimationCel[];
+  /** The layer's own texture (its RasterTextureManager's) when a cel shows it — cel 1 of a layer made animated, or
+   *  the first cel restored on load. The layer owns it: the timeline never destroys it (perf audit A1/A3). */
+  baseTexture?: GPUTexture;
 }
 
 // ─── Timeline ───────────────────────────────────────────────────────

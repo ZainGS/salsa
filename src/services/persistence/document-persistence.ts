@@ -30,7 +30,9 @@
  * GPU read-back: DocumentStateCoordinator serves unchanged pixels from its cache). The record is trusted only while
  * the on-disk manifest still carries the savedAt it was taken with (another tab or instance writing the document →
  * full write), is committed only after a write completes, and is dropped on any failure. Explicit saves (saveNow)
- * ignore it and write everything.
+ * ignore it and write everything — unless saveNow({ incremental: true }) (a host leaving the document / Ctrl+S, perf
+ * audit 2026-10-09 B5): explicit in every other way (not soft-deferred, "Saving…" reported up front), but planned and
+ * gathered like an automatic save, so only what changed is read back, encoded and written.
  *
  * This module has ZERO coupling to UI frameworks. Frogmarks wires it
  * through ShapeManager.
@@ -127,6 +129,13 @@ export interface AutoSaveConfig {
   intervalMs: number;
   /** Debounce time after stroke end before saving. Default: 5000 (5s). */
   strokeDebounceMs: number;
+  /** Debounce time after a DOCUMENT change (notifyDocumentChanged — ShapeManager calls it on every scene-graph change:
+   *  vector shapes added / moved / deleted / restyled, 3D edits; hosts may call it for settings) before an automatic
+   *  save. 0 = off. Default: 1500. During changes that never pause, a save still runs every changeMaxWaitMs. Only
+   *  while autosave is started (startAutoSave … stopAutoSave). */
+  changeDebounceMs?: number;
+  /** The longest a change debounce that keeps being re-armed may postpone its save. Default: 5000. */
+  changeMaxWaitMs?: number;
   /** Image format for layer pixel data. 'png' = recommended default. 'raw' = uncompressed (debug). */
   pixelFormat: PixelFormat;
 }
@@ -171,6 +180,14 @@ export class DocumentPersistence {
   private config: AutoSaveConfig;
   private autoSaveTimer: ReturnType<typeof setInterval> | null = null;
   private strokeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When the pending debounced save (stroke / change) was first requested (see notifyDocumentChanged). */
+  private debounceSince = 0;
+  /** startAutoSave … stopAutoSave: document-change notifications schedule saves only in between (never after a host
+   *  left the document — see cancelPendingSaves). */
+  private autoSaveActive = false;
+  /** A change debounce that keeps being re-armed (a long drag) still saves after this long (changeMaxWaitMs). */
+  private static readonly MAX_CHANGE_WAIT_MS = 5_000;
+  private static readonly DEFAULT_CHANGE_DEBOUNCE_MS = 1_500;
   /** The queued trailing save (runSave's "one more" after a save that had a change arrive mid-write). */
   private trailingTimer: ReturnType<typeof setTimeout> | null = null;
   private isSaving = false;
@@ -250,8 +267,9 @@ export class DocumentPersistence {
 
   /**
    * Set the callback that gathers the full document state.
-   * ShapeManager provides this. `opts.explicit` = a saveNow() (the provider may then read every pixel fresh); an
-   * automatic save passes false (the provider may serve unchanged pixels from a cache, with content keys).
+   * ShapeManager provides this. `opts.explicit` = a FULL explicit save, saveNow() without `incremental` (the provider
+   * then reads every pixel fresh); an automatic or incremental explicit save passes false (the provider may serve
+   * unchanged pixels from a cache, with content keys).
    */
   public setStateProvider(fn: (opts?: { explicit?: boolean }) => Promise<DocumentSavePayload>): void {
     this.getDocumentState = fn;
@@ -275,9 +293,12 @@ export class DocumentPersistence {
   // ── Auto-save lifecycle ───────────────────────────────────────────
 
   public startAutoSave(): void {
-    if (this.config.intervalMs <= 0) return;
     this.stopAutoSave();
+    // Change-debounced saves and the tab-hide / close flush run even with no interval (as the stroke-debounced saves
+    // always did): a change saved 1.5 s after it was made must not be lost to a refresh in between either.
+    this.autoSaveActive = true;
     this.attachFlushListeners();
+    if (this.config.intervalMs <= 0) return;
     this.autoSaveTimer = setInterval(() => {
       if (this.busyPredicate?.()) return;   // e.g. Play mode active — don't persist a transient animation frame
       this.triggerDeferrableSave();
@@ -302,6 +323,7 @@ export class DocumentPersistence {
   }
 
   public stopAutoSave(): void {
+    this.autoSaveActive = false;
     if (this.autoSaveTimer !== null) {
       clearInterval(this.autoSaveTimer);
       this.autoSaveTimer = null;
@@ -350,11 +372,35 @@ export class DocumentPersistence {
     if (this.config.strokeDebounceMs <= 0) return;
     if (this.strokeDebounceTimer !== null) {
       clearTimeout(this.strokeDebounceTimer);
+    } else {
+      this.debounceSince = Date.now();
     }
     this.strokeDebounceTimer = setTimeout(() => {
       this.triggerDeferrableSave();
       this.strokeDebounceTimer = null;
     }, this.config.strokeDebounceMs);
+  }
+
+  /**
+   * The document changed (anything but a raster stroke, which reports notifyStrokeEnd): schedule an automatic
+   * (incremental) save changeDebounceMs after the last change — shares the stroke debounce, so a burst of strokes and
+   * edits saves once. A change that keeps re-arming it (a long drag) does not postpone the save past
+   * changeMaxWaitMs (5 s). Before this, vector / 3D edits reached Salsa's document only with the interval (30 s) or a
+   * tab-hide flush, so a quick refresh after drawing could lose them. No-op unless autosave is started.
+   */
+  public notifyDocumentChanged(): void {
+    const ms = this.config.changeDebounceMs ?? DocumentPersistence.DEFAULT_CHANGE_DEBOUNCE_MS;
+    if (ms <= 0 || !this.autoSaveActive) return;
+    if (this.strokeDebounceTimer !== null) {
+      if (Date.now() - this.debounceSince >= (this.config.changeMaxWaitMs ?? DocumentPersistence.MAX_CHANGE_WAIT_MS)) return;   // let it fire
+      clearTimeout(this.strokeDebounceTimer);
+    } else {
+      this.debounceSince = Date.now();
+    }
+    this.strokeDebounceTimer = setTimeout(() => {
+      this.triggerDeferrableSave();
+      this.strokeDebounceTimer = null;
+    }, ms);
   }
 
   /** Trigger a save now (debounced if one is already in progress). Automatic path — skipped while the busy
@@ -376,21 +422,25 @@ export class DocumentPersistence {
    *  poses, script hides, the camera and UI vars, and rebuilding the editor view of all of it would duplicate every
    *  Stop restore path (any one missed silently persists corruption). Stop already restores all of it, so saving
    *  right after Stop reuses that one tested path. Calls made during one busy period share the same deferred save. */
-  public async saveNow(): Promise<boolean> {
+  /** `opts.incremental`: write only what differs from what this instance last wrote / loaded (see the header) — every
+   *  change is still written; the disk check and the content keys decide, exactly as for an automatic save. */
+  public async saveNow(opts: { incremental?: boolean } = {}): Promise<boolean> {
+    const full = !opts.incremental;
     if (this.busyPredicate?.()) {
       if (!this.deferred) { try { this.onDeferred?.(); } catch { /* host callback */ } }
-      return this.deferUntilIdle(true);
+      return this.deferUntilIdle(true, full);
     }
-    return this.executeSave(true);
+    return this.executeSave(true, full);
   }
 
   /** Poll interval for a deferred explicit save (see saveNow). */
   private static readonly DEFER_POLL_MS = 250;
-  private deferred: { promise: Promise<boolean>; resolve: (ok: boolean) => void; timer: ReturnType<typeof setInterval>; explicit: boolean } | null = null;
+  private deferred: { promise: Promise<boolean>; resolve: (ok: boolean) => void; timer: ReturnType<typeof setInterval>; explicit: boolean; full: boolean } | null = null;
 
-  /** One shared save that runs as soon as the busy predicate clears (D-P2). Explicit if any request sharing it was. */
-  private deferUntilIdle(explicit = false): Promise<boolean> {
-    if (this.deferred) { this.deferred.explicit ||= explicit; return this.deferred.promise; }
+  /** One shared save that runs as soon as the busy predicate clears (D-P2). Explicit if any request sharing it was;
+   *  full (every file) if any request sharing it was. */
+  private deferUntilIdle(explicit = false, full = explicit): Promise<boolean> {
+    if (this.deferred) { this.deferred.explicit ||= explicit; this.deferred.full ||= full; return this.deferred.promise; }
     let resolve!: (ok: boolean) => void;
     const promise = new Promise<boolean>((r) => { resolve = r; });
     const timer = setInterval(() => {
@@ -399,9 +449,9 @@ export class DocumentPersistence {
       if (!d) return;
       clearInterval(d.timer);
       this.deferred = null;   // BEFORE the save — a new busy period during it gets its own deferral
-      this.executeSave(d.explicit).then(d.resolve, () => d.resolve(false));
+      this.executeSave(d.explicit, d.full).then(d.resolve, () => d.resolve(false));
     }, DocumentPersistence.DEFER_POLL_MS);
-    this.deferred = { promise, resolve, timer, explicit };
+    this.deferred = { promise, resolve, timer, explicit, full };
     return promise;
   }
 
@@ -440,7 +490,9 @@ export class DocumentPersistence {
   public setSaveBlocked(reason: string | null): void { this.saveBlockedReason = reason; }
   public get saveBlocked(): string | null { return this.saveBlockedReason; }
 
-  private async executeSave(explicit = false): Promise<boolean> {
+  /** `explicit` = a saveNow() (reports "Saving…" up front); `full` = ignore the write record and read every pixel
+   *  fresh (a saveNow() without `incremental`). */
+  private async executeSave(explicit = false, full = explicit): Promise<boolean> {
     // Serialize: an explicit saveNow() used to bypass isSaving and write the same files CONCURRENTLY with a running
     // autosave (audit P9). Wait for the one in flight, then save (re-checking the gates below after the wait).
     while (this.inFlight) { try { await this.inFlight; } catch { /* it reported its own failure */ } }
@@ -450,17 +502,17 @@ export class DocumentPersistence {
       return false;
     }
     let busyAfterGather = false;
-    const run = this.runSave(() => { busyAfterGather = true; }, explicit);
+    const run = this.runSave(() => { busyAfterGather = true; }, explicit, full);
     this.inFlight = run;
     let ok: boolean;
     try { ok = await run; }
     finally { if (this.inFlight === run) this.inFlight = null; }
     // Play (etc.) started while the state was being gathered (the gather awaits pixel export before reading the 3D
     // scene) → nothing was written; save again once it ends (D-P2). Outside inFlight, so no self-wait.
-    return busyAfterGather ? this.deferUntilIdle(explicit) : ok;
+    return busyAfterGather ? this.deferUntilIdle(explicit, full) : ok;
   }
 
-  private async runSave(onBusy: () => void, explicit = false): Promise<boolean> {
+  private async runSave(onBusy: () => void, explicit = false, full = explicit): Promise<boolean> {
     if (!this.getDocumentState || !isOPFSAvailable()) return false;
 
     this.isSaving = true;
@@ -472,7 +524,7 @@ export class DocumentPersistence {
 
     try {
       const epoch0 = this.busyEpoch?.();
-      const payload = await this.getDocumentState({ explicit });
+      const payload = await this.getDocumentState({ explicit: full });
       if (this.busyPredicate?.()) { onBusy(); return false; }   // in-game frame — never write it (D-P2)
       if (this.busyEpoch && this.busyEpoch() !== epoch0) { onBusy(); return false; }   // a busy period came and went mid-gather
       // No document id = no document open yet (ShapeManager.startBlankDocument without an id): nowhere to write. It
@@ -482,7 +534,7 @@ export class DocumentPersistence {
         this.onSaveComplete?.(false);
         return false;
       }
-      const result = await withDocLock(payload.manifest.docId, () => this.writeToOPFS(payload, { explicit, onFirstWrite: start }));
+      const result = await withDocLock(payload.manifest.docId, () => this.writeToOPFS(payload, { explicit: full, onFirstWrite: start }));
       payload._onWriteComplete?.();   // also when nothing needed writing: the disk already holds this state
       if (started || result === 'written') this.onSaveComplete?.(true);
       return true;
@@ -530,7 +582,7 @@ export class DocumentPersistence {
     }
 
     // ── Plan: which files differ from what this instance last wrote / loaded (INCREMENTAL — see the header) ──
-    // The record is trusted only for the same document, an automatic save, and an on-disk manifest that still has
+    // The record is trusted only for the same document, an automatic / incremental save, and an on-disk manifest that still has
     // the savedAt it was taken with. Anything else → `prev` null → every file is written, as before.
     const docId = payload.manifest.docId;
     const r = this.written;

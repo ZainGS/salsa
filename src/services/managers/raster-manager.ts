@@ -576,6 +576,18 @@ export class RasterManager {
     }
     getLayerDitherConfig(layerId: string): DitherConfig | undefined { return this.layerMgr?.getLayerDitherConfig(layerId); }
 
+    /** BAKE DITHER: write the layer's current dithered look into its pixels for good and turn its dither off — ONE
+     *  raster undo entry (undo brings back the pre-bake pixels and the dither). False when nothing was baked (no
+     *  active dither on the layer, not a paint layer, an animation cel, or error diffusion's WASM not loaded). */
+    async bakeLayerDither(layerId: string): Promise<boolean> {
+        const comp = this.renderer?.rasterCompositor;
+        const lm = this.layerMgr;
+        if (!comp || !lm) return false;
+        const ok = await lm.bakeLayerDither(layerId, (layer, dst) => comp.bakeLayerDither(layer, dst));
+        if (ok) this.ctx.scheduleRender();
+        return ok;
+    }
+
     // ── Dither Color Controls ────────────────────────────────────────
 
     setDitherColorMode(mode: 'quantize' | 'duotone'): void { const cfg = this.getDitherConfig(); cfg.colorMode = mode; this.setDitherConfig(cfg); }

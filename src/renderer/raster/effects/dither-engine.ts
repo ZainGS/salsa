@@ -141,6 +141,16 @@ const WGSL_EDGE_HELPERS = /* wgsl */ `
       }
 `;
 
+// Shared WGSL: the dispatch REGION (2026-10-08, per-layer dither cache). params[8] = [x0, y0, x1, y1] in texels,
+// max-exclusive; a dispatch covers only the region and `gid` below is the ABSOLUTE texel, so every pattern / edge /
+// cell computation is the same as in a whole-texture dispatch (the region of a full pass is [0, 0, w, h]).
+const WGSL_REGION_HEAD = /* wgsl */ `let gid = vec3<u32>(gidIn.x + u32(params[8].x), gidIn.y + u32(params[8].y), 0u);
+        if (gid.x >= u32(params[8].z) || gid.y >= u32(params[8].w)) { return; }
+        if (gid.x >= dim.x || gid.y >= dim.y) { return; }`;
+
+/** Texels, max-exclusive. */
+export interface DitherTexelRect { x0: number; y0: number; x1: number; y1: number }
+
 export type DitherAlgorithm =
   // GPU compute (ordered, real-time)
   | 'bayer'
@@ -336,8 +346,14 @@ export class DitherEngine {
   private pingW = 0;
   private pingH = 0;
 
-  // Shared params buffer (32 floats = 128 bytes, enough for all algorithms + color controls)
+  // Shared params buffer (36 floats = 144 bytes: algorithm params[0..3], color + edge controls params[4..7],
+  // dispatch region params[8])
   private paramsBuf: GPUBuffer;
+  private regionData = new Float32Array(4);
+
+  /** Work counters (diagnostics / tests): compute dispatches and the texels they cover, texture copies (the
+   *  in-place apply() reads through a ping copy), and error-diffusion passes (GPU→CPU→WASM). */
+  public readonly stats = { dispatches: 0, dispatchTexels: 0, copies: 0, copyTexels: 0, errorDiffusionPasses: 0 };
 
   // PERF (audit 5.6): persistent MAP_READ readback buffer for the error-diffusion
   // path — recreated only when the required size changes instead of allocated and
@@ -354,9 +370,39 @@ export class DitherEngine {
   constructor(device: GPUDevice) {
     this.device = device;
     this.paramsBuf = device.createBuffer({
-      size: 128,  // 32 × f32
+      size: 144,  // 36 × f32
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+  }
+
+  /** Is this config an active ORDERED (GPU) dither — the kind apply() / applyRegion() run? */
+  public static isActiveOrdered(config: DitherConfig | undefined | null): boolean {
+    return !!config && config.enabled && config.strength > 0.001 && !DitherEngine.isErrorDiffusion(config.algorithm);
+  }
+
+  /**
+   * How far (texels) a change to the SOURCE can move the ordered-dither OUTPUT. A pixel's output reads only its own
+   * source texel, except with edge effects on: the content edge factor reads up to `edgeWidth` px around it, and the
+   * density dropout evaluates that factor once at the pattern CELL CENTRE (Bayer tile / halftone cell), up to about
+   * one cell away. So re-dithering a dirty source rect grown by this reach gives exactly the full re-dither.
+   * Conservative (generous rounding); 0 when no edge effect reads neighbours (width 0, all amounts 0, or the
+   * canvas-only edge mode, which is pure arithmetic).
+   */
+  public static rectReach(cfg: DitherConfig, texW: number): number {
+    const ew = cfg.edgeWidth ?? 0;
+    const amounts = (cfg.edgeFade ?? 0) + Math.abs(cfg.edgeShrink ?? 0) + (cfg.edgeDensity ?? 0);
+    if (ew < 0.5 || amounts < 0.001) return 0;          // edgeState's early-out: no taps at all
+    if (cfg.edgeMode === 'canvas') return 0;             // canvas distance only: no texture reads
+    let reach = Math.ceil(ew) + 2;                       // the 25 taps sit within radius (+ rounding)
+    if ((cfg.edgeDensity ?? 0) > 0.001) {
+      const ps = Math.max(cfg.patternScale || 1, 1e-3);
+      let cellPx = 0;
+      if (cfg.algorithm === 'bayer') cellPx = (1 << ((cfg.bayerLevel | 0) + 1)) * ps + ps;
+      else if (isHalftoneAlgorithm(cfg.algorithm)) cellPx = (texW / Math.max(cfg.halftoneFrequency || 1, 1e-3)) * ps;
+      // (noise / blue noise: density folds into coverage — no cells)
+      reach += Math.ceil(cellPx * 1.5) + 2;              // the cell centre is within ~0.71 cell of the pixel
+    }
+    return reach;
   }
 
   /** Numeric edge-mode for the shaders (params[3].x): 0 content, 1 canvas, 2 both.
@@ -382,11 +428,12 @@ export class DitherEngine {
   /**
    * Apply dithering to a texture in-place (synchronous — GPU ordered dithering only).
    * For error diffusion algorithms, this is a no-op. Use `applyAsync()` instead.
+   * In-place costs a full ping copy; to dither one texture INTO another (no copy, optionally
+   * one region) use `applyRegion()` — the per-layer dither cache does.
    *
    * PERF (audit 5.7): when `sharedEncoder` is provided, the input copy and the
    * compute dispatch are recorded into it and NO submit happens here — the
-   * caller owns the submit (the compositor batches its per-layer copy with the
-   * dither work into one submit). Without it, both commands still share one
+   * caller owns the submit. Without it, both commands still share one
    * internally-owned encoder/submit (was 2 standalone submits per call).
    * Note: the uniform writeBuffer calls below are queue-ordered ahead of any
    * later submit, so deferring the submit is safe — but because paramsBuf is
@@ -408,26 +455,62 @@ export class DitherEngine {
 
     // Copy input → ping (for reading)
     enc.copyTextureToTexture({ texture }, { texture: this.pingTex! }, { width: w, height: h });
+    this.stats.copies++; this.stats.copyTexels += w * h;
 
-    switch (config.algorithm) {
-      case 'bayer':
-        this.applyBayer(texture, w, h, config, enc);
-        break;
-      case 'blue_noise':
-        this.applyBlueNoise(texture, w, h, config, enc);
-        break;
-      case 'noise':
-        this.applyNoise(texture, w, h, config, enc);
-        break;
-      default:
-        // Every 'halftone_*' shape (an unknown one from a newer document renders as Dot).
-        if (isHalftoneAlgorithm(config.algorithm)) this.applyHalftone(texture, w, h, config, enc);
-        break;
-    }
+    this.record(this.pingTex!, texture, config, { x0: 0, y0: 0, x1: w, y1: h }, this.frameCounter, enc);
 
     if (!sharedEncoder) this.device.queue.submit([enc.finish()]);
 
     this.frameCounter++;
+  }
+
+  /**
+   * Ordered dither of `src` into a SEPARATE texture `out` of the same size, over `region` only (texels,
+   * max-exclusive; null / omitted = the whole texture). No copy: the shader reads `src` directly, so `src` is never
+   * modified (a raster layer can be its own source). Every texel the region covers gets exactly what a whole-texture
+   * pass writes there (the shaders work in absolute texel coordinates); texels outside it are left untouched — the
+   * per-layer dither cache re-dithers a stroke's dirty rect grown by rectReach() this way. `noiseSeed`: the 'noise'
+   * pattern's seed (fixed per cache, so a re-dithered rect matches the rest). One submit of its own (the shared
+   * params buffer is rewritten per call). Returns false when nothing was dispatched (inactive / error-diffusion
+   * config, size mismatch, empty region).
+   */
+  public applyRegion(
+    src: GPUTexture, out: GPUTexture, config: DitherConfig, region?: DitherTexelRect | null, noiseSeed = 0,
+  ): boolean {
+    if (!DitherEngine.isActiveOrdered(config)) return false;
+    const w = out.width, h = out.height;
+    if (w === 0 || h === 0 || src.width !== w || src.height !== h || src === out) return false;
+    const r = region
+      ? { x0: Math.max(0, Math.floor(region.x0)), y0: Math.max(0, Math.floor(region.y0)), x1: Math.min(w, Math.ceil(region.x1)), y1: Math.min(h, Math.ceil(region.y1)) }
+      : { x0: 0, y0: 0, x1: w, y1: h };
+    if (r.x1 <= r.x0 || r.y1 <= r.y0) return false;
+    const enc = this.device.createCommandEncoder();
+    this.record(src, out, config, r, noiseSeed, enc);
+    this.device.queue.submit([enc.finish()]);
+    return true;
+  }
+
+  /** Record one ordered-dither dispatch: `src` → `out` over region `r` (clipped, non-empty). */
+  private record(src: GPUTexture, out: GPUTexture, config: DitherConfig, r: DitherTexelRect, noiseSeed: number, enc: GPUCommandEncoder): void {
+    const w = out.width, h = out.height;
+    const rd = this.regionData;
+    rd[0] = r.x0; rd[1] = r.y0; rd[2] = r.x1; rd[3] = r.y1;
+    this.device.queue.writeBuffer(this.paramsBuf, 128, rd);   // params[8]: the region
+    switch (config.algorithm) {
+      case 'bayer':
+        this.applyBayer(src, out, w, h, config, enc, r);
+        break;
+      case 'blue_noise':
+        this.applyBlueNoise(src, out, w, h, config, enc, r);
+        break;
+      case 'noise':
+        this.applyNoise(src, out, w, h, config, enc, r, noiseSeed);
+        break;
+      default:
+        // Every 'halftone_*' shape (an unknown one from a newer document renders as Dot).
+        if (isHalftoneAlgorithm(config.algorithm)) this.applyHalftone(src, out, w, h, config, enc, r);
+        break;
+    }
   }
 
   /**
@@ -444,15 +527,34 @@ export class DitherEngine {
       return;
     }
 
-    // Error diffusion — WASM async path
+    const pixels = await this.errorDiffuse(texture, config);
+    if (!pixels) return;
+
+    // Write pixels back to GPU texture
+    this.device.queue.writeTexture(
+      { texture },
+      pixels,
+      { bytesPerRow: texture.width * 4 },
+      { width: texture.width, height: texture.height },
+    );
+  }
+
+  /**
+   * Error diffusion of `src`'s CURRENT pixels (as of the queue position of this call): GPU → CPU read-back, the
+   * WASM pass, and the result as tightly packed RGBA8 rows — nothing is written to the GPU (the caller decides where
+   * it goes, or drops it when it is stale). Null when the config is not an active error-diffusion one, the WASM
+   * module is not ready, or the texture is empty.
+   */
+  public async errorDiffuse(src: GPUTexture, config: DitherConfig): Promise<Uint8Array | null> {
+    if (!config.enabled || config.strength <= 0.001 || !DitherEngine.isErrorDiffusion(config.algorithm)) return null;
     if (!isWasmReady()) {
       console.warn('[DitherEngine] WASM not initialized — skipping error diffusion');
-      return;
+      return null;
     }
 
-    const w = texture.width;
-    const h = texture.height;
-    if (w === 0 || h === 0) return;
+    const w = src.width;
+    const h = src.height;
+    if (w === 0 || h === 0) return null;
 
     // 1. Read GPU texture → CPU buffer
     const bytesPerPixel = 4;
@@ -484,11 +586,12 @@ export class DitherEngine {
       ownsReadBuf = true;
     }
 
+    this.stats.errorDiffusionPasses++;
     const pixels = new Uint8Array(unpaddedRow * h);
     try {
       const enc = this.device.createCommandEncoder();
       enc.copyTextureToBuffer(
-        { texture },
+        { texture: src },
         { buffer: readBuf, bytesPerRow: paddedRow },
         { width: w, height: h },
       );
@@ -524,14 +627,7 @@ export class DitherEngine {
     //    For strength = 1.0, skip the blend — the WASM output is the final result.
     //    (Color controls like duotone are not supported for error diffusion yet —
     //     the WASM path operates on raw pixel colors directly.)
-
-    // 4. Write pixels back to GPU texture
-    this.device.queue.writeTexture(
-      { texture },
-      pixels,
-      { bytesPerRow: unpaddedRow },
-      { width: w, height: h },
-    );
+    return pixels;
   }
 
   /**
@@ -573,7 +669,7 @@ export class DitherEngine {
 
   // ─── Bayer Ordered Dithering ────────────────────────────────────
 
-  private applyBayer(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
+  private applyBayer(srcTex: GPUTexture, outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder, r: DitherTexelRect): void {
     this.ensureBayerPipeline();
 
     // params: [colorLevels, bayerLevel, strength, patternScale, perChannel, 0, 0, 0]
@@ -591,13 +687,13 @@ export class DitherEngine {
     const bg = this.device.createBindGroup({
       layout: this.bayerBGL!,
       entries: [
-        { binding: 0, resource: this.pingTex!.createView() },
+        { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: outTex.createView() },
         { binding: 2, resource: { buffer: this.paramsBuf } },
       ],
     });
 
-    this.dispatch(this.bayerPipeline!, bg, w, h, enc);
+    this.dispatch(this.bayerPipeline!, bg, r, enc);
   }
 
   private ensureBayerPipeline(): void {
@@ -606,7 +702,7 @@ export class DitherEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var srcTex: texture_2d<f32>;
       @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 8>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 9>;
 
       // Bayer matrix computation (procedural, no lookup texture needed)
       // Computes the Bayer threshold for a given (x, y) at a given matrix level.
@@ -651,9 +747,9 @@ export class DitherEngine {
       ${WGSL_APPLY_COLOR_MAPPING}
       ${WGSL_EDGE_HELPERS}
       @compute @workgroup_size(8, 8)
-      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      fn main(@builtin(global_invocation_id) gidIn: vec3<u32>) {
         let dim = textureDimensions(output);
-        if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+        ${WGSL_REGION_HEAD}
         let coords = vec2<i32>(i32(gid.x), i32(gid.y));
 
         let src = textureLoad(srcTex, coords, 0);
@@ -684,7 +780,7 @@ export class DitherEngine {
         // edgeFade's job, not density's.) params[3].y = the dropout seed.
         var cellDropped = false;
         let edgeDensity = params[7].w;
-        if (edgeDensity > 0.001) {
+        if (edgeDensity > 0.001 && params[7].x >= 0.5) {   // edgeWidth 0 = edge effects off: no edgeAt taps
           let cellSize = i32(1u << (bayerLevel + 1u));
           let cell = vec2<i32>(i32(sx) / cellSize, i32(sy) / cellSize);
           let centerPx = (vec2<f32>(cell) + 0.5) * f32(cellSize) * patternScale;
@@ -746,7 +842,7 @@ export class DitherEngine {
 
   // ─── Halftone Dithering ─────────────────────────────────────────
 
-  private applyHalftone(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
+  private applyHalftone(srcTex: GPUTexture, outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder, r: DitherTexelRect): void {
     this.ensureHalftonePipeline();
 
     const shapeIdx = Math.max(0, halftoneShapeIndex(cfg.algorithm));
@@ -773,13 +869,13 @@ export class DitherEngine {
     const bg = this.device.createBindGroup({
       layout: this.halftoneBGL!,
       entries: [
-        { binding: 0, resource: this.pingTex!.createView() },
+        { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: outTex.createView() },
         { binding: 2, resource: { buffer: this.paramsBuf } },
       ],
     });
 
-    this.dispatch(this.halftonePipeline!, bg, w, h, enc);
+    this.dispatch(this.halftonePipeline!, bg, r, enc);
   }
 
   private ensureHalftonePipeline(): void {
@@ -788,7 +884,7 @@ export class DitherEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var srcTex: texture_2d<f32>;
       @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 8>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 9>;
 
       fn luminance(c: vec3<f32>) -> f32 {
         return dot(c, vec3<f32>(0.299, 0.587, 0.114));
@@ -969,9 +1065,9 @@ export class DitherEngine {
       }
 
       @compute @workgroup_size(8, 8)
-      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      fn main(@builtin(global_invocation_id) gidIn: vec3<u32>) {
         let dim = textureDimensions(output);
-        if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+        ${WGSL_REGION_HEAD}
         let coords = vec2<i32>(i32(gid.x), i32(gid.y));
 
         let src = textureLoad(srcTex, coords, 0);
@@ -1006,7 +1102,7 @@ export class DitherEngine {
         // original artwork; that's edgeFade's job). params[3].y = the dropout seed.
         var cellDropped = false;
         let edgeDensity = params[7].w;
-        if (edgeDensity > 0.001) {
+        if (edgeDensity > 0.001 && params[7].x >= 0.5) {   // edgeWidth 0 = edge effects off: no edgeAt taps
           let cell = halftoneCell(px, py, angle, freq, texW, texH, shape);
           let centerPx = halftoneCellCenterPx(cell, angle, freq, texW, texH, shape) * patternScale;
           let eCell = edgeAt(vec2<i32>(centerPx), params[7].x);
@@ -1063,14 +1159,14 @@ export class DitherEngine {
 
   // ─── White Noise Dithering ──────────────────────────────────────
 
-  private applyNoise(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
+  private applyNoise(srcTex: GPUTexture, outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder, r: DitherTexelRect, seed: number): void {
     this.ensureNoisePipeline();
 
     const params = new Float32Array(16);
     params[0] = cfg.colorLevels;
     params[1] = cfg.strength;
     params[2] = cfg.perChannel ? 1.0 : 0.0;
-    params[3] = this.frameCounter; // seed
+    params[3] = seed; // seed (apply(): the frame counter; applyRegion(): the caller's fixed seed)
     params[12] = DitherEngine.edgeModeIndex(cfg);   // params[3].x: edge mode
     params[13] = Math.abs(Math.floor(cfg.edgeSeed ?? 0)) % 1e9;   // params[3].y: dropout seed
     this.device.queue.writeBuffer(this.paramsBuf, 0, params);
@@ -1079,13 +1175,13 @@ export class DitherEngine {
     const bg = this.device.createBindGroup({
       layout: this.noiseBGL!,
       entries: [
-        { binding: 0, resource: this.pingTex!.createView() },
+        { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: outTex.createView() },
         { binding: 2, resource: { buffer: this.paramsBuf } },
       ],
     });
 
-    this.dispatch(this.noisePipeline!, bg, w, h, enc);
+    this.dispatch(this.noisePipeline!, bg, r, enc);
   }
 
   private ensureNoisePipeline(): void {
@@ -1094,7 +1190,7 @@ export class DitherEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var srcTex: texture_2d<f32>;
       @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 8>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 9>;
 
       // PCG hash for deterministic random from pixel coord + seed
       fn pcgHash(input: u32) -> u32 {
@@ -1120,9 +1216,9 @@ export class DitherEngine {
       ${WGSL_APPLY_COLOR_MAPPING}
       ${WGSL_EDGE_HELPERS}
       @compute @workgroup_size(8, 8)
-      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      fn main(@builtin(global_invocation_id) gidIn: vec3<u32>) {
         let dim = textureDimensions(output);
-        if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+        ${WGSL_REGION_HEAD}
         let coords = vec2<i32>(i32(gid.x), i32(gid.y));
 
         let src = textureLoad(srcTex, coords, 0);
@@ -1186,7 +1282,7 @@ export class DitherEngine {
 
   // ─── Blue Noise Dithering ───────────────────────────────────────
 
-  private applyBlueNoise(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
+  private applyBlueNoise(srcTex: GPUTexture, outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder, r: DitherTexelRect): void {
     this.ensureBlueNoisePipeline();
     this.ensureBlueNoiseTexture();
 
@@ -1203,7 +1299,7 @@ export class DitherEngine {
     const bg = this.device.createBindGroup({
       layout: this.blueNoiseBGL!,
       entries: [
-        { binding: 0, resource: this.pingTex!.createView() },
+        { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: outTex.createView() },
         { binding: 2, resource: { buffer: this.paramsBuf } },
         { binding: 3, resource: this.blueNoiseTexture!.createView() },
@@ -1211,7 +1307,7 @@ export class DitherEngine {
       ],
     });
 
-    this.dispatch(this.blueNoisePipeline!, bg, w, h, enc);
+    this.dispatch(this.blueNoisePipeline!, bg, r, enc);
   }
 
   private ensureBlueNoisePipeline(): void {
@@ -1227,7 +1323,7 @@ export class DitherEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var srcTex: texture_2d<f32>;
       @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 8>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 9>;
       @group(0) @binding(3) var bnTex: texture_2d<f32>;
       @group(0) @binding(4) var bnSamp: sampler;
 
@@ -1243,9 +1339,9 @@ export class DitherEngine {
       ${WGSL_APPLY_COLOR_MAPPING}
       ${WGSL_EDGE_HELPERS}
       @compute @workgroup_size(8, 8)
-      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      fn main(@builtin(global_invocation_id) gidIn: vec3<u32>) {
         let dim = textureDimensions(output);
-        if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+        ${WGSL_REGION_HEAD}
         let coords = vec2<i32>(i32(gid.x), i32(gid.y));
 
         let src = textureLoad(srcTex, coords, 0);
@@ -1423,11 +1519,13 @@ export class DitherEngine {
   // PERF (audit 5.7): records into the encoder owned by apply() (or the
   // caller's shared encoder) instead of creating + submitting its own —
   // the copy and dispatch now ride a single submit.
-  private dispatch(pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, w: number, h: number, enc: GPUCommandEncoder): void {
+  private dispatch(pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, r: DitherTexelRect, enc: GPUCommandEncoder): void {
+    const rw = r.x1 - r.x0, rh = r.y1 - r.y0;
     const pass = enc.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
+    pass.dispatchWorkgroups(Math.ceil(rw / 8), Math.ceil(rh / 8));   // params[8] offsets it to the region
     pass.end();
+    this.stats.dispatches++; this.stats.dispatchTexels += rw * rh;
   }
 }

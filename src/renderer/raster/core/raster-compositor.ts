@@ -22,6 +22,9 @@ import { DitherEngine, DitherConfig, defaultDitherConfig } from '../effects/dith
 import type { FrameLinkAnimation } from '../../../animation';
 import { OnionSkinRenderer, type OnionFrame } from '../../../animation/onion-skin-renderer';
 import { RasterDirtyCursor, type DirtyTexelRect } from './raster-composite-dirty';
+import { LayerDitherCache, ditherConfigKey, unionDitherRect } from './layer-dither-cache';
+import { rasterTextureVersion } from '../raster-content-version';
+import { isRasterStrokeActive, onRasterStrokeEnd } from '../raster-stroke-activity';
 
 /** What one compositeIncremental call did. */
 export type IncrementalCompositeResult = 'skip' | 'rect' | 'full';
@@ -59,8 +62,12 @@ export interface CompositorLayerInfo {
   opacity: number;       // 0-1
   clipped: boolean;      // true → clip to alpha of layer below
   visible: boolean;
-  /** Optional per-layer dither config. When set and enabled, the layer is dithered before compositing. */
+  /** Optional per-layer dither config. When set and enabled, the layer is dithered before compositing — from its
+   *  own cached dithered copy (layer-dither-cache.ts), redone only when the layer's pixels or the config change. */
   ditherConfig?: DitherConfig;
+  /** Stable id of the layer for its dither cache (the renderer passes the layer id). Without one the cache is keyed
+   *  by the texture object (a new texture = a new cache entry; idle ones are freed after a while). */
+  cacheKey?: string;
   /** Optional per-layer procedural displacement animation. */
   frameLinkAnimation?: FrameLinkAnimation;
 }
@@ -157,10 +164,16 @@ export class RasterCompositor {
   private _ditherEngine: DitherEngine;
   private _ditherConfig: DitherConfig = defaultDitherConfig();
 
-  // Scratch texture for per-layer dithering (non-destructive: layer texture is never modified)
-  private _ditherScratchTex: GPUTexture | null = null;
-  private _ditherScratchW = 0;
-  private _ditherScratchH = 0;
+  // Per-layer dither: each dithered layer's own cached result (non-destructive: the layer texture is never modified)
+  private _ditherCache: LayerDitherCache;
+  /** Asked for a frame when work finished OUTSIDE a composite needs one (an error-diffusion result landed, a deferred
+   *  global error diffusion can run now that the stroke ended). The renderer sets it to its scheduleRender. */
+  public requestRender: (() => void) | null = null;
+  // Global dither: the finished composite (layers + global dither + grain) per output, reused while nothing it
+  // depends on changed (a pan / zoom / vector edit re-renders without touching a raster layer).
+  private _globalResults = new WeakMap<GPUTexture, { tex: GPUTexture; sig: string }>();
+  private _globalEDDeferred = false;
+  private _unsubStrokeEnd: () => void;
 
   // Onion skin rendering
   private _onionRenderer: OnionSkinRenderer;
@@ -178,7 +191,18 @@ export class RasterCompositor {
     });
 
     this._ditherEngine = new DitherEngine(device);
+    this._ditherCache = new LayerDitherCache(device, this._ditherEngine, () => {
+      this.invalidateIncremental();   // a cache texture changed outside a composite: the next one is a full one
+      this.requestRender?.();
+    });
     this._onionRenderer = new OnionSkinRenderer(device);
+    const self = new WeakRef(this);
+    const unsub = onRasterStrokeEnd(() => {
+      const c = self.deref();
+      if (!c) { unsub(); return; }
+      if (c._globalEDDeferred) { c._globalEDDeferred = false; c.requestRender?.(); }
+    });
+    this._unsubStrokeEnd = unsub;
 
     this.buildPipeline();
   }
@@ -198,6 +222,46 @@ export class RasterCompositor {
   /** Enable or disable dithering. */
   public setDitherEnabled(enabled: boolean): void {
     this._ditherConfig.enabled = enabled;
+  }
+
+  /** The per-layer dither cache's work counters (diagnostics / tests). */
+  public get ditherCacheStats(): LayerDitherCache['stats'] { return this._ditherCache.stats; }
+  /** The dither engine's work counters (diagnostics / tests). */
+  public get ditherEngineStats(): DitherEngine['stats'] { return this._ditherEngine.stats; }
+  /** Live per-layer dither cache entries. */
+  public get ditherCacheSize(): number { return this._ditherCache.size; }
+  /** The error-diffusion debounce (ms) for non-stroke changes. */
+  public set ditherDebounceMs(ms: number) { this._ditherCache.debounceMs = Math.max(0, ms); }
+
+  /** Free the dither caches of layers no longer in the document (ids = every raster layer id still listed). */
+  public retainLayerDitherCaches(ids: ReadonlySet<string>): void { this._ditherCache.retainOnly(ids); }
+  /** Free every per-layer dither cache (a document load; they rebuild on the next composite). */
+  public clearDitherCaches(): void { this._ditherCache.clear(); this._globalResults = new WeakMap(); }
+
+  /**
+   * BAKE: write `layer`'s dithered pixels into `dst` (normally the layer texture itself) and free its cache. The
+   * caller owns the undo snapshots, the dirty report and turning the layer's dither off. False when the layer has no
+   * active dither or an error-diffusion pass could not run.
+   */
+  public bakeLayerDither(layer: CompositorLayerInfo, dst: GPUTexture): Promise<boolean> {
+    return this._ditherCache.bakeInto(layer, dst);
+  }
+
+  /** The layers with each active per-layer dither swapped for its (brought up to date) cached texture, and the union
+   *  of the cache texels that changed doing so (the incremental composite re-composites them). */
+  private _resolveDithers(layers: CompositorLayerInfo[]): { layers: CompositorLayerInfo[]; changed: DirtyTexelRect | 'full' | null } {
+    let changed: DirtyTexelRect | 'full' | null = null;
+    let out: CompositorLayerInfo[] | null = null;
+    for (let i = 0; i < layers.length; i++) {
+      const l = layers[i];
+      if (!l.ditherConfig) continue;
+      if (!l.visible || !l.texture) continue;   // hidden: neither dithered nor freed (showing it again is free)
+      const r = this._ditherCache.resolve(l);
+      changed = unionDitherRect(changed, r.changed);
+      out ??= layers.slice();
+      out[i] = r.texture === l.texture ? { ...l, ditherConfig: undefined } : { ...l, texture: r.texture, ditherConfig: undefined };
+    }
+    return { layers: out ?? layers, changed };
   }
 
   /**
@@ -302,17 +366,16 @@ export class RasterCompositor {
   }
 
   /**
-   * Does this frame require the async composite path? Error-diffusion dithering
-   * (global OR any per-layer) needs a GPU→CPU→WASM round-trip that the sync
+   * Does this frame require the async composite path? A GLOBAL error-diffusion dither
+   * needs a GPU→CPU→WASM round-trip that the sync
    * `composite()` cannot do — it silently drops error-diffusion dither. Callers
    * MUST route through `compositeAsync()` when this returns true. Single source of
    * truth so the two hot callers can't drift out of sync (audit A4).
    */
-  public static needsAsyncComposite(layers: CompositorLayerInfo[], globalCfg: DitherConfig): boolean {
-    return (
-      DitherEngine.isErrorDiffusion(globalCfg.algorithm) ||
-      layers.some(l => l.ditherConfig?.enabled && DitherEngine.isErrorDiffusion(l.ditherConfig.algorithm))
-    );
+  public static needsAsyncComposite(_layers: CompositorLayerInfo[], globalCfg: DitherConfig): boolean {
+    // Per-layer error diffusion no longer needs it: the layer dither cache runs that pass in the background and the
+    // sync composite samples its result (2026-10-08).
+    return globalCfg.enabled && globalCfg.strength > 0.001 && DitherEngine.isErrorDiffusion(globalCfg.algorithm);
   }
 
   /**
@@ -321,94 +384,73 @@ export class RasterCompositor {
    *
    * The first visible layer is copied directly; subsequent layers are blended on top.
    * After all layers are composited, a global canvas grain overlay is applied (if enabled).
+   * Per-layer dithers (ordered AND error diffusion) come from the layer dither cache.
    *
-   * SYNC PATH: cannot apply error-diffusion dither — call `needsAsyncComposite()` first and
-   * route to `compositeAsync()` when it returns true, else error-diffusion layers render undithered.
+   * SYNC PATH: cannot apply a GLOBAL error-diffusion dither — call `needsAsyncComposite()` first and
+   * route to `compositeAsync()` when it returns true, else the global dither is skipped.
    */
   public composite(layers: CompositorLayerInfo[], outputTexture: GPUTexture): void {
     const w = outputTexture.width;
     const h = outputTexture.height;
     if (w === 0 || h === 0) return;
-
-    const visibleLayers = layers.filter(l => l.visible && l.texture);
-    if (visibleLayers.length === 0) {
-      this.clearTexture(outputTexture);
-      // Still apply grain — the blank canvas IS the paper
-      this.applyGrainOverlay(outputTexture, w, h);
-      return;
-    }
-
-    // Copy first visible layer → output (no blending needed for the base)
-    const first = visibleLayers[0];
-    const firstTex = this.maybeDitherLayer(first, w, h);
-    const copyEnc = this.device.createCommandEncoder();
-    copyEnc.copyTextureToTexture(
-      { texture: firstTex },
-      { texture: outputTexture },
-      { width: Math.min(firstTex.width, w), height: Math.min(firstTex.height, h) },
-    );
-    this.device.queue.submit([copyEnc.finish()]);
-    this.noteCopy(Math.min(firstTex.width, w) * Math.min(firstTex.height, h));
-    this.stats.submits++;
-
-    if (first.opacity < 1.0) {
-      this.applyBaseOpacity(outputTexture, first.opacity, w, h);
-    }
-
-    if (visibleLayers.length <= 1) {
-      // Single layer — still apply global dither + paper grain overlay
-      this._ditherEngine.apply(outputTexture, this._ditherConfig);
-      this.applyGrainOverlay(outputTexture, w, h);
-      return;
-    }
-
-    // Ensure persistent ping texture matches output dimensions
-    if (!this.pingTex || this.pingTexW !== w || this.pingTexH !== h) {
-      this.pingTex?.destroy();
-      this.pingTex = this.device.createTexture({
-        size: [w, h],
-        format: 'rgba8unorm',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
-      });
-      this.pingTexW = w;
-      this.pingTexH = h;
-    }
-
-    for (let i = 1; i < visibleLayers.length; i++) {
-      const layer = visibleLayers[i];
-      const layerTex = this.maybeDitherLayer(layer, w, h);
-      this._compositeLayerStep(layer, layerTex, outputTexture, w, h);
-    }
-
+    const resolved = this._resolveDithers(layers).layers;
+    const g = this._ditherConfig;
+    const sig = DitherEngine.isActiveOrdered(g) ? this.globalResultSignature(resolved, outputTexture) : null;
+    if (sig !== null && this.restoreGlobalResult(outputTexture, sig)) return;
+    if (!this._compositeStack(resolved, outputTexture)) return;   // (no visible layer: cleared + paper, no dither)
     // ── Global non-destructive dither post-process ──
-    this._ditherEngine.apply(outputTexture, this._ditherConfig);
-
+    this._ditherEngine.apply(outputTexture, g);
     // ── Global canvas grain overlay pass ──
     this.applyGrainOverlay(outputTexture, w, h);
+    if (sig !== null) this.storeGlobalResult(outputTexture, sig);
   }
 
   /**
-   * Async variant of composite() that supports error diffusion dithering
-   * (both per-layer and global). Falls back to sync GPU paths when possible.
+   * Async variant of composite() that supports a GLOBAL error diffusion dither
+   * (per-layer error diffusion is the layer dither cache's — composite() serves it too).
    *
-   * Call this instead of composite() when any layer or the global config
-   * uses an error diffusion algorithm (floyd_steinberg, atkinson, etc.).
+   * Call this instead of composite() when the global config uses an error diffusion
+   * algorithm (floyd_steinberg, atkinson, etc. — see needsAsyncComposite). While a brush
+   * stroke is in progress the global pass is deferred (the frame shows the composite
+   * without it) and runs once on the first composite after the stroke ends; a composite
+   * whose inputs did not change since the last one reuses that result.
    */
   public async compositeAsync(layers: CompositorLayerInfo[], outputTexture: GPUTexture): Promise<void> {
     const w = outputTexture.width;
     const h = outputTexture.height;
     if (w === 0 || h === 0) return;
+    const resolved = this._resolveDithers(layers).layers;
+    const g = { ...this._ditherConfig };
+    const globalOn = g.enabled && g.strength > 0.001;
+    const ed = globalOn && DitherEngine.isErrorDiffusion(g.algorithm);
+    const deferED = ed && isRasterStrokeActive();
+    const sig = globalOn && !deferED ? this.globalResultSignature(resolved, outputTexture) : null;
+    if (sig !== null && this.restoreGlobalResult(outputTexture, sig)) return;
+    if (!this._compositeStack(resolved, outputTexture)) return;
+    // ── Global non-destructive dither post-process (async) ──
+    if (deferED) this._globalEDDeferred = true;   // (the stroke-end listener asks for the frame that runs it)
+    else await this._ditherEngine.applyAsync(outputTexture, g);
+    // ── Global canvas grain overlay pass ──
+    this.applyGrainOverlay(outputTexture, w, h);
+    if (sig !== null) this.storeGlobalResult(outputTexture, sig);
+  }
 
+  /** The layer stack (base copy + opacity + blend steps) of composite() / compositeAsync(), dithers already resolved.
+   *  False when no layer is visible: the output was cleared and given the paper grain (the caller is done). */
+  private _compositeStack(layers: CompositorLayerInfo[], outputTexture: GPUTexture): boolean {
+    const w = outputTexture.width;
+    const h = outputTexture.height;
     const visibleLayers = layers.filter(l => l.visible && l.texture);
     if (visibleLayers.length === 0) {
       this.clearTexture(outputTexture);
+      // Still apply grain — the blank canvas IS the paper
       this.applyGrainOverlay(outputTexture, w, h);
-      return;
+      return false;
     }
 
-    // Copy first visible layer → output
+    // Copy first visible layer → output (no blending needed for the base)
     const first = visibleLayers[0];
-    const firstTex = await this.maybeDitherLayerAsync(first, w, h);
+    const firstTex = first.texture;
     const copyEnc = this.device.createCommandEncoder();
     copyEnc.copyTextureToTexture(
       { texture: firstTex },
@@ -422,36 +464,77 @@ export class RasterCompositor {
     if (first.opacity < 1.0) {
       this.applyBaseOpacity(outputTexture, first.opacity, w, h);
     }
+    if (visibleLayers.length <= 1) return true;
 
-    if (visibleLayers.length <= 1) {
-      await this._ditherEngine.applyAsync(outputTexture, this._ditherConfig);
-      this.applyGrainOverlay(outputTexture, w, h);
-      return;
-    }
-
-    // Ensure persistent ping texture
-    if (!this.pingTex || this.pingTexW !== w || this.pingTexH !== h) {
-      this.pingTex?.destroy();
-      this.pingTex = this.device.createTexture({
-        size: [w, h],
-        format: 'rgba8unorm',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
-      });
-      this.pingTexW = w;
-      this.pingTexH = h;
-    }
-
+    // Ensure persistent ping texture matches output dimensions
+    this.ensurePing(w, h);
     for (let i = 1; i < visibleLayers.length; i++) {
       const layer = visibleLayers[i];
-      const layerTex = await this.maybeDitherLayerAsync(layer, w, h);
-      this._compositeLayerStep(layer, layerTex, outputTexture, w, h);
+      this._compositeLayerStep(layer, layer.texture, outputTexture, w, h);
     }
+    return true;
+  }
 
-    // ── Global non-destructive dither post-process (async) ──
-    await this._ditherEngine.applyAsync(outputTexture, this._ditherConfig);
+  /** Everything a GLOBAL-dither composite of `out` depends on, layer pixels included (their content versions —
+   *  every pixel writer reports to raster-content-version.ts — and the dither caches' write counts). */
+  private globalResultSignature(layers: CompositorLayerInfo[], out: GPUTexture): string {
+    let sig = this.texId(out) + ':' + out.width + 'x' + out.height + '|' + ditherConfigKey(this._ditherConfig);
+    let frameLink = false;
+    for (const l of layers) {
+      if (!l.visible || !l.texture) continue;
+      const t = l.texture;
+      const ver = this._ditherCache.versionOf(t) ?? rasterTextureVersion(t);
+      sig += '|' + this.texId(t) + ',' + ver + ',' + t.width + ',' + t.height + ',' + l.blendMode + ',' + l.opacity + ',' + (l.clipped ? 1 : 0);
+      const a = l.frameLinkAnimation;
+      if (a && a.enabled) {
+        frameLink = true;
+        sig += ',fl' + a.type + ',' + a.amplitude + ',' + a.frequency + ',' + a.speed + ',' + a.direction + ',' + a.phase +
+          ',' + (a.displaceX !== false ? 1 : 0) + (a.displaceY ? 1 : 0) + ',' + a.rippleCenterX + ',' + a.rippleCenterY +
+          ',' + a.noiseOctaves + ',' + a.noiseLacunarity + ',' + a.noisePersistence + ',' + a.shakeSeed;
+      }
+    }
+    if (frameLink) sig += '|f' + this.currentFrame;
+    // 'noise' re-rolls its pattern on every pass: a reused result is still one of its frames (the same as an idle one).
+    const gm = this._grainManager;
+    const grainTex = gm ? gm.getGrainTexture() : null;
+    if (gm && grainTex && gm.getGrainStrength() > 0.001) {
+      const inv = gm.getGrainInvScale();
+      sig += '|g' + this.texId(grainTex) + ',' + gm.getGrainStrength() + ',' + inv[0] + ',' + inv[1];
+    }
+    return sig;
+  }
 
-    // ── Global canvas grain overlay pass ──
-    this.applyGrainOverlay(outputTexture, w, h);
+  /** Reuse the stored global-dither result of `out` when `sig` matches (one copy instead of the whole composite). */
+  private restoreGlobalResult(out: GPUTexture, sig: string): boolean {
+    const r = this._globalResults.get(out);
+    if (!r || r.sig !== sig || r.tex.width !== out.width || r.tex.height !== out.height) return false;
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture({ texture: r.tex }, { texture: out }, { width: out.width, height: out.height });
+    this.device.queue.submit([enc.finish()]);
+    this.noteCopy(out.width * out.height);
+    this.stats.submits++;
+    return true;
+  }
+
+  private storeGlobalResult(out: GPUTexture, sig: string): void {
+    let r = this._globalResults.get(out);
+    if (!r || r.tex.width !== out.width || r.tex.height !== out.height) {
+      r?.tex.destroy();
+      r = {
+        tex: this.device.createTexture({
+          size: [out.width, out.height], format: 'rgba8unorm',
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+        }),
+        sig: '',
+      };
+      this._globalResults.set(out, r);
+    }
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture({ texture: out }, { texture: r.tex }, { width: out.width, height: out.height });
+    this.device.queue.submit([enc.finish()]);
+    this.noteCopy(out.width * out.height);
+    this.stats.submits++;
+    r.sig = sig;
   }
 
   /** One blend step (E5): copy output→ping + blend layerTex over it back into output, in ONE submit,
@@ -524,8 +607,9 @@ export class RasterCompositor {
    *  - anything else → everything ('full'): the first call, a change to the layer list (texture identity, order,
    *    visibility, opacity, blend mode, clipping, sizes), to the output texture or the grain, and a whole-canvas
    *    dirty report.
-   * While a dither (global or per-layer) or a displacement animation is active — they read other texels / the
-   * frame number — every call is a legacy composite() ('full'); with a Frame Link displacement as the only obstacle,
+   * Per-layer dithers composite from their cached textures (layer-dither-cache.ts); the cache texels a call
+   * re-dithers join the dirty rect. While a GLOBAL dither or a displacement animation is active — they read other
+   * texels / the frame number — every call is a legacy composite() ('full'); with a Frame Link displacement as the only obstacle,
    * that composite is skipped while the frame number, the displacement params and the inputs above are unchanged and
    * nothing was reported dirty ('skip').
    *
@@ -543,7 +627,10 @@ export class RasterCompositor {
     if (w === 0 || h === 0) return 'skip';
     let slot = this._slots.get(slotKey);
     if (!slot) { slot = { cursor: new RasterDirtyCursor(), sig: null }; this._slots.set(slotKey, slot); }
-    const dirty = slot.cursor.take();   // always consumed: whatever we do below covers it
+    const resolved = this._resolveDithers(layers);
+    layers = resolved.layers;
+    // always consumed: whatever we do below covers it (plus the dither-cache texels re-dithered just now)
+    const dirty = unionDitherRect(slot.cursor.take(), resolved.changed);
     const sig = this._regionBroken ? null : this.incrementalSignature(layers, outputTexture);
     if (sig === null) {
       // A Frame Link displacement (and nothing else) rules the region passes out: the legacy full composite runs, but
@@ -597,7 +684,7 @@ export class RasterCompositor {
   }
 
   /** Everything the composited pixels depend on besides the layers' own pixels, as a string; null when this
-   *  frame can't be composited incrementally (a dither or a displacement animation is active).
+   *  frame can't be composited incrementally (a global dither or a displacement animation is active).
    *  `frameLink`: the signature of a LEGACY full composite() whose only obstacle is a Frame Link displacement — the
    *  same, plus the frame number and every displacement param composite() uploads ('fl' prefix, so it never matches
    *  a region-pass signature); null when there is no enabled Frame Link or a dither is active. */
@@ -606,10 +693,10 @@ export class RasterCompositor {
     if (g.enabled && g.strength > 0.001) return null;
     let sig = this.texId(out) + ':' + out.width + 'x' + out.height;
     let sawFrameLink = false;
-    for (const l of layers) {
+    for (const l of layers) {   // (per-layer dithers are resolved to their cached textures by the caller)
       if (!l.visible || !l.texture) continue;
       const d = l.ditherConfig;
-      if (d && d.enabled && d.strength > 0.001) return null;
+      if (d && d.enabled && d.strength > 0.001) return null;   // (an unresolved list: never from compositeIncremental)
       const t = l.texture;
       sig += '|' + this.texId(t) + ',' + t.width + ',' + t.height + ',' + l.blendMode + ',' + l.opacity + ',' + (l.clipped ? 1 : 0);
       const a = l.frameLinkAnimation;
@@ -966,9 +1053,9 @@ export class RasterCompositor {
     this.paramsBuf.destroy();
     this.pingTex?.destroy();
     this.pingTex = null;
+    this._ditherCache.destroy();
     this._ditherEngine.destroy();
-    this._ditherScratchTex?.destroy();
-    this._ditherScratchTex = null;
+    this._unsubStrokeEnd();
     this._grainOverlayPingTex?.destroy();
     this._grainOverlayPingTex = null;
     this._grainOverlayParamBuf?.destroy();
@@ -984,109 +1071,6 @@ export class RasterCompositor {
     this._regionGrainBuf?.destroy();
     this._regionGrainBuf = null;
     this._slots.clear();
-  }
-
-  // ── Per-layer dither helper ─────────────────────────────────────
-
-  /**
-   * If the layer has a per-layer dither config that is enabled, copy the layer
-   * texture to a scratch texture, apply dither to it, and return the scratch.
-   * Otherwise, return the layer's original texture unchanged (zero-cost path).
-   *
-   * Supports both GPU ordered dithering (sync) and WASM error diffusion (async).
-   */
-  private async maybeDitherLayerAsync(layer: CompositorLayerInfo, w: number, h: number): Promise<GPUTexture> {
-    const cfg = layer.ditherConfig;
-    if (!cfg || !cfg.enabled || cfg.strength <= 0.001) {
-      return layer.texture;
-    }
-
-    // Ensure scratch texture matches dimensions
-    if (!this._ditherScratchTex || this._ditherScratchW !== w || this._ditherScratchH !== h) {
-      this._ditherScratchTex?.destroy();
-      this._ditherScratchTex = this.device.createTexture({
-        size: [w, h],
-        format: 'rgba8unorm',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
-               GPUTextureUsage.COPY_SRC | GPUTextureUsage.STORAGE_BINDING,
-      });
-      this._ditherScratchW = w;
-      this._ditherScratchH = h;
-    }
-
-    // Copy layer texture → scratch (non-destructive: never touches original)
-    const cpEnc = this.device.createCommandEncoder();
-    const copyW = Math.min(layer.texture.width, w);
-    const copyH = Math.min(layer.texture.height, h);
-    cpEnc.copyTextureToTexture(
-      { texture: layer.texture },
-      { texture: this._ditherScratchTex },
-      { width: copyW, height: copyH },
-    );
-
-    if (!DitherEngine.isErrorDiffusion(cfg.algorithm)) {
-      // PERF (audit 5.7): ordered dithering records its copy+dispatch into our
-      // encoder — one submit for the whole per-layer dither instead of three.
-      this._ditherEngine.apply(this._ditherScratchTex, cfg, cpEnc);
-      this.device.queue.submit([cpEnc.finish()]);
-    } else {
-      // Error diffusion does a GPU→CPU readback + WASM round-trip; it needs the
-      // scratch copy submitted first, then runs its own (unavoidable) flow.
-      this.device.queue.submit([cpEnc.finish()]);
-      await this._ditherEngine.applyAsync(this._ditherScratchTex, cfg);
-    }
-
-    return this._ditherScratchTex;
-  }
-
-  /**
-   * Sync per-layer dither helper (GPU ordered only, skips error diffusion).
-   * Used by the sync composite() path.
-   */
-  private maybeDitherLayer(layer: CompositorLayerInfo, w: number, h: number): GPUTexture {
-    const cfg = layer.ditherConfig;
-    if (!cfg || !cfg.enabled || cfg.strength <= 0.001) {
-      return layer.texture;
-    }
-
-    // Error diffusion requires async — defensive no-op in the sync path. Callers are
-    // expected to route error-diffusion frames through compositeAsync() (see
-    // needsAsyncComposite); reaching here means an un-guarded caller, so the layer
-    // renders undithered rather than crashing.
-    if (DitherEngine.isErrorDiffusion(cfg.algorithm)) {
-      return layer.texture;
-    }
-
-    // Ensure scratch texture matches dimensions
-    if (!this._ditherScratchTex || this._ditherScratchW !== w || this._ditherScratchH !== h) {
-      this._ditherScratchTex?.destroy();
-      this._ditherScratchTex = this.device.createTexture({
-        size: [w, h],
-        format: 'rgba8unorm',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
-               GPUTextureUsage.COPY_SRC | GPUTextureUsage.STORAGE_BINDING,
-      });
-      this._ditherScratchW = w;
-      this._ditherScratchH = h;
-    }
-
-    // Copy layer texture → scratch (non-destructive: never touches original)
-    // PERF (audit 5.7): share one encoder with the dither engine's copy+dispatch
-    // — one submit per dithered layer instead of three standalone submits.
-    const cpEnc = this.device.createCommandEncoder();
-    const copyW = Math.min(layer.texture.width, w);
-    const copyH = Math.min(layer.texture.height, h);
-    cpEnc.copyTextureToTexture(
-      { texture: layer.texture },
-      { texture: this._ditherScratchTex },
-      { width: copyW, height: copyH },
-    );
-
-    // Apply per-layer dither to the scratch copy (records into cpEnc)
-    this._ditherEngine.apply(this._ditherScratchTex, cfg, cpEnc);
-    this.device.queue.submit([cpEnc.finish()]);
-
-    return this._ditherScratchTex;
   }
 
   // ── Helpers ─────────────────────────────────────────────────────

@@ -2,6 +2,10 @@ import { markRasterCompositeDirty } from './core/raster-composite-dirty';
 import { RasterCanvas } from './raster-canvas';
 import { RasterSnapshotManager, RasterRectPatch } from './core/raster-snapshot-manager';
 import { LegacyBrushStamp } from './brushes/legacy-brush-stamp';
+import { rasterContentSeq, rasterTextureWrittenAt } from './raster-content-version';
+
+/** One texture's undo history + the read-back seed still in flight (await it before using the history). */
+type TextureHistory = { mgr: RasterSnapshotManager; ready: Promise<void> | null };
 
 /**
  * RasterTextureManager — one GPU texture + upload/readback/export around it.
@@ -10,6 +14,12 @@ import { LegacyBrushStamp } from './brushes/legacy-brush-stamp';
  * single-dab compute brush. The snapshot logic now DELEGATES to RasterSnapshotManager (the extracted
  * single source of truth the paint engine also uses), and the legacy brush lives in LegacyBrushStamp
  * (fallback-only — the live painting path is RasterPaintEngine/BrushStampPipeline).
+ *
+ * Perf audit A3 (2026-10-09) — ANIMATION CELS: an animated layer shows a cel texture that is not this manager's
+ * texture (cel 1 of a layer animated in-session IS it). The owner points the history at the displayed texture with
+ * {@link setHistoryTarget}; pushSnapshot / undo / redo / historyMark then act on THAT texture's own history (one per
+ * cel texture, kept in a WeakMap — dropped with the cel). Strokes on cel 2+ used to snapshot and "undo" the base
+ * texture. pushStrokePatch routes by the texture the stroke painted.
  */
 export class RasterTextureManager {
   private device: GPUDevice;
@@ -25,6 +35,12 @@ export class RasterTextureManager {
   private snapshotMgr?: RasterSnapshotManager;
   // Legacy fallback brush (lazily created; see LegacyBrushStamp header)
   private legacyBrush?: LegacyBrushStamp;
+  /** A3: the texture undo acts on when it is not `texture` (an animation cel); null = `texture`. */
+  private historyTex: GPUTexture | null = null;
+  /** A3: per-cel-texture histories (not `texture`'s, which is `snapshotMgr`). */
+  private celHistories = new WeakMap<GPUTexture, TextureHistory>();
+  /** B3: `texture` provably still blank since its blank seed — `seq` = the content-version seq at the seed. */
+  private blankSince: { tex: GPUTexture; seq: number } | null = null;
 
   constructor(device: GPUDevice) {
     this.device = device;
@@ -58,6 +74,7 @@ export class RasterTextureManager {
     this.stagingBuffer = undefined; this.stagingSize = 0;
     this.snapshotMgr = undefined; this.legacyBrush = undefined;
     this._paneReadBuf = undefined; this._paneReadBufSize = 0; this._paneReadBusy = false;
+    this.historyTex = null; this.celHistories = new WeakMap(); this.blankSince = null;
   }
 
   ensureTexture(w: number, h: number) {
@@ -66,6 +83,8 @@ export class RasterTextureManager {
     const oldTex = this.texture;
     const copyW  = oldTex ? Math.min(this.width, w) : 0;
     const copyH  = oldTex ? Math.min(this.height, h) : 0;
+    // B3: a blank texture copied into a new one is still blank (the copy is not a reported write)
+    const stillBlank = !!oldTex && this.isProvablyBlank();
 
     this.width = w; this.height = h;
     this.texture = this.device.createTexture({
@@ -94,8 +113,16 @@ export class RasterTextureManager {
     // used in a submit" — seen when a rapid resize (e.g. a setDocumentSize thrash) reallocates the doc
     // texture mid-frame. onSubmittedWorkDone resolves once all prior submits (incl. the copy above) complete.
     if (oldTex) this.device.queue.onSubmittedWorkDone().then(() => oldTex.destroy()).catch(() => { /* device lost */ });
+    this.blankSince = stillBlank ? { tex: this.texture, seq: rasterContentSeq() } : null;
 
     return this.texture;
+  }
+
+  /** B3: `texture` is still exactly its blank seed — no write of any kind (attributed to it or unattributed) was
+   *  reported since. A writer that reports nothing at all is the one hole (the autosave verify read catches those). */
+  private isProvablyBlank(): boolean {
+    const b = this.blankSince;
+    return !!b && b.tex === this.texture && rasterTextureWrittenAt(b.tex) <= b.seq;
   }
 
   // Initialize with a blank snapshot - call this after creating the texture
@@ -115,9 +142,100 @@ export class RasterTextureManager {
     pass.end();
     this.device.queue.submit([encoder.finish()]);
     markRasterCompositeDirty(null, this.texture);   // BRUSH-5: the texture was cleared (autosave: this texture)
-    
-    // Seed the blank state as the initial snapshot so the first stroke is undoable.
-    await this.ensureSnapshotMgr().initialize(this.texture);
+
+    // Seed the blank state as the initial snapshot so the first stroke is undoable. B3: a BLANK seed — no read-back,
+    // no full RAM copy (was 64 MB + ~60–150 ms per new layer at 4096²).
+    this.ensureSnapshotMgr().initializeBlank(this.width, this.height);
+    this.blankSince = { tex: this.texture, seq: rasterContentSeq() };
+  }
+
+  /**
+   * A2 (perf audit 2026-10-09): `pixels` (tightly packed RGBA8 of `tex`'s size) were just uploaded into `tex` — this
+   * manager's texture or an animation cel's. A history that is still only its seed (or none) is re-seeded from those
+   * bytes, BORROWED (no read-back, no copy; the caller must not change them). A document load used to read the seed
+   * back BEFORE uploading, so fill / filter / clear then Ctrl+Z restored a blank layer. A history with real entries is
+   * left alone. False = not seeded (size mismatch / not pristine).
+   */
+  public seedHistoryFromPixels(tex: GPUTexture, pixels: ArrayBuffer | Uint8Array): boolean {
+    const w = tex.width, h = tex.height;
+    const bytes = pixels instanceof Uint8Array ? pixels : new Uint8Array(pixels);
+    if (!w || !h || bytes.length !== w * h * 4) return false;
+    if (tex === this.texture) {
+      if (this.snapshotMgr && !this.snapshotMgr.isPristine()) return false;
+      // a NEW stack: a read-back re-seed still in flight (reseedPristineHistory) lands in the dropped one
+      const mgr = new RasterSnapshotManager(this.device);
+      mgr.initializeFromPixels(w, h, bytes);
+      this.snapshotMgr?.destroy();
+      this.snapshotMgr = mgr;
+      this.blankSince = null;
+      return true;
+    }
+    const prev = this.celHistories.get(tex);
+    if (prev && !prev.ready && !prev.mgr.isPristine()) return false;
+    const mgr = new RasterSnapshotManager(this.device);
+    mgr.initializeFromPixels(w, h, bytes);
+    this.celHistories.set(tex, { mgr, ready: null });   // (a read-back seed still in flight lands in the dropped one)
+    return true;
+  }
+
+  /** A3 / B3: `tex` (an animation cel's texture, not this manager's) is freshly created and blank — seed its history
+   *  as BLANK (no read-back). */
+  public seedBlankHistory(tex: GPUTexture): void {
+    if (tex === this.texture) {
+      const mgr = new RasterSnapshotManager(this.device);   // (a read-back seed in flight lands in the dropped one)
+      mgr.initializeBlank(tex.width, tex.height);
+      this.snapshotMgr?.destroy();
+      this.snapshotMgr = mgr;
+      this.blankSince = { tex, seq: rasterContentSeq() };
+      return;
+    }
+    const mgr = new RasterSnapshotManager(this.device);
+    mgr.initializeBlank(tex.width, tex.height);
+    this.celHistories.set(tex, { mgr, ready: null });
+  }
+
+  /**
+   * A3: the texture undo / redo / pushSnapshot / historyMark act on — the animation cel the layer shows (null or this
+   * manager's texture = its own history). `seed` (the selected layer, playback stopped): a cel with no history yet
+   * gets one seeded NOW by a read-back (its current pixels), so the first edit on it is undoable; cels made blank /
+   * loaded from bytes were seeded already at no cost.
+   */
+  public setHistoryTarget(tex: GPUTexture | null, opts?: { seed?: boolean }): void {
+    this.historyTex = tex && tex !== this.texture ? tex : null;
+    const t = this.historyTex;
+    if (t && opts?.seed && !this.celHistories.has(t)) {
+      const mgr = new RasterSnapshotManager(this.device);
+      const entry: TextureHistory = { mgr, ready: null };
+      // initialize() submits its read-back synchronously, so it reads the pixels as they are now (before any edit)
+      entry.ready = mgr.initialize(t).catch(() => { /* device lost */ }).finally(() => { entry.ready = null; });
+      this.celHistories.set(t, entry);
+    }
+  }
+
+  /** The texture undo currently acts on (A3): the targeted cel, else this manager's texture. */
+  public getHistoryTexture(): GPUTexture | null {
+    return this.historyTex ?? this.texture ?? null;
+  }
+
+  /** Diagnostics / tests: the undo stats of `tex`'s history (default: the current target); null = none. */
+  public getHistoryStats(tex?: GPUTexture | null): ReturnType<RasterSnapshotManager['getStats']> | null {
+    const t = tex ?? this.getHistoryTexture();
+    if (!t) return null;
+    if (t === this.texture) return this.snapshotMgr?.getStats() ?? null;
+    return this.celHistories.get(t)?.mgr.getStats() ?? null;
+  }
+
+  /** The history for `tex` (this manager's or a cel's), created empty when `create`; awaits a seed in flight. */
+  private async historyFor(tex: GPUTexture, create: boolean): Promise<RasterSnapshotManager | null> {
+    if (tex === this.texture) return create ? this.ensureSnapshotMgr() : (this.snapshotMgr ?? null);
+    let h = this.celHistories.get(tex);
+    if (!h) {
+      if (!create) return null;
+      h = { mgr: new RasterSnapshotManager(this.device), ready: null };
+      this.celHistories.set(tex, h);
+    }
+    if (h.ready) await h.ready;
+    return this.celHistories.get(tex)?.mgr ?? null;
   }
 
   /**
@@ -130,7 +248,12 @@ export class RasterTextureManager {
   public async reseedPristineHistory(): Promise<boolean> {
     const mgr = this.snapshotMgr;
     if (!mgr || !this.texture || this.width === 0 || this.height === 0) return false;
-    if (mgr.getStats().kinds.length > 1) return false;
+    if (!mgr.isPristine()) return false;
+    // B3: a blank seed on a texture nothing has written stays a BLANK seed at the new size (no read-back)
+    if (mgr.seedKind() === 'blank' && this.isProvablyBlank()) {
+      mgr.initializeBlank(this.width, this.height);
+      return true;
+    }
     mgr.destroy();
     this.snapshotMgr = new RasterSnapshotManager(this.device);
     await this.snapshotMgr.initialize(this.texture);
@@ -150,31 +273,51 @@ export class RasterTextureManager {
   /** Capture the current texture onto the undo stack (dedup + 40ms coalescing — see RasterSnapshotManager). */
   public async pushSnapshot(opts?: { noCoalesce?: boolean }): Promise<void> {
     if (!this.texture || this.width === 0 || this.height === 0) return;
+    const cel = this.historyTex;
+    if (cel) { await (await this.historyFor(cel, true))?.pushSnapshot(cel, undefined, opts); return; }   // A3
+    this.blankSince = null;
     await this.ensureSnapshotMgr().pushSnapshot(this.texture, undefined, opts);
   }
 
-  /** The undo history's current / redo entry tokens (see RasterSnapshotManager.historyMark); null before any push. */
+  /** The undo history's current / redo entry tokens (see RasterSnapshotManager.historyMark) — of the targeted cel's
+   *  history when one is targeted (A3); null before any push. */
   public historyMark(): { top: object | null; next: object | null } | null {
+    const cel = this.historyTex;
+    if (cel) return this.celHistories.get(cel)?.mgr.historyMark() ?? null;
     return this.snapshotMgr ? this.snapshotMgr.historyMark() : null;
   }
 
   /** BRUSH-6: push a brush stroke's rect undo patch (see RasterSnapshotManager.pushPatch). `texture` is the
-   *  texture the stroke painted; when it isn't this manager's current one, falls back to a full pushSnapshot. */
+   *  texture the stroke painted: this manager's, or (A3) the targeted / a known cel's — its own history gets the
+   *  patch. Any other texture falls back to a full pushSnapshot of the current target. */
   public async pushStrokePatch(texture: GPUTexture, patch: RasterRectPatch): Promise<void> {
     if (!this.texture || this.width === 0 || this.height === 0) return;
-    if (texture !== this.texture) return this.pushSnapshot();
+    if (texture !== this.texture) {
+      if (texture !== this.historyTex && !this.celHistories.has(texture)) return this.pushSnapshot();
+      await (await this.historyFor(texture, true))?.pushPatch(texture, patch);
+      return;
+    }
+    this.blankSince = null;
     await this.ensureSnapshotMgr().pushPatch(this.texture, patch);
   }
 
   public async undo(): Promise<boolean> {
-    if (!this.texture || !this.snapshotMgr) return false;
+    if (!this.texture) return false;
+    const cel = this.historyTex;
+    if (cel) { const m = await this.historyFor(cel, false); return m ? m.undo(cel) : false; }   // A3 (no resize hook)
+    if (!this.snapshotMgr) return false;
+    this.blankSince = null;
     // resize hook: a snapshot may predate a document resize — reallocate to its dimensions first
     // (the old inline restore called ensureTexture(w, h) the same way).
     return this.snapshotMgr.undo(this.texture, (w, h) => this.ensureTexture(w, h));
   }
 
   public async redo(): Promise<boolean> {
-    if (!this.texture || !this.snapshotMgr) return false;
+    if (!this.texture) return false;
+    const cel = this.historyTex;
+    if (cel) { const m = await this.historyFor(cel, false); return m ? m.redo(cel) : false; }   // A3
+    if (!this.snapshotMgr) return false;
+    this.blankSince = null;
     return this.snapshotMgr.redo(this.texture, (w, h) => this.ensureTexture(w, h));
   }
 
@@ -385,5 +528,6 @@ export class RasterTextureManager {
     this._paneReadBuf = undefined; this._paneReadBufSize = 0; this._paneImage = null;
     this.snapshotMgr?.destroy();
     this.snapshotMgr = undefined;
+    this.historyTex = null; this.celHistories = new WeakMap(); this.blankSince = null;
   }
 }

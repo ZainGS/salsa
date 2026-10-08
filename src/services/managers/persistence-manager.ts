@@ -84,8 +84,9 @@ export class PersistenceManager {
     getAutoSaveConfig(): AutoSaveConfig | null { return this._persistence?.getConfig() ?? null; }
     onSaveEvent(onStart: () => void, onComplete: (success: boolean) => void): void { this._persistence?.setSaveCallbacks(onStart, onComplete); }
 
-    async saveDocument(): Promise<boolean> {
-        return this.ensurePersistence().saveNow();
+    /** `opts.incremental`: write only what changed (see ShapeManager.saveDocument). */
+    async saveDocument(opts?: { incremental?: boolean }): Promise<boolean> {
+        return this.ensurePersistence().saveNow(opts);
     }
 
     async loadDocument(docId: string): Promise<{
@@ -120,6 +121,7 @@ export class PersistenceManager {
     getDocumentName(): string { return this._currentDocName; }
     getDocumentId(): string { return this._currentDocId; }
     notifyStrokeEnd(): void { this._persistence?.notifyStrokeEnd(); }
+    notifyDocumentChanged(): void { this._persistence?.notifyDocumentChanged(); }
 
     // Expose internal state for ShapeManager's façade access
     get currentDocId(): string { return this._currentDocId; }

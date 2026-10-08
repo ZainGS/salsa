@@ -302,6 +302,108 @@ export function grainOverlayKernel(
   });
 }
 
+// ── Bayer ordered dither (dither-engine.ts) — edge effects (fade / shrink / density dropout, all three edge modes),
+// duotone / quantize / per-channel, invert and the params[8] dispatch region. Doubles instead of f32 and JS rounding
+// (WGSL round() is half-to-even): good for path-vs-path identity checks, not a bit-exact GPU reference. ──
+
+function pcgHash(v: number): number {
+  const state = (Math.imul(v >>> 0, 747796405) + 2891336453) >>> 0;
+  const word = Math.imul(((state >>> ((state >>> 28) + 4)) ^ state) >>> 0, 277803737) >>> 0;
+  return ((word >>> 22) ^ word) >>> 0;
+}
+function edgeCellRand(cx: number, cy: number, seed: number): number {
+  return pcgHash(((cx + 32768) >>> 0) + pcgHash((((cy + 32768) >>> 0) + pcgHash(seed >>> 0)) >>> 0) >>> 0) / 4294967295;
+}
+const clampN = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+const mixN = (a: number, b: number, t: number) => a + (b - a) * t;
+
+/** CPU port of the Bayer dither shader: `src` → `out`, params = the engine's 36-float uniform block. */
+export function ditherBayerKernel(src: CpuTexture, out: CpuTexture, p: Float32Array, tx: number, ty: number): void {
+  const W = out.width, H = out.height;
+  const alphaAt = (x: number, y: number) => src.data[(clampN(y, 0, src.height - 1) * src.width + clampN(x, 0, src.width - 1)) * 4 + 3] / 255;
+  const edgeFactor = (x: number, y: number, radius: number) => {
+    let cov = 1, count = 1;
+    for (let ring = 0; ring < 3; ring++) {
+      const r = radius * ((ring + 1) / 3);
+      for (let k = 0; k < 8; k++) {
+        const ang = Math.fround((k + ring * 0.5) * 0.7853981634);
+        const ox = Math.cos(ang) * r, oy = Math.sin(ang) * r;
+        const px = clampN(x + Math.trunc(ox + Math.sign(ox) * 0.5), 0, src.width - 1);
+        const py = clampN(y + Math.trunc(oy + Math.sign(oy) * 0.5), 0, src.height - 1);
+        cov += alphaAt(px, py) >= 0.004 ? 1 : 0;
+        count++;
+      }
+    }
+    return clampN((cov / count - 0.5) * 2, 0, 1);
+  };
+  const edgeCanvas = (x: number, y: number, radius: number) =>
+    clampN(Math.min(Math.min(x, y), Math.min(src.width - 1 - x, src.height - 1 - y)) / radius, 0, 1);
+  const edgeRaw = (x: number, y: number, radius: number) => {
+    const mode = p[12];
+    if (mode < 0.5) return edgeFactor(x, y, radius);
+    if (mode < 1.5) return edgeCanvas(x, y, radius);
+    return Math.min(edgeFactor(x, y, radius), edgeCanvas(x, y, radius));
+  };
+  const quantize = (v: number, levels: number) => Math.round(v * (levels - 1)) * (1 / (levels - 1));
+  const lum = (c: readonly number[]) => c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
+  const bayer = (x: number, y: number, level: number) => {
+    const size = 1 << (level + 1);
+    let xm = x % size, ym = y % size, value = 0, s = size >> 1;
+    for (let i = 0; i < level + 1; i++) {
+      const bx = xm >= s ? 1 : 0, by = ym >= s ? 1 : 0;
+      value = value * 4 + [0, 2, 3, 1][(bx ^ by) | (by << 1)];
+      xm %= s; ym %= s; s >>= 1;
+    }
+    return (value + 0.5) / (size * size);
+  };
+  const rx0 = Math.trunc(p[32]), ry0 = Math.trunc(p[33]), rx1 = Math.trunc(p[34]), ry1 = Math.trunc(p[35]);
+  for (let gy = 0; gy < ty; gy++) for (let gx = 0; gx < tx; gx++) {
+    const x = gx + rx0, y = gy + ry0;
+    if (x >= rx1 || y >= ry1 || x >= W || y >= H) continue;
+    const c = load(src, x, y);
+    if (c[3] < 0.004) { store(out, x, y, c); continue; }
+    const levels = p[0], level = Math.trunc(p[1]), strength = p[2], ps = p[3], perChannel = p[4] > 0.5;
+    const sx = Math.trunc(x / ps), sy = Math.trunc(y / ps);
+    const bias = (bayer(sx, sy, level) - 0.5) * (1 / levels);
+    // edgeState
+    let es = [1, 0, 1];
+    const ew = p[28], ef = p[29], esh = p[30], ed = p[31];
+    if (!(ew < 0.5 || (ef + Math.abs(esh) + ed) < 0.001)) {
+      const e = edgeRaw(x, y, ew);
+      es = [mixN(1, e, ef), (1 - e) * Math.abs(esh), e];
+    }
+    const eff = strength * es[0];
+    if (ed > 0.001 && ew >= 0.5) {
+      const cell = 1 << (level + 1);
+      const cx = Math.trunc(sx / cell), cy = Math.trunc(sy / cell);
+      const ccx = Math.trunc((cx + 0.5) * cell * ps), ccy = Math.trunc((cy + 0.5) * cell * ps);
+      const eCell = edgeRaw(clampN(ccx, 0, src.width - 1), clampN(ccy, 0, src.height - 1), ew);
+      if (edgeCellRand(cx, cy, Math.trunc(p[13])) > 1 - ed * (1 - eCell)) { store(out, x, y, [0, 0, 0, 0]); continue; }
+    }
+    const tq = esh < 0 ? 0 : 1;
+    let d: number[];
+    if (p[16] > 0.5) {
+      const db = p[19], tS = db > 0.5 ? 1 : 0, tb = esh < 0 ? 1 - tS : tS;
+      const v = quantize(mixN(db, tb, es[1]) + bias, levels); d = [v, v, v];
+    } else if (perChannel) {
+      d = [0, 1, 2].map(i => quantize(mixN(c[i], tq, es[1]) + bias, levels));
+    } else {
+      const v = quantize(mixN(lum(c), tq, es[1]) + bias, levels); d = [v, v, v];
+    }
+    // applyColorMapping
+    let res = [0, 1, 2].map(i => mixN(c[i], d[i], eff));
+    let a = c[3];
+    if (p[16] > 0.5) {
+      const t = lum(d), k = eff * p[18];
+      res = [0, 1, 2].map(i => mixN(c[i], mixN(p[24 + i], p[20 + i], t), k));
+      a = mixN(c[3], mixN(p[27], p[23], t), k);
+    } else if (p[17] > 0.5) {
+      res = [0, 1, 2].map(i => mixN(c[i], 1 - d[i], eff));
+    }
+    store(out, x, y, [...res, a]);
+  }
+}
+
 function copyTex(src: CpuTexture, so: { x?: number; y?: number } | undefined, dst: CpuTexture, dO: { x?: number; y?: number } | undefined, w: number, h: number) {
   const sx = so?.x ?? 0, sy = so?.y ?? 0, dx = dO?.x ?? 0, dy = dO?.y ?? 0;
   if (sx + w > src.width || sy + h > src.height || dx + w > dst.width || dy + h > dst.height) throw new Error('copy out of bounds');
@@ -345,7 +447,9 @@ export function createCpuDevice() {
     const tx = gx * 8, ty = gy * 8;
     counters.dispatchThreads += tx * ty;
     const code = pipeline.code;
-    if (code.includes('blendSoftLight')) {   // layer compositor blend step (params[5] = region in the BRUSH-5 variant)
+    if (code.includes('bayerThreshold')) {   // Bayer ordered dither (src binding 0 → output binding 1, params[8] = region)
+      ditherBayerKernel(tex(0), tex(1), f32(buf(2)), tx, ty);
+    } else if (code.includes('blendSoftLight')) {   // layer compositor blend step (params[5] = region in the BRUSH-5 variant)
       const p = f32(buf(3));
       layerBlendKernel(tex(0), tex(1), tex(2), p, tx, ty, code.includes('params[5]') ? p.subarray(20, 24) : null);
     } else if (code.includes('regionOpacity')) {   // base opacity over a region

@@ -546,6 +546,10 @@ class ShapeManager {
             this.interactionService.onSceneGraphChanged.subscribe(() => {
                 this.connectorService?.updateBoundConnectors();
             });
+            // Any scene-graph change (vector shapes, 3D edits) schedules the debounced incremental autosave (~1.5 s
+            // after the last change; no-op while autosave is off) — it used to wait for the 30 s interval, so a quick
+            // refresh after drawing lost the shapes.
+            this.interactionService.onSceneGraphChanged.subscribe(() => this.notifyDocumentChanged());
 
             // Initialize domain-specific delegate managers
             this.initDelegates();
@@ -2601,6 +2605,17 @@ class ShapeManager {
     /** Get the per-layer dither config (copy), or undefined if not set. */
     public getLayerDitherConfig(layerId: string): DitherConfig | undefined {
         return this.rasterLayerManager?.getLayerDitherConfig(layerId);
+    }
+
+    /**
+     * BAKE DITHER: write the layer's current dithered look (its per-layer dither, edge effects included) into the
+     * layer's pixels for good and turn its dither off (`enabled: false`, the settings kept) — ONE raster undo entry:
+     * undo restores the pre-bake pixels and turns the dither back on, redo bakes again. Resolves false when nothing
+     * was baked: no active dither on the layer, not a paint layer, an animation cel, or (error diffusion) the WASM
+     * module is not loaded. Hosts feature-detect it (`typeof sm.bakeLayerDither === 'function'`).
+     */
+    public bakeLayerDither(layerId: string): Promise<boolean> {
+        return this.raster?.bakeLayerDither(layerId) ?? Promise.resolve(false);
     }
 
     // ── Dither Color Controls (convenience wrappers) ─────────────────
@@ -13032,6 +13047,40 @@ class ShapeManager {
             this.emitSceneGraphChanged();
         }
 
+        /**
+         * Perf audit A4 (2026-10-09): rebuild an animated layer's cels EXACTLY — saved ids, start frames, hold durations,
+         * key / inbetween — with each cel's own pixels (`imageData` = a data URL; absent = a blank cel). Replaces the
+         * layer's cels (marks it animated first). A host import (Frogmarks .frog / cloud load) used to re-add cels with
+         * addCelAtFrame(frame) only: durations / types / ids were lost and cel pixels came back blank (the layer import
+         * wrote every cel image into the one layer texture). Decoded like importRasterLayersFromDataURLs (native size,
+         * centred on the canvas). Returns the restored cel ids.
+         */
+        public async restoreLayerCelsFromDataURLs(
+            layerId: string,
+            cels: Array<{ celId: string; startFrame: number; duration: number; celType?: 'key' | 'inbetween'; imageData?: string }>,
+        ): Promise<string[]> {
+            const rlm = this.rasterLayerManager;
+            if (!rlm || !rlm.getLayerById(layerId)) return [];
+            const { w, h } = rlm.getCanvasSize();
+            const pixels = new Map<string, ArrayBuffer>();
+            for (const c of cels) {
+                if (!c.imageData) continue;
+                try {
+                    const raster = await this.decodeImageToRasterCanvas(this.dataURLToBlob(c.imageData), w, h);
+                    const buf = raster?.getBuffer();   // (a fresh canvas: its bytes become the cel's undo seed, no copy)
+                    if (buf) pixels.set(c.celId, (buf.byteOffset === 0 && buf.byteLength === buf.buffer.byteLength ? buf.buffer : buf.slice().buffer) as ArrayBuffer);
+                } catch (e) {
+                    console.warn('restoreLayerCelsFromDataURLs: failed to decode cel', c.celId, e);
+                }
+            }
+            const ids = rlm.restoreCelsWithPixels(layerId, cels.map(c => ({
+                celId: c.celId, startFrame: c.startFrame, duration: c.duration,
+                celType: c.celType === 'inbetween' ? 'inbetween' : 'key', pixels: pixels.get(c.celId),
+            })));
+            this.emitSceneGraphChanged();
+            return ids;
+        }
+
         private dataURLToBlob(dataurl: string): Blob {
             const parts = dataurl.split(',');
             const header = parts[0];
@@ -14397,12 +14446,15 @@ class ShapeManager {
     /**
      * Trigger a manual save now. Returns true if save succeeded.
      * Use this for the "Save" button / Ctrl+S.
+     * `opts.incremental` (perf audit 2026-10-09 B5 — leaving a document, Ctrl+S): write only the files that changed
+     * since this document was last saved / loaded (changed layers / cels are read back + encoded; the rest are left on
+     * disk), like the automatic save. Without it every layer and cel is read back and written.
      */
-    public async saveDocument(): Promise<boolean> {
+    public async saveDocument(opts?: { incremental?: boolean }): Promise<boolean> {
         if (!this.persistence) {
             this.persistence = this._createPersistence();
         }
-        return this.persistence.saveNow();
+        return this.persistence.saveNow(opts);
     }
 
     /**
@@ -14681,6 +14733,14 @@ class ShapeManager {
         this.persistence?.notifyStrokeEnd();
     }
 
+    /** The document changed (not a raster stroke — that is notifyStrokeEnd): schedule the debounced incremental
+     *  autosave (AutoSaveConfig.changeDebounceMs, default 1.5 s). Every scene-graph change calls it already; a host
+     *  calls it for document settings changed through other APIs (3D look, canvas settings …). No pixels are marked
+     *  dirty. No-op while autosave is off. */
+    public notifyDocumentChanged(): void {
+        this.persistence?.notifyDocumentChanged();
+    }
+
     /** Incremental autosave counters (docs/ui/document-persistence.md): GPU read-backs vs cache hits for raster
      *  layers / cels / painted textures, saves that wrote vs found nothing to write, the files the last write wrote,
      *  and `unnotedChanges` (non-zero = some pixel writer did not report its write; caught by the verification read). */
@@ -14735,6 +14795,13 @@ class ShapeManager {
         if (!this.scene3d) return [];
         // Face-decal meshes are rebuilt from the face-rig metadata on load — don't persist them as nodes.
         return this.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument).map(m => this._buildMeshState(m));
+    }
+
+    /** The ids of exactly the nodes getScene3DNodeStates() returns — without serializing them (a host that only needs
+     *  the id list, e.g. Frogmarks' cloud save). */
+    public getScene3DNodeIds(): string[] {
+        if (!this.scene3d) return [];
+        return this.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument).map(m => m.id);
     }
 
     /** Serialize all Skeleton3D nodes — paired with getScene3DNodeStates() for project save. */

@@ -84,6 +84,9 @@ export class RasterLayerManager {
   // Microtask-debounce flag: prevents N addLayerWithId calls from firing N composition
   // callbacks. All calls within the same sync tick collapse into one deferred notification.
   private _compositionFlushPending = false;
+  /** Bake Dither undo entries: the undo-history token of a bake's AFTER snapshot → the dither config the bake
+   *  consumed. Undoing that entry turns the dither back on (with the pre-bake pixels); redoing it turns it off. */
+  private _ditherBakeEntries = new WeakMap<object, DitherConfig>();
   // optional callback to notify renderer of composition list changes
   private compositionCallback?: (list: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>) => void;
   // optional callback to notify renderer of split (BG/FG) composition list changes
@@ -120,6 +123,8 @@ export class RasterLayerManager {
     this.timeline.on((event) => {
       if (event.type === 'frame-changed') {
         this.onFrameChanged();
+      } else if (event.type === 'playback-state-changed' && !this.timeline.isPlaying()) {
+        this.syncHistoryTargets();   // A3: playback stopped on a cel — seed its undo history now (skipped while playing)
       }
     });
 
@@ -142,6 +147,7 @@ export class RasterLayerManager {
       // the window size, then sized — its first undo used to restore the window-size seed)
       if (before && layer.texture !== before) void layer.manager.reseedPristineHistory?.();
     }
+    this.syncHistoryTargets();   // A3: undo follows the textures the layers now show
     this.notifyCompositionChanged();
     // A size change recreates each layer's GPUTexture (ensureTexture allocates a
     // new one). The compositor was just updated above, but the paint/selection
@@ -268,9 +274,31 @@ export class RasterLayerManager {
     if (!l) return false;
     if (l.type === 'vector' || l.type === 'ephemera' || l.type === 'folder') return false;
     this.selectedLayerId = id;
+    this.syncHistoryTarget(l);   // A3: an animated layer's undo acts on the cel it shows
     // Notify renderer so it can point the paint engine at this layer's texture
     this.selectionCallback?.(l.texture ?? null, l.manager);
     return true;
+  }
+
+  /**
+   * A3 (perf audit 2026-10-09): point an animated layer's raster history at the cel it shows (its texture manager
+   * keeps one history per cel texture; a static layer / cel 1 = the manager's own). The SELECTED layer, playback
+   * stopped, also seeds a cel that has no history yet (a read-back — new / loaded cels were seeded for free).
+   */
+  private syncHistoryTarget(l: RasterLayer): void {
+    if (!l.manager || (l.type ?? 'layer') !== 'layer') return;
+    const animated = this.timeline.isLayerAnimated(l.id);
+    const seed = l.id === this.selectedLayerId && !this.timeline.isPlaying();
+    l.manager.setHistoryTarget?.(animated ? (l.texture ?? null) : null, { seed });
+  }
+
+  private syncHistoryTargets(): void {
+    for (const l of this.layers) this.syncHistoryTarget(l);
+  }
+
+  /** A3: an animated layer showing a BLANK frame (no cel) has no pixels to undo / snapshot. */
+  private showsNoCel(l: RasterLayer): boolean {
+    return !l.texture && this.timeline.isLayerAnimated(l.id);
   }
 
   /** The default vector layer — the first `'vector'`-type entry (or null). Unassigned vector shapes are stamped
@@ -806,27 +834,68 @@ export class RasterLayerManager {
   // 3D divider on load, and Ctrl+Z used to throw "Cannot read properties of undefined (reading 'undo')" here.
   public pushSnapshotForLayer(id: string) {
     const l = this.layers.find(x => x.id === id);
-    if (!l?.manager) return false;
+    if (!l?.manager || this.showsNoCel(l)) return false;
     void l.manager.pushSnapshot?.();
     return true;
   }
 
   public async undoForLayer(id: string): Promise<boolean> {
     const l = this.layers.find(x => x.id === id);
-    if (!l?.manager) return false;
+    if (!l?.manager || this.showsNoCel(l)) return false;
     const before = l.manager.getTexture?.() ?? null;
+    const top = l.manager.historyMark?.()?.top ?? null;
+    const baked = top ? this._ditherBakeEntries.get(top) : undefined;   // undoing a Bake Dither
     const ok = !!(await l.manager.undo?.());
+    if (ok && baked) l.ditherConfig = { ...baked };   // the pre-bake pixels come back with their live dither
     if (ok) { this.adoptReallocatedTexture(l, before); this.notifyCompositionChanged(); }
     return ok;
   }
 
   public async redoForLayer(id: string): Promise<boolean> {
     const l = this.layers.find(x => x.id === id);
-    if (!l?.manager) return false;
+    if (!l?.manager || this.showsNoCel(l)) return false;
     const before = l.manager.getTexture?.() ?? null;
     const ok = !!(await l.manager.redo?.());
+    if (ok) {
+      const top = l.manager.historyMark?.()?.top ?? null;
+      const baked = top ? this._ditherBakeEntries.get(top) : undefined;   // redoing a Bake Dither
+      if (baked) l.ditherConfig = { ...baked, enabled: false };
+    }
     if (ok) { this.adoptReallocatedTexture(l, before); this.notifyCompositionChanged(); }
     return ok;
+  }
+
+  /**
+   * BAKE DITHER: write the layer's current dithered look into its pixels for good and turn its dither off, as ONE
+   * raster undo entry (a BEFORE snapshot, the write, an AFTER snapshot — like the other one-shot raster edits). Undo
+   * restores the pre-bake pixels AND the dither config; redo bakes again. `bake(layer, dst)` writes the dithered
+   * pixels into `dst` (the compositor's layer dither cache — RasterCompositor.bakeLayerDither). False (nothing
+   * changed) when the layer has no pixels, no active dither, shows an animation cel, or the bake could not run.
+   */
+  public async bakeLayerDither(
+    id: string,
+    bake: (layer: { texture: GPUTexture; blendMode: LayerBlendMode; opacity: number; clipped: boolean; visible: boolean; ditherConfig: DitherConfig; cacheKey: string }, dst: GPUTexture) => Promise<boolean>,
+  ): Promise<boolean> {
+    const l = this.layers.find(x => x.id === id);
+    if (!l?.manager || !l.texture) return false;
+    const cfg = l.ditherConfig;
+    if (!cfg || !cfg.enabled || !(cfg.strength > 0.001)) return false;
+    if ((l.manager.getTexture?.() ?? null) !== l.texture) return false;   // an animation cel: not this history's texture
+    await l.manager.pushSnapshot?.({ noCoalesce: true });   // BEFORE (a dedup no-op when it is already the current entry)
+    const tex = l.texture;
+    if (!tex || l.ditherConfig !== cfg) return false;        // the layer changed while the snapshot was read
+    const ok = await bake({
+      texture: tex, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, visible: l.visible, ditherConfig: cfg, cacheKey: l.id,
+    }, tex);
+    if (!ok) return false;
+    bumpGpuPixelEpoch('full', tex);   // GPU-only pixels changed (BRUSH-5 dirty + device-lost shadow; autosave: this layer)
+    const markBefore = l.manager.historyMark?.()?.top ?? null;
+    await l.manager.pushSnapshot?.({ noCoalesce: true });   // AFTER: the baked state = ONE undo entry on this layer
+    const markAfter = l.manager.historyMark?.()?.top ?? null;
+    if (markAfter && markAfter !== markBefore) this._ditherBakeEntries.set(markAfter, { ...cfg });
+    l.ditherConfig = { ...cfg, enabled: false };
+    this.notifyCompositionChanged();
+    return true;
   }
 
   /** Undo / redo of an entry recorded at another size reallocates the manager's texture (its resize hook). The
@@ -916,11 +985,39 @@ export class RasterLayerManager {
     if (!layer) return false;
 
     this.timeline.registerLayer(layerId);
+    if (!animated && this.timeline.isLayerAnimated(layerId)) return this.makeLayerStatic(layer);
     this.timeline.setLayerAnimationType(
       layerId,
       animated ? 'animated' : 'static',
       animated ? layer.texture : undefined,
     );
+    this.syncHistoryTarget(layer);
+    return true;
+  }
+
+  /**
+   * Animated → static (perf audit A1/A3): the FIRST cel's drawing becomes the static layer, in the layer's own
+   * texture (its texture manager's — the one its undo history, resize and export use). The layer used to keep
+   * showing whatever cel the current frame had — a texture the conversion then destroyed (or none on a blank frame).
+   */
+  private makeLayerStatic(layer: RasterLayer): boolean {
+    const base = layer.manager?.getTexture?.() ?? null;
+    const first = this.timeline.getCels(layer.id)[0];
+    const copied = !!(base && first && first.texture !== base);
+    if (copied) {
+      const w = Math.min(base!.width, first!.texture.width), h = Math.min(base!.height, first!.texture.height);
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToTexture({ texture: first!.texture }, { texture: base! }, { width: w, height: h });
+      this.device.queue.submit([enc.finish()]);
+      bumpGpuPixelEpoch('full', base!);   // GPU-only pixels changed (BRUSH-5 dirty, device-lost shadow, autosave)
+    }
+    this.timeline.setLayerAnimationType(layer.id, 'static');   // destroys the other cels' textures
+    if (copied) this.timeline.setCelTexture(layer.id, first!.id, base!);   // …and the first one's (now in `base`)
+    if (base) layer.texture = base;
+    layer.manager?.setHistoryTarget?.(null);
+    if (copied) void layer.manager?.pushSnapshot?.();   // the static pixels = one undo entry on the layer's history
+    if (this.selectedLayerId === layer.id) this.selectionCallback?.(layer.texture ?? null, layer.manager);
+    this.notifyCompositionChanged();
     return true;
   }
 
@@ -934,24 +1031,15 @@ export class RasterLayerManager {
    * Returns the cel id, or null if the layer isn't animated.
    */
   public addCelAtCurrentFrame(layerId: string): string | null {
-    const cel = this.timeline.addCel(
-      layerId,
-      this.timeline.getCurrentFrame(),
-      this.device,
-      this.width,
-      this.height,
-    );
-    if (cel) {
-      this.onFrameChanged(); // update displayed texture
-      return cel.id;
-    }
-    return null;
+    return this.addCelAtFrame(layerId, this.timeline.getCurrentFrame());
   }
 
   /**
-   * Add a new blank cel at a specific frame for the specified layer.
+   * Add a new blank cel at a specific frame for the specified layer. (A cel already starting there is returned as
+   * is.) Splitting a hold gives the rest of the hold its own copy of the drawing (AnimationTimeline.addCel).
    */
   public addCelAtFrame(layerId: string, frame: number): string | null {
+    const prior = new Set(this.timeline.getCels(layerId).map(c => c.id));
     const cel = this.timeline.addCel(
       layerId,
       frame,
@@ -960,7 +1048,9 @@ export class RasterLayerManager {
       this.height,
     );
     if (cel) {
-      this.onFrameChanged();
+      // B3/A3: a NEW cel is blank — its undo history starts as a blank seed (no read-back)
+      if (!prior.has(cel.id)) this.layers.find(l => l.id === layerId)?.manager?.seedBlankHistory?.(cel.texture);
+      this.onFrameChanged(); // update displayed texture
       return cel.id;
     }
     return null;
@@ -991,6 +1081,7 @@ export class RasterLayerManager {
         layer.texture = celTexture;
       }
     }
+    this.syncHistoryTargets();   // A3: undo follows the cels now shown
 
     // Update selected layer paint target
     if (this.selectedLayerId) {
@@ -1029,6 +1120,7 @@ export class RasterLayerManager {
         layer.texture = celTexture;
       }
     }
+    this.syncHistoryTargets();   // A3: undo follows the cels now shown (seeded only when not playing)
 
     // Update the selected layer's paint target if it's animated
     if (this.selectedLayerId) {
@@ -1362,6 +1454,7 @@ export class RasterLayerManager {
   /**
    * Upload raw RGBA pixel data to a specific animation cel's texture.
    * Used by the persistence engine to restore cel pixel data.
+   * The bytes also become the cel's undo seed, BORROWED (not copied) — don't modify `pixels` afterwards.
    */
   public uploadPixelsToCel(layerId: string, celId: string, pixels: ArrayBuffer): boolean {
     const cels = this.timeline.getCels(layerId);
@@ -1376,6 +1469,8 @@ export class RasterLayerManager {
       { bytesPerRow: w * 4 },
       { width: w, height: h },
     );
+    // A2/A3: the cel's undo history starts from exactly these bytes (no read-back)
+    this.layers.find(l => l.id === layerId)?.manager?.seedHistoryFromPixels?.(cel.texture, pixels);
     return true;
   }
 
@@ -1383,41 +1478,95 @@ export class RasterLayerManager {
    * Restore cels for an animated layer from saved metadata.
    * Clears existing cels (from setLayerAnimated default), creates cels with specific IDs/timing.
    * Returns the created cel IDs for pixel data upload.
+   *
+   * Perf audit A3: the earliest cel shows the layer's OWN texture (cleared), as cel 1 of a layer animated in-session
+   * does — clearing the default cel used to DESTROY that texture while the layer's texture manager (its undo
+   * history, resize, export) kept using it. Every cel starts blank with a blank undo seed; uploadPixelsToCel re-seeds
+   * the ones that have pixels.
    */
   public restoreLayerCels(
     layerId: string,
     celMetas: Array<{ celId: string; startFrame: number; duration: number; celType: 'key' | 'inbetween' }>,
   ): string[] {
-    // First, clear the auto-created default cel from setLayerAnimated
+    // First, clear the auto-created default cel from setLayerAnimated (the timeline never destroys the layer's texture)
     const existingCels = this.timeline.getCels(layerId);
-    for (const c of existingCels) {
+    for (const c of [...existingCels]) {
       this.timeline.deleteCel(layerId, c.id);
     }
+
+    const layer = this.layers.find(l => l.id === layerId);
+    const own = this.timeline.getLayerAnimationState(layerId)?.baseTexture ?? null;
+    const base = own && own === layer?.manager?.getTexture?.() && own.width === this.width && own.height === this.height ? own : null;
+    let first: (typeof celMetas)[number] | null = null;
+    for (const m of celMetas) if (!first || m.startFrame < first.startFrame) first = m;
 
     // Create each cel with the saved ID and timing
     const created: string[] = [];
     for (const meta of celMetas) {
-      const texture = this.device.createTexture({
-        size: [this.width, this.height],
-        format: 'rgba8unorm',
-        usage:
-          GPUTextureUsage.TEXTURE_BINDING |
-          GPUTextureUsage.STORAGE_BINDING |
-          GPUTextureUsage.COPY_SRC |
-          GPUTextureUsage.COPY_DST |
-          GPUTextureUsage.RENDER_ATTACHMENT,
-      });
+      let texture: GPUTexture;
+      if (base && meta === first) {
+        texture = base;
+        const enc = this.device.createCommandEncoder();
+        enc.beginRenderPass({ colorAttachments: [{ view: base.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }] }).end();
+        this.device.queue.submit([enc.finish()]);
+        bumpGpuPixelEpoch('full', base);   // (cleared: it held the layer-level pixels of the save)
+      } else {
+        texture = this.device.createTexture({
+          size: [this.width, this.height],
+          format: 'rgba8unorm',
+          usage:
+            GPUTextureUsage.TEXTURE_BINDING |
+            GPUTextureUsage.STORAGE_BINDING |
+            GPUTextureUsage.COPY_SRC |
+            GPUTextureUsage.COPY_DST |
+            GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+      }
       const cel = this.timeline.addCelWithId(
         layerId, meta.celId, meta.startFrame, meta.duration, meta.celType, texture,
       );
-      if (cel) created.push(cel.id);
+      if (cel) {
+        created.push(cel.id);
+        layer?.manager?.seedBlankHistory?.(texture);   // B3: blank until its pixels are uploaded
+      } else if (texture !== base) texture.destroy();
     }
     return created;
   }
 
   /**
+   * Perf audit A4: rebuild an animated layer's cels exactly — saved ids, start frames, hold durations, key / inbetween —
+   * each with its own pixels (tightly packed RGBA8 at the canvas size; absent = blank). Marks the layer animated first,
+   * replaces its cels, grows the timeline to hold them and shows the current frame. The `pixels` become the cels'
+   * undo seeds (borrowed: don't modify them afterwards). For host imports (ShapeManager.restoreLayerCelsFromDataURLs).
+   */
+  public restoreCelsWithPixels(
+    layerId: string,
+    cels: Array<{ celId: string; startFrame: number; duration: number; celType: 'key' | 'inbetween'; pixels?: ArrayBuffer }>,
+  ): string[] {
+    const layer = this.layers.find(l => l.id === layerId);
+    if (!layer || (layer.type ?? 'layer') !== 'layer') return [];
+    if (!this.timeline.isLayerAnimated(layerId)) this.setLayerAnimated(layerId, true);
+    const metas = cels.map(c => ({
+      celId: c.celId, startFrame: Math.max(1, Math.round(c.startFrame)), duration: Math.max(1, Math.round(c.duration || 1)),
+      celType: c.celType,
+    }));
+    const ids = this.restoreLayerCels(layerId, metas);
+    const expected = this.width * this.height * 4;
+    for (const c of cels) {
+      if (c.pixels && c.pixels.byteLength === expected && ids.includes(c.celId)) this.uploadPixelsToCel(layerId, c.celId, c.pixels);
+    }
+    let end = 0;
+    for (const m of metas) end = Math.max(end, m.startFrame + m.duration - 1);
+    if (end > this.timeline.getFrameCount()) this.timeline.setFrameCount(end);
+    this.forceFrameSync();
+    return ids;
+  }
+
+  /**
    * Upload raw RGBA pixel data to an existing layer's texture.
    * Used by the persistence engine to restore layer state.
+   * The bytes also become the layer's undo seed when its history is still pristine, BORROWED (not copied) — don't
+   * modify `pixels` afterwards.
    */
   public uploadPixelsToLayer(layerId: string, pixels: ArrayBuffer): boolean {
     const layer = this.layers.find(l => l.id === layerId);
@@ -1435,6 +1584,10 @@ export class RasterLayerManager {
       { bytesPerRow: w * 4 },
       { width: w, height: h },
     );
+    // A2 (perf audit 2026-10-09): the undo seed was read back when the layer was created — BEFORE these pixels — so
+    // fill / filter / clear then Ctrl+Z on a loaded document restored a blank layer. Re-seed from the bytes in hand
+    // (no read-back); a size mismatch re-seeds by reading the texture back (after this upload, in queue order).
+    if (layer.manager && !layer.manager.seedHistoryFromPixels?.(layer.texture, pixels)) void layer.manager.reseedPristineHistory?.();
     return true;
   }
 
