@@ -108,6 +108,14 @@ export interface RealFrameReadback {
   rgba: Uint8ClampedArray; width: number; height: number; format: GPUTextureFormat;
   source: 'swapchain' | 'lastFrameTex' | 'postProcessOutput';
 }
+/** One raster layer of the composition list (RasterLayerManager → renderer). `animated`: the layer has cels (its
+ *  per-layer dither cache keeps one entry per cel texture — layer-dither-cache.ts, perf E5). */
+export interface RasterCompositionEntry {
+  id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean;
+  ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation;
+  animated?: boolean;
+}
+
 /** WebGPURenderer.getRenderDebugStatus: read-only facts a render-debug bisect needs (is the lo-res path on, ...). */
 export interface RenderDebugStatus {
   /** The scale the 3D scene renders at now (getResolutionScale().current; 1 = native) and the scaler mode. */
@@ -443,14 +451,14 @@ export class WebGPURenderer {
   private _floatingQuadVB?: GPUBuffer;
   private _floatingQuadIB?: GPUBuffer;
   // List of raster layers to composite in order (back-to-front)
-  private rasterCompositionList?: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>;
+  private rasterCompositionList?: Array<RasterCompositionEntry>;
   // Optional foreground raster layer list (layers above the 3D divider)
-  private rasterForegroundList?: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>;
+  private rasterForegroundList?: Array<RasterCompositionEntry>;
   // Foreground composite output texture
   private rasterTextureFG?: GPUTexture;
 
   // Setter to update composition list from external managers
-  public setRasterCompositionList(list: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>) {
+  public setRasterCompositionList(list: Array<RasterCompositionEntry>) {
     this.rasterCompositionList = list;
     // Clear the foreground list — if the caller is using the flat (non-split) path,
     // any stale rasterForegroundList from a previous 3D-divider split would otherwise
@@ -463,16 +471,73 @@ export class WebGPURenderer {
   /** Free the per-layer dither caches of layers that are no longer listed (deleted / replaced on a document load). */
   private retainLayerDitherCaches(): void {
     if (!this._rasterCompositor) return;
-    const ids = new Set<string>();
-    for (const l of this.rasterCompositionList ?? []) ids.add(l.id);
-    for (const l of this.rasterForegroundList ?? []) ids.add(l.id);
+    const ids = this._retainIds;   // (E8: reused — this runs on every timeline frame change)
+    ids.clear();
+    const a = this.rasterCompositionList, b = this.rasterForegroundList;
+    if (a) for (let i = 0; i < a.length; i++) ids.add(a[i].id);
+    if (b) for (let i = 0; i < b.length; i++) ids.add(b[i].id);
     this._rasterCompositor.retainLayerDitherCaches(ids);
+  }
+  private readonly _retainIds = new Set<string>();
+
+  // ── E8 (2026-10-09): the per-render compositor inputs and raster-quad bind groups are reused, not rebuilt ──
+  private readonly _compPoolMain: CompositorLayerInfo[] = [];
+  private readonly _compOutMain: CompositorLayerInfo[] = [];
+  private readonly _compPoolFG: CompositorLayerInfo[] = [];
+  private readonly _compOutFG: CompositorLayerInfo[] = [];
+  private _rasterQuadBG: { bg: GPUBindGroup; tex: GPUTexture; buf: GPUBuffer; sampler: GPUSampler; pipeline: GPURenderPipeline } | null = null;
+  private _rasterQuadBGFG: { bg: GPUBindGroup; tex: GPUTexture; buf: GPUBuffer; sampler: GPUSampler; pipeline: GPURenderPipeline } | null = null;
+
+  /** The composition list as compositor layers (layers without a texture — a blank cel — left out), written into
+   *  reused objects: `pool` keeps one object per slot, `out` is the returned list. */
+  private _fillCompositorLayers(list: ReadonlyArray<RasterCompositionEntry>, pool: CompositorLayerInfo[], out: CompositorLayerInfo[]): CompositorLayerInfo[] {
+    let n = 0;
+    for (let i = 0; i < list.length; i++) {
+      const l = list[i];
+      if (!l.texture) continue;
+      let c = pool[n];
+      if (!c) c = pool[n] = { texture: l.texture, blendMode: LayerBlendMode.Normal, opacity: 1, clipped: false, visible: true };
+      c.texture = l.texture;
+      c.blendMode = l.blendMode ?? LayerBlendMode.Normal;
+      c.opacity = l.opacity ?? 1.0;
+      c.clipped = l.clipped ?? false;
+      c.visible = l.visible ?? true;
+      c.ditherConfig = l.ditherConfig;
+      c.cacheKey = l.id;   // the layer's own dither cache
+      c.cacheCels = l.animated === true;   // E5: one dither cache entry per cel
+      c.frameLinkAnimation = l.frameLinkAnimation;
+      out[n++] = c;
+    }
+    out.length = n;
+    return out;
+  }
+
+  /** The raster-quad bind group for `tex` (cached while the texture, world buffer, sampler and pipeline are the same). */
+  private _rasterQuadBindGroup(fg: boolean, tex: GPUTexture, buf: GPUBuffer): GPUBindGroup {
+    const pm = this.pipelineManager!;
+    const pipeline = pm.getRasterPipeline();
+    const sampler = pm.getTexturedSampler();
+    const c = fg ? this._rasterQuadBGFG : this._rasterQuadBG;
+    if (c && c.tex === tex && c.buf === buf && c.sampler === sampler && c.pipeline === pipeline) return c.bg;
+    const bg = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: tex.createView() },
+      { binding: 1, resource: sampler },
+      { binding: 2, resource: { buffer: buf } },
+    ]});
+    const e = { bg, tex, buf, sampler, pipeline };
+    if (fg) this._rasterQuadBGFG = e; else this._rasterQuadBG = e;
+    return bg;
+  }
+
+  /** BRUSH-5 incremental composite in force this frame (the switch, minus the render-debug kill switch). */
+  private _dirtyCompositingOn(): boolean {
+    return WebGPURenderer.rasterDirtyCompositing && !(RD.on && RD.f.noRasterDirtyCompositing);
   }
 
   /** Set the split composition lists (background + foreground) for 3D divider support. */
   public setRasterCompositionListSplit(
-    background: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>,
-    foreground: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>,
+    background: Array<RasterCompositionEntry>,
+    foreground: Array<RasterCompositionEntry>,
   ) {
     this.rasterCompositionList = background;
     this.rasterForegroundList = foreground.length > 0 ? foreground : undefined;
@@ -974,7 +1039,7 @@ export class WebGPURenderer {
       const unsub = onRasterCompositeDirty(() => {
         const r = self.deref();
         if (!r) { unsub(); return; }
-        if (WebGPURenderer.rasterDirtyCompositing) r.scheduleRender();
+        if (r._dirtyCompositingOn()) r.scheduleRender();
       });
       this._rasterDirtyUnsub = unsub;
     }
@@ -1166,10 +1231,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
    * BRUSH-5 (docs/specs/mobile-parity.md §3): composite the 2D raster layers INCREMENTALLY — keep the composited
    * result and re-composite only when a layer changed, and only its dirty rect (RasterCompositor.compositeIncremental
    * + raster-composite-dirty.ts) — instead of copying and blending every layer from scratch every frame.
-   * false (the default until it is verified on devices) = the full composite every frame, exactly as before.
-   * Also sm.setRasterDirtyCompositing(on). Session-wide.
+   * ON by default since 2026-10-09 (perf E2: a timeline playing with 3D motion re-composited every layer every frame,
+   * 14–27 ms GPU at 1080p). false = the full composite every frame, exactly as before. Kill switches:
+   * sm.setRasterDirtyCompositing(false) (this session) and the render-debug flag noRasterDirtyCompositing
+   * (sm.setRenderDebug3D({ noRasterDirtyCompositing: true }) — persists per machine). Session-wide.
    */
-  public static rasterDirtyCompositing = false;
+  public static rasterDirtyCompositing = true;
   private _rasterDirtyUnsub: (() => void) | null = null;
 
   /** Is the onion skin going to draw into the composited output this frame? (same gates as applyOnionSkinOverlay) */
@@ -2378,19 +2445,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             if (this._rasterCompositor && this.rasterTexture) {
               // Pass current animation frame to compositor for procedural displacement
               this._rasterCompositor.currentFrame = this.currentAnimationFrame;
-              // Use the new GPU compositor with blend modes, opacity, clipping
-              const compositorLayers: CompositorLayerInfo[] = this.rasterCompositionList
-                .filter(l => l.texture)
-                .map(l => ({
-                  texture: l.texture!,
-                  blendMode: l.blendMode ?? LayerBlendMode.Normal,
-                  opacity: l.opacity ?? 1.0,
-                  clipped: l.clipped ?? false,
-                  visible: l.visible ?? true,
-                  ditherConfig: l.ditherConfig,
-                  cacheKey: l.id,   // the layer's own dither cache
-                  frameLinkAnimation: l.frameLinkAnimation,
-                }));
+              // E5: no per-layer error-diffusion pass starts while the timeline plays
+              this._rasterCompositor.playbackActive = !!this.rasterLayerManager?.getTimeline().isPlaying();
+              // Use the new GPU compositor with blend modes, opacity, clipping (E8: reused layer objects)
+              const compositorLayers = this._fillCompositorLayers(this.rasterCompositionList, this._compPoolMain, this._compOutMain);
               // Check if any layer or global dither uses error diffusion (requires async WASM)
               const globalDitherCfg = this._rasterCompositor.getDitherConfig();
               const needsAsync = RasterCompositor.needsAsyncComposite(compositorLayers, globalDitherCfg);
@@ -2398,7 +2456,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
               if (needsAsync) {
                 this._rasterCompositor.invalidateIncremental('main');
                 await this._rasterCompositor.compositeAsync(compositorLayers, this.rasterTexture);
-              } else if (WebGPURenderer.rasterDirtyCompositing && !this._onionSkinActive()) {
+              } else if (this._dirtyCompositingOn() && !this._onionSkinActive()) {
                 // BRUSH-5: only what changed (nothing at all on an idle frame). The onion skin draws into this
                 // output after the composite, so frames with it on take the full path below.
                 this._rasterCompositor.compositeIncremental(compositorLayers, this.rasterTexture, 'main');
@@ -2504,7 +2562,6 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
           //this.testRasterPipeline();
           if (rasterTexToRender) {
-            const layout = this.pipelineManager.getRasterPipeline().getBindGroupLayout(0);
             // ensure world buffer exists
             if (!this.rasterWorldBuf) {
               this.rasterWorldBuf = this.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -2513,11 +2570,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             const worldMatrix = this.interactionService.getWorldMatrix();
             this.device.queue.writeBuffer(this.rasterWorldBuf, 0, (worldMatrix as Float32Array).buffer);
 
-            const bg = this.device.createBindGroup({ layout, entries: [
-              { binding: 0, resource: rasterTexToRender.createView() },
-              { binding: 1, resource: this.pipelineManager.getTexturedSampler() },
-              { binding: 2, resource: { buffer: this.rasterWorldBuf } }
-            ]});
+            const bg = this._rasterQuadBindGroup(false, rasterTexToRender, this.rasterWorldBuf);   // (E8: cached)
             passEncoder.setPipeline(this.pipelineManager.getRasterPipeline());
             passEncoder.setBindGroup(0, bg);
 
@@ -2835,22 +2888,16 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
                      GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
             });
           }
-          const fgLayers: CompositorLayerInfo[] = this.rasterForegroundList
-            .filter(l => l.texture)
-            .map(l => ({
-              texture: l.texture!, blendMode: l.blendMode ?? LayerBlendMode.Normal,
-              opacity: l.opacity ?? 1.0, clipped: l.clipped ?? false,
-              visible: l.visible ?? true, ditherConfig: l.ditherConfig, cacheKey: l.id,
-              frameLinkAnimation: l.frameLinkAnimation,
-            }));
+          const fgLayers = this._fillCompositorLayers(this.rasterForegroundList, this._compPoolFG, this._compOutFG);   // (E8: reused)
           if (fgLayers.length > 0) {
             this._rasterCompositor.currentFrame = this.currentAnimationFrame;
+            this._rasterCompositor.playbackActive = !!this.rasterLayerManager?.getTimeline().isPlaying();
             const globalDitherCfg = this._rasterCompositor.getDitherConfig();
             const needsAsync = RasterCompositor.needsAsyncComposite(fgLayers, globalDitherCfg);
             if (needsAsync) {
               this._rasterCompositor.invalidateIncremental('fg');
               await this._rasterCompositor.compositeAsync(fgLayers, this.rasterTextureFG);
-            } else if (WebGPURenderer.rasterDirtyCompositing) {
+            } else if (this._dirtyCompositingOn()) {
               this._rasterCompositor.compositeIncremental(fgLayers, this.rasterTextureFG, 'fg');   // BRUSH-5
             } else {
               this._rasterCompositor.invalidateIncremental('fg');
@@ -2858,12 +2905,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             }
             // Draw the FG raster quad (same pipeline, same world transform, separate texture)
             if (this.rasterWorldQuadVB && this.rasterWorldQuadIB && this.rasterWorldBuf) {
-              const layout = this.pipelineManager.getRasterPipeline().getBindGroupLayout(0);
-              const fgBg = this.device.createBindGroup({ layout, entries: [
-                { binding: 0, resource: this.rasterTextureFG.createView() },
-                { binding: 1, resource: this.pipelineManager.getTexturedSampler() },
-                { binding: 2, resource: { buffer: this.rasterWorldBuf } },
-              ]});
+              const fgBg = this._rasterQuadBindGroup(true, this.rasterTextureFG, this.rasterWorldBuf);   // (E8: cached)
               passEncoder.setPipeline(this.pipelineManager.getRasterPipeline());
               passEncoder.setBindGroup(0, fgBg);
               passEncoder.setVertexBuffer(0, this.rasterWorldQuadVB);

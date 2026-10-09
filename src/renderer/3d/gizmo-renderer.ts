@@ -361,6 +361,21 @@ export function computeGizmoViewLocal(
   return { toCam: [lx, ly, lz], camPos: null };
 }
 
+/** A shared identity model matrix (world-space overlay geometry). Never mutate. */
+const IDENTITY16 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+/** E11: gizmo geometry built for view `a` still serves view `b` — the same projection kind and the centre→camera
+ *  direction (and, in perspective, the gizmo-local camera position) within ~1 % (≈ 0.5°: the ring near / far fade
+ *  and the painter's order can't visibly change). */
+export function gizmoViewClose(a: GizmoViewLocal | null, b: GizmoViewLocal): boolean {
+  if (!a) return false;
+  const EPS = 0.01;
+  if (Math.abs(a.toCam[0] - b.toCam[0]) > EPS || Math.abs(a.toCam[1] - b.toCam[1]) > EPS || Math.abs(a.toCam[2] - b.toCam[2]) > EPS) return false;
+  if (!a.camPos || !b.camPos) return a.camPos === b.camPos;
+  const tol = EPS * Math.hypot(b.camPos[0], b.camPos[1], b.camPos[2]);
+  return Math.abs(a.camPos[0] - b.camPos[0]) <= tol && Math.abs(a.camPos[1] - b.camPos[1]) <= tol && Math.abs(a.camPos[2] - b.camPos[2]) <= tol;
+}
+
 /** Facing of a gizmo-local ring point: its offset from the centre dotted with the centre→camera direction
  *  (> 0 = the near half, < 0 = the far half; a ring seen face-on sits at 0 everywhere = all near). */
 export function ringPointFacing(p: ArrayLike<number>, view: GizmoViewLocal): number {
@@ -752,43 +767,49 @@ const BOX_EDGES: [number, number][] = [
 ];
 
 /**
- * Build world-space selection box geometry.
- * Single mesh: oriented bounding box (OBB) with 8 corner handles.
- * Multiple meshes: one unified world-AABB enclosing all mesh OBBs, no corner handles.
+ * Build selection box geometry from its 8 corners (bit-indexed, as Mesh3D.obbCorners), in whatever space the corners
+ * are in (the draw's model matrix maps it to world). Single mesh: the box with 8 corner handles (`handles`); a multi
+ * selection: one unified world AABB, no handles.
  */
-function buildSelectionBoxGeometry(
-  meshes: Mesh3D[],
+function buildSelectionBoxFromCorners(
+  c: [number, number, number][],
+  handles: boolean,
   thickness: number,
   hoveredCorner: number | null,
 ): { verts: Float32Array; idxs: Uint32Array; vertCount: number; idxCount: number } {
   const verts: number[] = [];
   const idxs: number[]  = [];
-
-  if (meshes.length > 1) {
-    // Unified AABB around all meshes — one box, no corner handles
-    const c = computeCombinedAABBCorners(meshes);
-    if (c) {
-      for (const [a, b] of BOX_EDGES) addEdgePrism(verts, idxs, c[a], c[b], thickness, COL_SEL_EDGE);
-    }
-  } else {
-    for (const mesh of meshes) {
-      const c = mesh.obbCorners;
-      if (!c || c.length < 8) continue;
-      for (const [a, b] of BOX_EDGES) addEdgePrism(verts, idxs, c[a], c[b], thickness, COL_SEL_EDGE);
-      const sphereR = thickness * 2.2;
-      for (let ci = 0; ci < 8; ci++) {
-        const col = ci === hoveredCorner ? COL_SEL_CORNER_HOVER : COL_SEL_CORNER;
-        addUvSphere(verts, idxs, c[ci][0], c[ci][1], c[ci][2], sphereR, col);
-      }
+  for (const [a, b] of BOX_EDGES) addEdgePrism(verts, idxs, c[a], c[b], thickness, COL_SEL_EDGE);
+  if (handles) {
+    const sphereR = thickness * 2.2;
+    for (let ci = 0; ci < 8; ci++) {
+      const col = ci === hoveredCorner ? COL_SEL_CORNER_HOVER : COL_SEL_CORNER;
+      addUvSphere(verts, idxs, c[ci][0], c[ci][1], c[ci][2], sphereR, col);
     }
   }
+  const vertCount = Math.min(verts.length / 7, MAX_SEL_BOX_VERTS);
+  const idxCount  = vertCount === verts.length / 7 ? Math.min(idxs.length, MAX_SEL_BOX_IDXS) : 0;
+  return { verts: new Float32Array(verts), idxs: new Uint32Array(idxs), vertCount, idxCount };
+}
 
-  const vertCount = verts.length / 7;
-  const idxCount  = idxs.length;
-  const vf = new Float32Array(MAX_SEL_BOX_VERTS * 7);
-  const vi = new Uint32Array(MAX_SEL_BOX_IDXS);
-  if (vertCount > 0) { vf.set(verts, 0); vi.set(idxs, 0); }
-  return { verts: vf, idxs: vi, vertCount, idxCount };
+/**
+ * E11: split a world matrix into a RIGID frame (rotation columns + translation → `out`) and per-axis scales (`scl`),
+ * so geometry built in the rigid frame at the scaled size keeps a world-unit thickness. False when the 3×3 part is
+ * sheared or degenerate (the caller builds in world space instead).
+ */
+function rigidFrameOf(m: ArrayLike<number>, out: Float32Array, scl: Float64Array): boolean {
+  const s0 = Math.hypot(m[0], m[1], m[2]), s1 = Math.hypot(m[4], m[5], m[6]), s2 = Math.hypot(m[8], m[9], m[10]);
+  if (!(s0 > 1e-9 && s1 > 1e-9 && s2 > 1e-9)) return false;
+  const d01 = (m[0] * m[4] + m[1] * m[5] + m[2] * m[6]) / (s0 * s1);
+  const d02 = (m[0] * m[8] + m[1] * m[9] + m[2] * m[10]) / (s0 * s2);
+  const d12 = (m[4] * m[8] + m[5] * m[9] + m[6] * m[10]) / (s1 * s2);
+  if (Math.abs(d01) > 1e-4 || Math.abs(d02) > 1e-4 || Math.abs(d12) > 1e-4) return false;
+  out[0] = m[0] / s0; out[1] = m[1] / s0; out[2]  = m[2] / s0;  out[3]  = 0;
+  out[4] = m[4] / s1; out[5] = m[5] / s1; out[6]  = m[6] / s1;  out[7]  = 0;
+  out[8] = m[8] / s2; out[9] = m[9] / s2; out[10] = m[10] / s2; out[11] = 0;
+  out[12] = m[12]; out[13] = m[13]; out[14] = m[14]; out[15] = 1;
+  scl[0] = s0; scl[1] = s1; scl[2] = s2;
+  return true;
 }
 
 // ── Bone overlay ──────────────────────────────────────────────────
@@ -1384,6 +1405,20 @@ export class GizmoRenderer {
   private _selBoxVertBuf!: GPUBuffer;
   private _selBoxIdxBuf!:  GPUBuffer;
   private _selBoxUniBuf!:  GPUBuffer;
+  // E11: selection-box geometry cache (what _selBoxVertBuf / _selBoxIdxBuf hold) — rebuilt only when its key changes.
+  private readonly _sbKey = new Float64Array(32);
+  private readonly _sbKeyNext = new Float64Array(32);
+  private _sbKeyLen = -1;
+  private _sbIdxCount = 0;
+  private _sbThick = 0;
+  private readonly _sbScl = new Float64Array(3);
+  private readonly _sbModel = new Float32Array(16);
+  /** E8: one reused VP + model uniform staging array (the draws each allocated a Float32Array(32) per frame). */
+  private readonly _uScratch = new Float32Array(32);
+  /** E11 / E8 diagnostics: geometry REBUILDS since construction (a steady frame adds none). */
+  selectionBoxBuilds = 0;
+  gizmoBuilds = 0;
+  gridBuilds = 0;
 
   // Bone overlay GPU buffers (world-space geometry, model = identity)
   private _boneVertBuf!:     GPUBuffer;
@@ -1727,17 +1762,67 @@ export class GizmoRenderer {
     const scale  = GizmoRenderer.computeGizmoScale(camera, center);
     const thickness = scale * 0.018;
 
-    const { verts, idxs, vertCount, idxCount } = buildSelectionBoxGeometry(selectedMeshes, thickness, hoveredCorner);
+    // E11 (playback perf 2026-10-09): the box geometry (12 edge prisms + 8 corner spheres) was rebuilt + re-uploaded
+    // EVERY frame. Now it is rebuilt only when its key changes — the box SHAPE (a single mesh's box is built in its
+    // RIGID frame: rotation + translation go to the model uniform, so a moving / spinning selection reuses it), the
+    // hovered corner, or the camera-dependent thickness by more than 2 % (invisible). A sheared / multi selection
+    // keeps world-space geometry keyed on its exact corners.
+    const model = this._sbModel;
+    const key = this._sbKeyNext;
+    let n = 0, corners: [number, number, number][] | null = null, handles = false;
+    let rigidLocal: [number, number, number][] | null = null;
+    if (selectedMeshes.length === 1) {
+      const mesh = selectedMeshes[0];
+      const wc = mesh.obbCorners;                    // (refreshes stale bounds first)
+      const lc = mesh.obbLocalCorners;
+      if (!wc || wc.length < 8) return;
+      handles = true;
+      if (lc && lc.length >= 8 && rigidFrameOf(mesh.localMatrix as unknown as ArrayLike<number>, model, this._sbScl)) {
+        const s = this._sbScl;
+        key[n++] = 1;
+        for (let ci = 0; ci < 8; ci += 7) { key[n++] = lc[ci][0] * s[0]; key[n++] = lc[ci][1] * s[1]; key[n++] = lc[ci][2] * s[2]; }   // min + max corner
+        rigidLocal = lc;
+      } else {
+        mat4.identity(model as unknown as mat4);
+        key[n++] = 2;
+        for (let ci = 0; ci < 8; ci++) { key[n++] = wc[ci][0]; key[n++] = wc[ci][1]; key[n++] = wc[ci][2]; }
+        corners = wc;
+      }
+    } else {
+      mat4.identity(model as unknown as mat4);
+      corners = computeCombinedAABBCorners(selectedMeshes);
+      if (!corners) return;
+      key[n++] = 3;
+      key[n++] = corners[0][0]; key[n++] = corners[0][1]; key[n++] = corners[0][2];
+      key[n++] = corners[7][0]; key[n++] = corners[7][1]; key[n++] = corners[7][2];
+    }
+    key[n++] = hoveredCorner ?? -1;
+    const prev = this._sbKey;
+    let same = this._sbKeyLen === n && Math.abs(thickness - this._sbThick) <= this._sbThick * 0.02;
+    // (a 1e-5 relative tolerance: the rigid frame's axis scales come out of a float32 matrix, so a rotating mesh's
+    // box size wobbles in the 7th digit)
+    for (let i = 0; same && i < n; i++) if (Math.abs(prev[i] - key[i]) > 1e-5 * Math.max(1, Math.abs(key[i]))) same = false;
+    if (!same) {
+      if (rigidLocal) {   // the box in the rigid frame: object-space corners × the matrix's axis scales
+        const s = this._sbScl;
+        corners = rigidLocal.map((c) => [c[0] * s[0], c[1] * s[1], c[2] * s[2]] as [number, number, number]);
+      }
+      const g = buildSelectionBoxFromCorners(corners!, handles, this._sbThick = thickness, hoveredCorner);
+      this.selectionBoxBuilds++;
+      prev.set(key.subarray(0, n)); this._sbKeyLen = n; this._sbIdxCount = g.idxCount;
+      if (g.idxCount > 0) {
+        this.device.queue.writeBuffer(this._selBoxVertBuf, 0, g.verts, 0, g.vertCount * 7);
+        this.device.queue.writeBuffer(this._selBoxIdxBuf,  0, g.idxs,  0, g.idxCount);
+      }
+    }
+    const idxCount = this._sbIdxCount;
     if (idxCount === 0) return;
 
-    this.device.queue.writeBuffer(this._selBoxVertBuf, 0, verts, 0, vertCount * 7);
-    this.device.queue.writeBuffer(this._selBoxIdxBuf,  0, idxs,  0, idxCount);
-
-    // model = identity (geometry is already in world space)
+    // model = the selection's rigid frame (identity for world-space geometry)
     const vp = camera.getViewProjectionMatrix();
-    const uData = new Float32Array(32);
+    const uData = this._uScratch;
     uData.set(vp as Float32Array, 0);
-    uData.set(mat4.create() as Float32Array, 16);  // identity model
+    uData.set(model, 16);
     this.device.queue.writeBuffer(this._selBoxUniBuf, 0, uData);
 
     const bg = this.uniformBindGroup(this._selBoxUniBuf);   // cached (audit 5.12)
@@ -1767,31 +1852,69 @@ export class GizmoRenderer {
   ): void {
     if (opacity <= 0 || spacing <= 0) return;
 
-    const HALF_EXTENT = 10;                                  // grid spans UP TO ±10 world units
     const step = Math.max(spacing, 1e-4);                    // guard against zero/negative spacing
+    const [r, g, b] = color;
+
+    // Pick the grid plane: 0 = XZ ground (perspective, or an ortho top/bottom view), 1 = XY (front), 2 = ZY (side).
+    let plane = 0;
+    if (camera.mode === 'orthographic') {
+      const dx = camera.target[0] - camera.position[0];
+      const dy = camera.target[1] - camera.position[1];
+      const dz = camera.target[2] - camera.position[2];
+      const ax = Math.abs(dx), ay = Math.abs(dy), az = Math.abs(dz);
+      if (ay >= ax && ay >= az) plane = 0;
+      else if (az >= ax && az >= ay) plane = 1;
+      else plane = 2;
+    }
+
+    // E8 (playback perf 2026-10-09): the line vertices are world-space and depend only on these — they were rebuilt
+    // (an array of ~1.6k lines + a Float32Array) and re-uploaded EVERY frame the grid was visible.
+    const k = this._gridKey;
+    if (!(k[0] === step && k[1] === r && k[2] === g && k[3] === b && k[4] === opacity && k[5] === plane)) {
+      k[0] = step; k[1] = r; k[2] = g; k[3] = b; k[4] = opacity; k[5] = plane;
+      this._gridVertCount = this._buildGridVerts(step, r, g, b, opacity, plane);
+    }
+    const vertCount = this._gridVertCount;
+    if (vertCount === 0) return;
+
+    const vp = camera.getViewProjectionMatrix();
+    const uData = this._uScratch;
+    uData.set(vp as Float32Array, 0);
+    uData.set(IDENTITY16, 16);                               // identity model (world space)
+    this.device.queue.writeBuffer(this._gridUniBuf, 0, uData);
+
+    const bg = this.uniformBindGroup(this._gridUniBuf);   // cached (audit 5.12)
+
+    if (!this._setPipe(pass, this._boneLinePipe)) return;                    // line-list, depth less-equal, no depth write
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._gridVertBuf);
+    pass.draw(vertCount);
+  }
+
+  /** drawGrid's cache key (step, r, g, b, opacity, plane) and what _gridVertBuf holds for it. */
+  private readonly _gridKey = new Float64Array([NaN, NaN, NaN, NaN, NaN, NaN]);
+  private _gridVertCount = 0;
+
+  /** Build + upload the grid's line vertices (minor lines every `step`, the two axis lines brighter); returns the
+   *  vertex count (0 = nothing to draw). */
+  private _buildGridVerts(step: number, r: number, g: number, b: number, opacity: number, plane: number): number {
+    this.gridBuilds++;
+    const HALF_EXTENT = 10;                                  // grid spans UP TO ±10 world units
     // Cap the LINE COUNT, not the spacing — so fine grids (< 0.1) still render: the extent shrinks
     // instead of the cells. ≤200 lines/side stays well inside the vertex buffer.
     const n = Math.max(1, Math.min(Math.floor(HALF_EXTENT / step), 200));
     const ext = n * step;                                    // square out to the last full line
-    const [r, g, b] = color;
     const axisA = Math.min(1, opacity * 1.6);                // axis lines a touch more solid
 
     const COL_X: [number, number, number] = [0.95, 0.35, 0.35];
     const COL_Y: [number, number, number] = [0.45, 0.90, 0.45];
     const COL_Z: [number, number, number] = [0.35, 0.50, 0.95];
 
-    // Pick the grid plane (two in-plane axes + their axis-line colors).
+    // The grid plane's two in-plane axes + their axis-line colors.
     let aAxis: [number, number, number] = [1, 0, 0], bAxis: [number, number, number] = [0, 0, 1]; // XZ ground
     let aCol = COL_X, bCol = COL_Z;
-    if (camera.mode === 'orthographic') {
-      const dx = camera.target[0] - camera.position[0];
-      const dy = camera.target[1] - camera.position[1];
-      const dz = camera.target[2] - camera.position[2];
-      const ax = Math.abs(dx), ay = Math.abs(dy), az = Math.abs(dz);
-      if (ay >= ax && ay >= az) {            /* top/bottom → XZ ground (default) */ }
-      else if (az >= ax && az >= ay) { aAxis = [1, 0, 0]; bAxis = [0, 1, 0]; aCol = COL_X; bCol = COL_Y; } // front → XY
-      else                          { aAxis = [0, 0, 1]; bAxis = [0, 1, 0]; aCol = COL_Z; bCol = COL_Y; } // side → ZY
-    }
+    if (plane === 1) { aAxis = [1, 0, 0]; bAxis = [0, 1, 0]; aCol = COL_X; bCol = COL_Y; }        // front → XY
+    else if (plane === 2) { aAxis = [0, 0, 1]; bAxis = [0, 1, 0]; aCol = COL_Z; bCol = COL_Y; }   // side → ZY
 
     const lv: number[] = [];
     const P = (ca: number, cb: number): [number, number, number] =>
@@ -1811,22 +1934,18 @@ export class GizmoRenderer {
     pushLine(0, -ext, 0, ext, bCol[0], bCol[1], bCol[2], axisA);  // bAxis line
 
     const vertCount = lv.length / 7;
-    if (vertCount === 0 || vertCount > MAX_GRID_VERTS) return;
+    if (vertCount === 0 || vertCount > MAX_GRID_VERTS) return 0;
     this.device.queue.writeBuffer(this._gridVertBuf, 0, new Float32Array(lv), 0, vertCount * 7);
-
-    const vp = camera.getViewProjectionMatrix();
-    const uData = new Float32Array(32);
-    uData.set(vp as Float32Array, 0);
-    uData.set(mat4.create() as Float32Array, 16);            // identity model (world space)
-    this.device.queue.writeBuffer(this._gridUniBuf, 0, uData);
-
-    const bg = this.uniformBindGroup(this._gridUniBuf);   // cached (audit 5.12)
-
-    if (!this._setPipe(pass, this._boneLinePipe)) return;                    // line-list, depth less-equal, no depth write
-    pass.setBindGroup(0, bg);
-    pass.setVertexBuffer(0, this._gridVertBuf);
-    pass.draw(vertCount);
+    return vertCount;
   }
+
+  // E11: drawGizmoAt's geometry cache (what vertexBuffer / indexBuffer hold).
+  private _gzValid = false;
+  private _gzMode: GizmoMode = null;
+  private _gzHovered: GizmoAxis = null;
+  private _gzDragging: GizmoAxis = null;
+  private _gzView: GizmoViewLocal | null = null;
+  private _gzIdxCount = 0;
 
   /**
    * Draw the ILLUSTRATION artboard as a rectangle outline (the "render frame") in the XY plane at z=0 — a
@@ -2162,18 +2281,30 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
     // Upload uniforms
     const vp = camera.getViewProjectionMatrix();
-    const uData = new Float32Array(32);
+    const uData = this._uScratch;
     uData.set(vp as Float32Array, 0);
     uData.set(model as Float32Array, 16);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uData);
 
-    // Build and upload gizmo geometry (camera in gizmo-local space → ring near/far split + painter's order)
+    // Build and upload gizmo geometry (camera in gizmo-local space → ring near/far split + painter's order).
+    // E11: only when the mode / hover / drag state or the gizmo-local view changed — a steady selection (or one
+    // moving under a still camera by less than ~0.5° of view) reuses the uploaded geometry; the model uniform above
+    // carries its position / orientation / screen-constant scale.
     const view = GizmoRenderer.viewLocal(camera, model);
-    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry(mode, hovered, dragging, view);
+    let idxCount: number;
+    if (this._gzValid && this._gzMode === mode && this._gzHovered === hovered && this._gzDragging === dragging && gizmoViewClose(this._gzView, view)) {
+      idxCount = this._gzIdxCount;
+    } else {
+      const g = buildGizmoGeometry(mode, hovered, dragging, view);
+      this.gizmoBuilds++;
+      idxCount = g.idxCount;
+      this._gzValid = true; this._gzMode = mode; this._gzHovered = hovered; this._gzDragging = dragging; this._gzView = view; this._gzIdxCount = idxCount;
+      if (idxCount > 0) {
+        this.device.queue.writeBuffer(this.vertexBuffer, 0, g.verts, 0, g.vertCount * 7);
+        this.device.queue.writeBuffer(this.indexBuffer, 0, g.idxs, 0, idxCount);
+      }
+    }
     if (idxCount === 0) return;
-
-    this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
-    this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
 
     const bg = this.uniformBindGroup(this.uniformBuffer);   // cached (audit 5.12)
 
@@ -2660,6 +2791,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry('move', hovered, dragging, GizmoRenderer.viewLocal(camera, model));
     if (idxCount === 0) return;
 
+    this._gzValid = false;   // E11: the drawGizmoAt geometry cache no longer matches the shared buffers
     this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
     this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
 
@@ -2732,6 +2864,7 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry('rotate', hovered, dragging, GizmoRenderer.viewLocal(camera, model));
     if (idxCount === 0) return;
 
+    this._gzValid = false;   // E11: the drawGizmoAt geometry cache no longer matches the shared buffers
     this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
     this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
 

@@ -232,6 +232,22 @@ describe('defer predicate (raster timeline playback)', () => {
     p.destroy();
   });
 
+  it('a change-triggered save (notifyDocumentChanged) waits while playing and runs once after it stops (E10)', async () => {
+    vi.useFakeTimers();
+    const gather = failingProvider();
+    const p = new DocumentPersistence({ intervalMs: 0, strokeDebounceMs: 0, changeDebounceMs: 100 });
+    p.setStateProvider(gather);
+    let playing = true;
+    p.setDeferPredicate(() => playing);
+    p.startAutoSave();
+    for (let i = 0; i < 20; i++) { p.notifyDocumentChanged(); await vi.advanceTimersByTimeAsync(500); }   // edits during playback
+    expect(gather).not.toHaveBeenCalled();
+    playing = false;                                     // stopped
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(gather).toHaveBeenCalledTimes(1);             // one save of whatever changed
+    p.destroy();
+  });
+
   it('explicit saveNow does not wait for playback', async () => {
     const gather = failingProvider();
     const p = make(gather);

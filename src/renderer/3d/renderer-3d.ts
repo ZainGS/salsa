@@ -1877,6 +1877,7 @@ export class Renderer3D {
    *  runPostProcess would. True = the chain WOULD have drawn (a misprediction of postProcessMayRun — re-render). */
   skipPostProcess(w: number, h: number): boolean {
     const drew3D = this._drew3DThisFrame; this._drew3DThisFrame = false;
+    this._aaTakeRect(w, h);   // E6: consume the frame's FXAA region too
     const taaDone = this._taaOn && !!this._taa?.resolvedThisFrame;
     return this._fxaaGate(w, h, drew3D, taaDone) || (!(RD.on && RD.f.noPost) && !!this._postProcessPass?.willRun());
   }
@@ -1893,13 +1894,14 @@ export class Renderer3D {
     // ANTI-ALIASING (persona-polish A1) runs FIRST, so bloom sees clean edges and film grain is never smeared.
     let src = srcTex;
     const drew3D = this._drew3DThisFrame; this._drew3DThisFrame = false;
+    const aaRect = this._aaTakeRect(w, h);   // E6: the screen region the 3D content covers (null = the whole frame)
     const taaDone = this._taaOn && !!this._taa?.resolvedThisFrame;
     const pp = RD.on && RD.f.noPost ? null : this._postProcessPass ?? null;   // render debug: noPost skips it
     if (this._fxaaGate(w, h, drew3D, taaDone)) {
       this._fxaaPass ??= new FxaaPass(this.device, this._swapChainFormat);
       // FXAA is the last pass when no effect will run after it: straight into the target.
-      if (target && !pp?.willRun()) { if (this._fxaaPass.runInto(encoder, srcTex, w, h, this._aa.quality, target)) return 'target'; }
-      else src = this._fxaaPass.run(encoder, srcTex, w, h, this._aa.quality);
+      if (target && !pp?.willRun()) { if (this._fxaaPass.runInto(encoder, srcTex, w, h, this._aa.quality, target, aaRect)) return 'target'; }
+      else src = this._fxaaPass.run(encoder, srcTex, w, h, this._aa.quality, aaRect);
     }
     if (!pp) return src !== srcTex ? src : null;
     const time = this._worldTimeSec() % 3600;   // → film grain
@@ -1913,6 +1915,71 @@ export class Renderer3D {
   private _fxaaPass: FxaaPass | null = null;
   /** Set by drawMeshes / drawSkinnedMeshes, consumed by runPostProcess (AA only on frames with 3D content). */
   private _drew3DThisFrame = false;
+
+  // ── E6 (playback perf 2026-10-09): the FXAA region ──
+  // FXAA ran over the whole canvas, softening the 2D art (its dither pixels) next to a few small meshes. Each frame
+  // now notes the screen box of what it drew in 3D: plain meshes add their projected world AABB (+ a pad for screen-
+  // space outlines / silhouettes / the edge search); anything not bounded that way (skinned characters, particles,
+  // array-group instances, billboards, wind sway, vertex overrides, a mesh crossing the camera plane, very many
+  // meshes, the editor overlays, the 3D backdrop) makes it the whole frame — the old behaviour. Outside the box the
+  // FXAA pass copies its source (fxaa-pass.ts rect). Consumed with _drew3DThisFrame.
+  private _aaFull = false;
+  private _aaAny = false;
+  private _aaX0 = 0; private _aaY0 = 0; private _aaX1 = 0; private _aaY1 = 0;
+  private readonly _aaRect: [number, number, number, number] = [0, 0, 0, 0];
+  private readonly _aaBox: AABB3 = { minX: 0, minY: 0, minZ: 0, maxX: 0, maxY: 0, maxZ: 0 };
+  /** Above this many meshes a frame's FXAA region is the whole frame (a big scene covers the screen anyway). */
+  static AA_RECT_MAX_MESHES = 256;
+  /** Screen pad (px) around the projected boxes. */
+  static AA_RECT_PAD_PX = 16;
+  /** E6 master switch (false = FXAA over the whole frame, the old behaviour). */
+  static aaRectOn = true;
+  /** Some 3D content this frame has no box: FXAA covers the whole frame. */
+  private _aaNoteFull(): void { this._aaFull = true; }
+  /** Add the projected world boxes of `meshes` (drawn with the current camera) to the region. */
+  private _aaNoteMeshes(meshes: readonly Mesh3D[]): void {
+    if (this._aaFull) return;
+    if (!Renderer3D.aaRectOn || meshes.length > Renderer3D.AA_RECT_MAX_MESHES || this._arrayGroups.length > 0 || this._vertexBufferOverrides.size > 0) { this._aaFull = true; return; }
+    const bb = this._aaBox;
+    for (let i = 0; i < meshes.length; i++) {
+      const m = meshes[i];
+      if (m.billboard || m.billboardParent || m.material.windSway || m.hlodFade >= 0) { this._aaFull = true; return; }
+      if (!this.getMeshWorldAABB3D(m, bb)) continue;   // no geometry → nothing drawn
+      this._aaNoteWorldBox(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ);
+      if (this._aaFull) return;
+    }
+  }
+  /** Add a world-space box (projected with the current camera) to the FXAA region — kept in normalized screen units
+   *  (0..1, y down), so a lo-res 3D pass and the full-res FXAA agree. */
+  private _aaNoteWorldBox(minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number): void {
+    if (this._aaFull) return;
+    const vp = this.camera.getViewProjectionMatrix() as unknown as Float32Array;
+    let x0 = this._aaAny ? this._aaX0 : Infinity, y0 = this._aaAny ? this._aaY0 : Infinity;
+    let x1 = this._aaAny ? this._aaX1 : -Infinity, y1 = this._aaAny ? this._aaY1 : -Infinity;
+    for (let c = 0; c < 8; c++) {
+      const x = c & 1 ? maxX : minX, y = c & 2 ? maxY : minY, z = c & 4 ? maxZ : minZ;
+      const cw = vp[3] * x + vp[7] * y + vp[11] * z + vp[15];
+      if (!(cw > 1e-6)) { this._aaFull = true; return; }   // a corner at / behind the camera plane: unbounded on screen
+      const sx = (vp[0] * x + vp[4] * y + vp[8] * z + vp[12]) / cw * 0.5 + 0.5;
+      const sy = 0.5 - (vp[1] * x + vp[5] * y + vp[9] * z + vp[13]) / cw * 0.5;
+      if (sx < x0) x0 = sx; if (sx > x1) x1 = sx;
+      if (sy < y0) y0 = sy; if (sy > y1) y1 = sy;
+    }
+    this._aaAny = true;
+    this._aaX0 = x0; this._aaY0 = y0; this._aaX1 = x1; this._aaY1 = y1;
+  }
+  /** The frame's FXAA region in w×h pixels (null = the whole frame), and reset for the next frame. */
+  private _aaTakeRect(w: number, h: number): [number, number, number, number] | null {
+    const bounded = this._aaAny && !this._aaFull;
+    this._aaAny = false; this._aaFull = false;
+    if (!bounded) return null;
+    const pad = Renderer3D.AA_RECT_PAD_PX, r = this._aaRect;
+    r[0] = Math.max(0, Math.floor(this._aaX0 * w - pad)); r[1] = Math.max(0, Math.floor(this._aaY0 * h - pad));
+    r[2] = Math.min(w, Math.ceil(this._aaX1 * w + pad)); r[3] = Math.min(h, Math.ceil(this._aaY1 * h + pad));
+    if (!(r[2] > r[0] && r[3] > r[1])) { r[0] = r[1] = r[2] = r[3] = 0; }   // wholly off screen: nothing to smooth
+    if (r[0] <= 0 && r[1] <= 0 && r[2] >= w && r[3] >= h) return null;
+    return r;
+  }
   /** 3D anti-aliasing: mode 'fxaa' (default, quality 'medium') or 'off' (the original, aliased look). */
   setAntiAliasing(s: Partial<AntiAliasingSettings>): void { this._aa = sanitizeAntiAliasing({ ...this._aa, ...s }); }
   get antiAliasing(): AntiAliasingSettings { return { ...this._aa }; }
@@ -3649,6 +3716,7 @@ export class Renderer3D {
     const editData = (RD.on && RD.f.noMeshEditOverlays) ? null : this._meshEditDataForPass(pass);
     this._meshEditDataPass = null; this._meshEditDataMemo = null;   // the overlay is the frame's last reader
     if (!this._meshEditOverlay || !editData) return;
+    this._aaNoteFull();   // E6: editor overlay → FXAA over the whole frame (as before)
     // canvasHeight: the handles (dots, 3 px selected edges) are sized in screen pixels
     this._meshEditOverlay.draw(pass, editData, this.camera, canvasHeight);
     // The element-transform gizmo on the selection's centroid (on top of the wireframe; hidden by the no-gizmo debug flag)
@@ -3701,16 +3769,19 @@ export class Renderer3D {
    *  off in Player/creator modes. Selected emitters highlight via the shared selected-ids set. */
   drawEmitterIconsIfActive(pass: GPURenderPassEncoder, canvasHeight: number): void {
     if (!this._gizmoRenderer || this._frameEmitters.length === 0) return;
+    this._aaNoteFull();   // E6
     this._gizmoRenderer.drawEmitterIcons(
       pass, this._frameEmitters as unknown as { id: string; localMatrix: mat4 }[],
       this._selectedMeshIds, this.camera, canvasHeight);
   }
 
+  private readonly _selScratch: Mesh3D[] = [];
   drawSelectionGizmoIfActive(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
     if (!this._gizmoRenderer) return;
     const editData = this._meshEditDataForPass(pass);   // memoised: the overlay reads the same result below
     if (editData) return;
     if (this._arrayGizmoData) {
+      this._aaNoteFull();   // E6
       this._gizmoRenderer.drawArrayGizmo(pass, this._arrayGizmoData, this.camera, this._arrayHandleHovered);
       return;
     }
@@ -3718,6 +3789,7 @@ export class Renderer3D {
     // container's transform, no child expansion. Shares the same gizmo mode/hover/dragging state.
     if (this._selectedGroupTarget) {
       const target = [this._selectedGroupTarget];
+      this._aaNoteFull();   // E6 (a container's box is not a drawn mesh's)
       this._gizmoRenderer.drawSelectionBox(pass, target, this.camera, this._hoveredCorner);
       this._gizmoRenderer.drawGizmo(
         pass, target, this.camera, this._gizmoMode, this._hoveredAxis,
@@ -3726,7 +3798,9 @@ export class Renderer3D {
       return;
     }
     if (this._selectedMeshIds.size === 0) return;
-    const selectedMeshes = this._selectableMeshes.filter(m => this._selectedMeshIds.has(m.id));
+    // E8: reused scratch (was a filter() allocation every frame a selection is shown — playback included)
+    const selectedMeshes = this._selScratch; selectedMeshes.length = 0;
+    for (let i = 0; i < this._selectableMeshes.length; i++) { const m = this._selectableMeshes[i]; if (this._selectedMeshIds.has(m.id)) selectedMeshes.push(m); }
     // Selected particle EMITTERS anchor the gizmo too (the thin-wrapper precedent: not meshes, but the
     // gizmo only reads localMatrix). No selection BOX for them — no OBB; the icon highlight is the box.
     const selectedEmitters = this._frameEmitters.filter(e => this._selectedMeshIds.has(e.id));
@@ -3735,6 +3809,13 @@ export class Renderer3D {
     const gizmoTargets = selectedEmitters.length > 0
       ? [...selectedMeshes, ...(selectedEmitters as unknown as Mesh3D[])]
       : selectedMeshes;
+    // E6: the selection box hugs drawn meshes (already in the FXAA region, + its pad); the gizmo reaches ~1.5 gizmo
+    // scales from the selection centre (arrows / rings / cubes are ≤ ~1.25 in gizmo units).
+    if (this._gizmoMode !== null) {
+      const c = this._gizmoRenderer.computeCenter(gizmoTargets);
+      const r = GizmoRenderer.computeGizmoScale(this.camera, c) * 1.5;
+      this._aaNoteWorldBox(c[0] - r, c[1] - r, c[2] - r, c[0] + r, c[1] + r, c[2] + r);
+    }
     this._gizmoRenderer.drawGizmo(
       pass, gizmoTargets, this.camera, this._gizmoMode, this._hoveredAxis,
       canvasWidth, canvasHeight, this._draggingAxis,
@@ -3774,6 +3855,7 @@ export class Renderer3D {
    */
   drawGhostPreviewIfActive(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
     if (!this._ghostPreviewRenderer || !this._ghostPreviewData) return;
+    this._aaNoteFull();   // E6
     this.camera.aspect = canvasWidth / canvasHeight;
     this._ghostPreviewRenderer.update(this._ghostPreviewData);
     this._ghostPreviewRenderer.draw(pass, this.camera);
@@ -3795,6 +3877,9 @@ export class Renderer3D {
    */
   drawArmatureBg(pass: GPURenderPassEncoder, canvasW: number, canvasH: number): void {
     if (RD.on && RD.f.noBackground3D) return;   // render debug
+    // E6: a drawn backdrop (any mode but dim / none) covers the frame → FXAA over the whole frame
+    const bgMode = this._armatureModeActive ? this._armatureBgOpts.mode : this._meshEditBgActive ? this._meshEditBgOpts.mode : this._sceneBgOpts.mode;
+    if (bgMode !== 'dim' && bgMode !== 'none') this._aaNoteFull();
     if (this._armatureModeActive) {
       const mode = this._armatureBgOpts.mode;
       if (mode !== 'dim' && mode !== 'none') {
@@ -3880,6 +3965,7 @@ export class Renderer3D {
    *  which is a semi-transparent overlay rather than an opaque pre-mesh background). */
   drawMeshEditDimIfActive(pass: GPURenderPassEncoder, canvasW: number, canvasH: number): void {
     if (this._meshEditBgActive && this._meshEditBgOpts.mode === 'dim' && !(RD.on && RD.f.noMeshEditOverlays)) {
+      this._aaNoteFull();   // E6
       this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH);
     }
   }
@@ -3900,6 +3986,7 @@ export class Renderer3D {
    */
   drawGridIfActive(pass: GPURenderPassEncoder): void {
     if (!this._gridVisible || !this._gizmoRenderer || (RD.on && RD.f.noGrid)) return;
+    this._aaNoteWorldBox(-10, -10, -10, 10, 10, 10);   // E6: the grid spans at most ±10 world units (any plane)
     this._gizmoRenderer.drawGrid(pass, this.camera, this._gridSpacing, this._gridColor, this._gridOpacity);
   }
 
@@ -3915,6 +4002,7 @@ export class Renderer3D {
 
   drawArtboardFrameIfActive(pass: GPURenderPassEncoder): void {
     if (!this._artboardFrameVisible || !this._gizmoRenderer) return;
+    this._aaNoteWorldBox(-this._artboardHalfW, -this._artboardHalfH, 0, this._artboardHalfW, this._artboardHalfH, 0);   // E6
     this._gizmoRenderer.drawArtboardFrame(pass, this.camera, this._artboardHalfW, this._artboardHalfH, this._artboardColor, this._artboardOpacity);
   }
 
@@ -3934,6 +4022,7 @@ export class Renderer3D {
 
   drawArtboardTextureIfActive(pass: GPURenderPassEncoder): void {
     if (!this._artboardTexView || !this._gizmoRenderer) return;
+    this._aaNoteFull();   // E6: the illustration on the artboard plane
     this._gizmoRenderer.drawArtboardTexture(pass, this.camera, this._artboardTexHalfW, this._artboardTexHalfH, this._artboardTexView, this._artboardTexOpacity);
   }
 
@@ -3952,6 +4041,7 @@ export class Renderer3D {
 
   drawCameraFrustumIfActive(pass: GPURenderPassEncoder): void {
     if (!this._frustumSegments || !this._gizmoRenderer) return;
+    this._aaNoteFull();   // E6
     this._gizmoRenderer.drawCameraFrustum(pass, this.camera, this._frustumSegments, this._frustumColor, this._frustumOpacity);
   }
 
@@ -3973,6 +4063,7 @@ export class Renderer3D {
   /** Draw the vertex-snap double-circle viz on top of everything, if a drag is providing it. */
   drawSnapVizIfActive(pass: GPURenderPassEncoder, canvasH: number): void {
     const viz = this._snapVizProvider?.();
+    if (viz) this._aaNoteFull();   // E6
     if (viz && this._gizmoRenderer) this._gizmoRenderer.drawSnapViz(pass, this.camera, viz, canvasH);
   }
 
@@ -3993,6 +4084,7 @@ export class Renderer3D {
    */
   drawBoneOverlayIfActive(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
     if (!this._boneOverlaySkeleton) return;
+    this._aaNoteFull();   // E6
     if (this._armatureBgOpts.mode === 'dim') {
       this._armatureBgPass?.draw(pass, this._armatureBgOpts, canvasWidth, canvasHeight);
     }
@@ -4084,6 +4176,7 @@ export class Renderer3D {
 
     // Update camera aspect
     this.camera.aspect = canvasWidth / canvasHeight;
+    this._aaNoteMeshes(meshes);   // E6: this frame's FXAA region
 
     // Zoom-stable reflection reach: re-derive the texel budget from the persisted WORLD reach for this zoom.
     if (this._ssrEnabled) this._updateSSRReachBudget(canvasHeight);
@@ -5768,6 +5861,10 @@ export class Renderer3D {
 
     // Per-mesh hover highlight outline (hover only — selection uses AABB box below)
     if (this._highlightPass && this.meshBindGroup) {
+      const _hlTime = performance.now() / 1000;
+      // E8 (playback perf 2026-10-09): nothing hovered (the playback case) → skip the hover block entirely; it built
+      // its id list, entry closure and entry arrays every frame for nothing.
+      if (this._hoveredMeshIds.size > 0 || this._hoverOutlineRanges) {
       const hoverOnly = [...this._hoveredMeshIds].filter(id => !this._selectedMeshIds.has(id));
 
       // When hovering a specific ArrayGroup3D, restrict highlight to that group's slot range.
@@ -5803,7 +5900,6 @@ export class Renderer3D {
         }));
       });
 
-      const _hlTime = performance.now() / 1000;
       const hoverEntries = toEntries(hoverOnly);
 
       // Sub-range hover (one landmark's exact silhouette out of a merged mesh): resolve each {meshId, indexStart,
@@ -5836,6 +5932,7 @@ export class Renderer3D {
         this._silhouettePass.writeParams(this._hoverOutlineStyle, this._hoverOutlineStyle.thicknessPx, _hlTime);
         this._silhouettePass.composite(pass);
       }
+      }   // (hover block)
 
       // Source-link feedback: when a source mesh is selected, faintly highlight all linked instances.
       if (this._selectedSourceId && this._highlightPass && this.meshBindGroup && !(RD.on && RD.f.noHighlight)) {
@@ -5979,6 +6076,7 @@ export class Renderer3D {
     // Must happen after drawMeshes() so the atlas layer map is current.
     const visible = this._particleVisibleScratch; visible.length = 0;
     for (const e of emitters) if (e.visible) visible.push(e);
+    if (visible.length) this._aaNoteFull();   // E6
     for (const e of visible) {
       const animIds = e.config.animTextures;
       const animLayers = animIds && animIds.length > 0
@@ -6081,6 +6179,7 @@ export class Renderer3D {
     let total = 0;
     for (const s of srcs) if (s.gpuData && s.activeCount > 0) total += s.activeCount;
     if (total === 0) return;
+    this._aaNoteFull();   // E6
     if (!this._particlePipeline) this._initParticlePipeline();
     const pipe = this._particlePipeline!.get();
     if (!pipe) return;
@@ -9416,7 +9515,7 @@ export class Renderer3D {
     uploadUniforms = true,
   ): void {
     const _sk0 = performance.now();
-    if (meshes.length > 0) this._drew3DThisFrame = true;   // AA gate (runPostProcess)
+    if (meshes.length > 0) { this._drew3DThisFrame = true; this._aaNoteFull(); }   // AA gate (runPostProcess); E6: posed bounds → the whole frame
     this._prewarmForScene(meshes, true);   // P2.2
     const fs = this._frame;
     const visible = this._skinnedVisibleScratch; visible.length = 0;

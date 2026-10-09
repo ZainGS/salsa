@@ -85,6 +85,10 @@ export interface Scene3DAnimationHost {
     isSkeletonPlayDriven?(skeletonId: string): boolean;
 }
 
+/** A Frame Link rest pose (captured post-keyframe on the first frame the link runs). `applied` (E10): the pose the
+ *  link last put the mesh in (x y z rx ry rz sx sy sz) — a save while the mesh still sits there writes the rest. */
+export interface FlaRestTransform { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number; applied?: number[] }
+
 export class Scene3DAnimation {
     private _animPlayer?: AnimationPlayer3D;
     /** skeletonId → { the authored pose captured before a clip first started playing, + the active player }.
@@ -111,7 +115,7 @@ export class Scene3DAnimation {
     private _legIdleModes = new Map<string, LegIdleMode>();
 
     private _frameLinkAnims = new Map<string, FrameLinkAnimation3D>();
-    private _flaRest = new Map<string, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>();
+    private _flaRest = new Map<string, FlaRestTransform>();
 
     constructor(private readonly ctx: ManagerContext, private readonly host: Scene3DAnimationHost) {}
 
@@ -123,7 +127,7 @@ export class Scene3DAnimation {
     get legIdleModes(): Map<string, LegIdleMode> { return this._legIdleModes; }
     get idleBreaks(): Map<string, unknown> { return this._idleBreaks as unknown as Map<string, unknown>; }
     get squashStretch(): Map<string, unknown> { return this._squashStretch as unknown as Map<string, unknown>; }
-    get flaRestTransforms(): Map<string, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }> { return this._flaRest; }
+    get flaRestTransforms(): Map<string, FlaRestTransform> { return this._flaRest; }
 
     // ── Animation player ─────────────────────────────────────────────
 

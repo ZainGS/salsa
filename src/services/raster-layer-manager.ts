@@ -85,6 +85,13 @@ export type RasterLayer = {
   packageOwnerId?: string;
 };
 
+/** One layer of the composition list handed to the renderer (bottom → top). `animated`: the layer has cels (the
+ *  renderer's per-layer dither cache then keeps one entry per cel texture). */
+export interface RasterCompositionItem {
+  id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean;
+  ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation; animated?: boolean;
+}
+
 export class RasterLayerManager {
   private device: GPUDevice;
   private layers: RasterLayer[] = [];
@@ -98,11 +105,11 @@ export class RasterLayerManager {
    *  consumed. Undoing that entry turns the dither back on (with the pre-bake pixels); redoing it turns it off. */
   private _ditherBakeEntries = new WeakMap<object, DitherConfig>();
   // optional callback to notify renderer of composition list changes
-  private compositionCallback?: (list: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>) => void;
+  private compositionCallback?: (list: Array<RasterCompositionItem>) => void;
   // optional callback to notify renderer of split (BG/FG) composition list changes
   private compositionSplitCallback?: (
-    background: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>,
-    foreground: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>,
+    background: Array<RasterCompositionItem>,
+    foreground: Array<RasterCompositionItem>,
   ) => void;
   // optional callback when selected layer changes (so renderer can update paint target)
   private selectionCallback?: (layerTexture: GPUTexture | null, layerManager: RasterTextureManager | null) => void;
@@ -127,7 +134,7 @@ export class RasterLayerManager {
    *  allocation churn while scrubbing / exporting over blank cels). */
   private _spareCel: { tex: GPUTexture; seq: number } | null = null;
 
-  constructor(device: GPUDevice, width = 1024, height = 768, compositionCallback?: (list: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>) => void, selectionCallback?: (layerTexture: GPUTexture | null, layerManager: RasterTextureManager | null) => void) {
+  constructor(device: GPUDevice, width = 1024, height = 768, compositionCallback?: (list: Array<RasterCompositionItem>) => void, selectionCallback?: (layerTexture: GPUTexture | null, layerManager: RasterTextureManager | null) => void) {
     this.device = device;
     this.width = width;
     this.height = height;
@@ -568,7 +575,31 @@ export class RasterLayerManager {
     // stack-visibility inside the package composite.
     return this.layers
       .filter(l => ((l.type ?? 'layer') === 'layer' || l.type === 'reference') && !l.packageOwnerId)
-      .map(l => ({ id: l.id, texture: l.texture, visible: l.visible, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig, frameLinkAnimation: l.frameLinkAnimation }));
+      .map(l => ({ id: l.id, texture: l.texture, visible: l.visible, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig, frameLinkAnimation: l.frameLinkAnimation, animated: this.timeline.isLayerAnimated(l.id) }));
+  }
+
+  // E8 (perf 2026-10-09): the lists handed to the renderer's composition callbacks are REUSED (arrays + one object per
+  // slot, refilled in place) — they were rebuilt with filter + map on every timeline frame change. Only the renderer
+  // receives them; getTextureForComposition() / getTextureForCompositionSplit() still return fresh copies.
+  private readonly _compOut = { main: [] as RasterCompositionItem[], bg: [] as RasterCompositionItem[], fg: [] as RasterCompositionItem[] };
+  private readonly _compPool = { main: [] as RasterCompositionItem[], bg: [] as RasterCompositionItem[], fg: [] as RasterCompositionItem[] };
+
+  /** The drawable layers of this.layers[from, to) into the reused list `which`. */
+  private fillCompositionList(which: 'main' | 'bg' | 'fg', from: number, to: number): RasterCompositionItem[] {
+    const out = this._compOut[which], pool = this._compPool[which];
+    let n = 0;
+    for (let i = from; i < to; i++) {
+      const l = this.layers[i];
+      if (!(((l.type ?? 'layer') === 'layer' || l.type === 'reference') && !l.packageOwnerId)) continue;
+      let c = pool[n];
+      if (!c) c = pool[n] = { id: l.id };
+      c.id = l.id; c.texture = l.texture; c.visible = l.visible; c.blendMode = l.blendMode; c.opacity = l.opacity;
+      c.clipped = l.clipped; c.ditherConfig = l.ditherConfig; c.frameLinkAnimation = l.frameLinkAnimation;
+      c.animated = this.timeline.isLayerAnimated(l.id);
+      out[n++] = c;
+    }
+    out.length = n;
+    return out;
   }
 
   /**
@@ -589,7 +620,7 @@ export class RasterLayerManager {
     const mapLayer = (l: RasterLayer) => ({
       id: l.id, texture: l.texture, visible: l.visible, blendMode: l.blendMode,
       opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig,
-      frameLinkAnimation: l.frameLinkAnimation,
+      frameLinkAnimation: l.frameLinkAnimation, animated: this.timeline.isLayerAnimated(l.id),
     });
     const isDrawable = (l: RasterLayer) => ((l.type ?? 'layer') === 'layer' || l.type === 'reference') && !l.packageOwnerId;
     const background = this.layers.slice(0, dividerIdx).filter(isDrawable).map(mapLayer);
@@ -951,13 +982,16 @@ export class RasterLayerManager {
       // Structural/metadata change signal for the host Layers panel — fired regardless of whether
       // any raster texture actually re-composites, so vector-layer add/remove reaches the panel too.
       this.onLayerStructureChanged.emit();
-      if (this.has3DDivider() && this.compositionSplitCallback) {
-        const { background, foreground } = this.getTextureForCompositionSplit();
-        this.compositionSplitCallback(background, foreground);
+      const dividerIdx = this.compositionSplitCallback ? this.layers.findIndex(l => l.type === '3d-scene') : -1;
+      if (dividerIdx >= 0 && this.compositionSplitCallback) {
+        this.compositionSplitCallback(
+          this.fillCompositionList('bg', 0, dividerIdx),
+          this.fillCompositionList('fg', dividerIdx + 1, this.layers.length),
+        );
         return;
       }
       if (!this.compositionCallback) return;
-      this.compositionCallback(this.getTextureForComposition());
+      this.compositionCallback(this.fillCompositionList('main', 0, this.layers.length));
     });
   }
 

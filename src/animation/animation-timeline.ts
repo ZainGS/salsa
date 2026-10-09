@@ -265,7 +265,9 @@ export class AnimationTimeline {
   public play(): void {
     if (this.state.playbackState === 'playing') return;
     this.state.playbackState = 'playing';
-    this.lastFrameTime = performance.now();
+    this.lastFrameTime = -1;   // the clock anchors on the first rAF timestamp
+    this.framePhase = 0;
+    this.resetSpan();
     this.emit({ type: 'playback-state-changed' });
     this.tick();
   }
@@ -305,22 +307,144 @@ export class AnimationTimeline {
 
   private pingPongDirection: 1 | -1 = 1;
 
-  private tick = (): void => {
+  /**
+   * Playback clock (perf E1, 2026-10-09). Frames are counted from the rAF TIMESTAMP (the vsync time, not
+   * performance.now() at callback time) with a half-vsync tolerance:
+   *
+   *   phase += dt · fps / 1000;   advance while phase + ½·min(1, fps / displayHz) ≥ 1   (phase −= 1 per advance)
+   *
+   * The sum of dt telescopes, so timestamp jitter never accumulates; it only has to stay under half a vsync. A 60-fps
+   * timeline on a 60 Hz screen therefore advances exactly once per vsync (the old "elapsed >= frameDuration" test
+   * missed ~25 % of vsyncs on jitter and repeated a frame), 30 fps every second vsync, 24 fps alternates 2 / 3 vsyncs.
+   *
+   * Matched rates — display = m × fps within 0.5 % (60 / 59.94 / 60.05 Hz at 60 / 30 / 12 fps; 120 Hz at 60 / 30 / 24 /
+   * 12): the clock counts VSYNCS instead (round(dt / vsync) per callback, one frame per m). It locks to the display — a
+   * 60-fps timeline on a 59.94 Hz screen plays at 59.94 rather than skipping a frame every ~8 s — and the per-vsync
+   * increment is exact, so jitter can never flicker a frame at the threshold.
+   *
+   * Display rate: the vsync period is the median of the last 31 rAF deltas (robust to dropped frames) refined over a
+   * sliding window of the last 120 callbacks: (t_now − t_old) / vsyncs counted between them (≈ 0.1 % precise; the
+   * median alone is ~2 % noisy, too coarse for the 0.5 % match test). Matching needs a full window; adaptive-refresh
+   * changes re-converge within ~2 s. The phase is in FRAME units, so an fps change mid-play needs no rebase; a scrub /
+   * step simply continues from the new frame. A stall (> STALL_MS between callbacks: hidden tab, long task) advances
+   * one frame and restarts the phase instead of fast-forwarding. Several advances in one callback (fps above the
+   * display rate, a dropped vsync) emit ONE frame-changed.
+   */
+  private framePhase = 0;
+  private static readonly MEDIAN_SAMPLES = 31;
+  private static readonly SPAN_SAMPLES = 120;
+  private static readonly STALL_MS = 250;
+  private static readonly MATCH_TOLERANCE = 0.005;
+  private readonly rafDeltas = new Float64Array(AnimationTimeline.MEDIAN_SAMPLES);
+  private readonly rafDeltaScratch = new Float64Array(AnimationTimeline.MEDIAN_SAMPLES);
+  private rafDeltaCount = 0;
+  private rafDeltaNext = 0;
+  private medianPeriod = 1000 / 60;
+  // sliding window: timestamp + cumulative vsync count per callback
+  private readonly spanTimes = new Float64Array(AnimationTimeline.SPAN_SAMPLES);
+  private readonly spanVsyncs = new Float64Array(AnimationTimeline.SPAN_SAMPLES);
+  private spanCount = 0;
+  private spanNext = 0;
+  private spanCum = 0;
+  private displayHz = 60;
+  private displayHzPrecise = false;
+
+  /** Estimated display refresh rate used by the playback clock (Hz). */
+  public getDisplayHzEstimate(): number { return this.displayHz; }
+
+  private resetSpan(): void {
+    this.spanCount = 0;
+    this.spanNext = 0;
+    this.spanCum = 0;
+    this.displayHzPrecise = false;
+  }
+
+  /** Feed one rAF interval (ms) into the display-rate estimate; returns the vsyncs it spans (0 before an estimate). */
+  private noteRafDelta(now: number, dt: number): number {
+    if (!(dt > 2 && dt < 100)) {   // a duplicate callback / a stall is not a refresh interval
+      if (dt >= 100) this.resetSpan();
+      return 0;
+    }
+    const n = AnimationTimeline.MEDIAN_SAMPLES;
+    this.rafDeltas[this.rafDeltaNext] = dt;
+    this.rafDeltaNext = (this.rafDeltaNext + 1) % n;
+    if (this.rafDeltaCount < n) this.rafDeltaCount++;
+    if (this.rafDeltaCount < 5) return 0;
+    const s = this.rafDeltaScratch.subarray(0, this.rafDeltaCount);
+    s.set(this.rafDeltas.subarray(0, this.rafDeltaCount));
+    s.sort();
+    this.medianPeriod = s[this.rafDeltaCount >> 1];
+    const v = Math.max(1, Math.round(dt / this.medianPeriod));
+
+    const k = AnimationTimeline.SPAN_SAMPLES;
+    if (this.spanCount === 0) {   // the window starts at the previous callback
+      this.spanTimes[0] = now - dt;
+      this.spanVsyncs[0] = 0;
+      this.spanCount = 1;
+      this.spanNext = 1;
+      this.spanCum = 0;
+    }
+    this.spanCum += v;
+    const oldest = this.spanCount < k ? 0 : this.spanNext;   // the slot about to be overwritten = oldest when full
+    const tOld = this.spanTimes[oldest];
+    const cOld = this.spanVsyncs[oldest];
+    this.spanTimes[this.spanNext] = now;
+    this.spanVsyncs[this.spanNext] = this.spanCum;
+    this.spanNext = (this.spanNext + 1) % k;
+    if (this.spanCount < k) this.spanCount++;
+    const fine = this.spanCum > cOld ? (now - tOld) / (this.spanCum - cOld) : this.medianPeriod;
+    this.displayHzPrecise = this.spanCount >= k && Math.abs(fine - this.medianPeriod) < 0.1 * this.medianPeriod;
+    this.displayHz = Math.max(20, Math.min(360, 1000 / (this.displayHzPrecise ? fine : this.medianPeriod)));
+    return v;
+  }
+
+  private tick = (timestamp?: number): void => {
     if (this.state.playbackState !== 'playing') return;
 
-    const now = performance.now();
-    const frameDuration = 1000 / this.state.fps;
-    const elapsed = now - this.lastFrameTime;
-
-    if (elapsed >= frameDuration) {
-      this.lastFrameTime = now - (elapsed % frameDuration);
-      this.advanceFrame();
+    const now = typeof timestamp === 'number' ? timestamp : -1;
+    if (now >= 0) {
+      if (this.lastFrameTime < 0) {
+        this.lastFrameTime = now;   // anchor: the first frame stays on screen for one frame duration from here
+      } else {
+        const dt = now - this.lastFrameTime;
+        this.lastFrameTime = now;
+        if (dt > 0) {
+          const vsyncs = this.noteRafDelta(now, dt);
+          const fps = this.state.fps;
+          let steps = 0;
+          if (dt > AnimationTimeline.STALL_MS) {
+            steps = 1;
+            this.framePhase = 0;
+          } else {
+            // (before the Hz estimate has samples, the interval just measured stands in for it)
+            const hz = this.rafDeltaCount >= 5 ? this.displayHz : 1000 / dt;
+            const ratio = hz / fps;
+            const m = Math.round(ratio);
+            let tol: number;
+            if (this.displayHzPrecise && vsyncs > 0 && m >= 1
+              && Math.abs(ratio - m) < AnimationTimeline.MATCH_TOLERANCE * m) {
+              this.framePhase += vsyncs / m;   // matched: one frame per m vsyncs, exactly
+              tol = 0.5 / m;
+            } else {
+              this.framePhase += dt * fps / 1000;
+              tol = 0.5 * Math.min(1, fps / hz);
+            }
+            while (this.framePhase + tol >= 1) {
+              this.framePhase -= 1;
+              steps++;
+            }
+          }
+          if (steps > 0) this.advanceFrames(steps);
+          if (this.state.playbackState !== 'playing') return;   // 'none' reached the end
+        }
+      }
     }
 
     this.playbackRafId = requestAnimationFrame(this.tick);
   };
 
-  private advanceFrame(): void {
+  /** Advance `steps` frames (loop / ping-pong / none rules) and emit one frame-changed for the result. */
+  private advanceFrames(steps: number): void {
     const { playRangeStart: rs, playRangeEnd: re, loopMode } = this.state;
 
     // Single-frame range — nothing to advance to
@@ -329,31 +453,36 @@ export class AnimationTimeline {
     }
 
     let next = this.state.currentFrame;
+    let reachedEnd = false;
 
-    if (loopMode === 'ping-pong') {
-      next += this.pingPongDirection;
-      if (next > re) {
-        this.pingPongDirection = -1;
-        next = re - 1;
-      } else if (next < rs) {
-        this.pingPongDirection = 1;
-        next = rs + 1;
-      }
-      next = Math.max(rs, Math.min(re, next));
-    } else {
-      next += 1;
-      if (next > re) {
-        if (loopMode === 'loop') {
-          next = rs;
-        } else {
-          // 'none' — stop at end
-          this.pause();
-          return;
+    for (let i = 0; i < steps; i++) {
+      if (loopMode === 'ping-pong') {
+        next += this.pingPongDirection;
+        if (next > re) {
+          this.pingPongDirection = -1;
+          next = re - 1;
+        } else if (next < rs) {
+          this.pingPongDirection = 1;
+          next = rs + 1;
+        }
+        next = Math.max(rs, Math.min(re, next));
+      } else {
+        next += 1;
+        if (next > re) {
+          if (loopMode === 'loop') {
+            next = rs;
+          } else {
+            // 'none' — stop at end
+            next = re;
+            reachedEnd = true;
+            break;
+          }
         }
       }
     }
 
     this.setCurrentFrame(next);
+    if (reachedEnd) this.pause();
   }
 
   // ── Layer animation state ─────────────────────────────────────────

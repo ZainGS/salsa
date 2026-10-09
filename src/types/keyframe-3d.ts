@@ -219,6 +219,35 @@ export function sampleTrack<T>(
   return sorted[sorted.length - 1].value;
 }
 
+/**
+ * sampleTrack for a vec3 track (component-wise lerp, i.e. interpolateVec3) written INTO `out` — no result array per
+ * sample (E8: the timeline keyframe pass sampled position / rotation / scale of every animated mesh every frame, each
+ * a fresh [x, y, z]). Returns false (out untouched) for an empty / missing track. Same key selection as sampleTrack.
+ */
+export function sampleVec3TrackInto(track: readonly Keyframe<Vec3Value>[] | undefined, frame: number, out: Vec3Value): boolean {
+  if (!track || track.length === 0) return false;
+  let inOrder = true;
+  for (let i = 1; i < track.length; i++) { if (!(track[i - 1].frame <= track[i].frame)) { inOrder = false; break; } }
+  const sorted = inOrder ? track : track.slice().sort((a, b) => a.frame - b.frame);
+  const last = sorted[sorted.length - 1];
+  let v: Vec3Value = last.value;
+  if (frame <= sorted[0].frame) v = sorted[0].value;
+  else if (!(frame >= last.frame)) {
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const k0 = sorted[i], k1 = sorted[i + 1];
+      if (frame >= k0.frame && frame <= k1.frame) {
+        if (k0.easing === 'step') { v = k0.value; break; }
+        const et = applyEasing((frame - k0.frame) / (k1.frame - k0.frame), k0.easing);
+        const a = k0.value, b = k1.value;
+        out[0] = lerp(a[0], b[0], et); out[1] = lerp(a[1], b[1], et); out[2] = lerp(a[2], b[2], et);
+        return true;
+      }
+    }
+  }
+  out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
+  return true;
+}
+
 /** Upsert a keyframe into a track array (replace if frame already exists). */
 export function setKeyframe<T>(track: Keyframe<T>[], frame: number, value: T, easing: KeyframeEasing = 'linear'): void {
   const idx = track.findIndex(k => k.frame === frame);
@@ -290,13 +319,14 @@ export const DEFAULT_FRAME_LINK_ANIMATION_3D: FrameLinkAnimation3D = {
 export function evalFrameLink3D(
   anim: FrameLinkAnimation3D,
   frame: number,
-): { pos: Vec3Value; rot: Vec3Value; scale: Vec3Value; uvOffset: [number, number]; wind: Vec3Value } {
-  const pos: Vec3Value   = [0, 0, 0];
-  const rot: Vec3Value   = [0, 0, 0];
-  const scale: Vec3Value = [0, 0, 0];
-  const uvOffset: [number, number] = [0, 0];
-  const wind: Vec3Value  = [0, 0, 0];
-  if (!anim.enabled) return { pos, rot, scale, uvOffset, wind };
+  out?: FrameLinkEval3D,
+): FrameLinkEval3D {
+  // `out` (E8): a caller-owned result, zeroed and refilled — the per-frame keyframe pass reuses one (no 5 arrays + a
+  // result object per animated mesh per frame). Omitted → a fresh result (the old behaviour).
+  const r = out ?? createFrameLinkEval3D();
+  if (out) { r.pos.fill(0); r.rot.fill(0); r.scale.fill(0); r.uvOffset.fill(0); r.wind.fill(0); }
+  const { pos, rot, scale, uvOffset, wind } = r;
+  if (!anim.enabled) return r;
 
   const axisIdx = anim.axis === 'x' ? 0 : anim.axis === 'y' ? 1 : 2;
   const t = frame / Math.max(1, anim.framesPerCycle);
@@ -320,10 +350,9 @@ export function evalFrameLink3D(
     }
     case 'shake': {
       // Deterministic per-frame jitter using a simple hash
-      const h = (n: number) => ((Math.sin(n * 127.1 + frame * 311.7) * 43758.5453) % 1 + 1) % 1;
-      pos[0] = (h(0) * 2 - 1) * anim.amplitude;
-      pos[1] = (h(1) * 2 - 1) * anim.amplitude;
-      pos[2] = (h(2) * 2 - 1) * anim.amplitude;
+      pos[0] = (shakeHash(0, frame) * 2 - 1) * anim.amplitude;
+      pos[1] = (shakeHash(1, frame) * 2 - 1) * anim.amplitude;
+      pos[2] = (shakeHash(2, frame) * 2 - 1) * anim.amplitude;
       break;
     }
     case 'scroll': {
@@ -344,7 +373,18 @@ export function evalFrameLink3D(
       break;
     }
   }
-  return { pos, rot, scale, uvOffset, wind };
+  return r;
+}
+
+/** evalFrameLink3D's result: deltas to add on top of the keyframed values. */
+export interface FrameLinkEval3D { pos: Vec3Value; rot: Vec3Value; scale: Vec3Value; uvOffset: [number, number]; wind: Vec3Value }
+/** A zeroed FrameLinkEval3D (for evalFrameLink3D's `out`). */
+export function createFrameLinkEval3D(): FrameLinkEval3D {
+  return { pos: [0, 0, 0], rot: [0, 0, 0], scale: [0, 0, 0], uvOffset: [0, 0], wind: [0, 0, 0] };
+}
+/** 'shake': deterministic per-frame jitter in [0, 1) for component `n` (a simple sine hash). */
+function shakeHash(n: number, frame: number): number {
+  return ((Math.sin(n * 127.1 + frame * 311.7) * 43758.5453) % 1 + 1) % 1;
 }
 
 // ── Structured keyframe cloning ──────────────────────────────────────────────

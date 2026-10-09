@@ -112,6 +112,7 @@ import {
   cloneKeyframeTracks, hasAnyKeyframes, EMPTY_TRACK,
   interpolateVec3, interpolateVec4, interpolateScalar, interpolateEulerSlerp,
   FrameLinkAnimation3D, DEFAULT_FRAME_LINK_ANIMATION_3D, evalFrameLink3D,
+  sampleVec3TrackInto, createFrameLinkEval3D, type Vec3Value,
 } from '../../types/keyframe-3d';
 import { AnimationPlayer3D, AnimationPlayer3DConfig } from '../../renderer/3d/animation-player-3d';
 import { UndoManager3D } from './undo-manager-3d';
@@ -194,7 +195,7 @@ import { Scene3DImport } from './scene3d-import';
 import { Scene3DArrayBake } from './scene3d-array-bake';
 import { Scene3DWeightPaint } from './scene3d-weight-paint';
 import { Scene3DKitbash } from './scene3d-kitbash';
-import { Scene3DAnimation, IDLE_JOINTS, type LegIdleMode as _LegIdleMode } from './scene3d-animation';
+import { Scene3DAnimation, IDLE_JOINTS, type LegIdleMode as _LegIdleMode, type FlaRestTransform } from './scene3d-animation';
 import type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta } from '../../types/kitbash-3d';
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import { Scene3DGreasePencil } from './scene3d-grease-pencil';
@@ -407,6 +408,18 @@ function cloneMaterial3D(m: Material3D): Material3D {
 
 function cloneSubmesh3D(s: Submesh3D): Submesh3D {
     return { ...s, material: cloneMaterial3D(s.material) };
+}
+
+/** The `visible` track's interpolator: hold the earlier key (hoisted — no closure per sample). */
+const stepFirst = <T,>(a: T): T => a;
+
+/** E4: re-version the matrices of every descendant of a moved node (their world matrix rides the parent chain, but
+ *  their own matrix version — what the renderer's transforms fast path checks — would not move). */
+function bumpDescendantMatrices(n: { children: unknown[] }): void {
+    for (const c of n.children as Array<{ children: unknown[]; updateLocalMatrix?: () => void }>) {
+        c.updateLocalMatrix?.();
+        if (c.children.length) bumpDescendantMatrices(c);
+    }
 }
 
 /** PLAY CHARACTER OUTLINES on a settings restore (visual-polish item 10). The key is always saved since it existed, so:
@@ -10279,19 +10292,25 @@ export class Scene3DManager {
         // Runs on EVERY timeline frame (playback) — only meshes with something to apply: a keyframe track or a Frame
         // Link. Camera nodes always run (with no FOV track they drop a stale evaluated FOV).
         const fla = this._animation.frameLinkAnims;
-        let animated = false;
-        for (const mesh of this.getAllMeshes()) {
+        let animated = false, repack = false;
+        const meshes = this.getAllMeshes();
+        for (let i = 0; i < meshes.length; i++) {
+            const mesh = meshes[i];
             const has = hasAnyKeyframes(mesh.keyframeTracks) || fla.has(mesh.id);
             if (!has && !mesh.isCamera) continue;
-            this.applyMeshKeyframesAtFrame(mesh.id, frame);
+            if (this.applyMeshKeyframesAtFrame(mesh.id, frame)) repack = true;
             if (has) animated = true;
         }
         this.applyCameraKeyframesAtFrame(frame);
-        // Mesh transforms changed — tell the renderer to re-upload instance matrices.
-        // Without this, _instancesDirty stays false and uploadMeshInstances returns early,
-        // leaving the GPU with stale model/normal matrices. (Not when nothing is keyframed: a full re-upload per frame
-        // for nothing.)
-        if (animated || this._previewThroughCameras || hasAnyKeyframes(this._cameraKeyframeTracks)) this.renderer3D.markInstancesDirty();
+        // Tell the renderer to re-upload instance data (without it uploadMeshInstances returns early → stale matrices).
+        // E4 (playback perf 2026-10-09): a frame that only MOVED meshes (Frame Link bounce / sway / spin / pulse /
+        // shake, position / rotation / scale tracks) takes the transforms fast path — only the moved slots' matrices
+        // are rewritten (version-checked), no full repack / generation bump / draw re-rank, and the shadow map is NOT
+        // marked stale: the static shadow cache demotes a moving caster to its dynamic layer by itself (matrix
+        // version), so the static casters are not re-rendered every frame. Colour / opacity / visibility /
+        // blend-shape tracks still take the full path. (Not when nothing is keyframed: no per-frame work for nothing.)
+        if (repack) this.renderer3D.markInstancesDirty();
+        else if (animated || this._previewThroughCameras || hasAnyKeyframes(this._cameraKeyframeTracks)) this.renderer3D.markTransformsDirty();
         // Cinematic preview: the camera nodes have just been moved to their frame pose above — now point the render
         // camera through whichever one is active at this frame (runs AFTER, so it overrides the legacy camera track).
         if (this._previewThroughCameras) this._applyCameraPreviewAt(frame);
@@ -10308,18 +10327,34 @@ export class Scene3DManager {
         if (fov !== null) cam.fov = fov * Math.PI / 180;
     }
 
-    applyMeshKeyframesAtFrame(meshId: string, frame: number): void {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return;
-        const tracks = mesh.keyframeTracks;
+    /** E8 scratch for the per-frame keyframe pass (sampled vec3 tracks + the Frame Link deltas). */
+    private readonly _kfPos: Vec3Value = [0, 0, 0];
+    private readonly _kfRot: Vec3Value = [0, 0, 0];
+    private readonly _kfScale: Vec3Value = [0, 0, 0];
+    private readonly _kfFla = createFrameLinkEval3D();
 
-        const pos = sampleTrack(tracks.position ?? EMPTY_TRACK, frame, interpolateVec3);
-        if (pos) { mesh.x = pos[0]; mesh.y = pos[1]; mesh.z = pos[2]; }
+    /** Apply `meshId`'s keyframe tracks + Frame Link at `frame`. Returns true when something besides the transform
+     *  changed (colour / opacity / visibility / blend weights) — the caller then needs the full instance repack; a
+     *  transform-only change is covered by the transforms fast path (E4). */
+    applyMeshKeyframesAtFrame(meshId: string, frame: number): boolean {
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return false;
+        const tracks = mesh.keyframeTracks;
+        let repack = false;
+
+        // The transform is gathered into locals and assigned ONCE at the end (setTransform3D: one matrix rebuild, no
+        // version bump when unchanged) — it was 9 separate setters, each rebuilding the local matrix (E4).
+        const kp = this._kfPos, kr = this._kfRot, ks = this._kfScale;
+        const hasPos = sampleVec3TrackInto(tracks.position, frame, kp);
 
         // Camera nodes slerp their rotation so pans arc smoothly (euler-lerp wobbles on big turns); everything
         // else keeps the cheaper component-wise lerp (unchanged behaviour for characters/props).
-        const rot = sampleTrack(tracks.rotation ?? EMPTY_TRACK, frame, mesh.isCamera ? interpolateEulerSlerp : interpolateVec3);
-        if (rot) { mesh.rotationX = rot[0]; mesh.rotationY = rot[1]; mesh.rotation = rot[2]; }
+        let hasRot: boolean;
+        if (mesh.isCamera) {
+            const rot = sampleTrack(tracks.rotation ?? EMPTY_TRACK, frame, interpolateEulerSlerp);
+            hasRot = rot !== null;
+            if (rot) { kr[0] = rot[0]; kr[1] = rot[1]; kr[2] = rot[2]; }
+        } else hasRot = sampleVec3TrackInto(tracks.rotation, frame, kr);
 
         // Camera nodes: sample the optional FOV track (radians) into a transient map read by the preview driver for
         // an in-shot zoom. Not persisted here — the KEYFRAMES persist on the mesh; this is just the evaluated value.
@@ -10329,22 +10364,29 @@ export class Scene3DManager {
             else this._animatedCamFov.delete(mesh.id);
         }
 
-        const scale = sampleTrack(tracks.scale ?? EMPTY_TRACK, frame, interpolateVec3);
-        if (scale) { mesh.scaleX = scale[0]; mesh.scaleY = scale[1]; mesh.scaleZ = scale[2]; }
+        const hasScale = sampleVec3TrackInto(tracks.scale, frame, ks);
 
-        const color = sampleTrack(tracks.diffuseColor ?? EMPTY_TRACK, frame, interpolateVec4);
-        if (color) mesh.setDiffuseColor(color[0], color[1], color[2], color[3]);
+        if (tracks.diffuseColor && tracks.diffuseColor.length) {
+            const color = sampleTrack(tracks.diffuseColor, frame, interpolateVec4);
+            if (color) { mesh.setDiffuseColor(color[0], color[1], color[2], color[3]); repack = true; }
+        }
 
-        const opacity = sampleTrack(tracks.opacity ?? EMPTY_TRACK, frame, interpolateScalar);
-        if (opacity !== null) mesh.setOpacity(opacity);
+        if (tracks.opacity && tracks.opacity.length) {
+            const opacity = sampleTrack(tracks.opacity, frame, interpolateScalar);
+            if (opacity !== null) { mesh.setOpacity(opacity); repack = true; }
+        }
 
-        const vis = sampleTrack(tracks.visible ?? EMPTY_TRACK, frame, (a, _b, _t) => a);
-        if (vis !== null) mesh.visible = vis;
+        if (tracks.visible && tracks.visible.length) {
+            const vis = sampleTrack(tracks.visible, frame, stepFirst);
+            if (vis !== null) { mesh.visible = vis; repack = true; }
+        }
 
         // Blend shape weight tracks
         if (tracks.blendWeights) {
-            for (const [shapeName, track] of Object.entries(tracks.blendWeights)) {
-                const w = sampleTrack(track, frame, interpolateScalar);
+            let anyShape = false;
+            for (const shapeName in tracks.blendWeights) {
+                anyShape = true;
+                const w = sampleTrack(tracks.blendWeights[shapeName], frame, interpolateScalar);
                 if (w !== null) {
                     const idx = mesh.blendShapes.findIndex(s => s.name === shapeName);
                     if (idx >= 0) {
@@ -10353,46 +10395,83 @@ export class Scene3DManager {
                     }
                 }
             }
-            if (tracks.blendWeights && Object.keys(tracks.blendWeights).length > 0) {
+            if (anyShape) {
                 // Phase 1.5: only the changed shapes, uploaded in place (skinned parts too — they used to miss
                 // keyframed weights entirely, nothing set skinDirty here).
                 if (Mesh3D.blendFastPath) this._blendShapes.sync(mesh);
                 else mesh.evaluateBlendShapes();
+                repack = true;
             }
         }
+
+        // The keyframed transform (components without a track keep the mesh's current value).
+        let x = hasPos ? kp[0] : mesh.x, y = hasPos ? kp[1] : mesh.y, z = hasPos ? kp[2] : mesh.z;
+        let rx = hasRot ? kr[0] : mesh.rotationX, ry = hasRot ? kr[1] : mesh.rotationY, rz = hasRot ? kr[2] : mesh.rotation;
+        let sx = hasScale ? ks[0] : mesh.scaleX, sy = hasScale ? ks[1] : mesh.scaleY, sz = hasScale ? ks[2] : mesh.scaleZ;
 
         // Apply frame-link animation delta on top of keyframed values
         // (scroll type is driven by _ensureScrollCb pre-render callback instead)
         const fla = this._animation.frameLinkAnims.get(meshId);
+        let rest: FlaRestTransform | undefined;
         if (fla?.enabled && fla.type !== 'scroll') {
-            const { pos: dp, rot: dr, scale: ds } = evalFrameLink3D(fla, frame);
+            const { pos: dp, rot: dr, scale: ds } = evalFrameLink3D(fla, frame, this._kfFla);
             if (fla.type === 'spin') {
                 // Spin accumulates intentionally — constant angular velocity via +=
-                mesh.rotationX += dr[0]; mesh.rotationY += dr[1]; mesh.rotation += dr[2];
+                rx += dr[0]; ry += dr[1]; rz += dr[2];
             } else {
                 // Oscillating types: anchor to a rest pose so drift is structurally impossible.
                 // Capture rest on the first frame this FLA runs (post-keyframe, pre-delta).
                 // If a keyframe was applied this frame, use it as the base instead of rest.
                 const flaRest = this._animation.flaRestTransforms;
-                if (!flaRest.has(meshId)) {
-                    flaRest.set(meshId, {
-                        x: mesh.x, y: mesh.y, z: mesh.z,
-                        rx: mesh.rotationX, ry: mesh.rotationY, rz: mesh.rotation,
-                        sx: mesh.scaleX, sy: mesh.scaleY, sz: mesh.scaleZ,
-                    });
+                rest = flaRest.get(meshId);
+                if (!rest) {
+                    rest = { x, y, z, rx, ry, rz, sx, sy, sz };
+                    flaRest.set(meshId, rest);
                 }
-                const rest = flaRest.get(meshId)!;
-                mesh.x  = (pos   ? pos[0]   : rest.x)  + dp[0];
-                mesh.y  = (pos   ? pos[1]   : rest.y)  + dp[1];
-                mesh.z  = (pos   ? pos[2]   : rest.z)  + dp[2];
-                mesh.rotationX = (rot ? rot[0] : rest.rx) + dr[0];
-                mesh.rotationY = (rot ? rot[1] : rest.ry) + dr[1];
-                mesh.rotation  = (rot ? rot[2] : rest.rz) + dr[2];
-                mesh.scaleX = (scale ? scale[0] : rest.sx) + ds[0];
-                mesh.scaleY = (scale ? scale[1] : rest.sy) + ds[1];
-                mesh.scaleZ = (scale ? scale[2] : rest.sz) + ds[2];
+                x = (hasPos ? x : rest.x) + dp[0];
+                y = (hasPos ? y : rest.y) + dp[1];
+                z = (hasPos ? z : rest.z) + dp[2];
+                rx = (hasRot ? rx : rest.rx) + dr[0];
+                ry = (hasRot ? ry : rest.ry) + dr[1];
+                rz = (hasRot ? rz : rest.rz) + dr[2];
+                sx = (hasScale ? sx : rest.sx) + ds[0];
+                sy = (hasScale ? sy : rest.sy) + ds[1];
+                sz = (hasScale ? sz : rest.sz) + ds[2];
             }
         }
+        const moved = mesh.x !== x || mesh.y !== y || mesh.z !== z || mesh.rotationX !== rx || mesh.rotationY !== ry || mesh.rotation !== rz
+            || mesh.scaleX !== sx || mesh.scaleY !== sy || mesh.scaleZ !== sz;
+        if (moved) {
+            mesh.setTransform3D(x, y, z, rx, ry, rz, sx, sy, sz);
+            // Descendant meshes (attached decals, parented props) ride this mesh's matrix: bump their matrix versions
+            // so the version-checked transforms fast path rewrites them too (the full repack used to cover them).
+            if (mesh.children.length) bumpDescendantMatrices(mesh);
+        }
+        // E10: remember the pose the Frame Link put the mesh in — a save while the mesh still sits in exactly this
+        // pose writes the REST transform instead (frameLinkRestForSave), so a mid-animation save can't bake the
+        // displacement into the document (it was re-captured as the new rest on reload → a permanent offset).
+        if (rest) {
+            const a = rest.applied ?? (rest.applied = [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            a[0] = mesh.x; a[1] = mesh.y; a[2] = mesh.z; a[3] = mesh.rotationX; a[4] = mesh.rotationY; a[5] = mesh.rotation;
+            a[6] = mesh.scaleX; a[7] = mesh.scaleY; a[8] = mesh.scaleZ;
+        }
+        return repack;
+    }
+
+    /**
+     * E10: the transform a document save should write for `mesh` — its Frame Link REST pose while the mesh still sits
+     * in the pose the Frame Link last put it in (mid-animation), else null (save the live transform: no Frame Link
+     * rest, or the mesh was moved since — that move is the user's and wins). Spin has no rest (it accumulates).
+     */
+    frameLinkRestForSave(mesh: Mesh3D): { x: number; y: number; z: number; rotationX: number; rotationY: number; rotation: number; scaleX: number; scaleY: number; scaleZ: number } | null {
+        const rest = this._animation.flaRestTransforms.get(mesh.id);
+        const a = rest?.applied;
+        if (!rest || !a) return null;
+        const fla = this._animation.frameLinkAnims.get(mesh.id);
+        if (!fla?.enabled || fla.type === 'spin' || fla.type === 'scroll') return null;
+        if (a[0] !== mesh.x || a[1] !== mesh.y || a[2] !== mesh.z || a[3] !== mesh.rotationX || a[4] !== mesh.rotationY || a[5] !== mesh.rotation
+            || a[6] !== mesh.scaleX || a[7] !== mesh.scaleY || a[8] !== mesh.scaleZ) return null;
+        return { x: rest.x, y: rest.y, z: rest.z, rotationX: rest.rx, rotationY: rest.ry, rotation: rest.rz, scaleX: rest.sx, scaleY: rest.sy, scaleZ: rest.sz };
     }
 
     // ── Frame Link Animation 3D — extracted (scene3d-animation.ts Slice B); delegate. ──

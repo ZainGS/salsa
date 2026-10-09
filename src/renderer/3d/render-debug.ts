@@ -107,6 +107,9 @@ export type RenderDebugFlags = {
   /** Every 3D pass that LOADS colour clears it instead. Breaks the picture (an overlay pass wipes the scene); the point
    *  is only to see whether the garbage goes away. */
   clearColorLoads: boolean;
+  /** 2D raster layers: composite every layer from scratch every frame (BRUSH-5 incremental compositing OFF — the
+   *  pre-2026-10-09 default). The kill switch for a stale-layer / stale-cel symptom on a device. */
+  noRasterDirtyCompositing: boolean;
 };
 
 export type RenderDebugKey = keyof RenderDebugFlags;
@@ -148,6 +151,7 @@ export const RENDER_DEBUG_FLAGS: ReadonlyArray<{ key: RenderDebugKey; label: str
   { key: 'inlineOverlays', label: 'Overlays in the main pass' },
   { key: 'directToSwapchain', label: 'Draw straight to the canvas' },
   { key: 'noDirectPresent', label: 'Present via offscreen copy (old path)' },
+  { key: 'noRasterDirtyCompositing', label: '2D layers: full composite every frame' },
   { key: 'clearDepthStencilLoads', label: 'Clear depth/stencil loads' },
   { key: 'clearColorLoads', label: 'Clear colour loads (breaks picture)' },
 ];

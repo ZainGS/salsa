@@ -43,10 +43,23 @@ export function packFxaaParams(out: Float32Array, w: number, h: number, quality:
   return out;
 }
 
+/** E6: the pixel rect an FXAA pass covers (x0, y0, x1, y1), or null for the whole frame. */
+export type FxaaRect = readonly [number, number, number, number] | null;
+
+/** E6: the FXAA rect (clamped to the w×h frame; null = the whole frame) → params[8..11]. Pure (tested). */
+export function packFxaaRect(out: Float32Array, w: number, h: number, rect: FxaaRect | undefined): Float32Array {
+  if (!rect) { out[8] = 0; out[9] = 0; out[10] = w; out[11] = h; return out; }
+  out[8] = Math.max(0, Math.min(w, rect[0])); out[9] = Math.max(0, Math.min(h, rect[1]));
+  out[10] = Math.max(out[8], Math.min(w, rect[2])); out[11] = Math.max(out[9], Math.min(h, rect[3]));
+  return out;
+}
+
 export const FXAA_FS = /* wgsl */`
 @group(0) @binding(0) var src:  texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
-struct FxaaParams { a: vec4f, b: vec4f };   // a = (1/w, 1/h, search steps, sub-pixel) · b = (threshold, threshold min, 0, 0)
+// a = (1/w, 1/h, search steps, sub-pixel) · b = (threshold, threshold min, 0, 0) · c = the pixel rect FXAA covers
+// (x0, y0, x1, y1; E6): outside it the source passes through untouched (2D art next to the 3D keeps its exact pixels).
+struct FxaaParams { a: vec4f, b: vec4f, c: vec4f };
 @group(0) @binding(2) var<uniform> P: FxaaParams;
 
 fn fx_luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
@@ -60,9 +73,10 @@ fn fx_step(i: i32) -> f32 {
   return 8.0;
 }
 
-@fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+@fragment fn fs_main(@builtin(position) fc: vec4f, @location(0) uv: vec2f) -> @location(0) vec4f {
   let rc = P.a.xy;
   let cM = textureSampleLevel(src, samp, uv, 0.0);
+  if (fc.x < P.c.x || fc.y < P.c.y || fc.x >= P.c.z || fc.y >= P.c.w) { return cM; }
   let lM = fx_luma(cM.rgb);
   let lN = fx_l(uv + vec2f(0.0, -rc.y));
   let lS = fx_l(uv + vec2f(0.0, rc.y));
@@ -148,11 +162,13 @@ export class FxaaPass {
   private readonly _bgl: GPUBindGroupLayout;
   private readonly _sampler: GPUSampler;
   private readonly _buf: GPUBuffer;
-  private readonly _params = new Float32Array(8);
+  private readonly _params = new Float32Array(12);
   private _out: GPUTexture | null = null;
   private _bg: GPUBindGroup | null = null;
   private _bgSrc: GPUTexture | null = null;
-  private _key = '';
+  private _keyW = -1;   // the params last uploaded: frame size + quality (+ the rect in _params[8..11])
+  private _keyH = -1;
+  private _keyQ: AntiAliasingQuality | '' = '';
 
   constructor(private readonly device: GPUDevice, private readonly format: GPUTextureFormat) {
     this._bgl = device.createBindGroupLayout({ label: 'FXAABGL', entries: [
@@ -161,7 +177,7 @@ export class FxaaPass {
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
     ] });
     this._sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
-    this._buf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'FXAAParams' });
+    this._buf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'FXAAParams' });
     this._pipeline = GPUPipelineCache.for(device).render({
       label: 'FXAA',
       layout: device.createPipelineLayout({ bindGroupLayouts: [this._bgl] }),
@@ -173,31 +189,38 @@ export class FxaaPass {
   }
 
   /** Returns the anti-aliased output — or `src` UNCHANGED while the FXAA pipeline is still compiling (P2). */
-  run(encoder: GPUCommandEncoder, src: GPUTexture, w: number, h: number, quality: AntiAliasingQuality): GPUTexture {
+  run(encoder: GPUCommandEncoder, src: GPUTexture, w: number, h: number, quality: AntiAliasingQuality, rect: FxaaRect = null): GPUTexture {
     const pipeline = this._pipeline.get();
     if (!pipeline) return src;
     if (!this._out || this._out.width !== w || this._out.height !== h) {
       this._out?.destroy();
       this._out = this.device.createTexture({ size: [w, h], format: this.format, label: 'FXAAOut',
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
-      this._key = '';
+      this._keyW = -1;
     }
-    this._draw(encoder, pipeline, src, w, h, quality, this._out.createView());
+    this._draw(encoder, pipeline, src, w, h, quality, this._out.createView(), rect);
     return this._out;
   }
 
   /** The LAST pass of the frame (perf audit C2): FXAA straight into `target` (the canvas texture view, this pass's
    *  format, w×h) — no FXAAOut + copy. False (nothing drawn) while the pipeline is still compiling (P2). */
-  runInto(encoder: GPUCommandEncoder, src: GPUTexture, w: number, h: number, quality: AntiAliasingQuality, target: GPUTextureView): boolean {
+  runInto(encoder: GPUCommandEncoder, src: GPUTexture, w: number, h: number, quality: AntiAliasingQuality, target: GPUTextureView, rect: FxaaRect = null): boolean {
     const pipeline = this._pipeline.get();
     if (!pipeline) return false;
-    this._draw(encoder, pipeline, src, w, h, quality, target);
+    this._draw(encoder, pipeline, src, w, h, quality, target, rect);
     return true;
   }
 
-  private _draw(encoder: GPUCommandEncoder, pipeline: GPURenderPipeline, src: GPUTexture, w: number, h: number, quality: AntiAliasingQuality, view: GPUTextureView): void {
-    const key = `${w}x${h}:${quality}`;
-    if (key !== this._key) { this.device.queue.writeBuffer(this._buf, 0, packFxaaParams(this._params, w, h, quality)); this._key = key; }
+  private _draw(encoder: GPUCommandEncoder, pipeline: GPURenderPipeline, src: GPUTexture, w: number, h: number, quality: AntiAliasingQuality, view: GPUTextureView, rect: FxaaRect): void {
+    // Re-upload the params only when the size / quality / rect changed (no per-frame key string either).
+    const p = this._params;
+    const r0 = p[8], r1 = p[9], r2 = p[10], r3 = p[11];
+    packFxaaRect(p, w, h, rect);
+    if (this._keyW !== w || this._keyH !== h || this._keyQ !== quality || p[8] !== r0 || p[9] !== r1 || p[10] !== r2 || p[11] !== r3) {
+      packFxaaParams(p, w, h, quality);
+      this.device.queue.writeBuffer(this._buf, 0, p);
+      this._keyW = w; this._keyH = h; this._keyQ = quality;
+    }
     if (!this._bg || this._bgSrc !== src) {
       this._bg = this.device.createBindGroup({ layout: this._bgl, entries: [
         { binding: 0, resource: src.createView() }, { binding: 1, resource: this._sampler }, { binding: 2, resource: { buffer: this._buf } },

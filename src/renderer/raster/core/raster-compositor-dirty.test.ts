@@ -457,7 +457,7 @@ describe('no work when idle, bounded work per stroke frame', () => {
       expect(d.dispatches - s0.dispatches).toBe(4);
       expect(d.copyTexels - s0.copyTexels).toBe(5 * area);
       expect(d.dispatchTexels - s0.dispatchTexels).toBe(4 * area);
-      expect(d.submits - s0.submits).toBe(5);
+      expect(d.submits - s0.submits).toBe(1);                          // E9: one encoder, one submit per composite
       worst = Math.max(worst, d.bytes - s0.bytes);
     }
     expect(worst).toBeLessThan(fullBytes * 0.03);

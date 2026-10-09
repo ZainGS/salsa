@@ -15,6 +15,13 @@
  *   Clipping masks (clip to alpha of layer below)
  *   Visibility toggle (skip invisible layers)
  *   Global canvas grain overlay (paper texture applied to final output)
+ *
+ * ONE command encoder per composite (perf E9, 2026-10-09): every copy / blend / opacity / grain / global-dither pass
+ * of a composite() / compositeIncremental() / applyGrainOverlay() call is recorded into one batch encoder and
+ * submitted once at the end (was one submit per step: ~8–9 per render). Uniforms are written with queue.writeBuffer,
+ * which lands before the batch's submit, so a uniform buffer is written at most once per batch (claimUniform submits
+ * the batch early in the rare case one would be rewritten — the same layer texture listed twice). The per-layer
+ * dither cache and the error-diffusion read-back keep their own submits (they run before / outside the batch).
  */
 
 import { CanvasGrainManager } from '../canvas-grain';
@@ -33,11 +40,31 @@ export type IncrementalCompositeResult = 'skip' | 'rect' | 'full';
 interface IncrementalSlot {
   /** This target's position in the dirty-rect log. */
   cursor: RasterDirtyCursor;
-  /** Signature of the inputs the persistent output was last composited from by the REGION passes; null = the
-   *  output is not one of those (never composited / composited by the legacy path / post-processed in place) →
-   *  the next incremental composite is a full one. */
-  sig: string | null;
+  /** Signature of the inputs the persistent output was last composited from (numbers; see buildSignature) — valid
+   *  only while hasSig. hasSig false = the output is not a known composite (never composited / composited by another
+   *  path / post-processed in place) → the next incremental composite is a full one. */
+  sig: number[];
+  hasSig: boolean;
 }
+
+/** Element-wise equality of two signatures (NaN equals NaN: an undefined Frame Link field is written as NaN). */
+function sameSignature(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    if (x !== y && !(x !== x && y !== y)) return false;
+  }
+  return true;
+}
+
+function storeSignature(slot: IncrementalSlot, sig: readonly number[]): void {
+  const d = slot.sig;
+  d.length = sig.length;
+  for (let i = 0; i < sig.length; i++) d[i] = sig[i];
+  slot.hasSig = true;
+}
+
+const num = (v: number | undefined | null): number => (v === undefined || v === null ? NaN : v);
 
 /** Blend mode enum — matches the uniform values in the shader. */
 export enum LayerBlendMode {
@@ -68,6 +95,9 @@ export interface CompositorLayerInfo {
   /** Stable id of the layer for its dither cache (the renderer passes the layer id). Without one the cache is keyed
    *  by the texture object (a new texture = a new cache entry; idle ones are freed after a while). */
   cacheKey?: string;
+  /** An ANIMATED layer (it has cels): its dither cache keeps one entry per cel texture (bounded LRU) instead of one
+   *  per layer, so a cel swap reuses that cel's dithered result (layer-dither-cache.ts, perf E5). */
+  cacheCels?: boolean;
   /** Optional per-layer procedural displacement animation. */
   frameLinkAnimation?: FrameLinkAnimation;
 }
@@ -100,6 +130,8 @@ export class RasterCompositor {
 
   /** Current animation frame (1-indexed). Set before each composite call. */
   public currentFrame: number = 1;
+  /** Is the timeline playing? (the renderer sets it before compositing): per-layer error-diffusion passes wait. */
+  public playbackActive = false;
 
   // Persistent ping texture for accumulated result readback
   private pingTex: GPUTexture | null = null;
@@ -144,6 +176,59 @@ export class RasterCompositor {
   public readonly stats = {
     full: 0, rect: 0, skip: 0, submits: 0, copies: 0, dispatches: 0, copyTexels: 0, dispatchTexels: 0, bytes: 0,
   };
+
+  // ── E9: one command encoder per composite (see the file header) ──
+  private _enc: GPUCommandEncoder | null = null;
+  private _encDepth = 0;
+  /** Uniform buffers a command in the open batch reads (rewriting one first submits the batch). */
+  private _encUniforms = new Set<GPUBuffer>();
+  private readonly _submitList: GPUCommandBuffer[] = [null as unknown as GPUCommandBuffer];
+  /** Buffers to destroy once the batch is submitted (a destroyed buffer must not be in a submit). */
+  private _encTrash: GPUBuffer[] = [];
+
+  // ── E8: per-frame allocations ──
+  private _resolvedScratch: CompositorLayerInfo[] = [];
+  private _resolvedInfo = new WeakMap<CompositorLayerInfo, CompositorLayerInfo>();
+  private _resolvedChanged: DirtyTexelRect | 'full' | null = null;
+  private _sigScratch: number[] = [];
+  private _grainParamData = new Float32Array(4);
+  private _grainOverlayBG: { bg: GPUBindGroup; ping: GPUTexture; grain: GPUTexture; out: GPUTexture; buf: GPUBuffer } | null = null;
+  private _baseOpacityData = new Float32Array(1);
+  private _baseOpacityBG: { bg: GPUBindGroup; tmp: GPUTexture; out: GPUTexture; buf: GPUBuffer } | null = null;
+
+  /** The open batch encoder (made on first use). Only inside beginBatch() / endBatch(). */
+  private enc(): GPUCommandEncoder {
+    return this._enc ??= this.device.createCommandEncoder({ label: 'RasterCompositor batch' });
+  }
+  private beginBatch(): void { this._encDepth++; }
+  private endBatch(): void {
+    if (--this._encDepth > 0) return;
+    this._encDepth = 0;
+    this.flushBatch();
+  }
+  /** Submit what the batch recorded (one submit), then free its trash. */
+  private flushBatch(): void {
+    const e = this._enc;
+    this._enc = null;
+    this._encUniforms.clear();
+    if (e) {
+      const cb = this._submitList;
+      cb[0] = e.finish();
+      this.device.queue.submit(cb);
+      cb[0] = null as unknown as GPUCommandBuffer;   // (do not keep the finished buffer alive)
+      this.stats.submits++;
+    }
+    if (this._encTrash.length > 0) {
+      for (const b of this._encTrash) b.destroy();
+      this._encTrash.length = 0;
+    }
+  }
+  /** `buf` is about to be rewritten with queue.writeBuffer: if a command already recorded in the open batch reads it,
+   *  submit the batch first (writes land before the NEXT submit, so the recorded command would read the new value). */
+  private claimUniform(buf: GPUBuffer): void {
+    if (this._encUniforms.has(buf)) this.flushBatch();
+    this._encUniforms.add(buf);
+  }
   private noteCopy(texels: number): void { this.stats.copies++; this.stats.copyTexels += texels; this.stats.bytes += texels * 8; }
   /** `reads`: full-size textures the pass reads per texel (it writes one). */
   private noteDispatch(texels: number, reads: number): void {
@@ -191,10 +276,14 @@ export class RasterCompositor {
     });
 
     this._ditherEngine = new DitherEngine(device);
-    this._ditherCache = new LayerDitherCache(device, this._ditherEngine, () => {
-      this.invalidateIncremental();   // a cache texture changed outside a composite: the next one is a full one
+    this._ditherCache = new LayerDitherCache(device, this._ditherEngine, (tex) => {
+      // A cache texture changed outside a composite: an output composited from it is stale → full next time. An
+      // off-screen cel's result (landed after playback) leaves the outputs alone — showing that cel later changes the
+      // layer's texture identity, which the signature sees.
+      if (this._signatureMentions(tex)) this.invalidateIncremental();
       this.requestRender?.();
     });
+    this._ditherCache.isPlaybackActive = () => this.playbackActive;
     this._onionRenderer = new OnionSkinRenderer(device);
     const self = new WeakRef(this);
     const unsub = onRasterStrokeEnd(() => {
@@ -232,6 +321,14 @@ export class RasterCompositor {
   public get ditherCacheSize(): number { return this._ditherCache.size; }
   /** The error-diffusion debounce (ms) for non-stroke changes. */
   public set ditherDebounceMs(ms: number) { this._ditherCache.debounceMs = Math.max(0, ms); }
+  /** Per-cel dither cache limits of animated layers (E5): entries per layer (default 8) and bytes over all of them
+   *  (null = a quarter of the shared raster undo budget). Omitted = unchanged. */
+  public setDitherCelCacheLimits(perLayer?: number, bytes?: number | null): void {
+    if (perLayer !== undefined) this._ditherCache.maxCelsPerLayer = Math.max(1, Math.floor(perLayer));
+    if (bytes !== undefined) this._ditherCache.celBudgetBytes = bytes;
+  }
+  /** Bytes held by per-cel dither cache entries (diagnostics). */
+  public get ditherCelCacheBytes(): number { return this._ditherCache.celEntryBytes; }
 
   /** Free the dither caches of layers no longer in the document (ids = every raster layer id still listed). */
   public retainLayerDitherCaches(ids: ReadonlySet<string>): void { this._ditherCache.retainOnly(ids); }
@@ -247,9 +344,12 @@ export class RasterCompositor {
     return this._ditherCache.bakeInto(layer, dst);
   }
 
-  /** The layers with each active per-layer dither swapped for its (brought up to date) cached texture, and the union
-   *  of the cache texels that changed doing so (the incremental composite re-composites them). */
-  private _resolveDithers(layers: CompositorLayerInfo[]): { layers: CompositorLayerInfo[]; changed: DirtyTexelRect | 'full' | null } {
+  /** The layers with each active per-layer dither swapped for its (brought up to date) cached texture; the union of
+   *  the cache texels that changed doing so (the incremental composite re-composites them) is left in
+   *  _resolvedChanged. E8: the returned list is a reused scratch array of reused per-layer objects (it was a slice +
+   *  a spread per dithered layer per render) — valid until the next call. */
+  private _resolveDithers(layers: CompositorLayerInfo[]): CompositorLayerInfo[] {
+    this._ditherCache.beginFrame();
     let changed: DirtyTexelRect | 'full' | null = null;
     let out: CompositorLayerInfo[] | null = null;
     for (let i = 0; i < layers.length; i++) {
@@ -258,10 +358,20 @@ export class RasterCompositor {
       if (!l.visible || !l.texture) continue;   // hidden: neither dithered nor freed (showing it again is free)
       const r = this._ditherCache.resolve(l);
       changed = unionDitherRect(changed, r.changed);
-      out ??= layers.slice();
-      out[i] = r.texture === l.texture ? { ...l, ditherConfig: undefined } : { ...l, texture: r.texture, ditherConfig: undefined };
+      if (!out) {
+        out = this._resolvedScratch;
+        out.length = layers.length;
+        for (let j = 0; j < layers.length; j++) out[j] = layers[j];
+      }
+      let c = this._resolvedInfo.get(l);
+      if (!c) { c = { ...l }; this._resolvedInfo.set(l, c); }
+      c.texture = r.texture; c.blendMode = l.blendMode; c.opacity = l.opacity; c.clipped = l.clipped;
+      c.visible = l.visible; c.cacheKey = l.cacheKey; c.cacheCels = l.cacheCels;
+      c.frameLinkAnimation = l.frameLinkAnimation; c.ditherConfig = undefined;
+      out[i] = c;
     }
-    return { layers: out ?? layers, changed };
+    this._resolvedChanged = changed;
+    return out ?? layers;
   }
 
   /**
@@ -393,16 +503,21 @@ export class RasterCompositor {
     const w = outputTexture.width;
     const h = outputTexture.height;
     if (w === 0 || h === 0) return;
-    const resolved = this._resolveDithers(layers).layers;
+    const resolved = this._resolveDithers(layers);
     const g = this._ditherConfig;
     const sig = DitherEngine.isActiveOrdered(g) ? this.globalResultSignature(resolved, outputTexture) : null;
-    if (sig !== null && this.restoreGlobalResult(outputTexture, sig)) return;
-    if (!this._compositeStack(resolved, outputTexture)) return;   // (no visible layer: cleared + paper, no dither)
-    // ── Global non-destructive dither post-process ──
-    this._ditherEngine.apply(outputTexture, g);
-    // ── Global canvas grain overlay pass ──
-    this.applyGrainOverlay(outputTexture, w, h);
-    if (sig !== null) this.storeGlobalResult(outputTexture, sig);
+    this.beginBatch();
+    try {
+      if (sig !== null && this.restoreGlobalResult(outputTexture, sig)) return;
+      if (!this._compositeStack(resolved, outputTexture)) return;   // (no visible layer: cleared + paper, no dither)
+      // ── Global non-destructive dither post-process (recorded into the batch) ──
+      if (DitherEngine.isActiveOrdered(g)) this._ditherEngine.apply(outputTexture, g, this.enc());
+      // ── Global canvas grain overlay pass ──
+      this.applyGrainOverlay(outputTexture, w, h);
+      if (sig !== null) this.storeGlobalResult(outputTexture, sig);
+    } finally {
+      this.endBatch();
+    }
   }
 
   /**
@@ -419,20 +534,30 @@ export class RasterCompositor {
     const w = outputTexture.width;
     const h = outputTexture.height;
     if (w === 0 || h === 0) return;
-    const resolved = this._resolveDithers(layers).layers;
+    const resolved = this._resolveDithers(layers);
     const g = { ...this._ditherConfig };
     const globalOn = g.enabled && g.strength > 0.001;
     const ed = globalOn && DitherEngine.isErrorDiffusion(g.algorithm);
     const deferED = ed && isRasterStrokeActive();
     const sig = globalOn && !deferED ? this.globalResultSignature(resolved, outputTexture) : null;
-    if (sig !== null && this.restoreGlobalResult(outputTexture, sig)) return;
-    if (!this._compositeStack(resolved, outputTexture)) return;
+    this.beginBatch();
+    try {
+      if (sig !== null && this.restoreGlobalResult(outputTexture, sig)) return;
+      if (!this._compositeStack(resolved, outputTexture)) return;
+    } finally {
+      this.endBatch();   // (submitted before the async pass reads the output back)
+    }
     // ── Global non-destructive dither post-process (async) ──
     if (deferED) this._globalEDDeferred = true;   // (the stroke-end listener asks for the frame that runs it)
     else await this._ditherEngine.applyAsync(outputTexture, g);
-    // ── Global canvas grain overlay pass ──
-    this.applyGrainOverlay(outputTexture, w, h);
-    if (sig !== null) this.storeGlobalResult(outputTexture, sig);
+    this.beginBatch();
+    try {
+      // ── Global canvas grain overlay pass ──
+      this.applyGrainOverlay(outputTexture, w, h);
+      if (sig !== null) this.storeGlobalResult(outputTexture, sig);
+    } finally {
+      this.endBatch();
+    }
   }
 
   /** The layer stack (base copy + opacity + blend steps) of composite() / compositeAsync(), dithers already resolved.
@@ -440,8 +565,9 @@ export class RasterCompositor {
   private _compositeStack(layers: CompositorLayerInfo[], outputTexture: GPUTexture): boolean {
     const w = outputTexture.width;
     const h = outputTexture.height;
-    const visibleLayers = layers.filter(l => l.visible && l.texture);
-    if (visibleLayers.length === 0) {
+    let firstIdx = -1;
+    for (let i = 0; i < layers.length; i++) if (layers[i].visible && layers[i].texture) { firstIdx = i; break; }
+    if (firstIdx < 0) {
       this.clearTexture(outputTexture);
       // Still apply grain — the blank canvas IS the paper
       this.applyGrainOverlay(outputTexture, w, h);
@@ -449,27 +575,23 @@ export class RasterCompositor {
     }
 
     // Copy first visible layer → output (no blending needed for the base)
-    const first = visibleLayers[0];
+    const first = layers[firstIdx];
     const firstTex = first.texture;
-    const copyEnc = this.device.createCommandEncoder();
-    copyEnc.copyTextureToTexture(
+    this.enc().copyTextureToTexture(
       { texture: firstTex },
       { texture: outputTexture },
       { width: Math.min(firstTex.width, w), height: Math.min(firstTex.height, h) },
     );
-    this.device.queue.submit([copyEnc.finish()]);
     this.noteCopy(Math.min(firstTex.width, w) * Math.min(firstTex.height, h));
-    this.stats.submits++;
 
     if (first.opacity < 1.0) {
       this.applyBaseOpacity(outputTexture, first.opacity, w, h);
     }
-    if (visibleLayers.length <= 1) return true;
 
-    // Ensure persistent ping texture matches output dimensions
-    this.ensurePing(w, h);
-    for (let i = 1; i < visibleLayers.length; i++) {
-      const layer = visibleLayers[i];
+    for (let i = firstIdx + 1; i < layers.length; i++) {
+      const layer = layers[i];
+      if (!layer.visible || !layer.texture) continue;
+      this.ensurePing(w, h);   // persistent ping texture matching the output
       this._compositeLayerStep(layer, layer.texture, outputTexture, w, h);
     }
     return true;
@@ -508,11 +630,8 @@ export class RasterCompositor {
   private restoreGlobalResult(out: GPUTexture, sig: string): boolean {
     const r = this._globalResults.get(out);
     if (!r || r.sig !== sig || r.tex.width !== out.width || r.tex.height !== out.height) return false;
-    const enc = this.device.createCommandEncoder();
-    enc.copyTextureToTexture({ texture: r.tex }, { texture: out }, { width: out.width, height: out.height });
-    this.device.queue.submit([enc.finish()]);
+    this.enc().copyTextureToTexture({ texture: r.tex }, { texture: out }, { width: out.width, height: out.height });
     this.noteCopy(out.width * out.height);
-    this.stats.submits++;
     return true;
   }
 
@@ -529,11 +648,8 @@ export class RasterCompositor {
       };
       this._globalResults.set(out, r);
     }
-    const enc = this.device.createCommandEncoder();
-    enc.copyTextureToTexture({ texture: out }, { texture: r.tex }, { width: out.width, height: out.height });
-    this.device.queue.submit([enc.finish()]);
+    this.enc().copyTextureToTexture({ texture: out }, { texture: r.tex }, { width: out.width, height: out.height });
     this.noteCopy(out.width * out.height);
-    this.stats.submits++;
     r.sig = sig;
   }
 
@@ -572,11 +688,12 @@ export class RasterCompositor {
       };
       this._layerStepCache.set(layerTex, entry);
     }
+    this.claimUniform(entry.buf);
     this.device.queue.writeBuffer(entry.buf, 0, pd);
 
     const layerW = Math.min(layerTex.width, w);
     const layerH = Math.min(layerTex.height, h);
-    const enc = this.device.createCommandEncoder();
+    const enc = this.enc();
     enc.copyTextureToTexture(
       { texture: outputTexture },
       { texture: this.pingTex! },
@@ -588,10 +705,8 @@ export class RasterCompositor {
     const wgSize = 8;
     pass.dispatchWorkgroups(Math.ceil(layerW / wgSize), Math.ceil(layerH / wgSize));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
     this.noteCopy(w * h);
     this.noteDispatch(layerW * layerH, 2);
-    this.stats.submits++;
   }
 
   // ── Incremental composite (BRUSH-5) ─────────────────────────────
@@ -626,55 +741,70 @@ export class RasterCompositor {
     const w = outputTexture.width, h = outputTexture.height;
     if (w === 0 || h === 0) return 'skip';
     let slot = this._slots.get(slotKey);
-    if (!slot) { slot = { cursor: new RasterDirtyCursor(), sig: null }; this._slots.set(slotKey, slot); }
-    const resolved = this._resolveDithers(layers);
-    layers = resolved.layers;
+    if (!slot) { slot = { cursor: new RasterDirtyCursor(), sig: [], hasSig: false }; this._slots.set(slotKey, slot); }
+    layers = this._resolveDithers(layers);
     // always consumed: whatever we do below covers it (plus the dither-cache texels re-dithered just now)
-    const dirty = unionDitherRect(slot.cursor.take(), resolved.changed);
-    const sig = this._regionBroken ? null : this.incrementalSignature(layers, outputTexture);
-    if (sig === null) {
+    const dirty = unionDitherRect(slot.cursor.take(), this._resolvedChanged);
+    const sig = this._sigScratch;
+    const regionOk = !this._regionBroken && this.buildSignature(layers, outputTexture, false, sig);
+    if (!regionOk) {
       // A Frame Link displacement (and nothing else) rules the region passes out: the legacy full composite runs, but
       // only when its inputs moved — the frame number, the displacement params, the layer list, or reported pixels.
       // Renders between two frame changes then reuse the output (it is exactly what composite() wrote last time).
-      const flSig = this.incrementalSignature(layers, outputTexture, true);
-      if (flSig !== null && flSig === slot.sig && !dirty) { this.stats.skip++; return 'skip'; }
-      slot.sig = null;
+      const flOk = this.buildSignature(layers, outputTexture, true, sig);
+      if (flOk && slot.hasSig && sameSignature(sig, slot.sig) && !dirty) { this.stats.skip++; return 'skip'; }
+      slot.hasSig = false;
       this.stats.full++;
       this.composite(layers, outputTexture);
-      slot.sig = flSig;
+      if (flOk) storeSignature(slot, sig);
       return 'full';
     }
+    this.beginBatch();
     try {
-      if (sig !== slot.sig || dirty === 'full') {
-        slot.sig = null;
-        this._compositeRegion(layers, outputTexture, { x0: 0, y0: 0, x1: w, y1: h });
-        slot.sig = sig;
+      if (!slot.hasSig || !sameSignature(sig, slot.sig) || dirty === 'full') {
+        slot.hasSig = false;
+        this._compositeRegion(layers, outputTexture, 0, 0, w, h);
+        storeSignature(slot, sig);
         this.stats.full++;
         return 'full';
       }
       if (!dirty) { this.stats.skip++; return 'skip'; }
-      const R = { x0: Math.max(0, dirty.x0), y0: Math.max(0, dirty.y0), x1: Math.min(w, dirty.x1), y1: Math.min(h, dirty.y1) };
-      if (R.x1 <= R.x0 || R.y1 <= R.y0) { this.stats.skip++; return 'skip'; }
-      this._compositeRegion(layers, outputTexture, R);
+      const x0 = Math.max(0, dirty.x0), y0 = Math.max(0, dirty.y0), x1 = Math.min(w, dirty.x1), y1 = Math.min(h, dirty.y1);
+      if (x1 <= x0 || y1 <= y0) { this.stats.skip++; return 'skip'; }
+      this._compositeRegion(layers, outputTexture, x0, y0, x1, y1);
       this.stats.rect++;
       return 'rect';
     } catch (e) {
       // A region pipeline could not be built: stay on the legacy composite for good.
       console.warn('RasterCompositor: incremental composite unavailable, using the full composite', e);
       this._regionBroken = true;
-      slot.sig = null;
+      slot.hasSig = false;
       this.stats.full++;
       this.composite(layers, outputTexture);
       return 'full';
+    } finally {
+      this.endBatch();
     }
   }
 
   /** The output of `slotKey` (every slot when omitted) was, or is about to be, written by something other than
    *  compositeIncremental: its next compositeIncremental is a full one. */
   public invalidateIncremental(slotKey?: string): void {
-    if (slotKey === undefined) { for (const s of this._slots.values()) s.sig = null; return; }
+    if (slotKey === undefined) { for (const s of this._slots.values()) s.hasSig = false; return; }
     const slot = this._slots.get(slotKey);
-    if (slot) slot.sig = null;
+    if (slot) slot.hasSig = false;
+  }
+
+  /** Could an output's last composite have read `tex`? (its id appears in a valid signature; a coincidence with
+   *  another number only costs one needless full composite). */
+  private _signatureMentions(tex: GPUTexture): boolean {
+    const id = this._texIds.get(tex);
+    if (id === undefined) return false;
+    for (const s of this._slots.values()) {
+      if (!s.hasSig) continue;
+      for (let i = 0; i < s.sig.length; i++) if (s.sig[i] === id) return true;
+    }
+    return false;
   }
 
   private texId(t: GPUTexture): number {
@@ -683,64 +813,85 @@ export class RasterCompositor {
     return id;
   }
 
-  /** Everything the composited pixels depend on besides the layers' own pixels, as a string; null when this
-   *  frame can't be composited incrementally (a global dither or a displacement animation is active).
-   *  `frameLink`: the signature of a LEGACY full composite() whose only obstacle is a Frame Link displacement — the
-   *  same, plus the frame number and every displacement param composite() uploads ('fl' prefix, so it never matches
-   *  a region-pass signature); null when there is no enabled Frame Link or a dither is active. */
-  private incrementalSignature(layers: CompositorLayerInfo[], out: GPUTexture, frameLink = false): string | null {
+  /**
+   * Everything the composited pixels depend on besides the layers' own pixels, written into `sig` as numbers (E8: it
+   * was a string built per render). False when this frame can't be composited incrementally (a global dither or a
+   * displacement animation is active). `frameLink`: the signature of a LEGACY full composite() whose only obstacle
+   * is a Frame Link displacement — the same, plus the frame number and every displacement param composite() uploads
+   * (kind 1, so it never matches a region-pass signature, kind 0); false when there is no enabled Frame Link or a
+   * dither is active. Layout: [kind, frame, out id, w, h, visible count, 20 per visible layer, grain on, 4 grain].
+   */
+  private buildSignature(layers: CompositorLayerInfo[], out: GPUTexture, frameLink: boolean, sig: number[]): boolean {
     const g = this._ditherConfig;
-    if (g.enabled && g.strength > 0.001) return null;
-    let sig = this.texId(out) + ':' + out.width + 'x' + out.height;
+    if (g.enabled && g.strength > 0.001) return false;
+    let n = 0;
+    sig[n++] = frameLink ? 1 : 0;
+    sig[n++] = frameLink ? this.currentFrame : 0;
+    sig[n++] = this.texId(out); sig[n++] = out.width; sig[n++] = out.height;
+    const countAt = n++;
+    let count = 0;
     let sawFrameLink = false;
-    for (const l of layers) {   // (per-layer dithers are resolved to their cached textures by the caller)
+    for (let i = 0; i < layers.length; i++) {   // (per-layer dithers are resolved to their cached textures by the caller)
+      const l = layers[i];
       if (!l.visible || !l.texture) continue;
       const d = l.ditherConfig;
-      if (d && d.enabled && d.strength > 0.001) return null;   // (an unresolved list: never from compositeIncremental)
+      if (d && d.enabled && d.strength > 0.001) return false;   // (an unresolved list: never from compositeIncremental)
       const t = l.texture;
-      sig += '|' + this.texId(t) + ',' + t.width + ',' + t.height + ',' + l.blendMode + ',' + l.opacity + ',' + (l.clipped ? 1 : 0);
+      count++;
+      sig[n++] = this.texId(t); sig[n++] = t.width; sig[n++] = t.height;
+      sig[n++] = l.blendMode; sig[n++] = l.opacity; sig[n++] = l.clipped ? 1 : 0;
       const a = l.frameLinkAnimation;
       if (a && a.enabled) {
-        if (!frameLink) return null;   // displacement (reads other texels, changes with the frame number)
+        if (!frameLink) return false;   // displacement (reads other texels, changes with the frame number)
         sawFrameLink = true;
         // Exactly the inputs writeDisplacementParams reads (raw values: the ?? defaults are applied the same way).
-        sig += ',fl' + a.type + ',' + a.amplitude + ',' + a.frequency + ',' + a.speed + ',' + a.direction + ',' + a.phase +
-          ',' + (a.displaceX !== false ? 1 : 0) + (a.displaceY ? 1 : 0) + ',' + a.rippleCenterX + ',' + a.rippleCenterY +
-          ',' + a.noiseOctaves + ',' + a.noiseLacunarity + ',' + a.noisePersistence + ',' + a.shakeSeed;
+        sig[n++] = 1; sig[n++] = FRAME_LINK_TYPE_ID[a.type] ?? 0;
+        sig[n++] = num(a.amplitude); sig[n++] = num(a.frequency); sig[n++] = num(a.speed); sig[n++] = num(a.direction);
+        sig[n++] = num(a.phase); sig[n++] = a.displaceX !== false ? 1 : 0; sig[n++] = a.displaceY ? 1 : 0;
+        sig[n++] = num(a.rippleCenterX); sig[n++] = num(a.rippleCenterY); sig[n++] = num(a.noiseOctaves);
+        sig[n++] = num(a.noiseLacunarity); sig[n++] = num(a.noisePersistence);
+      } else {
+        for (let k = 0; k < 14; k++) sig[n++] = 0;
       }
     }
-    if (frameLink) {
-      if (!sawFrameLink) return null;
-      sig = 'fl' + this.currentFrame + '#' + sig;
-    }
+    if (frameLink && !sawFrameLink) return false;
+    sig[countAt] = count;
     const gm = this._grainManager;
     const grainTex = gm ? gm.getGrainTexture() : null;
     if (gm && grainTex && gm.getGrainStrength() > 0.001) {
       const inv = gm.getGrainInvScale();
-      sig += '|g' + this.texId(grainTex) + ',' + gm.getGrainStrength() + ',' + inv[0] + ',' + inv[1];
+      sig[n++] = 1; sig[n++] = this.texId(grainTex); sig[n++] = gm.getGrainStrength(); sig[n++] = inv[0]; sig[n++] = inv[1];
+    } else {
+      sig[n++] = 0;
     }
-    return sig;
+    sig.length = n;
+    return true;
   }
 
   /** The composite over `R` only (texels, max-exclusive, inside the output). Mirrors composite() pass for pass —
    *  minus the dithers and the displacement, which incrementalSignature() rules out. */
-  private _compositeRegion(layers: CompositorLayerInfo[], outputTexture: GPUTexture, R: DirtyTexelRect): void {
+  private _compositeRegion(layers: CompositorLayerInfo[], outputTexture: GPUTexture, x0: number, y0: number, x1: number, y1: number): void {
     const w = outputTexture.width;
     const h = outputTexture.height;
-    const visibleLayers = layers.filter(l => l.visible && l.texture);
-    if (visibleLayers.length === 0) {
+    const R = this._region;
+    R.x0 = x0; R.y0 = y0; R.x1 = x1; R.y1 = y1;
+    let firstIdx = -1;
+    for (let i = 0; i < layers.length; i++) if (layers[i].visible && layers[i].texture) { firstIdx = i; break; }
+    if (firstIdx < 0) {
       this._regionClear(outputTexture, R);
       this._regionGrain(outputTexture, w, h, R);   // the blank canvas IS the paper
       return;
     }
-    const first = visibleLayers[0];
+    const first = layers[firstIdx];
     this._regionCopyBase(first.texture, outputTexture, R);
     if (first.opacity < 1.0) this._regionBaseOpacity(outputTexture, first.opacity, w, h, R);
-    for (let i = 1; i < visibleLayers.length; i++) {
-      this._regionLayerStep(visibleLayers[i], outputTexture, w, h, R);
+    for (let i = firstIdx + 1; i < layers.length; i++) {
+      const l = layers[i];
+      if (l.visible && l.texture) this._regionLayerStep(l, outputTexture, w, h, R);
     }
     this._regionGrain(outputTexture, w, h, R);
   }
+  private _region: DirtyTexelRect = { x0: 0, y0: 0, x1: 0, y1: 0 };
 
   /** The persistent read-back texture of the region passes (the blend steps, the base opacity and the grain all
    *  read the output through it, one after the other). */
@@ -764,15 +915,12 @@ export class RasterCompositor {
     if (w <= 0 || h <= 0) return;
     const paddedRowBytes = Math.ceil(w * 4 / 256) * 256;
     const buf = this.device.createBuffer({ size: paddedRowBytes * h, usage: GPUBufferUsage.COPY_SRC });
-    const enc = this.device.createCommandEncoder();
-    enc.copyBufferToTexture(
+    this.enc().copyBufferToTexture(
       { buffer: buf, bytesPerRow: paddedRowBytes },
       { texture: tex, origin: { x: R.x0, y: R.y0 } },
       { width: w, height: h },
     );
-    this.device.queue.submit([enc.finish()]);
-    this.stats.submits++;
-    buf.destroy();
+    this._encTrash.push(buf);   // destroyed once the batch is submitted
   }
 
   /** Base layer → output over `R` (clipped to the layer's extent, like composite()'s base copy). */
@@ -780,15 +928,12 @@ export class RasterCompositor {
     const x1 = Math.min(R.x1, firstTex.width, outputTexture.width);
     const y1 = Math.min(R.y1, firstTex.height, outputTexture.height);
     if (x1 <= R.x0 || y1 <= R.y0) return;
-    const enc = this.device.createCommandEncoder();
-    enc.copyTextureToTexture(
+    this.enc().copyTextureToTexture(
       { texture: firstTex, origin: { x: R.x0, y: R.y0 } },
       { texture: outputTexture, origin: { x: R.x0, y: R.y0 } },
       { width: x1 - R.x0, height: y1 - R.y0 },
     );
-    this.device.queue.submit([enc.finish()]);
     this.noteCopy((x1 - R.x0) * (y1 - R.y0));
-    this.stats.submits++;
   }
 
   /** applyBaseOpacity over `R`: one submit, reading the output through the persistent ping texture. */
@@ -830,6 +975,7 @@ export class RasterCompositor {
     const d = this._regionOpacityData;
     d[0] = opacity; d[1] = 0; d[2] = 0; d[3] = 0;
     d[4] = R.x0; d[5] = R.y0; d[6] = R.x1; d[7] = R.y1;
+    this.claimUniform(this._regionOpacityBuf!);
     this.device.queue.writeBuffer(this._regionOpacityBuf!, 0, d);
     let cached = this._regionOpacityBG;
     if (!cached || cached.ping !== ping || cached.out !== tex) {
@@ -845,7 +991,7 @@ export class RasterCompositor {
         ping, out: tex,
       };
     }
-    const enc = this.device.createCommandEncoder();
+    const enc = this.enc();
     enc.copyTextureToTexture(
       { texture: tex, origin: { x: R.x0, y: R.y0 } },
       { texture: ping, origin: { x: R.x0, y: R.y0 } },
@@ -856,10 +1002,8 @@ export class RasterCompositor {
     pass.setBindGroup(0, cached.bg);
     pass.dispatchWorkgroups(Math.ceil(rw / 8), Math.ceil(rh / 8));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
     this.noteCopy(rw * rh);
     this.noteDispatch(rw * rh, 1);
-    this.stats.submits++;
   }
 
   /** The blend shader with a region: `params` grows by [x0, y0, x1, y1] and main() walks the region instead of
@@ -932,10 +1076,11 @@ export class RasterCompositor {
       };
       this._regionStepCache.set(layerTex, entry);
     }
+    this.claimUniform(entry.buf);
     this.device.queue.writeBuffer(entry.buf, 0, pd);
 
     // Only the region is read back: the shader reads the accumulated result at its own texel only.
-    const enc = this.device.createCommandEncoder();
+    const enc = this.enc();
     enc.copyTextureToTexture(
       { texture: outputTexture, origin: { x: R.x0, y: R.y0 } },
       { texture: ping, origin: { x: R.x0, y: R.y0 } },
@@ -946,10 +1091,8 @@ export class RasterCompositor {
     pass.setBindGroup(0, entry.bg);
     pass.dispatchWorkgroups(Math.ceil(rw / 8), Math.ceil(rh / 8));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
     this.noteCopy(rw * rh);
     this.noteDispatch(rw * rh, 2);
-    this.stats.submits++;
   }
 
   /** applyGrainOverlay over `R`. The grain is sampled at the ABSOLUTE canvas texel, so a sub-rect is seamless. */
@@ -1015,6 +1158,7 @@ export class RasterCompositor {
     const d = this._regionGrainData;
     d[0] = invScale[0]; d[1] = invScale[1]; d[2] = strength; d[3] = 0;
     d[4] = R.x0; d[5] = R.y0; d[6] = R.x1; d[7] = R.y1;
+    this.claimUniform(this._regionGrainBuf!);
     this.device.queue.writeBuffer(this._regionGrainBuf!, 0, d);
     let cached = this._regionGrainBG;
     if (!cached || cached.ping !== ping || cached.grain !== grainTex || cached.out !== tex) {
@@ -1032,7 +1176,7 @@ export class RasterCompositor {
         ping, grain: grainTex, out: tex,
       };
     }
-    const enc = this.device.createCommandEncoder();
+    const enc = this.enc();
     enc.copyTextureToTexture(
       { texture: tex, origin: { x: R.x0, y: R.y0 } },
       { texture: ping, origin: { x: R.x0, y: R.y0 } },
@@ -1043,10 +1187,8 @@ export class RasterCompositor {
     pass.setBindGroup(0, cached.bg);
     pass.dispatchWorkgroups(Math.ceil(rw / 8), Math.ceil(rh / 8));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
     this.noteCopy(rw * rh);
     this.noteDispatch(rw * rh, 1);
-    this.stats.submits++;
   }
 
   public destroy(): void {
@@ -1088,14 +1230,12 @@ export class RasterCompositor {
     new Uint8Array(buf.getMappedRange()).fill(0);
     buf.unmap();
 
-    const enc = this.device.createCommandEncoder();
-    enc.copyBufferToTexture(
+    this.enc().copyBufferToTexture(
       { buffer: buf, bytesPerRow: paddedRowBytes },
       { texture: tex },
       { width: w, height: h },
     );
-    this.device.queue.submit([enc.finish()]);
-    buf.destroy();
+    this._encTrash.push(buf);   // destroyed once the batch is submitted
   }
 
   /**
@@ -1118,9 +1258,8 @@ export class RasterCompositor {
       this._baseOpacityTmpH = h;
     }
     const tmpTex = this._baseOpacityTmp;
-    const cpEnc = this.device.createCommandEncoder();
-    cpEnc.copyTextureToTexture({ texture: tex }, { texture: tmpTex }, { width: w, height: h });
-    this.device.queue.submit([cpEnc.finish()]);
+    const enc = this.enc();
+    enc.copyTextureToTexture({ texture: tex }, { texture: tmpTex }, { width: w, height: h });
 
     // Simple compute pass to scale alpha
     if (!this._baseOpacityPipeline) {
@@ -1151,31 +1290,36 @@ export class RasterCompositor {
       });
     }
 
-    // Write opacity uniform
+    // Write opacity uniform (E8: a persistent Float32Array and a cached bind group)
     if (!this._baseOpacityBuf) {
       this._baseOpacityBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     }
-    this.device.queue.writeBuffer(this._baseOpacityBuf, 0, new Float32Array([opacity]));
+    this._baseOpacityData[0] = opacity;
+    this.claimUniform(this._baseOpacityBuf);
+    this.device.queue.writeBuffer(this._baseOpacityBuf, 0, this._baseOpacityData);
 
-    const bg = this.device.createBindGroup({
-      layout: this._baseOpacityBGL!,
-      entries: [
-        { binding: 0, resource: tmpTex.createView() },
-        { binding: 1, resource: tex.createView() },
-        { binding: 2, resource: { buffer: this._baseOpacityBuf } },
-      ],
-    });
+    let cached = this._baseOpacityBG;
+    if (!cached || cached.tmp !== tmpTex || cached.out !== tex || cached.buf !== this._baseOpacityBuf) {
+      cached = this._baseOpacityBG = {
+        bg: this.device.createBindGroup({
+          layout: this._baseOpacityBGL!,
+          entries: [
+            { binding: 0, resource: tmpTex.createView() },
+            { binding: 1, resource: tex.createView() },
+            { binding: 2, resource: { buffer: this._baseOpacityBuf } },
+          ],
+        }),
+        tmp: tmpTex, out: tex, buf: this._baseOpacityBuf,
+      };
+    }
 
-    const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(this._baseOpacityPipeline);
-    pass.setBindGroup(0, bg);
+    pass.setBindGroup(0, cached.bg);
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
     this.noteCopy(w * h);
     this.noteDispatch(w * h, 1);
-    this.stats.submits += 2;
   }
 
   // ── Global grain overlay ────────────────────────────────────────────
@@ -1196,19 +1340,26 @@ export class RasterCompositor {
     const invScale = this._grainManager.getGrainInvScale();
 
     this.ensureGrainOverlayPipeline();
+    this.beginBatch();
+    try {
+      this._grainOverlayPass(tex, w, h, grainTex, strength, invScale);
+    } finally {
+      this.endBatch();
+    }
+  }
 
-    // Write grain params: invScaleX, invScaleY, strength, pad
+  private _grainOverlayPass(tex: GPUTexture, w: number, h: number, grainTex: GPUTexture, strength: number, invScale: ArrayLike<number>): void {
+    // Write grain params: invScaleX, invScaleY, strength, pad (E8: a persistent Float32Array)
     if (!this._grainOverlayParamBuf) {
       this._grainOverlayParamBuf = this.device.createBuffer({
         size: 16,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
     }
-    this.device.queue.writeBuffer(
-      this._grainOverlayParamBuf,
-      0,
-      new Float32Array([invScale[0], invScale[1], strength, 0]),
-    );
+    const gp = this._grainParamData;
+    gp[0] = invScale[0]; gp[1] = invScale[1]; gp[2] = strength; gp[3] = 0;
+    this.claimUniform(this._grainOverlayParamBuf);
+    this.device.queue.writeBuffer(this._grainOverlayParamBuf, 0, gp);
 
     // Ensure ping texture for read-back
     if (!this._grainOverlayPingTex || this._grainOverlayPingW !== w || this._grainOverlayPingH !== h) {
@@ -1223,31 +1374,35 @@ export class RasterCompositor {
     }
 
     // Copy current composited output → ping
-    const cpEnc = this.device.createCommandEncoder();
-    cpEnc.copyTextureToTexture({ texture: tex }, { texture: this._grainOverlayPingTex! }, { width: w, height: h });
-    this.device.queue.submit([cpEnc.finish()]);
+    const ping = this._grainOverlayPingTex!;
+    const enc = this.enc();
+    enc.copyTextureToTexture({ texture: tex }, { texture: ping }, { width: w, height: h });
 
-    const bg = this.device.createBindGroup({
-      layout: this._grainOverlayBGL!,
-      entries: [
-        { binding: 0, resource: this._grainOverlayPingTex!.createView() },
-        { binding: 1, resource: grainTex.createView() },
-        { binding: 2, resource: this._grainOverlaySampler! },
-        { binding: 3, resource: { buffer: this._grainOverlayParamBuf } },
-        { binding: 4, resource: tex.createView() },
-      ],
-    });
+    // (E8: the bind group is cached while its textures / buffer are the same objects)
+    let cached = this._grainOverlayBG;
+    if (!cached || cached.ping !== ping || cached.grain !== grainTex || cached.out !== tex || cached.buf !== this._grainOverlayParamBuf) {
+      cached = this._grainOverlayBG = {
+        bg: this.device.createBindGroup({
+          layout: this._grainOverlayBGL!,
+          entries: [
+            { binding: 0, resource: ping.createView() },
+            { binding: 1, resource: grainTex.createView() },
+            { binding: 2, resource: this._grainOverlaySampler! },
+            { binding: 3, resource: { buffer: this._grainOverlayParamBuf } },
+            { binding: 4, resource: tex.createView() },
+          ],
+        }),
+        ping, grain: grainTex, out: tex, buf: this._grainOverlayParamBuf,
+      };
+    }
 
-    const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(this._grainOverlayPipeline!);
-    pass.setBindGroup(0, bg);
+    pass.setBindGroup(0, cached.bg);
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
     this.noteCopy(w * h);
     this.noteDispatch(w * h, 1);
-    this.stats.submits += 2;
   }
 
   private ensureGrainOverlayPipeline(): void {

@@ -462,3 +462,175 @@ describe('Global dither: no needless re-dither', () => {
     expect(es.errorDiffusionPasses).toBe(2);
   });
 });
+
+describe('Per-cel dither cache (animated layers, perf E5)', () => {
+  const celLayer = (tex: CpuTexture, cfg: DitherConfig, key = 'A'): CompositorLayerInfo => ({ ...layerOf(tex, cfg, key), cacheCels: true });
+
+  function cels(gpu: ReturnType<typeof createCpuDevice>, n: number, W: number, H: number, seed: number): CpuTexture[] {
+    const r = rng(seed);
+    return Array.from({ length: n }, () => {
+      const t = gpu.mkTex(W, H, 'rgba8unorm');
+      paint(gpu, t, { x0: 1, y0: 1, x1: W - 1, y1: H - 1 }, r);
+      return t;
+    });
+  }
+
+  it('each cel is dithered once, then every swap reuses its cached result (identical to a fresh dither)', () => {
+    const gpu = createCpuDevice();
+    const W = 48, H = 36;
+    const cs = cels(gpu, 5, W, H, 61);
+    const cfg = cfgOf({ bayerLevel: 1, edgeWidth: 3, edgeFade: 0.5 });
+    const comp = new RasterCompositor(gpu.device);
+    const out = gpu.mkTex(W, H, 'rgba8unorm');
+    const st = comp.ditherCacheStats, es = comp.ditherEngineStats;
+    for (let loop = 0; loop < 3; loop++) {
+      for (const c of cs) {
+        comp.composite([celLayer(c, cfg)], asGpu(out));
+        expect(same(out.data, fullDither(gpu, c, cfg))).toBe(true);
+      }
+      if (loop === 0) expect(st.fullRedithers).toBe(5);
+    }
+    expect(st.fullRedithers).toBe(5);    // was 15: the layer-id cache re-dithered on every swap
+    expect(es.dispatches).toBe(5);
+    expect(comp.ditherCacheSize).toBe(5);
+    // a write to one cel re-dithers only that cel (rect), the others stay cached
+    paint(gpu, cs[2], { x0: 5, y0: 5, x1: 15, y1: 12 }, rng(2));
+    for (const c of cs) {
+      comp.composite([celLayer(c, cfg)], asGpu(out));
+      expect(same(out.data, fullDither(gpu, c, cfg))).toBe(true);
+    }
+    expect(st.fullRedithers).toBe(5);
+    expect(st.rectRedithers).toBe(1);
+  });
+
+  it('bounded LRU: at most 8 cels per layer and the byte budget over all; the shown cel is never evicted', () => {
+    const gpu = createCpuDevice();
+    const W = 32, H = 24, bytes = W * H * 4;
+    const cs = cels(gpu, 12, W, H, 7);
+    const cfg = cfgOf({});
+    const comp = new RasterCompositor(gpu.device);
+    const out = gpu.mkTex(W, H, 'rgba8unorm');
+    for (const c of cs) comp.composite([celLayer(c, cfg)], asGpu(out));
+    expect(comp.ditherCacheSize).toBe(8);
+    expect(comp.ditherCacheStats.celEvictions).toBe(4);
+    expect(comp.ditherCelCacheBytes).toBe(8 * bytes);
+    // the most recent 8 are the ones kept: replaying them re-dithers nothing
+    const before = comp.ditherCacheStats.fullRedithers;
+    for (const c of cs.slice(4)) comp.composite([celLayer(c, cfg)], asGpu(out));
+    expect(comp.ditherCacheStats.fullRedithers).toBe(before);
+    // byte budget: two animated layers sharing 5 entries' worth
+    comp.setDitherCelCacheLimits(8, 5 * bytes);
+    const ds = cels(gpu, 4, W, H, 8);
+    for (let i = 0; i < 4; i++) {
+      comp.composite([celLayer(cs[i + 8], cfg, 'A'), celLayer(ds[i], cfg, 'B')], asGpu(out));
+      expect(comp.ditherCelCacheBytes).toBeLessThanOrEqual(5 * bytes);
+      const ref = gpu.mkTex(W, H, 'rgba8unorm');
+      new RasterCompositor(gpu.device).composite([celLayer(cs[i + 8], cfg, 'A'), celLayer(ds[i], cfg, 'B')], asGpu(ref));
+      expect(same(out.data, ref.data)).toBe(true);   // both shown cels were kept
+    }
+    // a budget smaller than what one composite shows keeps the shown entries (never drops shown pixels)
+    comp.setDitherCelCacheLimits(8, bytes);
+    comp.composite([celLayer(cs[0], cfg, 'A'), celLayer(ds[0], cfg, 'B')], asGpu(out));
+    expect(comp.ditherCacheSize).toBeGreaterThanOrEqual(2);
+    comp.retainLayerDitherCaches(new Set(['B']));   // layer A deleted: all its cel entries go
+    comp.composite([celLayer(ds[1], cfg, 'B')], asGpu(out));
+    expect(same(out.data, fullDither(gpu, ds[1], cfg))).toBe(true);
+  });
+
+  it('static ↔ animated: one entry per layer while static, per cel while animated', () => {
+    const gpu = createCpuDevice();
+    const W = 24, H = 16;
+    const cs = cels(gpu, 3, W, H, 3);
+    const cfg = cfgOf({});
+    const comp = new RasterCompositor(gpu.device);
+    const out = gpu.mkTex(W, H, 'rgba8unorm');
+    for (const c of cs) comp.composite([layerOf(c, cfg, 'L')], asGpu(out));
+    expect(comp.ditherCacheSize).toBe(1);   // static: a new texture replaces the entry
+    for (const c of cs) comp.composite([celLayer(c, cfg, 'L')], asGpu(out));
+    expect(comp.ditherCacheSize).toBe(3);
+    comp.composite([layerOf(cs[0], cfg, 'L')], asGpu(out));
+    expect(comp.ditherCacheSize).toBe(1);
+    expect(same(out.data, fullDither(gpu, cs[0], cfg))).toBe(true);
+  });
+
+  it('error diffusion: no pass while the timeline plays; each cel computed once after it stops; reused while playing', async () => {
+    vi.useFakeTimers();
+    const gpu = createCpuDevice();
+    const W = 24, H = 18;
+    const cs = cels(gpu, 3, W, H, 44);
+    const cfg = cfgOf({ algorithm: 'floyd_steinberg' });
+    const comp = new RasterCompositor(gpu.device);
+    let renders = 0;
+    comp.requestRender = () => { renders++; };
+    const out = gpu.mkTex(W, H, 'rgba8unorm');
+    const st = comp.ditherCacheStats;
+    const ed = (t: CpuTexture) => { const d = t.data.slice(); for (let i = 0; i < d.length; i += 4) for (let c = 0; c < 3; c++) d[i + c] = d[i + c] >= 128 ? 255 : 0; return d; };
+    comp.playbackActive = true;
+    for (let loop = 0; loop < 2; loop++) {
+      for (const c of cs) {
+        comp.compositeIncremental([celLayer(c, cfg)], asGpu(out), 'main');
+        expect(same(out.data, c.data)).toBe(true);    // raw until a result exists
+        await vi.advanceTimersByTimeAsync(400);       // a long hold: still no pass mid-playback
+      }
+    }
+    expect(st.errorDiffusionPasses).toBe(0);
+    expect(st.playbackDeferred).toBe(3);
+    // playback stops on cel 0: every cel seen gets its pass (one at a time)
+    comp.playbackActive = false;
+    comp.compositeIncremental([celLayer(cs[0], cfg)], asGpu(out), 'main');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(st.errorDiffusionPasses).toBe(3);
+    expect(st.errorDiffusionLanded).toBe(3);
+    expect(renders).toBe(3);
+    // the shown cel's result invalidated the output; the off-screen cels' results did not
+    expect(comp.compositeIncremental([celLayer(cs[0], cfg)], asGpu(out), 'main')).toBe('full');
+    expect(same(out.data, ed(cs[0]))).toBe(true);
+    expect(comp.compositeIncremental([celLayer(cs[0], cfg)], asGpu(out), 'main')).toBe('skip');
+    // playing again: every cel shows its cached result, no pass runs
+    comp.playbackActive = true;
+    for (let loop = 0; loop < 2; loop++) {
+      for (const c of cs) {
+        comp.compositeIncremental([celLayer(c, cfg)], asGpu(out), 'main');
+        expect(same(out.data, ed(c))).toBe(true);
+        await vi.advanceTimersByTimeAsync(300);
+      }
+    }
+    expect(st.errorDiffusionPasses).toBe(3);
+  });
+
+  it('bake of an animated layer bakes and frees only the shown cel', async () => {
+    const gpu = createCpuDevice();
+    const W = 20, H = 14;
+    const cs = cels(gpu, 3, W, H, 5);
+    const cfg = cfgOf({});
+    const comp = new RasterCompositor(gpu.device);
+    const out = gpu.mkTex(W, H, 'rgba8unorm');
+    for (const c of cs) comp.composite([celLayer(c, cfg)], asGpu(out));
+    const want = fullDither(gpu, cs[1], cfg);
+    expect(await comp.bakeLayerDither(celLayer(cs[1], cfg), asGpu(cs[1]))).toBe(true);
+    expect(same(cs[1].data, want)).toBe(true);
+    expect(comp.ditherCacheSize).toBe(2);
+  });
+});
+
+describe('ditherConfigKey memo (perf E8)', () => {
+  it('same object → same key without recomputing; in-place edits (fields, colour arrays) → a new key', async () => {
+    const { ditherConfigKey } = await import('./layer-dither-cache');
+    const cfg = cfgOf({ bayerLevel: 2 });
+    const k1 = ditherConfigKey(cfg);
+    expect(ditherConfigKey(cfg)).toBe(k1);
+    expect(ditherConfigKey({ ...cfg })).toBe(k1);
+    cfg.enabled = false;                       // setDitherEnabled mutates the global config in place
+    const k2 = ditherConfigKey(cfg);
+    expect(k2).not.toBe(k1);
+    cfg.enabled = true;
+    expect(ditherConfigKey(cfg)).toBe(k1);
+    cfg.foregroundColor[1] = 0.25;             // an array element changed in place
+    const k3 = ditherConfigKey(cfg);
+    expect(k3).not.toBe(k1);
+    (cfg as unknown as Record<string, unknown>).someNewField = 3;   // a field added later is covered
+    expect(ditherConfigKey(cfg)).not.toBe(k3);
+    const nan = cfgOf({ strength: NaN });
+    expect(ditherConfigKey(nan)).toBe(ditherConfigKey(nan));
+  });
+});

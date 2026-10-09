@@ -44,6 +44,12 @@ export function buildDocumentMeshState(scene3d: Scene3DManager, m: Mesh3D, doc?:
         ribbonData:           scene3d.getRibbonData3D(m.id) ?? undefined,
         frameLinkAnimation3D: scene3d.getFrameLinkAnimation3D(m.id) ?? undefined,
     };
+    // E10 (playback perf 2026-10-09): a Frame Link mesh saved mid-animation writes its REST transform, not the
+    // displaced frame pose — the reload re-captures its rest from the saved transform, so the displacement became a
+    // permanent offset. (Null when there is no rest, or the mesh was moved since the link last posed it.) Old saves
+    // need nothing: the field set is unchanged.
+    const rest = scene3d.frameLinkRestForSave?.(m);
+    if (rest) Object.assign(s, rest);
     // A PROCEDURAL BODY is fully regenerable from its bodyParams (a handful of numbers) — so DON'T persist the
     // large baked geometry + skinning (~1–2 MB of JSON float arrays per character). Store just the params and
     // rebuild on load (restoreMeshState → generateBodyResult). Shrinks each character from ~MB to ~KB.

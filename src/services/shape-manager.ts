@@ -1653,7 +1653,8 @@ class ShapeManager {
 
     /** BRUSH-5 (docs/specs/mobile-parity.md §3): re-composite the 2D raster layers only when, and only where, they
      *  changed (a persistent composite + dirty rects) instead of blending every layer from scratch every frame.
-     *  OFF by default for now; off = the full composite, exactly as before. Session-wide (all renderers). */
+     *  ON by default since 2026-10-09; off = the full composite, exactly as before. Session-wide (all renderers). A
+     *  per-machine kill switch that survives reloads: setRenderDebug3D({ noRasterDirtyCompositing: true }). */
     public setRasterDirtyCompositing(on: boolean): void {
         WebGPURenderer.rasterDirtyCompositing = !!on;
         this.webgpuRenderer?.rasterCompositor?.invalidateIncremental();
@@ -14382,7 +14383,9 @@ class ShapeManager {
         p.setDeferredCallback(() => this._notifyPersistDeferred('save'));
         // Timeline playback: a save reads back every layer + cel and PNG-encodes them — a hitch mid-animation. The
         // TIMED / stroke autosaves wait until playback stops (then run once); explicit and tab-hide saves don't wait.
-        p.setDeferPredicate(() => !!this.rasterLayerManager?.getTimeline().isPlaying());
+        // (+ the document's 3D keyframe player — it drives the same Frame Link / keyframe pass. A save that still lands
+        // mid-animation — the deferral cap, a tab-hide flush — writes Frame Link meshes at their rest pose, E10.)
+        p.setDeferPredicate(() => !!this.rasterLayerManager?.getTimeline().isPlaying() || !!this.scene3d?.getAnimationPlayer()?.playing);
         return p;
     }
 

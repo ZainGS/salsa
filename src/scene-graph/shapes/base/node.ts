@@ -208,6 +208,20 @@ export class Node {
         this.updateLocalMatrix();
     }
 
+    /**
+     * Assign the whole 3D transform (position, rotation X/Y/Z, scale X/Y/Z) with ONE matrix rebuild — the timeline
+     * keyframe / Frame Link pass used to call 9 setters per mesh per frame, each rebuilding the local matrix (and
+     * bumping its version). No-op (no version bump) when nothing changed.
+     */
+    public setTransform3D(x: number, y: number, z: number, rx: number, ry: number, rz: number, sx: number, sy: number, sz: number): void {
+        if (this._x === x && this._y === y && this._z === z && this._rotationX === rx && this._rotationY === ry && this._rotation === rz
+            && this._scaleX === sx && this._scaleY === sy && this._scaleZ === sz) return;
+        this._x = x; this._y = y; this._z = z;
+        this._rotationX = rx; this._rotationY = ry; this._rotation = rz;
+        this._scaleX = sx; this._scaleY = sy; this._scaleZ = sz;
+        this.updateLocalMatrix();
+    }
+
     // Transformations
     private _scaleX: number = 1;
     private _scaleY: number = 1;
