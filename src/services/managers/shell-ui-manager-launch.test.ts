@@ -153,7 +153,7 @@ describe('ShellUIManager launch — with a mounted scene (the renderer presents 
     expect(m.isLaunching).toBe(true);
     await vi.advanceTimersByTimeAsync(0);
     expect(r.calls).toEqual(['begin', 'ready']);
-    r.opts!.onFrame?.({ yaw: 0, tilt: 0, scale: 1, spin: 0, spinRate: 0, blur: 0, dim: 0.44, fade: 0, chromeOpacity: 0.5, black: false });
+    r.opts!.onFrame?.({ yaw: 0, tilt: 0, scale: 1, travel: 0, spin: 0, spinRate: 0, blur: 0, dim: 0.44, fade: 0, chromeOpacity: 0.5, black: false });
     expect(cluster.style.opacity).toBe('0.5');
     expect(cluster.style.pointerEvents).toBe('none');
     r.black();

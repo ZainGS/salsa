@@ -63,11 +63,11 @@ export function launchRegion(
  *  (The flick to the front keeps the idle whirl's direction — reversing it at the tap would jerk.) */
 export const CD_SPIN_DIR = -1;
 
-/** The launch frame's CDPose inside `region`. `y0` = the tile disc's idle bob at the tap (eased out with the flick). */
+/** The launch frame's CDPose inside `region`. `y0` = the disc's idle bob at the tap (eased out with the flight). */
 export function launchCDPose(lp: LaunchPose, tMs: number, y0: number, region: Pick<LaunchRegion, 'k' | 'offX' | 'offY'>, out: CDPose, sizeScale = 1, baseScale: number = CD_TILE_SCALE): CDPose {
-  const flick = easeOutCubic(tMs / LAUNCH.flickMs);
+  void tMs;
   out.x = region.offX;
-  out.y = region.offY + y0 * (1 - flick) * region.k;
+  out.y = region.offY + y0 * (1 - lp.travel) * region.k;
   out.tilt = lp.tilt;
   out.spin = lp.yaw;
   out.roll = CD_SPIN_DIR * lp.spin;
@@ -135,47 +135,75 @@ export function launchPreviewPose(s: LaunchPreviewState, nowMs: number, idle: CD
   return sd.done ? null : sd.pose;
 }
 
-// ── The split launch (2026-10-09): the tray tile only presses, the top hero viewer's CD does the rest ──
+// ── The flight to the centre (2026-10-09, after tablet testing) ──
+// The hero viewer's CD (the tapped cart's) — or, with no viewer, the tapped tile's disc — flies to the canvas centre
+// while it grows, tilts face-on and flicks to the front, then spins up there. It draws in a VIEWPORT that moves from
+// its source rect (the viewer region / the tile rect) to a centred rect: the disc stays centred in its viewport, so it
+// is never seen off-axis and frame 0 is exactly its idle draw; the viewport's height carries the growth.
 
-/** The hero viewer's CD grows only this much (×1.15, not the in-tile ×1.35): it already fills much of the viewer. */
-export const VIEWER_LAUNCH_GROW = 1.15;
-/** …as a share of the timeline's growth (launchCDPose / settleCDPose sizeScale). */
-export const VIEWER_LAUNCH_SIZE_SCALE = (VIEWER_LAUNCH_GROW - 1) / (LAUNCH.growScale - 1);
-
-/** The hero viewer region must be at least this many device px tall (and as tall as the tapped tile) to take the
- *  launch over; smaller / hidden (phone layout, the project grid) → the in-tile launch. */
+/** The hero viewer region must be at least this many device px tall to be the flight's source; else the tile is. */
 export const VIEWER_LAUNCH_MIN_PX = 96;
 
-/** Which disc plays the launch: the hero viewer's (the tile only presses), or the tile itself (the viewer is hidden or
- *  too small). */
+/** Where the flight starts: the hero viewer's CD, or the tapped tile's disc (no / a hidden / too small viewer). */
 export type LaunchStage = 'viewer' | 'tile';
 
-/** The hero viewer can take the launch over. `viewerShowsCart` = it is showing the tapped cart's CD. */
+/** The hero viewer is the flight's source when it is drawn, shows the tapped cart's CD and is big enough. */
 export function chooseLaunchStage(o: {
   viewerShowsCart: boolean; viewerVisible: boolean; viewerW: number; viewerH: number; tileH: number;
 }): LaunchStage {
-  const big = o.viewerH >= Math.max(VIEWER_LAUNCH_MIN_PX, o.tileH) && o.viewerW >= VIEWER_LAUNCH_MIN_PX;
+  const big = o.viewerH >= VIEWER_LAUNCH_MIN_PX && o.viewerW >= VIEWER_LAUNCH_MIN_PX;
   return o.viewerShowsCart && o.viewerVisible && big ? 'viewer' : 'tile';
 }
 
+/** A device-px rect. */
+export interface LaunchRect { x: number; y: number; w: number; h: number }
+
+/** The disc may take up to this share of the canvas's shorter side at the centre. */
+export const LAUNCH_FLIGHT_MAX_FRAC = 0.9;
+
 /**
- * The tray tile's pose while the viewer plays the launch: its idle pose at the tap (`idle0`), frozen — no whirl, no
- * bob — with only the press dip (×0.94 and back over the first 90 ms) on its scale.
+ * The centred viewport the disc flies to: the source viewport grown by ≈ LAUNCH.growScale, clamped so the disc (its
+ * idle scale `idleScale` → diameter idleScale·2/SHELL_VIEW_WORLD_H of the viewport height) fits the canvas.
+ */
+export function launchFlightTarget(src: LaunchRect, idleScale: number, canvasW: number, canvasH: number, out?: LaunchRect): LaunchRect {
+  const r = out ?? { x: 0, y: 0, w: 0, h: 0 };
+  const discFrac = Math.max(1e-6, (idleScale * 2) / SHELL_VIEW_WORLD_H);
+  const fit = (LAUNCH_FLIGHT_MAX_FRAC * Math.min(canvasW, canvasH)) / (discFrac * Math.max(1, src.h));
+  const g = Math.max(0, Math.min(LAUNCH.growScale, canvasH / Math.max(1, src.h), fit));
+  const h = Math.min(canvasH, src.h * g);
+  const w = Math.min(canvasW, Math.max(h, src.w * (h / Math.max(1, src.h))));
+  r.w = w; r.h = h; r.x = (canvasW - w) / 2; r.y = (canvasH - h) / 2;
+  return r;
+}
+
+/** The flight viewport at `travel` (0 = the source, 1 = the centre): integer px, inside the canvas. */
+export function launchFlightRegion(src: LaunchRect, dst: LaunchRect, travel: number, canvasW: number, canvasH: number, out: LaunchRect): LaunchRect {
+  const k = clamp01(travel);
+  const x = src.x + (dst.x - src.x) * k, y = src.y + (dst.y - src.y) * k;
+  const w = src.w + (dst.w - src.w) * k, h = src.h + (dst.h - src.h) * k;
+  out.x = Math.max(0, Math.round(x)); out.y = Math.max(0, Math.round(y));
+  out.w = Math.max(1, Math.min(canvasW - out.x, Math.round(w)));
+  out.h = Math.max(1, Math.min(canvasH - out.y, Math.round(h)));
+  return out;
+}
+
+/** The flying disc's pose in its flight viewport: the source's idle scale (the viewport grows), the flick, the tilt,
+ *  the spin-up as the clockwise roll; the bob eases out with the flight. */
+export function flightCDPose(lp: LaunchPose, y0: number, idleScale: number, out: CDPose): CDPose {
+  return launchCDPose(lp, 0, y0, UNIT_REGION, out, 0, idleScale);
+}
+
+/** The spin-down: the disc flies back to its source (lp.travel → 0) onto its idle pose there now (`idle`). */
+export function flightSettleCDPose(tMs: number, from: LaunchPose, idle: CDPose, reducedMotion: boolean, out: CDPose): { pose: LaunchPose; done: boolean } {
+  return settleCDPose(tMs, from, idle, UNIT_REGION, reducedMotion, out, 0, idle.scale);
+}
+
+/**
+ * The tray tile's pose while its cart's disc flies from the viewer: its idle pose at the tap (`idle0`), frozen — no
+ * whirl, no bob — with only the very subtle press dip (×0.97 and back over the first 90 ms) on its scale.
  */
 export function tilePressPose(tMs: number, idle0: CDPose, out: CDPose): CDPose {
   out.x = idle0.x; out.y = idle0.y; out.tilt = idle0.tilt; out.spin = idle0.spin; out.roll = idle0.roll;
   out.scale = idle0.scale * launchPressScale(tMs);
   return out;
-}
-
-/** The viewer CD's launch frame (viewer units): the flick from the viewer's own idle yaw / tilt at the tap, the gentle
- *  growth on top of its CURRENT idle scale (`idleScale` — it still carries the viewer's pop-in when the cart only just
- *  appeared), the spin-up as roll. */
-export function viewerLaunchCDPose(lp: LaunchPose, tMs: number, y0: number, idleScale: number, out: CDPose): CDPose {
-  return launchCDPose(lp, tMs, y0, UNIT_REGION, out, VIEWER_LAUNCH_SIZE_SCALE, idleScale);
-}
-
-/** The viewer CD's spin-down, handed back to the viewer's idle pose now (`idle`, viewer units). */
-export function viewerSettleCDPose(tMs: number, from: LaunchPose, idle: CDPose, reducedMotion: boolean, out: CDPose): { pose: LaunchPose; done: boolean } {
-  return settleCDPose(tMs, from, idle, UNIT_REGION, reducedMotion, out, VIEWER_LAUNCH_SIZE_SCALE, idle.scale);
 }

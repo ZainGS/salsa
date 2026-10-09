@@ -150,6 +150,8 @@ export interface ViewerSpec {
   swayOnly?: boolean;
   /** kind 'cd': the cart's seeded disc pattern, printed when it has no art (the art is viewerThumbId's atlas cell). */
   cdPattern?: CartDiscPatternRef;
+  /** kind 'cd': the cart is HOVERED — the disc turns to face the camera and holds still (no whirl) while this is set. */
+  facing?: boolean;
 }
 
 export interface ShellRenderModel {

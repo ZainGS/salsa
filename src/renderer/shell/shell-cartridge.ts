@@ -22,6 +22,7 @@ import type { ViewerSpec } from './shell-layout';
 import type { ShellThumbnailAtlas } from './shell-thumbnails';
 import type { Billboard3DGeometry } from '../3d/billboard-3d';
 import { shellGpuCached } from './shell-gpu-cache';
+import { easeOutQuart } from './shell-launch';
 import {
   SHELL_DEPTH_FORMAT, shellCartLayouts, shellCDPipeline, uploadShellCDMesh, cdIdlePose, cdPoseModel, writeCDUniforms,
   type CDFace, type CDPose,
@@ -369,6 +370,20 @@ export class CartridgeViewer {
   private appearKey = '';
   private appearStart = 0;
 
+  // Hero CD motion (2026-10-09). The whirl is integrated (not a function of time) so it can ease into / out of FACING:
+  // while its cart is hovered (spec.facing) the disc turns to face the camera and holds still. The first hover keeps the
+  // appear spin-up — it decelerates INTO the front (≥ 1.3 turns, ~0.9 s). Changing the hovered cart while facing:
+  // the disc stays face-on and the print swaps with a small pop. Hover off: the whirl eases back in from where it is.
+  private _cdYaw = NaN;            // current yaw (NaN = not started)
+  private _cdVel = 0;              // rad/s (the free whirl)
+  private _cdLastT = 0;
+  private _cdFacing = false;
+  private _cdTween: { start: number; from: number; to: number; dur: number } | null = null;
+  private _cdFaceK = 0;            // 0 idle .. 1 facing (tilt / bob blend)
+  private _cdFaceKey = '';
+  private _cdPopStart = -1;
+  private static readonly CD_IDLE_W = (Math.PI * 2) / 12;   // the old whirl: one turn / 12 s
+
   private depthTex: GPUTexture | null = null;
   private depthView: GPUTextureView | null = null;
   private depthSize: [number, number] = [0, 0];
@@ -585,14 +600,62 @@ export class CartridgeViewer {
     const gt = Math.min(age / 0.30, 1);
     const c1 = 1.70158, c3 = c1 + 1;
     const grow = 1 + c3 * Math.pow(gt - 1, 3) + c1 * Math.pow(gt - 1, 2);   // easeOutBack
-    const extraSpin = 1.3 * Math.PI * 2 * (1 - Math.exp(-age / 0.4));
+    const pp = this._cdPopStart >= 0 ? (timeSec - this._cdPopStart) / 0.22 : 1;
+    const pop = pp >= 0 && pp < 1 ? 1 + 0.04 * Math.sin(Math.PI * pp) : 1;
+    const k = this._cdFaceK;
     out.x = 0;
-    out.y = Math.sin(timeSec * Math.PI) * 0.12;
-    out.tilt = -24 * Math.PI / 180;
-    out.spin = spec.swayOnly ? Math.sin(timeSec * 0.5) * 0.5236 : (timeSec % 12) / 12 * Math.PI * 2 + extraSpin;
+    out.y = Math.sin(timeSec * Math.PI) * 0.12 * (1 - 0.6 * k);
+    out.tilt = (-24 + 16 * k) * Math.PI / 180;     // −24° idle → −8° facing
+    out.spin = Number.isFinite(this._cdYaw) ? this._cdYaw : (timeSec % 12) / 12 * Math.PI * 2;
     out.roll = 0;
-    out.scale = 1.2 * grow * (spec.scale ?? 1);
+    out.scale = 1.2 * grow * pop * (spec.scale ?? 1);
     return out;
+  }
+
+  /** Advance the hero CD's motion to timeSec (once per render; cdViewerIdlePose reads the result). */
+  private _advanceCD(spec: ViewerSpec, timeSec: number, justAppeared: boolean, thumb: UV | null): void {
+    const TAU = Math.PI * 2;
+    const sway = (t: number): number => Math.sin(t * 0.5) * 0.5236;
+    if (!Number.isFinite(this._cdYaw)) { this._cdYaw = spec.swayOnly ? sway(timeSec) : (timeSec % 12) / 12 * TAU; this._cdVel = CartridgeViewer.CD_IDLE_W; this._cdLastT = timeSec; }
+    const dt = Math.min(0.05, Math.max(0, timeSec - this._cdLastT));
+    this._cdLastT = timeSec;
+    const facing = !!spec.facing;
+    // the front angle at least `ahead` radians forward of yaw (sway themes: the nearest front)
+    const front = (ahead: number): number => spec.swayOnly
+      ? TAU * Math.round(this._cdYaw / TAU)
+      : TAU * Math.ceil((this._cdYaw + ahead) / TAU);
+    if (facing && (!this._cdFacing || justAppeared)) {
+      // start facing: the first hover spins up and decelerates into the front; a later one just turns to it
+      const to = front(justAppeared ? 1.3 * TAU : 0.15);
+      const turns = Math.abs(to - this._cdYaw) / TAU;
+      this._cdTween = { start: timeSec, from: this._cdYaw, to, dur: justAppeared ? 1.3 : Math.min(1.2, 0.55 + 0.45 * turns) };
+    }
+    if (!facing && this._cdFacing) { this._cdTween = null; this._cdVel = 0; }   // release: the whirl eases back in
+    // the appear spin-up = the original flourish: 1.3 extra turns decaying with τ 0.4 s (initial extra ω = 1.3·2π / 0.4)
+    if (!facing && justAppeared && !spec.swayOnly) this._cdVel = CartridgeViewer.CD_IDLE_W + (1.3 * TAU) / 0.4;
+    this._cdFacing = facing;
+    if (facing) {
+      const tw = this._cdTween;
+      if (tw) {
+        const p = (timeSec - tw.start) / tw.dur;
+        this._cdYaw = tw.from + (tw.to - tw.from) * easeOutQuart(p);
+        if (p >= 1) { this._cdYaw = tw.to; this._cdTween = null; }
+      }
+      this._cdVel = 0;
+    } else if (spec.swayOnly) {
+      this._cdYaw += (sway(timeSec) - this._cdYaw) * Math.min(1, dt * 3);
+    } else {
+      this._cdVel += (CartridgeViewer.CD_IDLE_W - this._cdVel) * Math.min(1, dt / 0.4);
+      this._cdYaw += this._cdVel * dt;
+    }
+    this._cdFaceK += ((facing ? 1 : 0) - this._cdFaceK) * Math.min(1, dt * 6);
+    // a new print while facing: a small pop (the disc stays face-on)
+    const pat = spec.cdPattern ?? null;
+    const key = thumb ? `a:${thumb.u0.toFixed(5)},${thumb.v0.toFixed(5)}` : `p:${pat ? pat.seed : '-'}`;
+    if (key !== this._cdFaceKey) {
+      if (this._cdFaceKey && facing && !justAppeared && !this._cdTween) this._cdPopStart = timeSec;
+      this._cdFaceKey = key;
+    }
   }
 
   /**
@@ -625,7 +688,9 @@ export class CartridgeViewer {
     // pop in (scale up with a little overshoot) and spin quickly, decelerating
     // into the idle spin.
     const curKey = spec.billboardKey ?? ('#' + spec.kind);
-    if (curKey !== this.appearKey) { this.appearKey = curKey; this.appearStart = timeSec; }
+    const justAppeared = curKey !== this.appearKey;
+    if (justAppeared) { this.appearKey = curKey; this.appearStart = timeSec; }
+    if (isCD && !cdPose) this._advanceCD(spec, timeSec, justAppeared, thumb);
     const age = Math.max(0, timeSec - this.appearStart);
     const gt = Math.min(age / 0.30, 1);                    // grow over ~0.3s
     const c1 = 1.70158, c3 = c1 + 1;

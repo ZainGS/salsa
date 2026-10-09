@@ -2,24 +2,25 @@ import { describe, it, expect } from 'vitest';
 import {
   LAUNCH, LAUNCH_TILT0, frontYawTarget, launchPose, launchSpinRate, launchSpinAngle, launchFadeWindow, launchBlackAtMs,
   spinDownPose, spinDownDurationMs, returnRevealAlpha, prefersReducedMotion, easeOutCubic, smoothstep01, type LaunchClock,
+  flickDurationMs, launchSpinWindow,
 } from './shell-launch';
 
 const TAU = Math.PI * 2;
 const DEG = Math.PI / 180;
 const clock = (o: Partial<LaunchClock> = {}): LaunchClock => ({ yaw0: 0.7, readyAtMs: 120, ...o });
 
-describe('frontYawTarget', () => {
-  it('is a front-facing angle between half a turn and one and a half turns ahead, for any start yaw', () => {
+describe('frontYawTarget — an even flourish', () => {
+  it('the flick always turns at least 1 and less than 2 full turns (whirl direction), ending front-facing', () => {
     for (let y = -20; y <= 40; y += 0.37) {
       const t = frontYawTarget(y);
       const k = t / TAU;
       expect(Math.abs(k - Math.round(k))).toBeLessThan(1e-9);
-      expect(t - y).toBeGreaterThanOrEqual(Math.PI - 1e-9);
-      expect(t - y).toBeLessThan(3 * Math.PI + 1e-9);
+      expect(t - y).toBeGreaterThanOrEqual(TAU - 1e-9);
+      expect(t - y).toBeLessThan(2 * TAU + 1e-9);
     }
   });
 
-  it('a disc already facing the user still makes one full turn; turns and the front angle are honoured', () => {
+  it('a disc already facing the user makes exactly one turn; turns and the front angle are honoured', () => {
     expect(frontYawTarget(0)).toBeCloseTo(TAU);
     expect(frontYawTarget(TAU * 3)).toBeCloseTo(TAU * 4);
     expect(frontYawTarget(0, 2)).toBeCloseTo(2 * TAU);
@@ -29,66 +30,85 @@ describe('frontYawTarget', () => {
   });
 });
 
+describe('launchPose — the flick (constant start velocity, easeOutCubic)', () => {
+  const yawRate = (c: LaunchClock, t: number) => (launchPose(t + 0.01, c).yaw - launchPose(t, c).yaw) / 0.01;
+
+  it('every flick starts at the same angular velocity ω0, whatever the start yaw', () => {
+    for (const yaw0 of [0, 0.7, 2.1, 4.4, 6.2, 31.4]) {
+      expect(yawRate(clock({ yaw0 }), 0)).toBeCloseTo(LAUNCH.flickOmega0, 3);
+    }
+  });
+
+  it('its duration is T = 3Δ/ω0 (1.5 turns ≈ 550 ms, 1–2 turns ≈ 370–730 ms) and it stops front-facing', () => {
+    expect(flickDurationMs(0)).toBeCloseTo((3 * TAU) / LAUNCH.flickOmega0);
+    expect(flickDurationMs(TAU - Math.PI)).toBeCloseTo(550, 0);   // 1.5 turns
+    for (let y = 0; y < TAU; y += 0.31) {
+      const T = flickDurationMs(y);
+      expect(T).toBeGreaterThanOrEqual(366);
+      expect(T).toBeLessThan(734);
+      const c = clock({ yaw0: y });
+      expect(launchPose(T, c).yaw).toBeCloseTo(frontYawTarget(y));
+      expect(Math.abs(yawRate(c, T - 0.02))).toBeLessThan(1e-3);   // ~0 at the end
+      // monotonic
+      let prev = -Infinity;
+      for (let t = 0; t <= T; t += 15) { const v = launchPose(t, c).yaw; expect(v).toBeGreaterThanOrEqual(prev - 1e-12); prev = v; }
+    }
+  });
+
+  it('the spin-up starts a beat after the flick ends, and is at full speed by ~1.2 s', () => {
+    for (const yaw0 of [0, 1.3, 3.9, 6.0]) {
+      const sw = launchSpinWindow(yaw0);
+      expect(sw.startMs).toBeCloseTo(flickDurationMs(yaw0) + LAUNCH.spinBeatMs);
+      const c = clock({ yaw0, readyAtMs: null });
+      expect(launchPose(sw.startMs - 1, c).spinRate).toBe(0);
+      expect(launchPose(sw.startMs + 50, c).spinRate).toBeGreaterThan(0);
+      expect(launchPose(Math.max(LAUNCH.spinFullAtMs, sw.startMs + LAUNCH.spinMinRampMs), c).spinRate).toBeCloseTo(LAUNCH.spinMaxRevPerSec);
+    }
+  });
+});
+
 describe('launchPose — the curve', () => {
   it('starts exactly at the idle pose (no jump on the tap)', () => {
     const p = launchPose(0, clock());
-    expect(p).toMatchObject({ yaw: 0.7, scale: 1, spin: 0, spinRate: 0, blur: 0, dim: 0, fade: 0, chromeOpacity: 1, black: false });
+    expect(p).toMatchObject({ yaw: 0.7, scale: 1, travel: 0, spin: 0, spinRate: 0, blur: 0, dim: 0, fade: 0, chromeOpacity: 1, black: false });
     expect(p.tilt).toBeCloseTo(LAUNCH_TILT0);
   });
 
-  it('press dip: smaller during the first 90 ms (deepest ×0.94 mid-way, growth included)', () => {
-    const mid = launchPose(LAUNCH.pressMs / 2, clock());
-    const grow = 1 + (LAUNCH.growScale - 1) * easeOutCubic(LAUNCH.pressMs / 2 / LAUNCH.flickMs);
-    expect(mid.scale).toBeCloseTo(grow * LAUNCH.pressScale, 6);
-    expect(launchPose(LAUNCH.pressMs, clock()).scale).toBeGreaterThan(1);
-  });
-
-  it('flick: yaw eases out monotonically to the front by 500 ms, tilt −26° → −6°, grown ×1.35, then holds', () => {
+  it('the flight (travel) eases in-out over 550 ms: tilt −26° → −6°, grown ×1.6, then holds', () => {
     const c = clock({ yaw0: 2.1 });
-    const target = frontYawTarget(2.1);
-    let prev = -Infinity;
-    for (let t = 0; t <= LAUNCH.flickMs; t += 10) {
-      const y = launchPose(t, c).yaw;
-      expect(y).toBeGreaterThanOrEqual(prev - 1e-12);
-      prev = y;
-    }
-    // eases OUT: more than half the turn in the first quarter of the time
-    expect((launchPose(125, c).yaw - 2.1) / (target - 2.1)).toBeGreaterThan(0.5);
-    for (const t of [LAUNCH.flickMs, 800, 3000]) {
+    expect(launchPose(LAUNCH.travelMs / 2, c).travel).toBeCloseTo(0.5);
+    expect(launchPose(LAUNCH.travelMs / 4, c).travel).toBeLessThan(0.25);   // eases in
+    for (const t of [LAUNCH.travelMs, 900, 3000]) {
       const p = launchPose(t, c);
-      expect(p.yaw).toBeCloseTo(target);
+      expect(p.travel).toBe(1);
       expect(p.tilt).toBeCloseTo(LAUNCH.tiltEndDeg * DEG);
       expect(p.scale).toBeCloseTo(LAUNCH.growScale);
     }
+    // the press is only very subtle now
+    expect(LAUNCH.pressScale).toBeGreaterThanOrEqual(0.97);
   });
 
-  it('spin-up: none before 520 ms, ω = ωmax(t/600)² to 4 rev/s, monotonic, angle = its integral', () => {
-    expect(launchSpinRate(LAUNCH.spinStartMs)).toBe(0);
-    expect(launchSpinRate(LAUNCH.spinStartMs + 300)).toBeCloseTo(LAUNCH.spinMaxRevPerSec * 0.25);
-    expect(launchSpinRate(LAUNCH.spinStartMs + LAUNCH.spinRampMs)).toBeCloseTo(LAUNCH.spinMaxRevPerSec);
-    expect(launchSpinRate(5000)).toBe(LAUNCH.spinMaxRevPerSec);
+  it('spin rate: ω = ωmax(s/ramp)², monotonic, angle = its integral', () => {
+    const sw = launchSpinWindow(0.7);
     let prevW = 0, prevA = 0;
     for (let t = 0; t <= 2500; t += 5) {
-      const w = launchSpinRate(t), a = launchSpinAngle(t);
+      const w = launchSpinRate(t, sw.startMs, sw.rampMs), a = launchSpinAngle(t, sw.startMs, sw.rampMs);
       expect(w).toBeGreaterThanOrEqual(prevW - 1e-12);
       expect(a).toBeGreaterThanOrEqual(prevA - 1e-12);
       prevW = w; prevA = a;
     }
-    // numeric integral of the rate matches the closed form (also past the ramp)
-    for (const end of [800, LAUNCH.spinStartMs + LAUNCH.spinRampMs, 1800]) {
+    for (const end of [900, sw.startMs + sw.rampMs, 1800]) {
       let sum = 0;
       const dt = 0.05;
-      for (let t = 0; t < end; t += dt) sum += launchSpinRate(t + dt / 2) * (dt / 1000) * TAU;
-      expect(launchSpinAngle(end)).toBeCloseTo(sum, 2);
+      for (let t = 0; t < end; t += dt) sum += launchSpinRate(t + dt / 2, sw.startMs, sw.rampMs) * (dt / 1000) * TAU;
+      expect(launchSpinAngle(end, sw.startMs, sw.rampMs)).toBeCloseTo(sum, 2);
     }
-    // blur follows: none slow, full at full speed
-    expect(launchPose(600, clock()).blur).toBe(0);
     expect(launchPose(2000, clock({ readyAtMs: null })).blur).toBeCloseTo(1);
   });
 
-  it('dim 0 → 0.88 between 250 and 1000 ms; the HTML chrome fades with it', () => {
-    expect(launchPose(LAUNCH.dimStartMs, clock()).dim).toBe(0);
-    const half = launchPose((LAUNCH.dimStartMs + LAUNCH.dimEndMs) / 2, clock());
+  it('the dim starts at the tap: 0 → 0.88 over 300 ms; the HTML chrome fades with it', () => {
+    expect(launchPose(0, clock()).dim).toBe(0);
+    const half = launchPose(LAUNCH.dimEndMs / 2, clock());
     expect(half.dim).toBeCloseTo(LAUNCH.dimMax / 2);
     expect(half.chromeOpacity).toBeCloseTo(0.5);
     expect(launchPose(LAUNCH.dimEndMs, clock()).dim).toBeCloseTo(LAUNCH.dimMax);

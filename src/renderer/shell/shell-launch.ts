@@ -3,7 +3,7 @@
  * GPU. A tap on an installed cart's CD plays:
  *
  *   0–90 ms     press dip (scale ×0.94 and back)
- *   0–500 ms    flick to the front: yaw eases out (easeOutCubic) to the next "facing the user" angle about one turn
+ *   0–~850 ms   flick to the front: yaw eases out (easeOutQuart) to the next "facing the user" angle about one turn
  *               ahead, the tilt rises −26° → −6°, the disc grows ×1.35 in its tile
  *   520–1120 ms spin-up about the disc's own axis: ω = ωmax·(t/600)², to 4 rev/s (+ rotational blur as it gets fast)
  *   250–1000 ms dim 0 → 0.88 under the disc (+ the top-right DOM cluster fades with it)
@@ -21,18 +21,31 @@
 /** Every launch timing (ms) / amount, in one place. */
 export const LAUNCH = {
   pressMs: 90,
-  pressScale: 0.94,
-  flickMs: 500,
-  /** About this many turns to the front (frontYawTarget picks the nearest front angle 0.5–1.5 turns ahead). */
+  /** A very subtle dip (the instant dim is the tap's feedback now). */
+  /** No press dip (2026-10-09: it felt odd); 1 = off. The instant dim is the tap feedback. */
+  pressScale: 1,
+  /** A 1.5-turn flick takes this long; every flick starts at the same angular velocity (flickOmega0) and eases out. */
+  flickMs: 950,
+  /** The flick's starting angular velocity (rad/ms): easeOutQuart over Δ in T has ω0 = 4Δ/T → 1.5 turns in flickMs.
+   *  (2026-10-09: was easeOutCubic in 550 ms — it stopped too abruptly; quart + longer = a long gentle settle.) */
+  flickOmega0: (4 * 1.5 * 2 * Math.PI) / 950,
+  /** The flick turns at least this many turns (and less than one more) to the front. */
   flickTurns: 1,
+  /** The disc flies from its viewer / tile to the canvas centre over this long (easeOutQuart: it moves at once and
+   *  settles into the centre — an ease-in start looked like a hesitation). */
+  travelMs: 850,
   tiltStartDeg: -26,
   tiltEndDeg: -6,
-  growScale: 1.35,
-  spinStartMs: 520,
-  spinRampMs: 600,
+  /** The flight grows the disc to about this (the renderer clamps it to what fits the canvas). */
+  growScale: 1.6,
+  /** The spin-up starts this long after the flick ends… */
+  spinBeatMs: 20,
+  /** …and reaches full speed at about this (ramp at least spinMinRampMs). */
+  spinFullAtMs: 1200,
+  spinMinRampMs: 300,
   spinMaxRevPerSec: 4,
-  dimStartMs: 250,
-  dimEndMs: 1000,
+  dimStartMs: 0,
+  dimEndMs: 300,
   dimMax: 0.88,
   /** The final fade never starts before this, even when the cart was ready at once. */
   minFadeStartMs: 1600,
@@ -61,8 +74,10 @@ export interface LaunchPose {
   yaw: number;
   /** Tilt (about the horizontal axis). */
   tilt: number;
-  /** Scale of the disc in its tile (×1 = idle). */
+  /** Scale of the disc (×1 = idle; grows with the flight to ≈ growScale). */
   scale: number;
+  /** The flight from the viewer / tile to the canvas centre, 0..1 (easeOutCubic; back to 0 in a spin-down). */
+  travel: number;
   /** Angle about the disc's OWN axis (the "real CD" spin). */
   spin: number;
   /** Spin rate, revolutions per second. */
@@ -94,34 +109,48 @@ export interface LaunchClock {
 
 export const clamp01 = (x: number): number => (x <= 0 ? 0 : x >= 1 ? 1 : x);
 export const easeOutCubic = (x: number): number => { const u = 1 - clamp01(x); return 1 - u * u * u; };
+/** A longer, gentler tail than cubic (the flick + the hover turn settle with it). */
+export const easeOutQuart = (x: number): number => { const u = 1 - clamp01(x); return 1 - u * u * u * u; };
 export const smoothstep01 = (x: number): number => { const u = clamp01(x); return u * u * (3 - 2 * u); };
+export const easeInOutCubic = (x: number): number => { const u = clamp01(x); return u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2; };
 
 /** The default idle tilt of a Shell CD, radians. */
 export const LAUNCH_TILT0 = LAUNCH.tiltStartDeg * DEG;
 
 /**
- * The yaw the flick ends at: the front-facing angle (`front` + k·2π) about `turns` turns ahead of `yaw0` — at least
- * (turns − ½) and less than (turns + ½) turns ahead, in the whirl's (positive) direction. So the flick is always a
- * real turn, never a twitch of a few degrees or a near-standstill.
+ * The yaw the flick ends at: the front-facing angle (`front` + k·2π) at least `turns` turns and less than turns + 1
+ * ahead of `yaw0`, in the whirl's (positive) direction — so every flick is a full flourish (1 to 2 turns), never a
+ * twitch.
  */
 export function frontYawTarget(yaw0: number, turns: number = LAUNCH.flickTurns, front = 0): number {
-  const k = Math.ceil((yaw0 - front + (turns - 0.5) * TAU) / TAU);
-  return front + k * TAU;
+  return front + TAU * Math.ceil((yaw0 + turns * TAU - front) / TAU);
+}
+
+/** The flick's duration for a start yaw: T = 4Δ/ω0 (constant starting angular velocity, easeOutQuart to a stop). */
+export function flickDurationMs(yaw0: number): number {
+  return (4 * (frontYawTarget(yaw0) - yaw0)) / LAUNCH.flickOmega0;
+}
+
+/** When the spin-up starts (the flick's end + a beat) and how long it ramps to full speed. */
+export function launchSpinWindow(yaw0: number): { startMs: number; rampMs: number } {
+  // the spin starts once the disc has both finished its flick AND reached the centre (+ a short beat)
+  const startMs = Math.max(flickDurationMs(yaw0), LAUNCH.travelMs) + LAUNCH.spinBeatMs;
+  return { startMs, rampMs: Math.max(LAUNCH.spinMinRampMs, LAUNCH.spinFullAtMs - startMs) };
 }
 
 /** Spin rate (rev/s) at `t` ms after the tap (0 before the spin-up; ωmax·(s/ramp)² during it; ωmax after). */
-export function launchSpinRate(t: number): number {
-  const s = t - LAUNCH.spinStartMs;
+export function launchSpinRate(t: number, startMs: number, rampMs: number): number {
+  const s = t - startMs;
   if (s <= 0) return 0;
-  const u = Math.min(1, s / LAUNCH.spinRampMs);
+  const u = Math.min(1, s / rampMs);
   return LAUNCH.spinMaxRevPerSec * u * u;
 }
 
 /** Spin angle (radians) at `t` — the exact integral of launchSpinRate. */
-export function launchSpinAngle(t: number): number {
-  const s = t - LAUNCH.spinStartMs;
+export function launchSpinAngle(t: number, startMs: number, rampMs: number): number {
+  const s = t - startMs;
   if (s <= 0) return 0;
-  const R = LAUNCH.spinRampMs, w = LAUNCH.spinMaxRevPerSec;
+  const R = rampMs, w = LAUNCH.spinMaxRevPerSec;
   const revs = s <= R
     ? (w * s * s * s) / (3 * R * R) / 1000
     : ((w * R) / 3 + w * (s - R)) / 1000;
@@ -163,17 +192,19 @@ export function launchPose(t: number, c: LaunchClock): LaunchPose {
   const fade = w ? smoothstep01((t - w.startMs) / w.durationMs) : 0;
   const black = !!w && t >= w.startMs + w.durationMs;
   if (c.reducedMotion) {
-    return { yaw: c.yaw0, tilt: tilt0, scale: 1, spin: 0, spinRate: 0, blur: 0, dim: 0, fade, chromeOpacity: 1 - fade, black };
+    return { yaw: c.yaw0, tilt: tilt0, scale: 1, travel: 0, spin: 0, spinRate: 0, blur: 0, dim: 0, fade, chromeOpacity: 1 - fade, black };
   }
-  const flick = easeOutCubic(t / LAUNCH.flickMs);
-  const yaw = c.yaw0 + (frontYawTarget(c.yaw0) - c.yaw0) * flick;
-  const tilt = tilt0 + (LAUNCH.tiltEndDeg * DEG - tilt0) * flick;
+  const flickT = flickDurationMs(c.yaw0);
+  const yaw = c.yaw0 + (frontYawTarget(c.yaw0) - c.yaw0) * easeOutQuart(t / flickT);
+  const travel = easeOutQuart(t / LAUNCH.travelMs);
+  const tilt = tilt0 + (LAUNCH.tiltEndDeg * DEG - tilt0) * travel;
   const press = launchPressScale(t);
-  const scale = (1 + (LAUNCH.growScale - 1) * flick) * press;
-  const spinRate = launchSpinRate(t);
+  const scale = (1 + (LAUNCH.growScale - 1) * travel) * press;
+  const sw = launchSpinWindow(c.yaw0);
+  const spinRate = launchSpinRate(t, sw.startMs, sw.rampMs);
   const dim = LAUNCH.dimMax * smoothstep01((t - LAUNCH.dimStartMs) / (LAUNCH.dimEndMs - LAUNCH.dimStartMs));
   const chromeOpacity = 1 - Math.max(dim / LAUNCH.dimMax, fade);
-  return { yaw, tilt, scale, spin: launchSpinAngle(t), spinRate, blur: launchBlur(spinRate), dim, fade, chromeOpacity, black };
+  return { yaw, tilt, scale, travel, spin: launchSpinAngle(t, sw.startMs, sw.rampMs), spinRate, blur: launchBlur(spinRate), dim, fade, chromeOpacity, black };
 }
 
 /** How long a spin-down (error / cancel) runs. */
@@ -202,6 +233,7 @@ export function spinDownPose(t: number, from: LaunchPose, opts: { tilt0?: number
       yaw: from.yaw,
       tilt: from.tilt + (tilt0 - from.tilt) * e,
       scale: from.scale + (1 - from.scale) * e,
+      travel: from.travel * (1 - e),
       spin,
       spinRate,
       blur: launchBlur(spinRate),

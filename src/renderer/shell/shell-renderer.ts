@@ -49,8 +49,8 @@ import {
   LAUNCH, launchPose, spinDownPose, type LaunchClock, type LaunchPose, type ShellLaunchBeginOptions, type ShellLaunchPresenter,
 } from './shell-launch';
 import {
-  launchRegion, launchCDPose, settleCDPose, viewerLaunchCDPose, viewerSettleCDPose, tilePressPose, chooseLaunchStage, LAUNCH_BLUR_ARC,
-  type LaunchRegion, type LaunchStage,
+  launchFlightTarget, launchFlightRegion, flightCDPose, flightSettleCDPose, tilePressPose, chooseLaunchStage, LAUNCH_BLUR_ARC,
+  type LaunchRect, type LaunchStage,
 } from './shell-launch-pose';
 
 export const FONT_FAMILY = '"Bungee", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
@@ -1530,12 +1530,11 @@ export class ShellRenderer implements ShellLaunchPresenter {
   get modeFadeActive(): boolean { return this._fade !== null; }
 
   // ── Cart launch (ShellLaunchPresenter; docs/specs/frogcart-cd-art-and-launch.md Part A) ──
-  // SPLIT (2026-10-09): the tapped tray tile only presses (×0.94 and back) and then holds still at its idle pose, dimmed
-  // with the rest of the Shell; the top hero viewer — which the tap switched to that cart's CD — plays the flick, the
-  // spin-up and the fade, drawn over the dim. When the viewer is hidden / too small (phone layout, the project grid)
-  // the tile plays it all itself in a grown viewport (the 'tile' stage). Error / Esc → the spin-down hands the disc back
-  // to its idle motion and the tile whirls on from where it paused. Everything is computed from the clock inside
-  // render(): nothing is rebuilt per frame.
+  // FLIGHT (2026-10-09): the dim starts at the tap; the hero viewer's CD (switched to the tapped cart at the tap) flies
+  // from the viewer to the canvas centre (a viewport moving source → centre, easeOutCubic) while it grows, tilts face-on
+  // and flicks to the front, then spins up there over the dim, then the fade. The tray tile holds its idle pose (a very
+  // subtle press), dimmed. No viewer → the flight starts from the tapped tile's disc. Error / Esc → the disc flies back
+  // while it spins down and the tile whirls on from where it paused. Computed from the clock inside render().
   private _launch: {
     opts: ShellLaunchBeginOptions;
     clock: LaunchClock;
@@ -1554,7 +1553,10 @@ export class ShellRenderer implements ShellLaunchPresenter {
   private readonly _launchCD: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
   private readonly _launchTilePose: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
   private readonly _launchIdle: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
-  private readonly _launchRegion: LaunchRegion = { x: 0, y: 0, w: 0, h: 0, k: 1, offX: 0, offY: 0 };
+  /** The flight: its source viewport (the viewer region / the tile rect), its centred target, this frame's viewport. */
+  private readonly _flightSrc: LaunchRect = { x: 0, y: 0, w: 0, h: 0 };
+  private readonly _flightDst: LaunchRect = { x: 0, y: 0, w: 0, h: 0 };
+  private readonly _launchRegion: LaunchRect = { x: 0, y: 0, w: 0, h: 0 };
   private readonly _launchRgb: [number, number, number] = [0.04, 0.04, 0.04];
   /** Per cart tile: seconds its idle clock runs behind (it held still for a launch that then failed / was cancelled). */
   private readonly _tileTimeOffset = new Map<string, number>();
@@ -1583,12 +1585,13 @@ export class ShellRenderer implements ShellLaunchPresenter {
   }
 
   /** This frame's launch state (prepareLaunchFrame; reused: no allocation per frame).
-   *  tile = drawn LATER in its grown viewport ('tile' stage); pressTile = drawn in place with its press pose ('viewer'
-   *  stage); viewer = the hero viewer's CD is drawn after the dim with the launch pose. */
+   *  fly = the flying disc is drawn after the dim in _launchRegion (viewer = it is the hero viewer's CD, whose normal draw
+   *  is skipped; tile = it is that tray tile's disc, whose tray draw is skipped); pressTile = the tray tile held still
+   *  (pressed) in place while the viewer's CD flies. */
   private readonly _lf: {
-    on: boolean; tile: RenderTile | null; pressTile: RenderTile | null; viewer: boolean; slot: number;
+    on: boolean; fly: boolean; tile: RenderTile | null; pressTile: RenderTile | null; viewer: boolean; slot: number;
     pose: LaunchPose | null; blur: number; goBlack: boolean; settled: boolean;
-  } = { on: false, tile: null, pressTile: null, viewer: false, slot: -1, pose: null, blur: 0, goBlack: false, settled: false };
+  } = { on: false, fly: false, tile: null, pressTile: null, viewer: false, slot: -1, pose: null, blur: 0, goBlack: false, settled: false };
 
   /** The hero viewer region's height (device px), and whether the viewer is drawn at all. */
   private viewerHeightPx(h: number): number { return Math.max(0, (this.model?.viewerFraction ?? 0) * h); }
@@ -1597,25 +1600,31 @@ export class ShellRenderer implements ShellLaunchPresenter {
     return !!m?.viewer && !m.projectGrid && this.dbg.hero && this._heroReady && !this._loadingDots;
   }
 
-  /** Evaluate the launch for this frame: the timeline pose (dim / fade), and which disc draws how. */
+  /** Evaluate the launch for this frame: the timeline pose (dim / fade), the flying disc's pose + viewport. */
   private prepareLaunchFrame(nowMs: number, now: number, w: number, h: number): void {
     const lf = this._lf;
     const L = this._launch;
-    lf.on = !!L; lf.tile = null; lf.pressTile = null; lf.viewer = false; lf.slot = -1;
+    lf.on = !!L; lf.fly = false; lf.tile = null; lf.pressTile = null; lf.viewer = false; lf.slot = -1;
     lf.pose = null; lf.blur = 0; lf.goBlack = false; lf.settled = false;
     if (!L) return;
     const found = this.findLaunchTile(L.opts.slotId);
     const reduced = !!L.clock.reducedMotion;
     const m = this.model;
+    // The flight's source: the hero viewer's CD (its region + its idle pose now), else the tapped tile's disc.
     const viewerSpec = L.stage === 'viewer' && m?.viewer?.kind === 'cd' && this.viewerVisible() ? m.viewer : null;
-    const region = L.stage === 'tile' && found
-      ? launchRegion(found.tile.rect as [number, number, number, number], w, h, undefined, this._launchRegion) : null;
-    const viewerIdle = viewerSpec ? this.viewer.cdViewerIdlePose(viewerSpec, now, this._launchIdle) : null;
+    const src = this._flightSrc;
+    let srcIdle: CDPose | null = null;
+    if (viewerSpec) {
+      src.x = 0; src.y = 0; src.w = w; src.h = this.viewerHeightPx(h);
+      srcIdle = this.viewer.cdViewerIdlePose(viewerSpec, now, this._launchIdle);
+    } else if (L.stage === 'tile' && found) {
+      src.x = found.tile.rect[0]; src.y = found.tile.rect[1]; src.w = found.tile.rect[2]; src.h = found.tile.rect[3];
+      srcIdle = cdIdlePose(this.cartTileClock(found.tile.id, now), found.slot * 1.7, this._launchIdle);
+    }
     if (L.phase === 'launch') {
       const t = nowMs - L.opts.startMs;
       const lp = launchPose(t, L.clock);
-      if (region) launchCDPose(lp, t, L.y0, region, this._launchCD);
-      if (viewerIdle) viewerLaunchCDPose(lp, t, L.y0, viewerIdle.scale, this._launchCD);
+      if (srcIdle) flightCDPose(lp, L.y0, srcIdle.scale, this._launchCD);
       if (L.tileIdle0) tilePressPose(t, L.tileIdle0, this._launchTilePose);
       lf.pose = lp;
       lf.goBlack = lp.black;
@@ -1624,23 +1633,20 @@ export class ShellRenderer implements ShellLaunchPresenter {
       if (L.tileIdle0) tilePressPose(LAUNCH.pressMs, L.tileIdle0, this._launchTilePose);
     } else if (L.from) {
       const t = nowMs - L.settleStart;
-      if (region && found) {
-        const idle = cdIdlePose(this.tileClock(now), found.slot * 1.7, this._launchIdle);
-        const sd = settleCDPose(t, L.from, idle, region, reduced, this._launchCD);
-        lf.pose = sd.pose; lf.settled = sd.done;
-      } else if (viewerIdle) {
-        const sd = viewerSettleCDPose(t, L.from, viewerIdle, reduced, this._launchCD);
-        lf.pose = sd.pose; lf.settled = sd.done;
-      } else {
-        const sd = spinDownPose(t, L.from, { reducedMotion: reduced });
-        lf.pose = sd.pose; lf.settled = sd.done;
-      }
+      // the disc flies back to its source (travel → 0) while it spins down onto its idle pose there
+      const sd = srcIdle ? flightSettleCDPose(t, L.from, srcIdle, reduced, this._launchCD) : spinDownPose(t, L.from, { reducedMotion: reduced });
+      lf.pose = sd.pose; lf.settled = sd.done;
     }
     if (lf.pose) { L.last = lf.pose; lf.blur = lf.pose.blur * LAUNCH_BLUR_ARC; }
     if (!lf.settled) {
-      if (found && region) { lf.tile = found.tile; lf.slot = found.slot; }
-      if (viewerIdle) lf.viewer = true;
-      // the tray tile holds its pressed idle pose until the launch fails / is cancelled (then it whirls on)
+      if (srcIdle && lf.pose) {
+        const dst = launchFlightTarget(src, srcIdle.scale, w, h, this._flightDst);
+        launchFlightRegion(src, dst, lf.pose.travel, w, h, this._launchRegion);
+        lf.fly = true;
+        lf.viewer = !!viewerSpec;
+        if (!viewerSpec && found) { lf.tile = found.tile; lf.slot = found.slot; }
+      }
+      // the tray tile holds its idle pose (pressed) while the viewer's CD flies, until a failure / cancel (it whirls on)
       if (found && L.tileIdle0 && L.phase !== 'settling') { lf.pressTile = found.tile; lf.slot = found.slot; }
     }
     if (lf.pose && L.phase !== 'black') {
@@ -2911,30 +2917,24 @@ export class ShellRenderer implements ShellLaunchPresenter {
         pass.draw(3);
       }
       const t = lf.tile;
-      let drew = false;
-      if (lf.viewer && m.viewer && lp.fade < 0.999) {
-        // the hero viewer's CD, bright over the dim: its own region, depth reset there first (the tiles / chrome below
-        // may have written depth into it)
-        const vh = Math.min(h, Math.ceil(this.viewerHeightPx(h)));
-        this.viewer.resetDepth(pass, w, h, 0, 0, w, vh);
-        const vr = this._region;
-        vr.x = 0; vr.y = 0; vr.w = w; vr.h = this.viewerHeightPx(h);
-        const thumb = m.viewerThumbId ? this.thumbAtlas.touch(m.viewerThumbId, uv) : null;
-        this.viewer.render(pass, vr, m.viewer, now, thumb, 1, this._launchCD, lf.blur);
-        drew = true;
-      } else if (t && lp.fade < 0.999) {
+      if (lf.fly && lp.fade < 0.999 && (lf.viewer ? !!m.viewer : !!t)) {
+        // The flying disc, bright over the dim, in its flight viewport (source → centre); the tiles / chrome / hero below
+        // wrote depth inside it: clear it there first.
         const r = this._launchRegion;
-        // the neighbouring tiles' discs wrote depth inside the grown viewport: clear it there first
         this.viewer.resetDepth(pass, w, h, r.x, r.y, r.w, r.h);
-        const face = this._cdFace;
-        face.art = this.thumbAtlas.touch(t.id, this._cdUv);
-        face.pattern = t.cdPattern ?? null;
         const vr = this._region;
         vr.x = r.x; vr.y = r.y; vr.w = r.w; vr.h = r.h;
-        this.viewer.drawCD(pass, vr, face, tileNow, lf.slot, this._launchCD, lf.blur);
-        drew = true;
+        if (lf.viewer && m.viewer) {
+          const thumb = m.viewerThumbId ? this.thumbAtlas.touch(m.viewerThumbId, uv) : null;
+          this.viewer.render(pass, vr, m.viewer, now, thumb, 1, this._launchCD, lf.blur);
+        } else if (t) {
+          const face = this._cdFace;
+          face.art = this.thumbAtlas.touch(t.id, this._cdUv);
+          face.pattern = t.cdPattern ?? null;
+          this.viewer.drawCD(pass, vr, face, tileNow, lf.slot, this._launchCD, lf.blur);
+        }
+        pass.setViewport(0, 0, w, h, 0, 1);
       }
-      if (drew) pass.setViewport(0, 0, w, h, 0, 1);
       if (lp.fade > 0.001) {
         const fd = this.scratch('launchFade', 12);
         fd[0] = rgb[0]; fd[1] = rgb[1]; fd[2] = rgb[2]; fd[3] = 1;

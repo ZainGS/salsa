@@ -104,6 +104,13 @@ export interface ShellSlotMenuEvent {
 const SHELL_CLOSE_MIN_HIT_COARSE_CSS = 44;
 
 /** Synthetic tile id for the trailing "＋ Install cart" slot in shell mode. */
+/**
+ * Hovering a cart (2026-10-09): true = the top viewer's CD does the appear spin-up, decelerates INTO the front and holds
+ * still facing the camera while hovered (CartridgeViewer._advanceCD, spec.facing). false = the ORIGINAL flourish the
+ * user liked too: the same spin-up decaying into the free idle whirl (never faces the camera) — kept to switch back to.
+ */
+export const SHELL_CD_HOVER_FACES = true;
+
 export const SHELL_ADD_CART_ID = '__add_cart__';
 /** Synthetic tile id for the leading "＋ New project" slot in Illustrations mode. */
 export const SHELL_NEW_PROJECT_ID = '__new_project__';
@@ -1876,7 +1883,9 @@ export class ShellUIManager {
     const cartId = this.viewerCartId();
     if (cartId) {
       const slot = this.getSlot(cartId);
-      return { kind: 'cd', bodyColor: [0.72, 0.74, 0.80, 1], labelColor: [0.9, 0.9, 0.95, 1], cdPattern: slotDiscPattern(slot ?? { id: cartId }) };
+      // hovered (not just selected): the disc turns to face the camera and holds still
+      const facing = SHELL_CD_HOVER_FACES && this.view.hoveredSlotId === cartId;
+      return { kind: 'cd', bodyColor: [0.72, 0.74, 0.80, 1], labelColor: [0.9, 0.9, 0.95, 1], cdPattern: slotDiscPattern(slot ?? { id: cartId }), facing };
     }
 
     if (this.view.mode === 'illustrations') {

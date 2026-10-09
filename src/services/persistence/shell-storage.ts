@@ -138,6 +138,13 @@ export interface ProjectRegistry {
  */
 export const PACKAGING_ENABLED = true;
 
+/**
+ * The Shell's Package Designer TILE only (2026-10-09: hidden until the designer is finished — the user will re-add it).
+ * Unlike PACKAGING_ENABLED this leaves the packaging module (sm.packaging, the CD Kit, the package editor route) alone:
+ * it just keeps the app off the home screen. Flip to true to bring the tile back.
+ */
+export const SHELL_SHOW_PACKAGE_DESIGNER = false;
+
 const PACKAGE_DESIGNER_APP: ShellSlot = {
   id: 'system:packageDesigner',
   order: 1,
@@ -156,8 +163,8 @@ export const SYSTEM_APPS: ReadonlyArray<ShellSlot> = [
     name: 'Illustrator',
     description: 'Browse and open your .frogmarks projects',
   },
-  // Package Designer sits right after Illustrator (gated by the feature flag).
-  ...(PACKAGING_ENABLED ? [PACKAGE_DESIGNER_APP] : []),
+  // Package Designer sits right after Illustrator (gated by the feature flag + the tile switch).
+  ...(PACKAGING_ENABLED && SHELL_SHOW_PACKAGE_DESIGNER ? [PACKAGE_DESIGNER_APP] : []),
   {
     id: 'system:settings',
     order: 2,

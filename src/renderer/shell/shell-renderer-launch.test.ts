@@ -10,16 +10,16 @@ import { ShellRenderer, parseLaunchColor } from './shell-renderer';
 import { LAUNCH, type ShellLaunchBeginOptions } from './shell-launch';
 import { cdIdlePose, CD_TILE_SCALE, type CDPose } from './shell-cd';
 import { CartridgeViewer } from './shell-cartridge';
-import { VIEWER_LAUNCH_GROW } from './shell-launch-pose';
+import { launchFlightTarget } from './shell-launch-pose';
 
 type R = Pick<ShellRenderer, 'beginLaunch' | 'markLaunchReady' | 'skipLaunch' | 'cancelLaunch' | 'launchActive' | 'launchBlack'
   | 'setReducedMotion' | 'setPointer' | 'start' | 'stop' | 'render'> & {
   prepareLaunchFrame(nowMs: number, now: number, w: number, h: number): void;
   finishLaunchFrame(): void;
   tileClock(now: number): number;
-  _lf: { on: boolean; tile: { id: string } | null; pressTile: { id: string } | null; viewer: boolean; slot: number; pose: { dim: number; fade: number; black: boolean; chromeOpacity: number } | null; blur: number; goBlack: boolean; settled: boolean };
+  _lf: { on: boolean; fly: boolean; tile: { id: string } | null; pressTile: { id: string } | null; viewer: boolean; slot: number; pose: { dim: number; fade: number; black: boolean; chromeOpacity: number } | null; blur: number; goBlack: boolean; settled: boolean };
   _launchCD: { spin: number; tilt: number; scale: number; roll: number; y: number };
-  _launchRegion: { w: number; h: number; k: number };
+  _launchRegion: { x: number; y: number; w: number; h: number };
   _launchTilePose: { spin: number; tilt: number; scale: number; roll: number; y: number };
   launchStage: 'viewer' | 'tile' | null;
   cartTileClock(id: string, now: number): number;
@@ -47,9 +47,10 @@ function renderer(viewerCart: string | null = null, viewerFraction = 0.4): R {
     _launch: null,
     _launchCD: { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 },
     _launchIdle: { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 },
-    _launchRegion: { x: 0, y: 0, w: 0, h: 0, k: 1, offX: 0, offY: 0 },
+    _launchRegion: { x: 0, y: 0, w: 0, h: 0 },
+    _flightSrc: { x: 0, y: 0, w: 0, h: 0 }, _flightDst: { x: 0, y: 0, w: 0, h: 0 },
     _launchRgb: [0, 0, 0],
-    _lf: { on: false, tile: null, pressTile: null, viewer: false, slot: -1, pose: null, blur: 0, goBlack: false, settled: false },
+    _lf: { on: false, fly: false, tile: null, pressTile: null, viewer: false, slot: -1, pose: null, blur: 0, goBlack: false, settled: false },
     _reducedMotion: false, _calmTime: 0,
     running: true, destroyed: false, pointerTarget: [0, 0],
   });
@@ -169,7 +170,7 @@ describe('ShellRenderer launch presenter', () => {
     expect(r.pointerTarget).toEqual([0.8, -0.5]);
   });
 
-  it('SPLIT: with the viewer showing the tapped cart, the viewer plays the launch and the tile only presses, then holds', () => {
+  it('FLIGHT: the viewer CD flies to the centre (grown in its viewport) and plays the launch; the tile only holds', () => {
     const r = renderer('b');
     const o = opts();
     r.beginLaunch(o);
@@ -189,19 +190,29 @@ describe('ShellRenderer launch presenter', () => {
     // mid-press: the tile dips; the viewer flicks
     r.prepareLaunchFrame(10_045, 10.045, 1920, 1080);
     expect(r._launchTilePose.scale).toBeLessThan(tile0.scale);
-    // after the press the tile is back at ×1 and FROZEN (no whirl / bob) while the viewer spins up, grown ×1.15
+    // mid-flight: the viewport is between the viewer region and the centred target
+    const src = { x: 0, y: 0, w: 1920, h: 432 };
+    const dst = launchFlightTarget(src, v0.scale, 1920, 1080);
+    r.prepareLaunchFrame(10_000 + LAUNCH.travelMs / 2, 10 + LAUNCH.travelMs / 2000, 1920, 1080);
+    expect(r._lf.fly).toBe(true);
+    expect(r._launchRegion.h).toBeGreaterThan(432);
+    expect(r._launchRegion.h).toBeLessThan(dst.h);
+    expect(r._launchRegion.y).toBeGreaterThan(0);
+    // after the press the tile is back at ×1 and FROZEN (no whirl / bob) while the disc spins up at the centre
     r.prepareLaunchFrame(11_300, 11.3, 1920, 1080);
     expect(r._launchTilePose.scale).toBeCloseTo(tile0.scale);
     expect(r._launchTilePose.spin).toBeCloseTo(tile0.spin);
     expect(r._launchTilePose.y).toBeCloseTo(tile0.y);
     const vNow = r.viewer.cdViewerIdlePose(spec, 11.3, { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 } as CDPose);
-    expect(r._launchCD.scale).toBeCloseTo(vNow.scale * VIEWER_LAUNCH_GROW);
+    expect(r._launchCD.scale).toBeCloseTo(vNow.scale);            // the viewport carries the growth
+    expect(r._launchRegion.h).toBe(Math.round(dst.h));
+    expect(r._launchRegion.y + r._launchRegion.h / 2).toBeCloseTo(540, -1);
     expect(Math.abs(r._launchCD.roll)).toBeGreaterThan(1);   // the disc-axis spin
     expect(r._lf.blur).toBeGreaterThan(0);
     expect(r._lf.pose!.dim).toBeCloseTo(LAUNCH.dimMax);
   });
 
-  it('SPLIT error / cancel: the viewer CD spins down to its idle pose; the tile whirls on from where it paused', () => {
+  it('FLIGHT error / cancel: the disc flies back into the viewer while it spins down; the tile whirls on from where it paused', () => {
     const r = renderer('b');
     const o = opts();
     r.beginLaunch(o);
@@ -221,17 +232,19 @@ describe('ShellRenderer launch presenter', () => {
     const idle = r.viewer.cdViewerIdlePose(spec, 11.85, { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 } as CDPose);
     expect(r._launchCD.scale).toBeCloseTo(idle.scale);
     expect(r._launchCD.tilt).toBeCloseTo(idle.tilt);
+    expect((r._lf.pose as { travel?: number } | null)?.travel ?? 0).toBeCloseTo(0);   // back in the viewer
     expect(((r._launchCD.spin - idle.spin) / (2 * Math.PI)) % 1).toBeCloseTo(0);
     r.finishLaunchFrame();
     expect(o.onSettled).toHaveBeenCalled();
   });
 
-  it('SPLIT fallback: no viewer, a viewer showing another cart, or one too small → the in-tile launch', () => {
+  it('FLIGHT fallback: no viewer, a viewer showing another cart, or one too small → the flight starts from the tile', () => {
     for (const r of [renderer(null), renderer('a'), renderer('b', 0.05)]) {
       r.beginLaunch(opts());
       expect(r.launchStage).toBe('tile');
       r.prepareLaunchFrame(10_500, 10.5, 1920, 1080);
       expect(r._lf.tile?.id).toBe('b');
+      expect(r._lf.fly).toBe(true);
       expect(r._lf.viewer).toBe(false);
       expect(r._lf.pressTile).toBeNull();
     }
