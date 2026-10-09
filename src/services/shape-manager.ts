@@ -6163,7 +6163,28 @@ class ShapeManager {
      * the original. The operation is undo-able via `undo3D()`.
      */
     public duplicateMesh3D(nodeId: string) {
-        return this.scene3d.duplicateMesh(nodeId);
+        const copy = this.scene3d.duplicateMesh(nodeId);
+        if (copy) this._duplicateUvPaintTexture(nodeId, copy);
+        return copy;
+    }
+
+    /** A duplicate of a UV-painted mesh gets its OWN copy of the painted texture, registered under its id: it used to
+     *  share the source's live GPU texture (painting either one changed both) without an entry of its own, so the save
+     *  — which writes painted textures per mesh id — skipped it and the copy reloaded unpainted (white). */
+    private _duplicateUvPaintTexture(srcId: string, copy: Mesh3D): void {
+        const srcMgr = this._uvPaintTextures.get(srcId);
+        const srcTex = srcMgr?.getTexture();
+        const device = this.webgpuRenderer?.getDevice();
+        if (!srcTex || !device || copy.diffuseTexture !== srcTex) return;
+        const mgr = new RasterTextureManager(device);
+        const tex = mgr.ensureTexture(srcTex.width, srcTex.height);
+        const enc = device.createCommandEncoder();
+        enc.copyTextureToTexture({ texture: srcTex }, { texture: tex }, [srcTex.width, srcTex.height]);
+        device.queue.submit([enc.finish()]);
+        bumpGpuPixelEpoch('none', tex);   // GPU-only pixels changed (device-lost shadow; incremental autosave: this texture)
+        this._uvPaintTextures.set(copy.id, mgr);
+        copy.diffuseTexture = tex; copy.material.hasTexture = true; copy.gpuDirty = true;
+        this.scheduleRender();
     }
 
     // ── Multi-material submesh API ────────────────────────────────────

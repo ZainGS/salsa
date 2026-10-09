@@ -8875,14 +8875,22 @@ export class Scene3DManager {
             material:  { ...src.material },
         });
         copy.name = src.name + ' copy';
-        // Offset so the duplicate doesn't sit exactly on top of the original
-        copy.x += 0.5;
-        copy.rotationX = src.rotationX;
-        copy.rotationY = src.rotationY;
-        copy.rotation  = src.rotation;
-        copy.scaleX = src.scaleX;
-        copy.scaleY = src.scaleY;
-        copy.scaleZ = src.scaleZ;
+        // A Frame Link source mid-animation: the copy starts from its REST pose (else the displacement becomes the
+        // copy's rest). Offset so the duplicate doesn't sit exactly on top of the original.
+        const rest = this.frameLinkRestForSave(src);
+        copy.setTransform3D(
+            (rest?.x ?? src.x) + 0.5, rest?.y ?? src.y, rest?.z ?? src.z,
+            rest?.rotationX ?? src.rotationX, rest?.rotationY ?? src.rotationY, rest?.rotation ?? src.rotation,
+            rest?.scaleX ?? src.scaleX, rest?.scaleY ?? src.scaleY, rest?.scaleZ ?? src.scaleZ);
+        // The edit topology + its vertex colours (an Edit Mesh-edited source), outline, camera occluder mode. (The
+        // geometry above is the source's MODIFIED geometry, so the modifier stack is baked in, not copied — and the
+        // edit topology only matches it without modifiers.)
+        if (src.editMesh && !src.blendShapes.length && !src.modifiers.length) {
+            try { copy.editMesh = EditMesh.fromJSON(src.editMesh.toJSON()); } catch { copy.editMesh = null; }
+        }
+        copy.vertexColors = src.vertexColors ? src.vertexColors.slice() : null;
+        copy.cameraBlock = src.cameraBlock;
+        if (src.outline || src.outlineRings) this._restoreOutline(copy, structuredClone({ outline: src.outline, outlineRings: src.outlineRings }));
 
         // Share texture library references (GPU textures are re-fetched by renderer)
         copy.textureLibraryId    = src.textureLibraryId;
@@ -8903,6 +8911,9 @@ export class Scene3DManager {
 
         const parent = src.parent ?? this.ctx.sceneGraph.root;
         parent.addChild(copy);
+        // The Frame Link animation (kept per mesh id, so the copy had none; set once the copy is in the graph)
+        const fla = this.getFrameLinkAnimation3D(src.id);
+        if (fla) this.setFrameLinkAnimation3D(copy.id, structuredClone(fla));
         this.ctx.emitSceneGraphChanged();
         this.ctx.setSelectedNode(copy.id);
         this.renderer3D.setSelectedMeshIds(new Set([copy.id]));
