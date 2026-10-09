@@ -25,7 +25,7 @@
  */
 
 import { CanvasGrainManager } from '../canvas-grain';
-import { DitherEngine, DitherConfig, defaultDitherConfig } from '../effects/dither-engine';
+import { DitherEngine, DitherConfig, defaultDitherConfig, ditherConfigActive } from '../effects/dither-engine';
 import type { FrameLinkAnimation } from '../../../animation';
 import { OnionSkinRenderer, type OnionFrame } from '../../../animation/onion-skin-renderer';
 import { RasterDirtyCursor, type DirtyTexelRect } from './raster-composite-dirty';
@@ -108,13 +108,51 @@ const FRAME_LINK_TYPE_ID: Readonly<Record<string, number>> = {
   'wave': 1, 'shake': 2, 'ripple': 3, 'noise': 4, 'turbulence': 5,
 };
 
+/** The frame range a Frame Link "Loop to Fit" animation repeats over (1-based, inclusive): the timeline play range. */
+export interface FrameLinkLoopRange { start: number; end: number }
+
+/** What the displacement shader is given for one layer: the frame it evaluates, the phase advance per frame, and
+ *  (noise types, Loop to Fit) the loop length it cross-fades over — 0 = no cross-fade. */
+export interface FrameLinkTiming { frame: number; speed: number; blendLoop: number }
+
+/**
+ * Frame Link loop modes (UI audit 2026-10-09: Loop was stored but never read).
+ *  - Free: the phase advances at Speed forever (frame = the timeline frame).
+ *  - Loop to Fit: the animation repeats exactly over the play range (L frames), so playback loops seamlessly:
+ *    Wave / Ripple round the speed to a whole number of cycles per L frames (at least one, sign kept);
+ *    Shake repeats its jitter sequence every L frames;
+ *    Noise / Turbulence (not periodic) cross-fade: D(t) * (1 - t/L) + D(t - L) * t/L over t = 0..L-1, which starts at
+ *    D(0) and returns to it at t = L.
+ * Frames outside the range wrap into it.
+ */
+export function frameLinkTiming(
+  anim: Pick<FrameLinkAnimation, 'type' | 'speed' | 'loopMode'>, frame: number, range: FrameLinkLoopRange | null,
+): FrameLinkTiming {
+  const speed = anim.speed ?? 0.15;
+  if (anim.loopMode !== 'loop-to-fit' || !range) return { frame, speed, blendLoop: 0 };
+  const start = Math.round(range.start);
+  const L = Math.max(1, Math.round(range.end) - start + 1);
+  const t = (((Math.round(frame) - start) % L) + L) % L;
+  switch (anim.type) {
+    case 'wave': case 'ripple': {
+      const TAU = Math.PI * 2;
+      let n = Math.round(speed * L / TAU);
+      if (n === 0 && speed !== 0) n = speed > 0 ? 1 : -1;
+      return { frame: start + t, speed: n * TAU / L, blendLoop: 0 };
+    }
+    case 'shake': return { frame: start + t, speed, blendLoop: 0 };
+    case 'noise': case 'turbulence': return { frame: t, speed, blendLoop: L > 1 ? L : 0 };
+    default: return { frame, speed, blendLoop: 0 };
+  }
+}
+
 export class RasterCompositor {
   private device: GPUDevice;
   private pipeline!: GPUComputePipeline;
   private bindGroupLayout!: GPUBindGroupLayout;
 
   // Uniform buffer for per-layer params:
-  //   vec4[0] = [blendMode, opacity, clipped, pad]
+  //   vec4[0] = [blendMode, opacity, clipped, dispBlendLoop]   (dispBlendLoop: frameLinkTiming)
   //   vec4[1] = [dispType, dispAmplitude, dispFrequency, dispSpeed]
   //   vec4[2] = [dispDirection, dispPhase, currentFrame, dispFlags]
   //   vec4[3] = [rippleCenterX, rippleCenterY, noiseOctaves, noiseLacunarity]
@@ -130,6 +168,9 @@ export class RasterCompositor {
 
   /** Current animation frame (1-indexed). Set before each composite call. */
   public currentFrame: number = 1;
+  /** The timeline play range (the renderer sets it with currentFrame): what Frame Link "Loop to Fit" repeats over.
+   *  null = no timeline (Loop to Fit behaves like Free). */
+  public frameLoopRange: FrameLinkLoopRange | null = null;
   /** Is the timeline playing? (the renderer sets it before compositing): per-layer error-diffusion passes wait. */
   public playbackActive = false;
 
@@ -443,6 +484,7 @@ export class RasterCompositor {
     const anim = layer.frameLinkAnimation;
     if (!anim || !anim.enabled) {
       // Type 0 = none, amplitude 0 → computeDisplacement returns (0,0)
+      pd[3] = 0;
       pd[4] = 0; pd[5] = 0; pd[6] = 0; pd[7] = 0;
       pd[8] = 0; pd[9] = 0; pd[10] = this.currentFrame; pd[11] = 0;
       pd[12] = 0; pd[13] = 0; pd[14] = 0; pd[15] = 0;
@@ -453,15 +495,17 @@ export class RasterCompositor {
     const dirRad = (anim.direction ?? 0) * Math.PI / 180;
     const flags = (anim.displaceX !== false ? 1 : 0) | (anim.displaceY ? 2 : 0);
 
+    const tm = frameLinkTiming(anim, this.currentFrame, this.frameLoopRange);   // Free / Loop to Fit
+    pd[3]  = tm.blendLoop;
     // vec4[1]: dispType, amplitude, frequency, speed
     pd[4]  = FRAME_LINK_TYPE_ID[anim.type] ?? 0;
     pd[5]  = anim.amplitude ?? 0;
     pd[6]  = anim.frequency ?? 3;
-    pd[7]  = anim.speed ?? 0.15;
-    // vec4[2]: direction(rad), phase, currentFrame, flags
+    pd[7]  = tm.speed;
+    // vec4[2]: direction(rad), phase, frame, flags
     pd[8]  = dirRad;
     pd[9]  = anim.phase ?? 0;
-    pd[10] = this.currentFrame;
+    pd[10] = tm.frame;
     pd[11] = flags;
     // vec4[3]: rippleCenterX, rippleCenterY, noiseOctaves, noiseLacunarity
     pd[12] = anim.rippleCenterX ?? 0.5;
@@ -485,7 +529,7 @@ export class RasterCompositor {
   public static needsAsyncComposite(_layers: CompositorLayerInfo[], globalCfg: DitherConfig): boolean {
     // Per-layer error diffusion no longer needs it: the layer dither cache runs that pass in the background and the
     // sync composite samples its result (2026-10-08).
-    return globalCfg.enabled && globalCfg.strength > 0.001 && DitherEngine.isErrorDiffusion(globalCfg.algorithm);
+    return ditherConfigActive(globalCfg) && DitherEngine.isErrorDiffusion(globalCfg.algorithm);
   }
 
   /**
@@ -536,7 +580,7 @@ export class RasterCompositor {
     if (w === 0 || h === 0) return;
     const resolved = this._resolveDithers(layers);
     const g = { ...this._ditherConfig };
-    const globalOn = g.enabled && g.strength > 0.001;
+    const globalOn = ditherConfigActive(g);
     const ed = globalOn && DitherEngine.isErrorDiffusion(g.algorithm);
     const deferED = ed && isRasterStrokeActive();
     const sig = globalOn && !deferED ? this.globalResultSignature(resolved, outputTexture) : null;
@@ -574,18 +618,30 @@ export class RasterCompositor {
       return false;
     }
 
-    // Copy first visible layer → output (no blending needed for the base)
     const first = layers[firstIdx];
     const firstTex = first.texture;
-    this.enc().copyTextureToTexture(
-      { texture: firstTex },
-      { texture: outputTexture },
-      { width: Math.min(firstTex.width, w), height: Math.min(firstTex.height, h) },
-    );
-    this.noteCopy(Math.min(firstTex.width, w) * Math.min(firstTex.height, h));
+    if (RasterCompositor.baseNeedsBlendStep(first)) {
+      // A displaced base (Frame Link): the copy would skip the displacement, so the base takes the blend step over a
+      // cleared output instead — as Normal, unclipped (over a transparent backdrop that is exactly what the copy +
+      // base-opacity pass give; blend modes / clipping of the bottom layer keep meaning nothing, as before).
+      this.clearTexture(outputTexture);
+      this.ensurePing(w, h);
+      const b = this._baseStepLayer;
+      b.texture = firstTex; b.visible = true; b.opacity = first.opacity; b.frameLinkAnimation = first.frameLinkAnimation;
+      this._compositeLayerStep(b, firstTex, outputTexture, w, h);
+      b.frameLinkAnimation = undefined;
+    } else {
+      // Copy first visible layer → output (no blending needed for the base)
+      this.enc().copyTextureToTexture(
+        { texture: firstTex },
+        { texture: outputTexture },
+        { width: Math.min(firstTex.width, w), height: Math.min(firstTex.height, h) },
+      );
+      this.noteCopy(Math.min(firstTex.width, w) * Math.min(firstTex.height, h));
 
-    if (first.opacity < 1.0) {
-      this.applyBaseOpacity(outputTexture, first.opacity, w, h);
+      if (first.opacity < 1.0) {
+        this.applyBaseOpacity(outputTexture, first.opacity, w, h);
+      }
     }
 
     for (let i = firstIdx + 1; i < layers.length; i++) {
@@ -595,6 +651,24 @@ export class RasterCompositor {
       this._compositeLayerStep(layer, layer.texture, outputTexture, w, h);
     }
     return true;
+  }
+
+  /** The base layer's blend-step stand-in (reused: no allocation per frame). */
+  private readonly _baseStepLayer: CompositorLayerInfo = {
+    texture: null as unknown as GPUTexture, blendMode: LayerBlendMode.Normal, opacity: 1, clipped: false, visible: true,
+  };
+
+  /**
+   * Does the BOTTOM visible layer need the blend step instead of the plain copy? Only for a visible Frame Link
+   * displacement — the one per-layer step the copy skips that shows over an empty backdrop (its dither comes resolved,
+   * its opacity has its own pass, the grain runs over the whole output, and blend mode / clipping mean nothing over
+   * transparency). The same test as the shader's (amplitude below 0.001 = no displacement). compositeIncremental
+   * never runs this on its region passes: any enabled Frame Link (base included) takes the legacy composite(), and
+   * its signature carries the base's Frame Link params, so the decision is part of it.
+   */
+  public static baseNeedsBlendStep(l: Pick<CompositorLayerInfo, 'frameLinkAnimation'>): boolean {
+    const a = l.frameLinkAnimation;
+    return !!a && a.enabled && (FRAME_LINK_TYPE_ID[a.type] ?? 0) !== 0 && (a.amplitude ?? 0) >= 0.001;
   }
 
   /** Everything a GLOBAL-dither composite of `out` depends on, layer pixels included (their content versions —
@@ -612,10 +686,13 @@ export class RasterCompositor {
         frameLink = true;
         sig += ',fl' + a.type + ',' + a.amplitude + ',' + a.frequency + ',' + a.speed + ',' + a.direction + ',' + a.phase +
           ',' + (a.displaceX !== false ? 1 : 0) + (a.displaceY ? 1 : 0) + ',' + a.rippleCenterX + ',' + a.rippleCenterY +
-          ',' + a.noiseOctaves + ',' + a.noiseLacunarity + ',' + a.noisePersistence + ',' + a.shakeSeed;
+          ',' + a.noiseOctaves + ',' + a.noiseLacunarity + ',' + a.noisePersistence + ',' + a.shakeSeed + ',' + (a.loopMode ?? 'free');
       }
     }
-    if (frameLink) sig += '|f' + this.currentFrame;
+    if (frameLink) {
+      const r = this.frameLoopRange;
+      sig += '|f' + this.currentFrame + (r ? ',' + r.start + '-' + r.end : '');
+    }
     // 'noise' re-rolls its pattern on every pass: a reused result is still one of its frames (the same as an idle one).
     const gm = this._grainManager;
     const grainTex = gm ? gm.getGrainTexture() : null;
@@ -819,14 +896,17 @@ export class RasterCompositor {
    * displacement animation is active). `frameLink`: the signature of a LEGACY full composite() whose only obstacle
    * is a Frame Link displacement — the same, plus the frame number and every displacement param composite() uploads
    * (kind 1, so it never matches a region-pass signature, kind 0); false when there is no enabled Frame Link or a
-   * dither is active. Layout: [kind, frame, out id, w, h, visible count, 20 per visible layer, grain on, 4 grain].
+   * dither is active. Layout: [kind, frame, loop start, loop end, out id, w, h, visible count, 22 per visible layer,
+   * grain on, 4 grain].
    */
   private buildSignature(layers: CompositorLayerInfo[], out: GPUTexture, frameLink: boolean, sig: number[]): boolean {
     const g = this._ditherConfig;
-    if (g.enabled && g.strength > 0.001) return false;
+    if (ditherConfigActive(g)) return false;
     let n = 0;
     sig[n++] = frameLink ? 1 : 0;
     sig[n++] = frameLink ? this.currentFrame : 0;
+    sig[n++] = frameLink && this.frameLoopRange ? this.frameLoopRange.start : 0;
+    sig[n++] = frameLink && this.frameLoopRange ? this.frameLoopRange.end : 0;
     sig[n++] = this.texId(out); sig[n++] = out.width; sig[n++] = out.height;
     const countAt = n++;
     let count = 0;
@@ -835,7 +915,7 @@ export class RasterCompositor {
       const l = layers[i];
       if (!l.visible || !l.texture) continue;
       const d = l.ditherConfig;
-      if (d && d.enabled && d.strength > 0.001) return false;   // (an unresolved list: never from compositeIncremental)
+      if (ditherConfigActive(d)) return false;   // (an unresolved list: never from compositeIncremental)
       const t = l.texture;
       count++;
       sig[n++] = this.texId(t); sig[n++] = t.width; sig[n++] = t.height;
@@ -850,8 +930,9 @@ export class RasterCompositor {
         sig[n++] = num(a.phase); sig[n++] = a.displaceX !== false ? 1 : 0; sig[n++] = a.displaceY ? 1 : 0;
         sig[n++] = num(a.rippleCenterX); sig[n++] = num(a.rippleCenterY); sig[n++] = num(a.noiseOctaves);
         sig[n++] = num(a.noiseLacunarity); sig[n++] = num(a.noisePersistence);
+        sig[n++] = num(a.shakeSeed); sig[n++] = a.loopMode === 'loop-to-fit' ? 1 : 0;
       } else {
-        for (let k = 0; k < 14; k++) sig[n++] = 0;
+        for (let k = 0; k < 16; k++) sig[n++] = 0;
       }
     }
     if (frameLink && !sawFrameLink) return false;
@@ -1577,15 +1658,24 @@ export class RasterCompositor {
         return mix(mix(a, b, ux), mix(c, d, ux), uy) * 2.0 - 1.0; // range: -1..1
       }
 
-      // Compute texel displacement for a given pixel position
+      // Texel displacement for a pixel. Loop to Fit for the noise types (params[0].w = loop length L, 0 = off):
+      // cross-fade the frame with the frame one loop earlier, so the end of the loop meets its start.
       fn computeDisplacement(px: f32, py: f32) -> vec2<f32> {
+        let frame   = params[2].z;
+        let loopLen = params[0].w;
+        let d = computeDisplacementAt(px, py, frame);
+        if (loopLen < 0.5) { return d; }
+        return mix(d, computeDisplacementAt(px, py, frame - loopLen), frame / loopLen);
+      }
+
+      // Texel displacement for a given pixel position at a given frame
+      fn computeDisplacementAt(px: f32, py: f32, frame: f32) -> vec2<f32> {
         let dispType  = i32(params[1].x);  // 0=none, 1=wave, 2=shake, 3=ripple, 4=noise, 5=turbulence
         let amplitude = params[1].y;
         let freq      = params[1].z;
         let speed     = params[1].w;
         let dir       = params[2].x;       // radians
         let phase     = params[2].y;
-        let frame     = params[2].z;
         let flags     = u32(params[2].w);  // bit0 = displaceX, bit1 = displaceY
         let texW      = params[4].z;
         let texH      = params[4].w;

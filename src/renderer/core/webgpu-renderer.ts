@@ -1766,6 +1766,20 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   }
 
   private rasterLayerManager?: RasterLayerManager;
+
+  /** The compositor's clock before a composite: the animation frame, whether the timeline plays (E5) and the play
+   *  range Frame Link "Loop to Fit" repeats over (one reused object: no allocation per frame). */
+  private _syncCompositorClock(): void {
+    const c = this._rasterCompositor;
+    if (!c) return;
+    const tl = this.rasterLayerManager?.getTimeline();
+    c.currentFrame = this.currentAnimationFrame;
+    c.playbackActive = !!tl?.isPlaying();
+    if (!tl) { c.frameLoopRange = null; return; }
+    const r = c.frameLoopRange ?? (c.frameLoopRange = { start: 1, end: 1 });
+    r.start = tl.getPlayRangeStart();
+    r.end = tl.getPlayRangeEnd();
+  }
   public setRasterLayerManager(mgr: RasterLayerManager) {
     this.rasterLayerManager = mgr;
     // Register a selection callback so we can redirect painting to the active layer
@@ -2443,10 +2457,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             }
             
             if (this._rasterCompositor && this.rasterTexture) {
-              // Pass current animation frame to compositor for procedural displacement
-              this._rasterCompositor.currentFrame = this.currentAnimationFrame;
-              // E5: no per-layer error-diffusion pass starts while the timeline plays
-              this._rasterCompositor.playbackActive = !!this.rasterLayerManager?.getTimeline().isPlaying();
+              // Pass current animation frame (+ play range, for Frame Link Loop to Fit) to the compositor for
+              // procedural displacement; E5: no per-layer error-diffusion pass starts while the timeline plays
+              this._syncCompositorClock();
               // Use the new GPU compositor with blend modes, opacity, clipping (E8: reused layer objects)
               const compositorLayers = this._fillCompositorLayers(this.rasterCompositionList, this._compPoolMain, this._compOutMain);
               // Check if any layer or global dither uses error diffusion (requires async WASM)
@@ -2890,8 +2903,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           }
           const fgLayers = this._fillCompositorLayers(this.rasterForegroundList, this._compPoolFG, this._compOutFG);   // (E8: reused)
           if (fgLayers.length > 0) {
-            this._rasterCompositor.currentFrame = this.currentAnimationFrame;
-            this._rasterCompositor.playbackActive = !!this.rasterLayerManager?.getTimeline().isPlaying();
+            this._syncCompositorClock();
             const globalDitherCfg = this._rasterCompositor.getDitherConfig();
             const needsAsync = RasterCompositor.needsAsyncComposite(fgLayers, globalDitherCfg);
             if (needsAsync) {

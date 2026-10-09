@@ -24,6 +24,15 @@ export class LineDrawingService {
     /** Default arrowhead style for newly drawn lines. */
     public defaultArrowStart: ArrowheadStyle = 'none';
     public defaultArrowEnd: ArrowheadStyle = 'none';
+    /** Default arrowhead size for newly drawn lines (Line.arrowSize: a multiple of the stroke width). */
+    public defaultArrowSize: number = LineDrawingService.DEFAULT_ARROW_SIZE;
+    public static readonly DEFAULT_ARROW_SIZE = 6;
+
+    /** Set {@link defaultArrowSize}; a non-finite or non-positive value is ignored. */
+    public setDefaultArrowSize(size: number): void {
+        const n = Number(size);
+        if (Number.isFinite(n) && n > 0) this.defaultArrowSize = n;
+    }
 
     private handlePointerDownBound = (event: PointerEvent) => this.handlePointerDown(event);
     private handlePointerMoveBound = (event: PointerEvent) => this.handlePointerMove(event);
@@ -195,6 +204,7 @@ export class LineDrawingService {
         this.currentLine.isStaging = true;
         this.currentLine.arrowStart = this.defaultArrowStart;
         this.currentLine.arrowEnd = this.defaultArrowEnd;
+        this.currentLine.arrowSize = this.defaultArrowSize;
         // One undo step for the finished line (begin before it is attached: the commit sees it as added)
         this._undoToken = this.interactionService.vectorUndo?.begin(this.sceneGraph.root, []) ?? null;
 

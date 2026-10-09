@@ -130,7 +130,8 @@ export class WornEdgesGenerator implements IEphemeraGenerator {
           { value: 'scuffed', label: 'Scuffs/dust'  },
         ], group: 'Damage' },
       { key: 'wear',      label: 'Wear amount', type: 'range', default: 0.5, min: 0, max: 1, step: 0.05, group: 'Damage' },
-      { key: 'foldCount', label: 'Fold count',  type: 'range', default: 3,   min: 0, max: 10, step: 1,   group: 'Damage' },
+      { key: 'foldCount', label: 'Fold count',  type: 'range', default: 3,   min: 0, max: 10, step: 1,   group: 'Damage',
+        showIf: { key: 'style', equals: ['creases', 'all'] } },
       { key: 'color',     label: 'Damage color', type: 'color', default: '#000000',                      group: 'Color' },
       { key: 'seed',      label: 'Seed',        type: 'seed',  default: 1,                                group: 'Color' },
     ];

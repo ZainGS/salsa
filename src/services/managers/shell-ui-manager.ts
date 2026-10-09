@@ -12,9 +12,10 @@
  *
  * It is intentionally decoupled from rendering. The WebGPU shell scene
  * (cartridge viewer, slot grid, SDF labels) subscribes to `onChange` and
- * reads state via the getters here. The renderer-coupled lifecycle
- * (`initialize`/`destroy`/`launchSlot`) is stubbed for later phases — see
- * docs/specs/shell-ui.md for the full phase plan.
+ * reads state via the getters here. The renderer-coupled lifecycle is
+ * initializeScene / destroyScene; a cart opens through launchSlot (the CD
+ * launch animation → the cart for the Player — docs/specs/frogcart-cd-art-and-launch.md).
+ * See docs/specs/shell-ui.md for the full phase plan.
  *
  * Frogmarks accesses this via `shapeManager.shell`.
  */
@@ -43,6 +44,7 @@ import {
   openShellImportPicker, readCartListing, shellCartFilesToInstall, SHELL_CART_ACCEPT, SHELL_IMPORT_ACCEPT,
   type ShellImportHandler,
 } from './shell-import';
+import { readCartArt, cartArtToThumbDataUrl, slotDiscPattern } from './shell-cart-art';
 import {
   computeShellLayout,
   computeProjectGrid,
@@ -70,6 +72,33 @@ import { syncShellCanvasBacking, shellBackingRatio } from '../../renderer/shell/
 import { DESKTOP_CAPS } from '../../renderer/core/gpu-capabilities';
 import { isHostModalOpen, shellShouldIgnoreEscape } from './shell-escape-guard';
 import { shellCartCountLabel, shellEmptyGridLines } from '../../renderer/shell/shell-chrome-logic';
+import { LAUNCH, prefersReducedMotion, type ShellLaunchPresenter } from '../../renderer/shell/shell-launch';
+import { ShellLaunchFlow, type ShellLaunchResult, type ShellLaunchErrorCode } from './shell-launch-flow';
+import { ShellLongPress } from './shell-long-press';
+
+export { ShellLaunchError, type ShellLaunchResult, type ShellLaunchErrorCode } from './shell-launch-flow';
+
+/** launchSlot's options (all optional). */
+export interface ShellLaunchOptions {
+  /** CSS colour the launch fades to — the Player's black by default (LAUNCH.fadeColor, #0a0a0a). */
+  fadeColor?: string;
+  /** Override prefers-reduced-motion (true = a quick fade only). */
+  reducedMotion?: boolean;
+  /** Read the cart's bytes yourself (default: readCartBinary — the OPFS copy). */
+  loadCart?: (slotId: string) => Promise<ArrayBuffer | Uint8Array | Blob | null>;
+  /** Give up reading + checking the cart after this long (default LAUNCH.timeoutMs, 10 s) → 'timeout'. */
+  timeoutMs?: number;
+}
+
+/** A cart tile asked for its options sheet (long-press with touch / pen, or right-click). */
+export interface ShellSlotMenuEvent {
+  id: string;
+  kind: 'local' | 'remote';
+  /** Where the press was (client / CSS px) — for anchoring a popover; a sheet can ignore it. */
+  clientX: number;
+  clientY: number;
+  source: 'long-press' | 'context-menu';
+}
 
 /** Minimum hit box (CSS px) of a project card's ✕ on a coarse (finger) pointer — the drawn button is ~14 px. */
 const SHELL_CLOSE_MIN_HIT_COARSE_CSS = 44;
@@ -91,11 +120,6 @@ export const SHELL_DOWNLOAD_ID = '__download__';
 
 /** The Settings system app's slot id (the cluster's Settings button activates it, like the tile). */
 export const SHELL_SETTINGS_ID = 'system:settings';
-
-/** TEMP: show a demo FrogCart CD tile so the CD visual can be tuned before the
- *  cart-upload path exists. Flip off (or delete this + its use in buildSpecs)
- *  once real carts populate the registry. See docs/specs/shell-cd.md. */
-const SHELL_DEMO_CD = true;
 
 /** Dwell duration (ms) before a hovered tile auto-unfocuses. Matches the
  *  renderer's countdown ring (RING_SECONDS). */
@@ -215,6 +239,26 @@ export class ShellUIManager {
   readonly onActivate = new EventEmitter<ShellActivateEvent>();
   /** Subscribe to project-card ✕ clicks (delete intent). The host opens its own deletion modal for the id. */
   readonly onProjectDelete = new EventEmitter<ShellDeleteEvent>();
+  /** Subscribe to a cart tile's options request (long-press / right-click): the host shows its Play / Remove sheet.
+   *  Fires outside any framework zone (a pointer timer / listener). */
+  readonly onSlotMenu = new EventEmitter<ShellSlotMenuEvent>();
+
+  // ── Cart launch (docs/specs/frogcart-cd-art-and-launch.md Part A) ──
+  /** This build launches carts (launchSlot resolves with the cart). Hosts guard on this — the old Phase-6 stub was
+   *  also a function, so `typeof launchSlot === 'function'` doesn't tell them apart. */
+  readonly launchSupported = true as const;
+  private _launchFlow: ShellLaunchFlow | null = null;
+  /** The cart whose launch the top viewer is playing (its CD is shown there whatever is hovered); null = none. */
+  private _launchViewerId: string | null = null;
+  /** The loader of the launch being started (launchSlot's opts.loadCart, else readCartBinary). */
+  private _launchLoader: ((slotId: string) => Promise<ArrayBuffer | Uint8Array | Blob | null>) | null = null;
+  /** Long-press tracker for cart tiles (touch / pen) → onSlotMenu. */
+  private readonly _longPress = new ShellLongPress({ onLongPress: (f) => this.emitSlotMenu(f.id, f.clientX, f.clientY, 'long-press') });
+  private boundContextMenu?: (e: MouseEvent) => void;
+  /** prefers-reduced-motion, cached per mount (the renderer calms the idle whirl + parallax). */
+  private _reducedMotion = false;
+  private _reducedMotionMql: MediaQueryList | null = null;
+  private _onReducedMotionChange: (() => void) | null = null;
 
   // ── Renderer-coupled scene state (populated by initializeScene) ──
   private renderer: ShellRenderer | null = null;
@@ -430,13 +474,56 @@ export class ShellUIManager {
     try {
       const buffer = await file.arrayBuffer();
       const { name, description } = readCartListing(new Uint8Array(buffer), file.name);
+      const disc = await this.readCartDiscFields(new Uint8Array(buffer));   // its disc art + pattern seed
       const id = crypto.randomUUID();
       const opfsPath = await this.storage.writeLocalCart(id, buffer);
-      await this.upsertCartSlot({ id, type: 'local', name, description, opfsPath, order: 0 });
+      await this.upsertCartSlot({ id, type: 'local', name, description, opfsPath, order: 0, ...disc });
       this.setSelectedSlot(id);   // focus the freshly installed cart
     } catch (e) {
       console.warn('[Shell] Failed to import cart:', e);
     }
+  }
+
+  /** A cart slot's disc fields, read from the cart's bytes: thumbnailDataUrl = its disc art (a 256 px square; absent =
+   *  none, the disc prints its pattern), cdPattern = the pattern seed, artChecked. Never throws. */
+  private async readCartDiscFields(bytes: Uint8Array): Promise<Pick<ShellSlot, 'thumbnailDataUrl' | 'cdPattern' | 'artChecked'>> {
+    const { art, pattern } = readCartArt(bytes);
+    const out: Pick<ShellSlot, 'thumbnailDataUrl' | 'cdPattern' | 'artChecked'> = { artChecked: true };
+    if (pattern) out.cdPattern = pattern;
+    const url = art ? await cartArtToThumbDataUrl(art) : null;
+    if (url) out.thumbnailDataUrl = url;
+    return out;
+  }
+
+  private _artBackfillQueued = false;
+  /**
+   * ONE-TIME backfill for carts installed before disc art existed (no slot.artChecked): read each one's art + pattern
+   * seed from its OPFS copy, one cart per calm moment, and store them on the slot. Queued once per page.
+   */
+  private scheduleCartArtBackfill(): void {
+    if (this._artBackfillQueued || !ShellStorage.isAvailable()) return;
+    const pending = () => this.registry.slots.filter(s => (s.type === 'local' || s.type === 'remote') && !s.artChecked).map(s => s.id);
+    if (!pending().length) return;
+    this._artBackfillQueued = true;
+    const step = (): void => {
+      const id = pending()[0];
+      if (!id) return;
+      this.enqueueCalm(async () => {
+        if (!this.renderer) { this._artBackfillQueued = false; return; }   // unmounted: the next mount resumes
+        const slot = this.registry.slots.find(s => s.id === id);
+        if (slot && !slot.artChecked) {
+          let bytes: ArrayBuffer | null = null;
+          try {
+            bytes = slot.type === 'local' ? await this.storage.readLocalCart(id) : await this.storage.readCachedCart(id);
+          } catch { bytes = null; }
+          const disc: Partial<ShellSlot> = bytes ? await this.readCartDiscFields(new Uint8Array(bytes)) : { artChecked: true };
+          // Removed meanwhile → skip. patchCartSlot saves + emits 'registry' → the tile re-draws with its art.
+          if (this.registry.slots.some(s => s.id === id)) await this.patchCartSlot(id, disc);
+        }
+        step();
+      });
+    };
+    step();
   }
 
   /** Remove a cart slot and its on-disk binaries. */
@@ -803,6 +890,7 @@ export class ShellUIManager {
       this.mountChromeCluster();  // top-right utility icons + panels (HTML-in-Canvas)
       this.renderer.start(); // idle cartridge animation
       this.schedulePrewarm(); // the Illustrations view's labels + first screenful of thumbnails, at idle
+      this.scheduleCartArtBackfill(); // once: disc art + pattern for carts installed before disc art existed
 
       // Load the Bungee web font, then re-rasterize the labels with it.
       void ensureShellFont().then(() => {
@@ -1255,6 +1343,11 @@ export class ShellUIManager {
 
   /** Unmount the shell scene, release GPU resources, and resume the main renderer. */
   destroyScene(): void {
+    // A launch still pending is rejected ('unmounted') — its animation is going away with the scene. (A launch that
+    // already resolved — black, the host is opening the Player — just loses its cover here.)
+    this._launchFlow?.destroy();
+    this._launchViewerId = null;
+    this._longPress.cancel();
     if (!this.renderer) return;
     this.clearDwell();
     this.stopTypewriter();
@@ -1303,9 +1396,163 @@ export class ShellUIManager {
     this.resumeMainOnDestroy = false;
   }
 
-  /** Phase 6: full launch flow — update check → load .frogcart → swap renderer. */
-  async launchSlot(_slotId: string): Promise<void> {
-    throw new Error('ShellUIManager.launchSlot is not implemented yet (Phase 6 — Remote cart install / launch).');
+  // ── Cart launch ──────────────────────────────────────────────────────
+
+  /**
+   * Launch an installed cart: the CD launch animation starts AT ONCE (call it from the tap — the host does, from
+   * onActivate) while the cart's bytes are read and checked (probeFrogcart); resolves with the cart once the screen
+   * has faded to black, so the host can open it in the Player straight away. The Shell's input is locked meanwhile: a
+   * tap skips ahead, Esc cancels. Rejects with a ShellLaunchError (`code`): 'busy' | 'not-found' | 'not-installed' |
+   * 'read-failed' | 'invalid-cart' | 'too-new' | 'timeout' (the Shell spins the disc back down — show a toast),
+   * 'cancelled' (Esc / cancelLaunch — no toast), 'unmounted' (the scene was torn down mid-launch).
+   */
+  launchSlot(slotId: string, opts: ShellLaunchOptions = {}): Promise<ShellLaunchResult> {
+    shellMark('shell:launch');
+    this._launchLoader = opts.loadCart ?? null;
+    const reducedMotion = opts.reducedMotion ?? this.reducedMotion;
+    // The top viewer plays the launch on the tapped cart's CD: switch it to THAT cart now (whatever was hovered /
+    // selected), so the renderer's first launch frame already shows its art / pattern there.
+    const showInViewer = !this._launchFlow?.busy && this.view.mode === 'shell' && !!this.cartKindOf(slotId);
+    if (showInViewer && this._launchViewerId !== slotId) {
+      this._launchViewerId = slotId;
+      this.rebuildAndRender();
+    }
+    const endViewer = () => {
+      if (!showInViewer || this._launchViewerId !== slotId) return;
+      this._launchViewerId = null;
+      this.rebuildAndRender();
+    };
+    try {
+      return this.launchFlow.start(slotId, {
+        reducedMotion,
+        fadeColor: opts.fadeColor ?? LAUNCH.fadeColor,
+        timeoutMs: opts.timeoutMs,
+        onFrame: (pose) => this.applyLaunchChrome(pose.chromeOpacity),
+        onSettled: () => { this.applyLaunchChrome(null); endViewer(); },
+      }).then(
+        (r) => { this.applyLaunchChrome(0); return r; },
+        (e: unknown) => {
+          // The presenter fades the chrome back in through onSettled; with none (or an instant failure) restore it now.
+          if (!this.launchPresenterActive()) { this.applyLaunchChrome(null); endViewer(); }
+          throw e;
+        },
+      );
+    } finally {
+      this._launchLoader = null;   // the flow called the loader synchronously in start()
+    }
+  }
+
+  /** A launch is running (animating, loading, fading, spinning down) or has reached black — the Shell ignores
+   *  hover / scroll / tile taps meanwhile (a tap skips, Esc cancels). */
+  get isLaunching(): boolean {
+    return (this._launchFlow?.busy ?? false) || this.launchPresenterActive();
+  }
+
+  /** Stop a launch (rejects it with 'cancelled'; the disc spins back down), or — after it reached black, e.g. the
+   *  Player could not be opened — fade the Shell back in. False when there was nothing to cancel. */
+  cancelLaunch(): boolean {
+    if (this._launchFlow?.cancel()) return true;
+    const p = this.launchPresenter();
+    if (p?.launchActive) { p.cancelLaunch(performance.now()); return true; }
+    return false;
+  }
+
+  /** The stored .frogcart bytes of a cart slot: a local cart's installed copy, a remote cart's cached copy; null for a
+   *  system app, an unknown slot or a missing file. */
+  async readCartBinary(slotId: string): Promise<ArrayBuffer | null> {
+    const slot = this.getSlot(slotId);
+    if (!slot || slot.type === 'system' || !ShellStorage.isAvailable()) return null;
+    return slot.type === 'remote' ? this.storage.readCachedCart(slotId) : this.storage.readLocalCart(slotId);
+  }
+
+  /** prefers-reduced-motion (cached while the scene is mounted). */
+  get reducedMotion(): boolean { return this._reducedMotionMql ? this._reducedMotion : prefersReducedMotion(); }
+
+  private get launchFlow(): ShellLaunchFlow {
+    return this._launchFlow ??= new ShellLaunchFlow({
+      presenter: () => this.launchPresenter(),
+      loadCart: (id) => (this._launchLoader ?? ((s: string) => this.readCartBinary(s)))(id),
+      precheck: (id) => this.launchPrecheck(id),
+    });
+  }
+
+  private launchPrecheck(slotId: string): ShellLaunchErrorCode | null {
+    const slot = this.getSlot(slotId);
+    if (!slot) return 'not-found';
+    if (slot.type === 'system') return 'not-installed';
+    if (slot.type === 'remote' && !slot.cachedOpfsPath && !this._launchLoader) return 'not-installed';
+    return null;
+  }
+
+  /** What draws the launch: the ShellRenderer (the tapped disc's pose in a grown viewport, the dim UNDER it, the final
+   *  fade, the loop stopping at black). Null with no scene mounted (the launch then resolves without an animation). */
+  private launchPresenter(): ShellLaunchPresenter | null {
+    const r = this.renderer as unknown as Partial<ShellLaunchPresenter> | null;
+    if (!r || !this.sceneCanvas) return null;
+    return typeof r.beginLaunch === 'function' && typeof r.markLaunchReady === 'function'
+      && typeof r.skipLaunch === 'function' && typeof r.cancelLaunch === 'function' ? r as ShellLaunchPresenter : null;
+  }
+
+  /** The presenter is animating, spinning down, or holding black. */
+  private launchPresenterActive(): boolean {
+    return this.launchPresenter()?.launchActive ?? false;
+  }
+
+  /** Fade the HTML chrome (the top-right cluster) with the launch; null = back to normal. */
+  private applyLaunchChrome(opacity: number | null): void {
+    const el = this.clusterEl;
+    if (!el) return;
+    if (opacity === null) {
+      el.style.opacity = '';
+      el.style.pointerEvents = '';
+      el.removeAttribute('data-launching');
+      return;
+    }
+    el.style.opacity = String(Math.max(0, Math.min(1, opacity)));
+    el.style.pointerEvents = 'none';
+    el.setAttribute('data-launching', '');
+    this.closeClusterPanel();
+  }
+
+  /** A cart tile asked for its sheet (long-press / right-click). Not while launching. */
+  private emitSlotMenu(id: string, clientX: number, clientY: number, source: ShellSlotMenuEvent['source']): void {
+    if (this.isLaunching) return;
+    const kind = this.cartKindOf(id);
+    if (!kind) return;
+    this.onSlotMenu.emit({ id, kind, clientX, clientY, source });
+  }
+
+  /** 'local' / 'remote' for an installed cart tile, else null (system apps, chips, the demo tile, Import). */
+  private cartKindOf(id: string | null): 'local' | 'remote' | null {
+    if (!id) return null;
+    const t = this.getSlot(id)?.type;
+    return t === 'local' || t === 'remote' ? t : null;
+  }
+
+  /** Cache prefers-reduced-motion for this mount and follow its changes: the renderer (setReducedMotion) freezes the 3D
+   *  tiles' idle whirl and rests the parallax. */
+  private watchReducedMotion(): void {
+    if (this._reducedMotionMql || typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    try {
+      const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+      this._reducedMotionMql = mql;
+      const apply = () => {
+        this._reducedMotion = mql.matches;
+        if (this._reducedMotion) this.renderer?.setPointer(0, 0);   // parallax back to rest
+        (this.renderer as unknown as { setReducedMotion?: (on: boolean) => void } | null)?.setReducedMotion?.(this._reducedMotion);
+      };
+      this._onReducedMotionChange = apply;
+      mql.addEventListener?.('change', apply);
+      apply();
+    } catch { this._reducedMotionMql = null; }
+  }
+
+  private unwatchReducedMotion(): void {
+    if (this._reducedMotionMql && this._onReducedMotionChange) {
+      try { this._reducedMotionMql.removeEventListener?.('change', this._onReducedMotionChange); } catch { /* gone */ }
+    }
+    this._reducedMotionMql = null;
+    this._onReducedMotionChange = null;
   }
 
   // ── Scene rendering helpers ──────────────────────────────────────────
@@ -1327,16 +1574,13 @@ export class ShellUIManager {
       const kind: ShellTileSpec['kind'] =
         s.type === 'system' ? 'system' : s.type === 'remote' ? 'remote' : 'local';
       // System apps render as spinning Billboard3D cutouts, not flat-faced coins;
-      // carts render as CDs.
-      specs.push({ id: s.id, kind, label: s.name, billboardKey: kind === 'system' ? s.id : undefined, cd: kind === 'remote' || kind === 'local', ...flag(s.id) });
+      // carts render as CDs (printing their art, else their seeded pattern).
+      const cd = kind === 'remote' || kind === 'local';
+      specs.push({ id: s.id, kind, label: s.name, billboardKey: kind === 'system' ? s.id : undefined, cd, cdPattern: cd ? slotDiscPattern(s) : undefined, ...flag(s.id) });
     }
     // "Import" (the download-arrow Billboard3D) sits right after Illustrator →
-    // order becomes: Illustrator, Import, Settings, [carts], Demo Cart.
+    // order becomes: Illustrator, Import, Settings, [carts].
     specs.splice(1, 0, { id: SHELL_ADD_CART_ID, kind: 'empty', label: 'Import', billboardKey: SHELL_DOWNLOAD_ID, ...flag(SHELL_ADD_CART_ID) });
-    // TEMP demo CD — preview the FrogCart CD tile until upload lands. See shell-cd.md.
-    if (SHELL_DEMO_CD) {
-      specs.push({ id: '__demo_cart__', kind: 'remote', label: 'Demo Cart', cd: true, ...flag('__demo_cart__') });
-    }
     return specs;
   }
 
@@ -1365,7 +1609,7 @@ export class ShellUIManager {
     this.currentModel.viewer = viewer;
     // Billboard cutouts sample their icon from the atlas under billboardKey;
     // otherwise the cartridge/sketchbook samples a thumbnail by id:
-    //   • shell mode    → the selected cart's thumbnail (on the cartridge)
+    //   • shell mode    → the CD's cart (the HOVERED cart, else the selected one): its disc art
     //   • illustrations → the hovered (else selected) project's thumbnail,
     //                     shown polaroid-style on the sketchbook mesh. The
     //                     dwell keeps hoveredSlotId set through the countdown,
@@ -1375,7 +1619,7 @@ export class ShellUIManager {
     this.currentModel.viewerThumbId = viewer.billboardKey
       ?? (this.view.mode === 'illustrations'
             ? (this.view.hoveredSlotId ?? this.view.selectedSlotId ?? undefined)
-            : (this.view.selectedSlotId ?? undefined));
+            : (this.viewerCartId() ?? this.view.selectedSlotId ?? undefined));
     // Dwell countdown ring follows the focused tile (full while paused).
     this.currentModel.ringTileId = this.dwellId ?? undefined;
     this.currentModel.ringCountdownStart = this.dwellCountdownStart;
@@ -1575,8 +1819,19 @@ export class ShellUIManager {
     }
   }
 
+  /** The cart whose CD the top viewer shows (home only): the hovered CD tile, else the selected cart. Null = the
+   *  viewer shows something else. */
+  private viewerCartId(): string | null {
+    if (this.view.mode !== 'shell') return null;
+    if (this._launchViewerId) return this._launchViewerId;   // a cart launch plays on the viewer (launchSlot)
+    const hov = this.view.hoveredSlotId;
+    if (hov && this.currentModel?.tiles.some(t => t.id === hov && t.cd)) return hov;
+    const sel = this.view.selectedSlotId ? this.getSlot(this.view.selectedSlotId) : null;
+    return sel && (sel.type === 'local' || sel.type === 'remote') ? sel.id : null;
+  }
+
   /** Decide what the top viewer shows: the Illustrations sketchbook, the
-   *  selected cart's cartridge, or the default branded cartridge. */
+   *  selected cart's CD, or the default branded cartridge. */
   private buildViewerSpec(): ViewerSpec {
     const themeOutline = this.activeTheme.billboardOutline;
     const billboard = (
@@ -1601,6 +1856,12 @@ export class ShellUIManager {
       };
     };
 
+    // A cart launch plays on the viewer's CD: that cart, whatever is hovered (launchSlot).
+    const launching = this.view.mode === 'shell' ? this._launchViewerId : null;
+    if (launching) {
+      const slot = this.getSlot(launching);
+      return { kind: 'cd', bodyColor: [0.72, 0.74, 0.80, 1], labelColor: [0.9, 0.9, 0.95, 1], cdPattern: slotDiscPattern(slot ?? { id: launching }) };
+    }
     // Hovering a system app shows its Billboard3D icon cutout in the viewer.
     const hov = this.view.hoveredSlotId ? this.getSlot(this.view.hoveredSlotId) : null;
     // Package Designer is special: a kraft-brown cardboard BOX cube, not a flat billboard icon.
@@ -1610,9 +1871,13 @@ export class ShellUIManager {
     if (hov?.type === 'system') return billboard(hov.id);
     // Hovering the synthetic "Install Cart" tile shows the download arrow.
     if (this.view.hoveredSlotId === SHELL_ADD_CART_ID) return billboard(SHELL_DOWNLOAD_ID);
-    // Hovering a FrogCart (a CD tile) shows the CD in the top viewer, not the hero.
-    const hovTile = this.view.hoveredSlotId ? this.currentModel.tiles.find(t => t.id === this.view.hoveredSlotId) : undefined;
-    if (hovTile?.cd) return { kind: 'cd', bodyColor: [0.72, 0.74, 0.80, 1], labelColor: [0.9, 0.9, 0.95, 1] };
+    // Hovering a FrogCart (a CD tile) — or, with nothing else hovered, the SELECTED cart — shows its CD in the top
+    // viewer (its art via viewerThumbId, else its seeded pattern), not the hero / a cartridge slab.
+    const cartId = this.viewerCartId();
+    if (cartId) {
+      const slot = this.getSlot(cartId);
+      return { kind: 'cd', bodyColor: [0.72, 0.74, 0.80, 1], labelColor: [0.9, 0.9, 0.95, 1], cdPattern: slotDiscPattern(slot ?? { id: cartId }) };
+    }
 
     if (this.view.mode === 'illustrations') {
       // A selected/hovered project shows the sketchbook; otherwise the hero.
@@ -1774,12 +2039,22 @@ export class ShellUIManager {
     // (#shellCanvas is touch-action:none and has no wheel there). Past an 8 CSS-px threshold it's a drag, and
     // the click the browser fires on release is swallowed so a scroll doesn't open a card.
     this.boundPointerDown = (e) => {
+      // Long-press a cart (touch / pen) → its Play / Remove sheet (onSlotMenu). Every press resets the tracker.
+      if (this.isLaunching) { this._longPress.cancel(); return; }
+      let pressed: string | null = null;
+      if (this.view.mode === 'shell') {
+        const [lx, ly] = this.toDevicePx(canvas, e.clientX, e.clientY);
+        const hit = this.hitTest(lx, ly);
+        if (this.cartKindOf(hit)) pressed = hit;
+      }
+      this._longPress.down(e, pressed);
       if (this.view.mode !== 'illustrations' || (e.pointerType === 'mouse' && e.button !== 0)) return;
       const [, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
       this.gridDrag = { pointerId: e.pointerId, startY: py, startScroll: this.gridScrollY, dragging: false };
       this.suppressNextClick = false;
     };
     this.boundPointerUp = (e) => {
+      this._longPress.up(e);
       const d = this.gridDrag;
       if (!d || d.pointerId !== e.pointerId) return;
       this.gridDrag = null;
@@ -1789,6 +2064,8 @@ export class ShellUIManager {
       }
     };
     this.boundPointerMove = (e) => {
+      this._longPress.move(e);
+      if (this.isLaunching) return;   // input lock: no hover rebuilds / parallax while a cart launches
       const [px, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
       const drag = this.gridDrag;
       if (drag && drag.pointerId === e.pointerId && this.view.mode === 'illustrations') {
@@ -1805,11 +2082,16 @@ export class ShellUIManager {
         }
       }
       this.handleHover(this.hitTest(px, py));
-      // Feed normalized pointer (-1..1 from center) to the renderer for parallax.
+      // Feed normalized pointer (-1..1 from center) to the renderer for parallax (none with reduced motion).
+      if (this._reducedMotion) return;
       const w = canvas.width || 1, h = canvas.height || 1;
       this.renderer?.setPointer((px / w) * 2 - 1, (py / h) * 2 - 1);
     };
     this.boundClick = (e) => {
+      // A launch owns the screen: a tap skips ahead (not the 2nd click of the launching double-click — the flow
+      // guards that), nothing else reacts.
+      if (this.isLaunching) { this._launchFlow?.skip(); return; }
+      if (this._longPress.swallowClick()) return;   // the release of a long-press (its sheet is open)
       if (this.suppressNextClick) { this.suppressNextClick = false; return; }   // end of a grid drag-scroll
       const [px, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
       // Panel titlebar zoom −/+ buttons (same factor as Ctrl+wheel).
@@ -1829,6 +2111,7 @@ export class ShellUIManager {
       if (id) this.handleClick(id);
     };
     this.boundDblClick = (e) => {
+      if (this.isLaunching) return;   // the 2nd click of the tap that launched: never a second launch
       const [px, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
       // Don't open the illustration when the double-click lands on its ✕ (the first click already fired delete).
       if (this.view.mode === 'illustrations' && hitTestProjectGridClose(this.currentModel, px, py, this.sceneCanvas?.width ?? 0, this.closeMinHitPx(canvas))) return;
@@ -1839,6 +2122,11 @@ export class ShellUIManager {
       if (id) this.handleActivate(id);
     };
     this.boundKeyDown = (e) => {
+      // Esc during a launch cancels it (spin-down, no toast); nothing else reacts while it runs.
+      if (this.isLaunching) {
+        if (e.key === 'Escape' && this.cancelLaunch()) e.preventDefault();
+        return;
+      }
       // Not an Escape a host dialog consumed / meant for itself (it used to close the dialog AND flip the grid home).
       if (e.key === 'Escape' && this.view.mode === 'illustrations'
         && !shellShouldIgnoreEscape(e, isHostModalOpen(typeof document !== 'undefined' ? document : null))) {
@@ -1848,6 +2136,7 @@ export class ShellUIManager {
     // Wheel: Ctrl/⌘+wheel zooms tile size; plain wheel pages horizontally.
     this.boundWheel = (e) => {
       e.preventDefault();
+      if (this.isLaunching) return;
       // Illustrations grid: plain wheel scrolls the grid vertically.
       if (this.view.mode === 'illustrations') {
         this.gridScrollY += (e.deltaY || 0) * shellBackingRatio(canvas);   // CSS px → canvas device px (as backed)
@@ -1870,6 +2159,18 @@ export class ShellUIManager {
     canvas.addEventListener('dblclick', this.boundDblClick);
     addZonelessListener(canvas, 'wheel', this.boundWheel, { passive: false });
     window.addEventListener('keydown', this.boundKeyDown);
+    // Right-click a cart (or the browser's own long-press, Android) → its sheet; no browser menu over a cart.
+    this.boundContextMenu = (e) => {
+      if (this.isLaunching) { e.preventDefault(); return; }
+      if (this.view.mode !== 'shell') return;
+      const [px, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
+      const id = this.hitTest(px, py);
+      if (!this.cartKindOf(id)) return;
+      e.preventDefault();
+      if (this._longPress.claimContextMenu()) this.emitSlotMenu(id!, e.clientX, e.clientY, 'context-menu');
+    };
+    addZonelessListener(canvas, 'contextmenu', this.boundContextMenu);
+    this.watchReducedMotion();
 
     this.resizeObserver = new ResizeObserver(() => this.rebuildAndRender());
     this.resizeObserver.observe(canvas);
@@ -1887,7 +2188,11 @@ export class ShellUIManager {
       if (this.boundClick) c.removeEventListener('click', this.boundClick);
       if (this.boundDblClick) c.removeEventListener('dblclick', this.boundDblClick);
       if (this.boundWheel) removeZonelessListener(c, 'wheel', this.boundWheel);
+      if (this.boundContextMenu) removeZonelessListener(c, 'contextmenu', this.boundContextMenu);
     }
+    this.boundContextMenu = undefined;
+    this._longPress.cancel();
+    this.unwatchReducedMotion();
     if (this.boundKeyDown) window.removeEventListener('keydown', this.boundKeyDown);
     this.renderer?.cancelModeFade();
     this.transitionActive = false;
@@ -1943,14 +2248,12 @@ export class ShellUIManager {
       else this.onActivate.emit({ id, kind: 'system' });
       return;
     }
-    // A cart: the first tap selects it (the viewer shows it), a tap on the selected cart opens it — a phone has no
-    // double-click, so opening a cart used to be impossible there.
-    if (this.view.selectedSlotId === id) {
-      this._tapActivated = { id, at: performance.now() };
-      this.handleActivate(id);
-      return;
-    }
+    // A cart: ONE tap (or click) opens it — the host's onActivate starts launchSlot, whose animation begins at once.
+    // (It used to be select-first, then a second tap.) The dblclick that may follow is ignored (_tapActivated, and
+    // the input lock while the launch runs). Long-press / right-click opens the cart's sheet instead (onSlotMenu).
     this.setSelectedSlot(id);
+    this._tapActivated = { id, at: performance.now() };
+    this.handleActivate(id);
   }
 
   /** The cart a second click just opened (the dblclick that follows it must not open it again). */

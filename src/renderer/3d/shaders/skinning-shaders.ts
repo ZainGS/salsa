@@ -152,7 +152,9 @@ const SKINNED_VS_BODY = /* wgsl */`
   let jitter   = scene.ps1Config.x;
   let gridSize = scene.ps1Config.y;
   if (jitter > 0.0 && gridSize > 0.0) {
-    clipPos = snapToGrid(clipPos, gridSize * (1.0 - jitter) + gridSize * jitter);
+    // Jitter 0..1 = how far each vertex is pulled onto the Snap Grid (1 = fully snapped, the classic PS1 wobble);
+    // past 1 the grid itself coarsens (2 = half the Snap Grid resolution).
+    clipPos = mix(clipPos, snapToGrid(clipPos, gridSize / max(jitter, 1.0)), min(jitter, 1.0));
   }
 
   // Gouraud lighting
@@ -291,7 +293,9 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   let jitter   = scene.ps1Config.x;
   let gridSize = scene.ps1Config.y;
   if (jitter > 0.0 && gridSize > 0.0) {
-    clipPos = snapToGrid(clipPos, gridSize * (1.0 - jitter) + gridSize * jitter);
+    // Jitter 0..1 = how far each vertex is pulled onto the Snap Grid (1 = fully snapped, the classic PS1 wobble);
+    // past 1 the grid itself coarsens (2 = half the Snap Grid resolution).
+    clipPos = mix(clipPos, snapToGrid(clipPos, gridSize / max(jitter, 1.0)), min(jitter, 1.0));
   }
 
   // Gouraud lighting with heat color as diffuse (gives depth cues)
@@ -353,7 +357,9 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   let jitter   = scene.ps1Config.x;
   let gridSize = scene.ps1Config.y;
   if (jitter > 0.0 && gridSize > 0.0) {
-    clipPos = snapToGrid(clipPos, gridSize * (1.0 - jitter) + gridSize * jitter);
+    // Jitter 0..1 = how far each vertex is pulled onto the Snap Grid (1 = fully snapped, the classic PS1 wobble);
+    // past 1 the grid itself coarsens (2 = half the Snap Grid resolution).
+    clipPos = mix(clipPos, snapToGrid(clipPos, gridSize / max(jitter, 1.0)), min(jitter, 1.0));
   }
 
   let worldTangent3 = normalize((inst.normalMatrix * vec4<f32>(skinnedTanXYZ, 0.0)).xyz);

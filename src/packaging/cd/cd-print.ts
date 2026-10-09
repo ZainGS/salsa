@@ -11,8 +11,12 @@
 import { cdFrontInsert, CD_FRONT_INSERT } from '../templates/cd-front-insert';
 import { cdTrayCard, CD_TRAY_CARD } from '../templates/cd-tray-card';
 import { cdBooklet, CD_BOOKLET } from '../templates/cd-booklet';
-import { CD_DISC } from './cd-disc-geometry';
+import { CD_DISC, CD_DISC_SAFE_R } from './cd-disc-geometry';
 import type { CDPiece } from './cd-kit-assembly';
+
+/** Disc printable-area / stacking-ring inner radius (mm) — art inside this is left unprinted (the clear hub ring).
+ *  Defined with the disc geometry (renderer/3d/cd-disc); re-exported here for the print API. */
+export { CD_DISC_SAFE_R };
 
 type P2 = [number, number];
 export type PrintMarkKind = 'cut' | 'fold' | 'bleed' | 'safe';
@@ -40,9 +44,6 @@ export interface CDPrintSpec {
 export const CD_PRINT_PIECES: CDPiece[] = ['frontInsert', 'trayCard', 'disc', 'booklet'];
 
 const MARK_COLOR: Record<PrintMarkKind, string> = { cut: '#000000', fold: '#00aaff', bleed: '#ff3399', safe: '#33cc66' };
-
-/** Disc printable-area / stacking-ring inner radius (mm) — art inside this may be obscured by the hub clamp. */
-export const CD_DISC_SAFE_R = 18;
 
 /** The print spec for a piece at `dpi` (default 300). Throws for a non-printed piece (lid/tray). */
 export function cdPrintSpec(piece: CDPiece, dpi = 300): CDPrintSpec {

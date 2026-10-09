@@ -4,7 +4,7 @@ import * as path from 'path';
 import { generateHair, hairStylePreset, DEFAULT_HAIR_PARAMS, type HairParams } from './hair-generator';
 import { LOCK_STYLE_DEFAULTS } from './hair-locks';
 import {
-    HAIR_CONTROL_MODES, HAIR_NON_GEOMETRY_KEYS, HAIR_GATHERED_INERT, hairControlModeOf, hairControlVisible, hairControlVisibleFor, hairGatheredOf,
+    HAIR_CONTROL_MODES, HAIR_NON_GEOMETRY_KEYS, HAIR_GATHERED_INERT, HAIR_BUZZ_INERT, hairControlModeOf, hairControlVisible, hairControlVisibleFor, hairGatheredOf,
     type HairControlMode,
 } from './hair-control-modes';
 
@@ -66,6 +66,11 @@ function altValue(key: string, cur: unknown): unknown {
 const geom = (p: P) => generateHair(HEAD, p as Partial<HairParams>).geometry;
 const same = (a: { vertices: Float32Array; indices: ArrayLike<number> }, b: { vertices: Float32Array; indices: ArrayLike<number> }) =>
     a.vertices.length === b.vertices.length && a.indices.length === b.indices.length && a.vertices.every((v, i) => v === b.vertices[i]);
+/** Same SHAPE: positions (12-float stride, 0-2) + indices only — a key that only rescales uv.v (the gradient / sheen
+ *  reference) counts as inert for the in-mode rules. */
+const samePos = (a: { vertices: Float32Array; indices: ArrayLike<number> }, b: { vertices: Float32Array; indices: ArrayLike<number> }) =>
+    a.vertices.length === b.vertices.length && a.indices.length === b.indices.length
+    && Array.from(a.indices).every((v, i) => v === b.indices[i]) && a.vertices.every((v, i) => i % 12 > 2 || v === b.vertices[i]);
 
 describe('hair mode → control map (HAIR_CONTROL_MODES)', () => {
     it('routes hairMode values like generateHair (absent / unknown = chunky)', () => {
@@ -102,12 +107,60 @@ describe('hair mode → control map (HAIR_CONTROL_MODES)', () => {
         for (const key of Object.keys(HAIR_CONTROL_MODES)) {
             if (HAIR_NON_GEOMETRY_KEYS.includes(key) || !hairControlVisible(key, 'locks') || key === 'gather') continue;
             const base: P = { ...gathered, ...(CONTEXT[key] ?? {}) };
-            const changed = !same(geom(base), geom({ ...base, [key]: altValue(key, base[key]) }));
+            const changed = !samePos(geom(base), geom({ ...base, [key]: altValue(key, base[key]) }));
             const shown = hairControlVisibleFor(key, base);
             if (changed !== shown) wrong.push(`${key} (${shown ? 'shown but inert' : 'hidden but live'})`);
         }
         expect(wrong, wrong.join(', ')).toEqual([]);
     });
+
+    // In-mode conditions (UI dead-controls audit 2026-10-09 §3 Hair): per scenario, every geometry key of the mode is
+    // shown by hairControlVisibleFor exactly when perturbing it changes the hair's shape.
+    const LEGACY_SC: P = { tailStyle: 'twin', frontDrape: 0 };
+    // Buzz clamps Thickness / Crown to <= 0.03 (the panel caps those sliders there): perturb inside the clamp.
+    const IN_BUZZ_CLAMP: P = { capThickness: 0.01, crownRound: 0.01 };
+    const SCENARIOS: Array<{ name: string; mode: HairControlMode; patch: P; alt?: P }> = [
+        { name: 'chunky, bangs Count 0', mode: 'chunky', patch: { ...LEGACY_SC, bangCount: 0 } },
+        { name: 'chunky, bangs Style Fringe', mode: 'chunky', patch: { ...LEGACY_SC, partingStyle: 'fringe' } },
+        { name: 'chunky, buzz cut', mode: 'chunky', patch: { ...LEGACY_SC, buzzCut: true }, alt: IN_BUZZ_CLAMP },
+        { name: 'cards, buzz cut', mode: 'cards', patch: { ...LEGACY_SC, buzzCut: true, cardifyCap: true }, alt: IN_BUZZ_CLAMP },
+        { name: 'cards, no tails + no drape', mode: 'cards', patch: { tailStyle: 'none', frontDrape: 0, cardifyCap: false } },
+        { name: 'cards, no tails + no drape, cardified cap', mode: 'cards', patch: { tailStyle: 'none', frontDrape: 0, cardifyCap: true } },
+        { name: 'cards, spiky + cardified cap', mode: 'cards', patch: { ...LEGACY_SC, spikeCap: true, cardifyCap: true } },
+        { name: 'chunky, no tails + spiky', mode: 'chunky', patch: { tailStyle: 'none', frontDrape: 0, spikeCap: true } },
+        { name: 'chunky, no tails + front drape', mode: 'chunky', patch: { tailStyle: 'none', frontDrape: 1 } },
+        { name: 'chunky, stubble', mode: 'chunky', patch: { ...LEGACY_SC, facialHair: 'stubble' } },
+        { name: 'locks, fringe None', mode: 'locks', patch: { fringeStyle: 'none' } },
+        { name: 'locks, fringe Straight', mode: 'locks', patch: { fringeStyle: 'straight' } },
+        { name: 'locks, fringe Choppy', mode: 'locks', patch: { fringeStyle: 'choppy' } },
+        { name: 'locks, spikes', mode: 'locks', patch: { lockSpike: 0.6 } },
+        { name: 'locks, drill tails', mode: 'locks', patch: { tailForm: 'drill' } },
+        { name: 'locks, no tails', mode: 'locks', patch: { tailStyle: 'none' } },
+        { name: 'locks, gathered + choppy fringe', mode: 'locks', patch: { gather: true, fringeStyle: 'choppy' } },
+    ];
+    /** Enum keys: the first choice that differs from the current value (ALT can coincide with a scenario's value). */
+    const CHOICES: Record<string, string[]> = {
+        partingStyle: ['fringe', 'parted', 'swept'], fringeStyle: ['straight', 'choppy', 'swept'], tailForm: ['braid', 'bundle', 'drill'],
+        facialHair: ['full', 'goatee'], tailStyle: ['pony', 'twin'], curlType: ['spiral', 'wave'], spikePattern: ['grid', 'radial'],
+        frontDrapeSide: ['left', 'both'], frontDrapeOrigin: ['front', 'back'], tailTip: ['blunt', 'point'], lockCurlType: ['spiral', 'wave'],
+        bunStyle: ['round', 'space'],
+    };
+    const altFor = (key: string, cur: unknown): unknown => CHOICES[key]?.find((c) => c !== String(cur ?? '')) ?? altValue(key, cur);
+    for (const sc of SCENARIOS) {
+        it(`in-mode visibility: ${sc.name}`, () => {
+            const wrong: string[] = [];
+            for (const key of Object.keys(HAIR_CONTROL_MODES)) {
+                if (HAIR_NON_GEOMETRY_KEYS.includes(key) || !hairControlVisible(key, sc.mode)) continue;
+                // the key's own prerequisites, then the scenario's condition on top (it wins over a conflicting prerequisite)
+                const base: P = { ...BASE[sc.mode], ...(CONTEXT[key] ?? {}), ...sc.patch };
+                const alt = sc.alt && key in sc.alt ? sc.alt[key] : altFor(key, base[key]);
+                const changed = !samePos(geom(base), geom({ ...base, [key]: alt }));
+                const shown = hairControlVisibleFor(key, base);
+                if (changed !== shown) wrong.push(`${key} (${shown ? 'shown but inert' : 'hidden but live'})`);
+            }
+            expect(wrong, `${sc.name}: ${wrong.join(', ')}`).toEqual([]);
+        });
+    }
 
     it('the Frogmarks character panel copy matches (when the Frogmarks repo is checked out beside Salsa)', () => {
         const f = path.resolve(__dirname, '../../../../Frogmarks/Frogmarks/ClientApp/src/app/illustrate/components/character-panel/character-panel.component.ts');
@@ -120,8 +173,19 @@ describe('hair mode → control map (HAIR_CONTROL_MODES)', () => {
         const ours: Record<string, string> = {};
         for (const [k, v] of Object.entries(HAIR_CONTROL_MODES)) ours[k] = [...v].sort().join(',');
         expect(theirs).toEqual(ours);
-        const g = /HAIR_GATHERED_INERT[^=]*=\s*\[([^\]]*)\]/.exec(src);
+        const g = /export const HAIR_GATHERED_INERT[^=]*=\s*\[([^\]]*)\]/.exec(src);
         expect(g, 'HAIR_GATHERED_INERT in the panel').not.toBeNull();
         expect(g![1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean)).toEqual([...HAIR_GATHERED_INERT]);
+        const b = /export const HAIR_BUZZ_INERT[^=]*=\s*\[([^\]]*)\]/.exec(src);
+        expect(b, 'HAIR_BUZZ_INERT in the panel').not.toBeNull();
+        expect(b![1].split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean)).toEqual([...HAIR_BUZZ_INERT]);
+        // hairControlVisibleFor: the same rules (compared without whitespace / comments)
+        const fnBody = (text: string): string => {
+            const i = text.indexOf('export function hairControlVisibleFor');
+            const j = text.indexOf('\n}', i);
+            return text.slice(i, j).replace(/\/\/[^\n]*/g, '').replace(/\s+/g, '');
+        };
+        const oursSrc = fs.readFileSync(path.resolve(__dirname, 'hair-control-modes.ts'), 'utf8');
+        expect(fnBody(src), 'hairControlVisibleFor in the panel').toBe(fnBody(oursSrc));
     });
 });

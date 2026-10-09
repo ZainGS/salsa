@@ -21,8 +21,15 @@ export interface StampParams {
   cy: number;
   /** Radius in texels after dynamics are applied. */
   radius: number;
-  /** RGBA color in 0-1 range. Alpha = per-dab opacity (flow × dynamics). */
+  /** RGBA color in 0-1 range. Alpha = the dab's COVERAGE CEILING (opacity × opacity pressure × jitter). */
   color: [number, number, number, number];
+  /**
+   * How much of the way to its ceiling one dab takes a texel (flow × flow pressure, 0-1; default 1). On the wet
+   * (normal paint) path overlapping dabs build up: newA = a + (ceiling·tip − a)·flow, never past the ceiling — so
+   * Opacity caps the stroke and Flow sets the build-up (flow 1 = the old max-of-dabs stroke, byte for byte). On the
+   * direct paths (erasers, Multiply / Screen / Overlay) the dab strength is ceiling × flow, as before.
+   */
+  flow?: number;
   /** Tip rotation in radians. */
   rotation: number;
   /** 0 = paint, 1 = erase-fade, 2 = erase-clear, 3 = erase-hard, 4 = multiply, 5 = screen, 6 = overlay. */
@@ -54,6 +61,18 @@ export interface StampParams {
   dualBrushTileMode?: number; // 0 = dab-local, 1 = canvas-tiling
   dualBrushRotation?: number; // per-dab random rotation for organic variation
 
+  // ── Brush texture (the preset's own Texture, BrushPreset.texture) ──
+  /** Tiling grayscale texture (r8unorm). null = none. */
+  brushTexture?: GPUTexture | null;
+  /** Tile size multiplier: one texture pixel covers `scale` canvas texels. */
+  brushTextureScale?: number;
+  /** 0 = no effect, 1 = full. */
+  brushTextureStrength?: number;
+  /** 0 = multiply (tip × texture), 1 = subtract (tip − (1 − texture) × strength). */
+  brushTextureMode?: number;
+  /** Canvas texel the texture's origin sits at: [0, 0] = canvas-anchored, the stroke's first dab = stroke-anchored. */
+  brushTextureOrigin?: [number, number];
+
   /** When true, dab is stamped into stroke accumulation layer using max-alpha (wet-stroke mode). */
   wetStroke?: boolean;
 }
@@ -63,7 +82,7 @@ export interface TexelRect { x0: number; y0: number; x1: number; y1: number }
 
 /** Bytes of CPU→GPU uniform staging per batch (BRUSH-1b). ~250 dabs; a fuller batch submits early and goes on. */
 const STAGING_BYTES = 64 * 1024;
-/** Staging reserved per dab (5 stamp uniforms + bleed + one composite rect, 16-byte aligned) — see reserveStaging. */
+/** Staging reserved per dab (6 stamp uniforms + bleed + one composite rect, 16-byte aligned: 192) — see reserveStaging. */
 const DAB_STAGING_BYTES = 256;
 /** Kept free so the final composite of a flush always has a slot for its rect uniform. */
 const STAGING_HEADROOM = 32;
@@ -113,7 +132,7 @@ export class BrushStampPipeline {
   // Pre-allocated typed arrays to avoid GC pressure (rewritten every dab)
   private paramData = new Float32Array(8);
   private colorData = new Float32Array(4);
-  private aspectData = new Float32Array(2);
+  private aspectData = new Float32Array(4);   // aspectX, aspectY, flow, pad
 
   // Persistent ping-pong texture (avoids alloc+destroy per dab)
   private pingTex: GPUTexture | null = null;
@@ -153,6 +172,11 @@ export class BrushStampPipeline {
   private dualBrushData = new Float32Array(8); // scale, strength, blendOp, tileMode, rotation, pad, pad, pad
   private dummyDualTex: GPUTexture;
   private cachedDualTex: GPUTexture | null = null;
+
+  // Brush texture (the preset's own Texture) — the dummy is the 1x1 white grain texture
+  private brushTexBuf: GPUBuffer;
+  private brushTexData = new Float32Array(8); // scale, strength, mode, pad, originX, originY, pad, pad
+  private cachedBrushTex: GPUTexture | null = null;
 
   // ── Wet-stroke (indirect painting) state ──
   // Prevents opacity buildup when painting over the same area within a single stroke.
@@ -271,7 +295,11 @@ export class BrushStampPipeline {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.aspectBuf = device.createBuffer({
-      size: 8, // 2 floats: aspectX, aspectY
+      size: 16, // 4 floats: aspectX, aspectY, flow, pad
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.brushTexBuf = device.createBuffer({
+      size: 32, // 8 floats: scale, strength, mode, pad, originX, originY, pad, pad
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -423,6 +451,24 @@ export class BrushStampPipeline {
     else this.stagingU32.set(data, off >> 2);
     enc.copyBufferToBuffer(this.stagingBuf, off, dst, 0, n * 4);
     this.stagingCursor = off + Math.ceil((n * 4) / 16) * 16;
+  }
+
+  /** The last values staged into each per-stroke-constant uniform (grain / dual brush / brush texture). */
+  private lastStaged = new Map<GPUBuffer, Float32Array>();
+
+  /** stageUniform, skipped when `data` equals what was last staged into `dst`: the buffer already holds it (or a
+   *  copy recorded earlier in this in-order command stream will put it there before this dab's dispatch). These
+   *  blocks are the same for every dab of a stroke, so this keeps the per-dab staging traffic at the old level. */
+  private stageUniformIfChanged(enc: GPUCommandEncoder, dst: GPUBuffer, data: Float32Array): void {
+    let last = this.lastStaged.get(dst);
+    if (last && last.length === data.length) {
+      let same = true;
+      for (let i = 0; i < data.length; i++) if (last[i] !== data[i]) { same = false; break; }
+      if (same) return;
+    }
+    this.stageUniform(enc, dst, data);
+    if (!last || last.length !== data.length) { last = new Float32Array(data.length); this.lastStaged.set(dst, last); }
+    last.set(data);
   }
 
   /** Record the deferred wet-stroke composite over everything that changed since the last one. */
@@ -937,6 +983,7 @@ export class BrushStampPipeline {
 
     const a = this.aspectData;
     a[0] = aspect[0]; a[1] = aspect[1];
+    a[2] = Math.max(0, Math.min(1, params.flow ?? 1)); a[3] = 0;
     this.stageUniform(enc, this.aspectBuf, a);
 
     // Resolve selection mask: use real mask or dummy 1x1 (no constraint)
@@ -949,7 +996,7 @@ export class BrushStampPipeline {
     g[1] = params.grainInvScale?.[1] ?? 0;
     g[2] = params.grainTexture ? (params.grainStrength ?? 0) : 0; // 0 strength when no grain
     g[3] = 0;
-    this.stageUniform(enc, this.grainBuf, g);
+    this.stageUniformIfChanged(enc, this.grainBuf, g);
 
     // Resolve dual brush texture: use real dual brush or dummy 1x1 (no modulation)
     const dualTex = params.dualBrushTexture ?? this.dummyDualTex;
@@ -960,7 +1007,19 @@ export class BrushStampPipeline {
     db[3] = params.dualBrushTileMode ?? 0; // 0=dab-local, 1=canvas-tiling
     db[4] = params.dualBrushRotation ?? 0;
     db[5] = 0; db[6] = 0; db[7] = 0;
-    this.stageUniform(enc, this.dualBrushBuf, db);
+    this.stageUniformIfChanged(enc, this.dualBrushBuf, db);
+
+    // Resolve the brush texture: the preset's own, or the white dummy at strength 0 (no modulation)
+    const brushTex = params.brushTexture ?? this.dummyGrainTex;
+    const bt = this.brushTexData;
+    bt[0] = params.brushTextureScale ?? 1;
+    bt[1] = params.brushTexture ? (params.brushTextureStrength ?? 0) : 0;
+    bt[2] = params.brushTextureMode ?? 0;
+    bt[3] = 0;
+    bt[4] = params.brushTextureOrigin?.[0] ?? 0;
+    bt[5] = params.brushTextureOrigin?.[1] ?? 0;
+    bt[6] = 0; bt[7] = 0;
+    this.stageUniformIfChanged(enc, this.brushTexBuf, bt);
 
     // Reuse bind group if textures haven't changed (common case: same stroke)
     if (
@@ -970,7 +1029,8 @@ export class BrushStampPipeline {
       this.cachedTipTex === tipTexture &&
       this.cachedMaskTex === maskTex &&
       this.cachedGrainTex === grainTex &&
-      this.cachedDualTex === dualTex
+      this.cachedDualTex === dualTex &&
+      this.cachedBrushTex === brushTex
     ) {
       // Bind group is still valid — uniforms were already updated in-place
     } else {
@@ -990,6 +1050,8 @@ export class BrushStampPipeline {
           { binding: 10, resource: { buffer: this.grainBuf } },
           { binding: 11, resource: dualTex.createView() },
           { binding: 12, resource: { buffer: this.dualBrushBuf } },
+          { binding: 13, resource: brushTex.createView() },
+          { binding: 14, resource: { buffer: this.brushTexBuf } },
         ],
       });
       this.cachedSrcTex = srcTexture;
@@ -998,6 +1060,7 @@ export class BrushStampPipeline {
       this.cachedMaskTex = maskTex;
       this.cachedGrainTex = grainTex;
       this.cachedDualTex = dualTex;
+      this.cachedBrushTex = brushTex;
     }
 
     const pass = enc.beginComputePass();
@@ -1157,6 +1220,7 @@ export class BrushStampPipeline {
 
   public destroy(): void {
     this.batchEnc = null;   // drop anything unsubmitted (the device objects die with us)
+    this.lastStaged.clear();
     this.batchDepth = 0;
     this.stagingCursor = 0;
     this.stagingBuf.destroy();
@@ -1165,6 +1229,7 @@ export class BrushStampPipeline {
     this.colorBuf.destroy();
     this.aspectBuf.destroy();
     this.grainBuf.destroy();
+    this.brushTexBuf.destroy();
     this.pingTex?.destroy();
     this.pingTex = null;
     this.strokeBaseTex?.destroy();
@@ -1609,7 +1674,8 @@ export class BrushStampPipeline {
       // flags encodes: bit 0 = lockTransparency, bit 1 = wetStroke
       @group(0) @binding(3) var<uniform> params: array<f32, 8>;
       @group(0) @binding(4) var<uniform> color: vec4<f32>;
-      @group(0) @binding(5) var<uniform> aspect: vec2<f32>;
+      // aspect: aspectX, aspectY, flow (per-dab deposit, 0-1), pad
+      @group(0) @binding(5) var<uniform> aspect: vec4<f32>;
       @group(0) @binding(6) var tipTex: texture_2d<f32>;
       @group(0) @binding(7) var selMask: texture_2d<f32>;
       @group(0) @binding(8) var grainTex: texture_2d<f32>;
@@ -1619,6 +1685,10 @@ export class BrushStampPipeline {
       @group(0) @binding(11) var dualTex: texture_2d<f32>;
       // dualParams: scale, strength, blendOp, tileMode, rotation, pad, pad, pad
       @group(0) @binding(12) var<uniform> dualParams: array<f32, 8>;
+      // The preset's own texture (BrushPreset.texture), sampled with the repeat grain sampler
+      @group(0) @binding(13) var brushTex: texture_2d<f32>;
+      // brushTexParams: scale, strength, mode (0 multiply, 1 subtract), pad, originX, originY, pad, pad
+      @group(0) @binding(14) var<uniform> brushTexParams: array<f32, 8>;
 
       fn blend(dst: vec4<f32>, src: vec4<f32>) -> vec4<f32> {
         let outA = src.a + dst.a * (1.0 - src.a);
@@ -1682,6 +1752,9 @@ export class BrushStampPipeline {
         var tipAlpha = textureSampleLevel(tipTex, tipSamp, vec2<f32>(u, v), 0.0).r;
 
         if (tipAlpha <= 0.001) { return; }
+        // The bare tip shape (before grain / texture / dual): the hard eraser cuts this silhouette.
+        let rawTip = tipAlpha;
+        let flow = aspect.z;
 
         // ── Canvas grain modulation ──
         // Sample the tiling grain texture at the canvas-space texel position.
@@ -1692,6 +1765,22 @@ export class BrushStampPipeline {
           let grainVal = textureSampleLevel(grainTex, grainSamp, grainUV, 0.0).r;
           // mix(1.0, grainVal, strength): at strength=0 no effect, at strength=1 full grain
           tipAlpha = tipAlpha * mix(1.0, grainVal, grainStrength);
+        }
+
+        // ── Brush texture (the preset's own) ──
+        // Tiles in canvas texels from its origin (canvas-anchored at 0,0 or stroke-anchored at the first dab).
+        let texStrength = brushTexParams[1];
+        if (texStrength > 0.001) {
+          let texDim = vec2<f32>(textureDimensions(brushTex));
+          let texOrigin = vec2<f32>(brushTexParams[4], brushTexParams[5]);
+          let texUV = (vec2<f32>(f32(ix), f32(iy)) - texOrigin) / (texDim * max(brushTexParams[0], 0.01));
+          let texVal = textureSampleLevel(brushTex, grainSamp, texUV, 0.0).r;
+          if (brushTexParams[2] > 0.5) {
+            // Subtract: the dark parts of the texture are cut out of the tip
+            tipAlpha = max(0.0, tipAlpha - (1.0 - texVal) * texStrength);
+          } else {
+            tipAlpha = tipAlpha * mix(1.0, texVal, texStrength);
+          }
         }
 
         // ── Dual brush texture modulation ──
@@ -1734,27 +1823,29 @@ export class BrushStampPipeline {
           }
         }
 
-        let brushAlpha = color.a * tipAlpha * maskVal;
+        // coverage = this dab's ceiling at this texel (opacity x tip); brushAlpha = what one dab deposits
+        let coverage = color.a * tipAlpha * maskVal;
+        let brushAlpha = coverage * flow;
         let existing = textureLoad(srcTex, vec2<i32>(ix, iy), 0);
         var out: vec4<f32> = existing;
 
         if (mode == 0) {
           // Paint (normal blend)
           if (wetStroke) {
-            // Wet-stroke mode: writing to stroke accumulation layer.
-            // Use max-alpha: the stroke layer opacity at each texel is the maximum
-            // of all dabs that touched it, NOT their additive sum.
-            // This prevents opacity buildup when painting over the same area.
-            let newA = max(existing.a, brushAlpha);
-            // Blend the color: if the new dab has higher alpha, use its color;
-            // otherwise keep the existing color.
+            // Wet-stroke mode: writing to the stroke accumulation layer. Opacity is the stroke's ceiling and flow
+            // the build-up: a dab moves the texel a fraction flow of the way up to its coverage, and never lowers
+            // it. Flow 1 = the max of the dabs (no build-up past one dab, the old behaviour).
+            var newA = existing.a;
             var newRGB = color.rgb;
-            if (existing.a > 0.001 && existing.a >= brushAlpha) {
-              newRGB = existing.rgb;
+            if (coverage > existing.a) {
+              newA = mix(existing.a, coverage, flow);
+              if (existing.a > 0.001) {
+                // Lerp colour from existing toward new by the share of the alpha this dab added
+                let t = (newA - existing.a) / max(newA, 0.001);
+                newRGB = mix(existing.rgb, color.rgb, t);
+              }
             } else if (existing.a > 0.001) {
-              // Lerp color from existing toward new based on alpha increase
-              let t = (brushAlpha - existing.a) / max(brushAlpha, 0.001);
-              newRGB = mix(existing.rgb, color.rgb, t);
+              newRGB = existing.rgb;
             }
             out = vec4<f32>(newRGB, newA);
           } else {
@@ -1782,10 +1873,11 @@ export class BrushStampPipeline {
           }
           out = vec4<f32>(newRGB, newA);
         } else if (mode == 3) {
-          // Erase (hard with sharper falloff)
-          let t = 1.0 - smoothstep(0.0, r, d);
-          let hardT = pow(t, 3.0);
-          let brushAlphaHard = color.a * hardT;
+          // Erase (hard edge): the tip's silhouette at full strength (opacity x flow), with a narrow
+          // anti-aliased rim. Ignores the tip's soft falloff, grain, texture and dual brush. (Before
+          // 2026-10-09 this was a cubic radial falloff - SOFTER than the soft eraser.)
+          let hardT = smoothstep(0.2, 0.5, rawTip);
+          let brushAlphaHard = color.a * flow * hardT * maskVal;
           let newA = existing.a * (1.0 - brushAlphaHard);
           var newRGB = existing.rgb;
           if (newA <= 0.0) {
@@ -1854,6 +1946,8 @@ export class BrushStampPipeline {
         { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         { binding: 11, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 13, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 14, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       ],
     });
 

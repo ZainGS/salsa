@@ -26,37 +26,47 @@ import { applyErrorDiffusion, isWasmReady, type ErrorDiffusionAlgorithm } from '
 // (audit B4). Every dither shader binds the same params layout (params[4]=mode/invert/tintOp,
 // params[5]=fg, params[6]=bg), so the helper interpolates verbatim.
 const WGSL_APPLY_COLOR_MAPPING = /* wgsl */ `
-      fn applyColorMapping(original: vec3<f32>, dithered: vec3<f32>, srcAlpha: f32, strength: f32) -> vec4<f32> {
+      // strength = the dither Strength; fade = the edge-fade multiplier (edgeState x, 1 = none); duoSmooth = the
+      // duotone level before quantizing (the flat tone the dot pattern averages to; unused in quantize mode).
+      fn applyColorMapping(original: vec3<f32>, dithered: vec3<f32>, srcAlpha: f32, strength: f32, fade: f32, duoSmooth: f32) -> vec4<f32> {
         let colorMode = params[4].x;
         let invertP = params[4].y > 0.5;
         let tintOp = params[4].z;
         let fg = params[5];
         let bg = params[6];
-        var result = mix(original, dithered, strength);
+        let k = strength * fade;
+        var result = mix(original, dithered, k);
         var outA = srcAlpha;
         if (colorMode > 0.5) {
-          // Duotone: the dithered value encodes the spatial pattern (0 or 1 at 1-bit).
-          // duotoneBias already controls coverage/inversion, so map directly to FG/BG.
-          let t = dot(dithered, vec3<f32>(0.299, 0.587, 0.114));
+          // Duotone (2026-10-09: Strength and Tint are distinct). The dithered value encodes the spatial pattern
+          // (0 or 1 at 1-bit; duotoneBias already sets the coverage). Strength = how much of the PATTERN shows:
+          // 0 = the flat two-colour tone at that coverage, 1 = crisp dots. Tint = how strongly the two colours
+          // replace the original artwork. The edge fade dissolves back to the original, as in quantize mode.
+          let t = mix(duoSmooth, dot(dithered, vec3<f32>(0.299, 0.587, 0.114)), strength);
           let duotone = mix(bg.rgb, fg.rgb, t);
           let duotoneA = mix(bg.a, fg.a, t);
-          result = mix(original, duotone, strength * tintOp);
-          outA = mix(srcAlpha, duotoneA, strength * tintOp);
+          let kt = tintOp * fade;
+          result = mix(original, duotone, kt);
+          outA = mix(srcAlpha, duotoneA, kt);
         } else if (invertP) {
           let inverted = vec3<f32>(1.0) - dithered;
-          result = mix(original, inverted, strength);
+          result = mix(original, inverted, k);
         }
         return vec4<f32>(result, outA);
       }
 `;
 
-// Shared WGSL: edge/boundary effects (2026-09-15). `edgeFactor` estimates distance to the layer's
-// CONTENT edge (alpha boundary) as a 0→1 factor over `radius` px: a 25-tap disc average of src
-// alpha reads ~0.5 at a straight boundary and →1 deep inside; remapped so 0 ≈ at the edge. Every
-// dither shader binds srcTex at @binding(0) and the same params layout (params[7] = edgeWidth /
-// edgeFade / edgeShrink / edgeDensity), so the helpers interpolate verbatim — same pattern as
+// Shared WGSL: edge/boundary effects (2026-09-15; content distance = jump flood since 2026-10-09). `edgeFactor`
+// turns the distance to the layer's CONTENT edge (alpha boundary) into a 0→1 factor over `radius` px. The distance
+// comes from a jump-flood pass the engine runs before the dither dispatch (WGSL_JFA_* below, recordEdgeFlood): it
+// leaves, per texel of the distance DOMAIN, the nearest unpainted texel. Every dither shader binds srcTex at
+// @binding(0), the seeds at @binding(7) and the same params layout (params[7] = edgeWidth / edgeFade / edgeShrink /
+// edgeDensity, params[9] = the domain), so the helpers interpolate verbatim — same pattern as
 // WGSL_APPLY_COLOR_MAPPING above.
 const WGSL_EDGE_HELPERS = /* wgsl */ `
+      // Nearest unpainted texel per domain texel (x | y << 16, domain-relative; 0xFFFFFFFF = none in reach).
+      @group(0) @binding(7) var edgeSeeds: texture_2d<u32>;
+
       // Per-cell hash for density dropout (PCG-style; named edge* to avoid colliding with the
       // noise shader's own rand helpers).
       fn edgeHashU(input: u32) -> u32 {
@@ -69,26 +79,20 @@ const WGSL_EDGE_HELPERS = /* wgsl */ `
         return f32(h) / 4294967295.0;
       }
 
-      // 0 at the content (alpha) boundary → 1 at >= radius px inside. 25 taps: centre + 3 rings.
-      // Coverage counts alpha PRESENCE (a >= 0.004, the same cutoff the dither early-out uses),
-      // not alpha VALUE — a half-opacity wash must read as solid interior, not as "near an edge".
+      // 0 at the content (alpha) boundary -> 1 at >= radius px inside. "Unpainted" = alpha < 0.004 (the same
+      // cutoff the dither early-out uses): alpha PRESENCE, not value - a half-opacity wash reads as solid interior.
+      // The texture border is NOT a boundary. Distance is measured from the boundary BETWEEN texels (centre
+      // distance - 0.5); the ramp 1 - (1 - t)^1.5 (t = distance / radius) is the old 25-tap coverage profile at a
+      // straight edge, without its steps. params[9] = the seeds domain [x0, y0, x1, y1] in texels (max-exclusive).
       fn edgeFactor(coords: vec2<i32>, radius: f32) -> f32 {
-        let dim = vec2<i32>(textureDimensions(srcTex));
-        var cov = 1.0;   // the centre pixel passed the caller's alpha early-out
-        var count = 1.0;
-        for (var ring = 0u; ring < 3u; ring = ring + 1u) {
-          let r = radius * (f32(ring + 1u) / 3.0);
-          for (var k = 0u; k < 8u; k = k + 1u) {
-            // 8 taps per ring, staggered a half-step per ring so taps don't line up radially.
-            let ang = (f32(k) + f32(ring) * 0.5) * 0.7853981634;
-            let o = vec2<f32>(cos(ang), sin(ang)) * r;
-            let p = clamp(coords + vec2<i32>(o + sign(o) * 0.5), vec2<i32>(0), dim - vec2<i32>(1));
-            cov = cov + select(0.0, 1.0, textureLoad(srcTex, p, 0).a >= 0.004);
-            count = count + 1.0;
-          }
-        }
-        cov = cov / count;
-        return clamp((cov - 0.5) * 2.0, 0.0, 1.0);
+        let o = vec2<i32>(params[9].xy);
+        let l = clamp(coords - o, vec2<i32>(0), vec2<i32>(params[9].zw) - o - vec2<i32>(1));
+        let v = textureLoad(edgeSeeds, l, 0).x;
+        if (v == 0xFFFFFFFFu) { return 1.0; }
+        let dv = vec2<f32>(vec2<i32>(i32(v & 0xFFFFu), i32(v >> 16u)) - l);
+        let t = clamp((sqrt(dot(dv, dv)) - 0.5) / radius, 0.0, 1.0);
+        let u = 1.0 - t;
+        return 1.0 - u * sqrt(u);
       }
 
       // 0 at the CANVAS border → 1 at >= radius px inside it. Pure arithmetic — no taps.
@@ -103,7 +107,7 @@ const WGSL_EDGE_HELPERS = /* wgsl */ `
         let mode = params[3].x;
         if (mode < 0.5) {          // content: the painted alpha boundary (nearest no-paint gap)
           return edgeFactor(coords, radius);
-        } else if (mode < 1.5) {   // canvas: the texture border only (skips the 24 taps entirely)
+        } else if (mode < 1.5) {   // canvas: the texture border only (no distance read; the engine runs no jump flood)
           return edgeFactorCanvas(coords, radius);
         }
         return min(edgeFactor(coords, radius), edgeFactorCanvas(coords, radius));   // nearest wins
@@ -147,6 +151,101 @@ const WGSL_EDGE_HELPERS = /* wgsl */ `
 const WGSL_REGION_HEAD = /* wgsl */ `let gid = vec3<u32>(gidIn.x + u32(params[8].x), gidIn.y + u32(params[8].y), 0u);
         if (gid.x >= u32(params[8].z) || gid.y >= u32(params[8].w)) { return; }
         if (gid.x >= dim.x || gid.y >= dim.y) { return; }`;
+
+// Content-edge DISTANCE (2026-10-09): a jump flood (JFA) over a DOMAIN rect of the source. Seeds = the unpainted
+// texels (alpha < 0.004); after the passes every domain texel holds its nearest seed as x | y << 16, relative to the
+// domain origin (0xFFFFFFFF = none found). Two r32uint scratch textures ping-pong; params are one 16-byte slot per
+// pass in jfaParamsBuf (bound at a 256-byte offset). The step schedule is a pure function of the edge width
+// (ditherEdgeJfaSteps), never of the domain - see DitherEngine.rectReach for why that makes a region pass exact.
+const WGSL_JFA_INIT = /* wgsl */ `
+      // JFA-INIT: every UNPAINTED domain texel is its own seed.
+      @group(0) @binding(0) var srcTex: texture_2d<f32>;
+      @group(0) @binding(1) var seedsOut: texture_storage_2d<r32uint, write>;
+      @group(0) @binding(2) var<uniform> jp: vec4<i32>;   // domain origin (x, y) in source texels, domain size (w, h)
+      @compute @workgroup_size(8, 8)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let l = vec2<i32>(gid.xy);
+        if (l.x >= jp.z || l.y >= jp.w) { return; }
+        let painted = textureLoad(srcTex, l + jp.xy, 0).a >= 0.004;
+        let v = select(u32(l.x) | (u32(l.y) << 16u), 0xFFFFFFFFu, painted);
+        textureStore(seedsOut, l, vec4<u32>(v, 0u, 0u, 0u));
+      }
+`;
+const WGSL_JFA_STEP = /* wgsl */ `
+      // JFA-STEP: keep the nearest of the 3x3 candidates one step apart (ties: the first in dy, dx order).
+      // Reads outside the domain are skipped (outside the texture there is no seed: its border is not an edge).
+      @group(0) @binding(0) var seedsIn: texture_2d<u32>;
+      @group(0) @binding(1) var seedsOut: texture_storage_2d<r32uint, write>;
+      @group(0) @binding(2) var<uniform> jp: vec4<i32>;   // domain size (w, h), step, unused
+      @compute @workgroup_size(8, 8)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let p = vec2<i32>(gid.xy);
+        if (p.x >= jp.x || p.y >= jp.y) { return; }
+        var best = 0xFFFFFFFFu;
+        var bestD = 0xFFFFFFFFu;
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+          for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let q = p + vec2<i32>(dx, dy) * jp.z;
+            if (q.x < 0 || q.y < 0 || q.x >= jp.x || q.y >= jp.y) { continue; }
+            let v = textureLoad(seedsIn, q, 0).x;
+            if (v == 0xFFFFFFFFu) { continue; }
+            let d = vec2<u32>(vec2<i32>(abs(i32(v & 0xFFFFu) - p.x), abs(i32(v >> 16u) - p.y)));
+            let dd = d.x * d.x + d.y * d.y;
+            if (dd < bestD) { bestD = dd; best = v; }
+          }
+        }
+        textureStore(seedsOut, p, vec4<u32>(best, 0u, 0u, 0u));
+      }
+`;
+
+/** Widest edge band (px) the engine honours: wider values clamp to it (a band past the texture diagonal is moot). */
+export const DITHER_EDGE_WIDTH_MAX = 4096;
+
+/** Params slots of one flood (init + steps; the widest band needs 1 + 15). */
+const JFA_MAX_PASSES = 20;
+/** A pooled flood scratch unused this long (ms) is freed. */
+const JFA_IDLE_MS = 2000;
+/** Seeds are packed as x | y << 16: a flood domain is at most this many texels on a side. */
+const JFA_MAX_DOMAIN = 0xFFFF;
+
+const finiteOr0 = (v: number | undefined): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+
+/** The edge width a config renders with: NaN / negative / missing → 0 (off), capped at DITHER_EDGE_WIDTH_MAX. */
+export function ditherEdgeWidth(cfg: Pick<DitherConfig, 'edgeWidth'> | null | undefined): number {
+  const w = cfg?.edgeWidth;
+  if (typeof w !== 'number' || !(w > 0)) return 0;   // (NaN fails the comparison)
+  return Math.min(w, DITHER_EDGE_WIDTH_MAX);
+}
+
+const jfaStepMemo = new Map<number, readonly number[]>();
+
+/**
+ * The jump-flood step schedule for an edge band of `width` px (a pure function of the width). Only seeds nearer than
+ * width + 0.5 texel centres change the edge factor, so the flood must reach M = ceil(width + 0.5): the smallest first
+ * step whose ceil-halving run (s, ceil(s / 2), ..., 1) sums to >= M, then two refinement passes (2, 1 — "JFA+2"),
+ * which brings the flood's few sub-texel misses to ~0 (measured vs a brute-force distance transform).
+ */
+export function ditherEdgeJfaSteps(width: number): readonly number[] {
+  const m = Math.max(1, Math.ceil(Math.min(width > 0 ? width : 0, DITHER_EDGE_WIDTH_MAX) + 0.5));   // (NaN → 0)
+  const hit = jfaStepMemo.get(m);
+  if (hit) return hit;
+  const run = (s0: number) => { const r: number[] = []; for (let s = s0; ; s = Math.ceil(s / 2)) { r.push(s); if (s === 1) break; } return r; };
+  const sum = (r: number[]) => r.reduce((a, b) => a + b, 0);
+  let s0 = Math.max(1, Math.floor(m / 2) - 2 * Math.ceil(Math.log2(m + 1)));   // (below the minimum: the run sums < 2 s0 + 2 log2 s0)
+  while (sum(run(s0)) < m) s0++;
+  const steps = run(s0);
+  if (m >= 3) steps.push(2, 1);
+  const out = Object.freeze(steps);
+  jfaStepMemo.set(m, out);
+  return out;
+}
+
+/** How far (texels, Chebyshev) the jump flood of `width` can carry a seed: the sum of its steps. */
+export function ditherEdgeJfaCone(width: number): number {
+  let c = 0;
+  for (const s of ditherEdgeJfaSteps(width)) c += s;
+  return c;
+}
 
 /** Texels, max-exclusive. */
 export interface DitherTexelRect { x0: number; y0: number; x1: number; y1: number }
@@ -221,7 +320,9 @@ export interface DitherConfig {
   /** Halftone screen frequency (cells per texture width). Default: 40. */
   halftoneFrequency: number;
 
-  /** Strength/blend: 0 = original, 1 = fully dithered. Default: 1.0. */
+  /** Strength: how strongly the dither PATTERN applies. Quantize mode (and error diffusion): a blend of the original
+   *  (0) and the dithered result (1). Duotone: the flat two-colour tone the pattern averages to (0) → the crisp dot
+   *  pattern (1) — how much the colours replace the artwork is `tintOpacity`. Default: 1.0. */
   strength: number;
 
   /** Pattern scale multiplier (1 = 1:1, 2 = 2× larger pattern). Default: 1.0. */
@@ -245,7 +346,8 @@ export interface DitherConfig {
    *  In quantize mode this inverts the dithered output. In duotone mode, prefer `duotoneBias` instead. */
   invertPattern: boolean;
 
-  /** How strongly the duotone colors replace the original (0 = original, 1 = full duotone). Default: 1.0. */
+  /** Duotone Tint: how strongly the two duotone colors replace the original artwork (0 = original, 1 = full
+   *  duotone), independent of `strength` since 2026-10-09 (it was strength × tint). Default: 1.0. */
   tintOpacity: number;
 
   /** Duotone coverage bias (0–1). Controls the balance between FG and BG dot coverage.
@@ -256,11 +358,14 @@ export interface DitherConfig {
 
   // ── Edge/Boundary Effects (2026-09-15) ──
   // The "edge" is the CONTENT boundary — where the layer's painted alpha ends (a stroke's outline,
-  // a filled shape's rim). A cheap alpha-coverage disc sample gives a smooth 0→1 distance factor
-  // over `edgeWidth` px; the three amounts below shape how the pattern behaves inside that band.
+  // a filled shape's rim). The distance to it (a jump-flood distance transform since 2026-10-09 — was
+  // a 25-tap coverage estimate) gives a smooth 0→1 factor over `edgeWidth` px; the three amounts below
+  // shape how the pattern behaves inside that band.
   // Ordered (GPU) algorithms only — error-diffusion (WASM) ignores these.
 
-  /** Width in px of the edge band the effects ramp across. 0 = edge effects off. Default: 0. */
+  /** Width in texels (layer px) of the edge band the effects ramp across, 0..DITHER_EDGE_WIDTH_MAX (4096; wider
+   *  clamps; NaN / negative = 0). 0 = edge effects off. Any width is smooth (exact distance, no taps); a wide band in
+   *  'content' mode costs a log2(width)-pass flood over the changed region grown by about the width. Default: 0. */
   edgeWidth: number;
 
   /** 0–1: fade the dither back to the original toward the edge (pattern dissolves out). Default: 0. */
@@ -289,6 +394,28 @@ export interface DitherConfig {
    *  stroke outlines, blob rims, erased holes (the nearest no-paint gap). 'canvas' = the texture's
    *  own border (analytic distance, cheapest). 'both' = nearest of the two. */
   edgeMode: 'content' | 'canvas' | 'both';
+}
+
+/**
+ * Does this config change any pixel? Enabled, and a visible Strength — or, in Duotone mode for the ordered (GPU)
+ * algorithms, a visible Tint (Strength 0 there is the flat two-colour tone, still tinted). Error diffusion ignores
+ * the color mode (WASM dithers the raw colors), so for it only Strength counts. The single gate every dither path
+ * (layer cache, compositor, bake) uses.
+ */
+export function ditherConfigActive(cfg: DitherConfig | null | undefined): cfg is DitherConfig {
+  if (!cfg || !cfg.enabled) return false;
+  if (cfg.strength > 0.001) return true;
+  return cfg.colorMode === 'duotone' && (cfg.tintOpacity ?? 1) > 0.001 && !DitherEngine.isErrorDiffusion(cfg.algorithm);
+}
+
+/**
+ * Error-diffusion Strength: blend the WASM result `out` back toward the original `orig` in place (RGBA8, the same
+ * length): out = orig + (out − orig) × strength, rounded. Strength ≥ 1 leaves `out` as it is.
+ */
+export function blendDitherStrength(out: Uint8Array, orig: Uint8Array, strength: number): void {
+  const s = Math.max(0, Math.min(1, strength));
+  if (s >= 1) return;
+  for (let i = 0; i < out.length; i++) out[i] = Math.round(orig[i] + (out[i] - orig[i]) * s);
 }
 
 /** Default config for a newly created dither effect. */
@@ -346,14 +473,46 @@ export class DitherEngine {
   private pingW = 0;
   private pingH = 0;
 
-  // Shared params buffer (36 floats = 144 bytes: algorithm params[0..3], color + edge controls params[4..7],
-  // dispatch region params[8])
+  // Shared params buffer (40 floats = 160 bytes: algorithm params[0..3], color + edge controls params[4..7],
+  // dispatch region params[8], content-edge seeds domain params[9])
   private paramsBuf: GPUBuffer;
-  private regionData = new Float32Array(4);
+  private regionData = new Float32Array(8);
+
+  // Content-edge jump flood (2026-10-09): pipelines, the per-pass params slots, two POOLED r32uint scratch textures
+  // (grown to the largest domain seen, freed after JFA_IDLE_MS without use — never per layer) and a 1x1 "no seed"
+  // stand-in bound when a dispatch needs no distance.
+  private jfaInitPipeline: GPUComputePipeline | null = null;
+  private jfaInitBGL: GPUBindGroupLayout | null = null;
+  private jfaStepPipeline: GPUComputePipeline | null = null;
+  private jfaStepBGL: GPUBindGroupLayout | null = null;
+  private jfaParamsBuf: GPUBuffer | null = null;
+  private jfaParamData = new Int32Array(JFA_MAX_PASSES * 64);
+  private jfaTex: [GPUTexture, GPUTexture] | null = null;
+  private jfaViews: [GPUTextureView, GPUTextureView] | null = null;
+  private jfaStepBGs: GPUBindGroup[] = [];
+  private jfaCapW = 0;
+  private jfaCapH = 0;
+  private jfaLastUse = 0;
+  private jfaTimer: ReturnType<typeof setTimeout> | null = null;
+  private noSeedsTex: GPUTexture | null = null;
+  private noSeedsView: GPUTextureView | null = null;
+  /** The seeds view the next dither bind group uses (set by record()). */
+  private curSeedsView: GPUTextureView | null = null;
+
+  /** Most texels a pooled scratch domain may cover before applyRegion() splits a big region into tiles (2 × 4 bytes
+   *  per texel: the default 2048² = 32 MB). Tiling is skipped when the edge reach makes tiles inefficient (then one
+   *  domain = the region grown by the reach, clipped to the texture). */
+  public jfaScratchBudgetTexels = 2048 * 2048;
+  /** Smallest useful tile side (texels): when the reach leaves less than this inside the budget, no tiling. */
+  public jfaMinTileSide = 512;
 
   /** Work counters (diagnostics / tests): compute dispatches and the texels they cover, texture copies (the
-   *  in-place apply() reads through a ping copy), and error-diffusion passes (GPU→CPU→WASM). */
-  public readonly stats = { dispatches: 0, dispatchTexels: 0, copies: 0, copyTexels: 0, errorDiffusionPasses: 0 };
+   *  in-place apply() reads through a ping copy), error-diffusion passes (GPU→CPU→WASM), and the content-edge jump
+   *  flood (floods = domains, jfaDispatches / jfaTexels = its passes, scratch allocations). */
+  public readonly stats = {
+    dispatches: 0, dispatchTexels: 0, copies: 0, copyTexels: 0, errorDiffusionPasses: 0,
+    floods: 0, jfaDispatches: 0, jfaTexels: 0, jfaScratchAllocs: 0,
+  };
 
   // PERF (audit 5.6): persistent MAP_READ readback buffer for the error-diffusion
   // path — recreated only when the required size changes instead of allocated and
@@ -370,39 +529,54 @@ export class DitherEngine {
   constructor(device: GPUDevice) {
     this.device = device;
     this.paramsBuf = device.createBuffer({
-      size: 144,  // 36 × f32
+      size: 160,  // 40 × f32
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
   }
 
+  /** Does this config's edge effect read the CONTENT distance (the jump flood)? Edge band on (width >= 0.5), any
+   *  amount set, and the 'content' or 'both' mode. A superset of the shaders' own early-outs (any amount, not the
+   *  shaders' >= 0.001 sum), so the flood never misses a dispatch that reads it. */
+  public static usesContentDistance(cfg: DitherConfig): boolean {
+    if (ditherEdgeWidth(cfg) < 0.5 || cfg.edgeMode === 'canvas') return false;
+    const amt = Math.abs(finiteOr0(cfg.edgeFade)) + Math.abs(finiteOr0(cfg.edgeShrink)) + Math.abs(finiteOr0(cfg.edgeDensity));
+    return amt > 0;
+  }
+
+  /** How far (texels) the density dropout's ONE edge evaluation per pattern cell (at the cell centre) can sit from
+   *  a pixel of that cell: about 0.71 cell, generously rounded. 0 without density or for cell-less patterns. */
+  private static cellReach(cfg: DitherConfig, texW: number): number {
+    if (!(finiteOr0(cfg.edgeDensity) > 0.001)) return 0;
+    const ps = Math.max(cfg.patternScale || 1, 1e-3);
+    let cellPx = 0;
+    if (cfg.algorithm === 'bayer') cellPx = (1 << ((cfg.bayerLevel | 0) + 1)) * ps + ps;
+    else if (isHalftoneAlgorithm(cfg.algorithm)) cellPx = (texW / Math.max(cfg.halftoneFrequency || 1, 1e-3)) * ps;
+    // (noise / blue noise: density folds into coverage — no cells)
+    return cellPx > 0 ? Math.ceil(cellPx * 1.5) + 2 : 0;
+  }
+
   /** Is this config an active ORDERED (GPU) dither — the kind apply() / applyRegion() run? */
   public static isActiveOrdered(config: DitherConfig | undefined | null): boolean {
-    return !!config && config.enabled && config.strength > 0.001 && !DitherEngine.isErrorDiffusion(config.algorithm);
+    return ditherConfigActive(config) && !DitherEngine.isErrorDiffusion(config.algorithm);
   }
 
   /**
-   * How far (texels) a change to the SOURCE can move the ordered-dither OUTPUT. A pixel's output reads only its own
-   * source texel, except with edge effects on: the content edge factor reads up to `edgeWidth` px around it, and the
-   * density dropout evaluates that factor once at the pattern CELL CENTRE (Bayer tile / halftone cell), up to about
-   * one cell away. So re-dithering a dirty source rect grown by this reach gives exactly the full re-dither.
-   * Conservative (generous rounding); 0 when no edge effect reads neighbours (width 0, all amounts 0, or the
-   * canvas-only edge mode, which is pure arithmetic).
+   * How far (texels, per axis) a change to the SOURCE can move the ordered-dither OUTPUT. A pixel's output reads only
+   * its own source texel, except with content edge effects on (usesContentDistance):
+   *  - its edge factor comes from the jump flood. A flood pass at p reads p ± step, so the flood's result at p is a
+   *    function of the alpha PRESENCE within the CONE of p: Chebyshev radius ditherEdgeJfaCone(width) = the sum of the
+   *    steps (≈ width + log2(width) + 3 — more than the width itself: a far seed can still re-route the flood). The
+   *    schedule depends on the width only and the flood skips reads outside its domain, so a flood over ANY domain
+   *    that contains p's cone gives p exactly the whole-texture flood's seed — that is what makes a region pass equal
+   *    to a full pass (applyRegion floods the region grown by this reach);
+   *  - the density dropout evaluates the factor once at the pattern CELL CENTRE (Bayer tile / halftone cell), up to
+   *    about 0.71 cell away (cellReach, generously rounded) — whose cone counts too.
+   * So reach = cone + cell term, and re-dithering a dirty source rect grown by it gives exactly the full re-dither.
+   * 0 when nothing reads the distance (width 0, all amounts 0, or the canvas-only mode, which is pure arithmetic).
    */
   public static rectReach(cfg: DitherConfig, texW: number): number {
-    const ew = cfg.edgeWidth ?? 0;
-    const amounts = (cfg.edgeFade ?? 0) + Math.abs(cfg.edgeShrink ?? 0) + (cfg.edgeDensity ?? 0);
-    if (ew < 0.5 || amounts < 0.001) return 0;          // edgeState's early-out: no taps at all
-    if (cfg.edgeMode === 'canvas') return 0;             // canvas distance only: no texture reads
-    let reach = Math.ceil(ew) + 2;                       // the 25 taps sit within radius (+ rounding)
-    if ((cfg.edgeDensity ?? 0) > 0.001) {
-      const ps = Math.max(cfg.patternScale || 1, 1e-3);
-      let cellPx = 0;
-      if (cfg.algorithm === 'bayer') cellPx = (1 << ((cfg.bayerLevel | 0) + 1)) * ps + ps;
-      else if (isHalftoneAlgorithm(cfg.algorithm)) cellPx = (texW / Math.max(cfg.halftoneFrequency || 1, 1e-3)) * ps;
-      // (noise / blue noise: density folds into coverage — no cells)
-      reach += Math.ceil(cellPx * 1.5) + 2;              // the cell centre is within ~0.71 cell of the pixel
-    }
-    return reach;
+    if (!DitherEngine.usesContentDistance(cfg)) return 0;
+    return ditherEdgeJfaCone(ditherEdgeWidth(cfg)) + DitherEngine.cellReach(cfg, texW);
   }
 
   /** Numeric edge-mode for the shaders (params[3].x): 0 content, 1 canvas, 2 both.
@@ -436,11 +610,14 @@ export class DitherEngine {
    * caller owns the submit. Without it, both commands still share one
    * internally-owned encoder/submit (was 2 standalone submits per call).
    * Note: the uniform writeBuffer calls below are queue-ordered ahead of any
-   * later submit, so deferring the submit is safe — but because paramsBuf is
-   * shared, callers must submit the encoder before the next apply() call.
+   * later submit, so deferring the submit is safe — but because paramsBuf (and
+   * the content-edge flood's params slots / pooled scratch) are shared, callers
+   * must submit the encoder before the next apply() / applyRegion() call. The
+   * content-edge flood here covers the whole texture in one domain (no tiling:
+   * one shared encoder) — 8 bytes of transient scratch per texel.
    */
   public apply(texture: GPUTexture, config: DitherConfig, sharedEncoder?: GPUCommandEncoder): void {
-    if (!config.enabled || config.strength <= 0.001) return;
+    if (!ditherConfigActive(config)) return;
     // Error diffusion requires async — skip silently in sync path
     if (DitherEngine.isErrorDiffusion(config.algorithm)) return;
 
@@ -484,18 +661,62 @@ export class DitherEngine {
       ? { x0: Math.max(0, Math.floor(region.x0)), y0: Math.max(0, Math.floor(region.y0)), x1: Math.min(w, Math.ceil(region.x1)), y1: Math.min(h, Math.ceil(region.y1)) }
       : { x0: 0, y0: 0, x1: w, y1: h };
     if (r.x1 <= r.x0 || r.y1 <= r.y0) return false;
-    const enc = this.device.createCommandEncoder();
-    this.record(src, out, config, r, noiseSeed, enc);
-    this.device.queue.submit([enc.finish()]);
+    for (const t of this.planTiles(config, r, w, h)) {
+      // one submit per tile: the shared params buffer / flood slots are rewritten per tile (queue-ordered)
+      const enc = this.device.createCommandEncoder();
+      this.record(src, out, config, t, noiseSeed, enc);
+      this.device.queue.submit([enc.finish()]);
+    }
     return true;
   }
 
-  /** Record one ordered-dither dispatch: `src` → `out` over region `r` (clipped, non-empty). */
+  /** The tiles applyRegion() dispatches `r` in: one, unless a content-edge flood domain (the region grown by the
+   *  reach) would exceed jfaScratchBudgetTexels, tiles of a useful size (>= jfaMinTileSide) fit it and their overlapping
+   *  floods cost at most 1.5x the one-domain flood. Tiles give
+   *  exactly the same texels (each tile's flood domain contains every cone it reads — rectReach). */
+  private planTiles(cfg: DitherConfig, r: DitherTexelRect, w: number, h: number): DitherTexelRect[] {
+    if (!DitherEngine.usesContentDistance(cfg)) return [r];
+    const reach = DitherEngine.rectReach(cfg, w);
+    const dw = Math.min(w, r.x1 + reach) - Math.max(0, r.x0 - reach), dh = Math.min(h, r.y1 + reach) - Math.max(0, r.y0 - reach);
+    const budget = this.jfaScratchBudgetTexels;
+    if (dw * dh <= budget) return [r];
+    const side = Math.floor(Math.sqrt(budget)) - 2 * reach;
+    if (side < Math.max(1, this.jfaMinTileSide)) return [r];
+    // even splits (no sliver tiles), each at most `side` square
+    const nx = Math.ceil((r.x1 - r.x0) / side), ny = Math.ceil((r.y1 - r.y0) / side);
+    const tiles: DitherTexelRect[] = [];
+    let work = 0;
+    for (let j = 0; j < ny; j++) {
+      const y0 = r.y0 + Math.floor(((r.y1 - r.y0) * j) / ny), y1 = r.y0 + Math.floor(((r.y1 - r.y0) * (j + 1)) / ny);
+      for (let i = 0; i < nx; i++) {
+        const x0 = r.x0 + Math.floor(((r.x1 - r.x0) * i) / nx), x1 = r.x0 + Math.floor(((r.x1 - r.x0) * (i + 1)) / nx);
+        tiles.push({ x0, y0, x1, y1 });
+        work += (Math.min(w, x1 + reach) - Math.max(0, x0 - reach)) * (Math.min(h, y1 + reach) - Math.max(0, y0 - reach));
+      }
+    }
+    // the tiles' flood domains overlap by 2 × reach: not worth it past 1.5× the one-domain flood (then: one domain)
+    return work <= 1.5 * dw * dh ? tiles : [r];
+  }
+
+  /** Record one ordered-dither dispatch: `src` → `out` over region `r` (clipped, non-empty) — preceded, when the
+   *  config reads the content distance, by the jump flood over the region grown by rectReach (clipped). */
   private record(src: GPUTexture, out: GPUTexture, config: DitherConfig, r: DitherTexelRect, noiseSeed: number, enc: GPUCommandEncoder): void {
     const w = out.width, h = out.height;
     const rd = this.regionData;
     rd[0] = r.x0; rd[1] = r.y0; rd[2] = r.x1; rd[3] = r.y1;
-    this.device.queue.writeBuffer(this.paramsBuf, 128, rd);   // params[8]: the region
+    if (DitherEngine.usesContentDistance(config)) {
+      const reach = DitherEngine.rectReach(config, w);
+      const dom = {
+        x0: Math.max(0, r.x0 - reach), y0: Math.max(0, r.y0 - reach),
+        x1: Math.min(w, r.x1 + reach), y1: Math.min(h, r.y1 + reach),
+      };
+      this.curSeedsView = this.recordEdgeFlood(src, dom, ditherEdgeJfaSteps(ditherEdgeWidth(config)), enc);
+      rd[4] = dom.x0; rd[5] = dom.y0; rd[6] = dom.x1; rd[7] = dom.y1;
+    } else {
+      this.curSeedsView = this.noSeeds();
+      rd[4] = 0; rd[5] = 0; rd[6] = 1; rd[7] = 1;
+    }
+    this.device.queue.writeBuffer(this.paramsBuf, 128, rd);   // params[8]: the region, params[9]: the seeds domain
     switch (config.algorithm) {
       case 'bayer':
         this.applyBayer(src, out, w, h, config, enc, r);
@@ -519,7 +740,7 @@ export class DitherEngine {
    * For error diffusion, reads the texture to CPU, runs WASM, writes back.
    */
   public async applyAsync(texture: GPUTexture, config: DitherConfig): Promise<void> {
-    if (!config.enabled || config.strength <= 0.001) return;
+    if (!ditherConfigActive(config)) return;
 
     if (!DitherEngine.isErrorDiffusion(config.algorithm)) {
       // Ordered dithering — GPU sync path
@@ -614,7 +835,8 @@ export class DitherEngine {
       else this._readBufBusy = false;
     }
 
-    // 2. Run WASM error diffusion in-place
+    // 2. Run WASM error diffusion in-place (on a copy's worth of originals kept for Strength < 1)
+    const orig = config.strength < 0.999 ? pixels.slice() : null;
     applyErrorDiffusion(
       config.algorithm as ErrorDiffusionAlgorithm,
       pixels,
@@ -623,10 +845,11 @@ export class DitherEngine {
       config.colorLevels,
     );
 
-    // 3. Blend with original based on strength (if strength < 1)
-    //    For strength = 1.0, skip the blend — the WASM output is the final result.
-    //    (Color controls like duotone are not supported for error diffusion yet —
-    //     the WASM path operates on raw pixel colors directly.)
+    // 3. Strength: blend the result back toward the original (every caller — the layer dither cache, its Bake and
+    //    the global dither — writes these pixels out as they are). Strength 1: the WASM output is final.
+    //    (Duotone / Scale / Invert / edge effects do not apply to error diffusion: the WASM pass dithers the raw
+    //     colors; the host panels hide those controls for these algorithms.)
+    if (orig) blendDitherStrength(pixels, orig, config.strength);
     return pixels;
   }
 
@@ -648,12 +871,154 @@ export class DitherEngine {
     data[9]  = cfg.backgroundColor[1];
     data[10] = cfg.backgroundColor[2];
     data[11] = cfg.backgroundColor[3];
-    // 12..15 = params[7]: edge effects (defensive ?? — configs saved before 2026-09-15 lack them)
-    data[12] = cfg.edgeWidth ?? 0;
-    data[13] = cfg.edgeFade ?? 0;
-    data[14] = cfg.edgeShrink ?? 0;
-    data[15] = cfg.edgeDensity ?? 0;
+    // 12..15 = params[7]: edge effects (configs saved before 2026-09-15 lack them; NaN / negative width = off,
+    // wider than DITHER_EDGE_WIDTH_MAX clamps — the same sanitised width the flood schedule and rectReach use)
+    data[12] = ditherEdgeWidth(cfg);
+    data[13] = finiteOr0(cfg.edgeFade);
+    data[14] = finiteOr0(cfg.edgeShrink);
+    data[15] = finiteOr0(cfg.edgeDensity);
     this.device.queue.writeBuffer(this.paramsBuf, 64, data); // offset 64 = after first 16 floats
+  }
+
+  // ─── Content-edge jump flood ────────────────────────────────────
+
+  /**
+   * Record the jump flood over `dom` (texels of `src`, clipped, non-empty) into `enc`: the init pass, then one pass per
+   * step of `steps`. Returns the view holding the result (seeds relative to dom's origin). Uses the pooled scratch.
+   */
+  private recordEdgeFlood(src: GPUTexture, dom: DitherTexelRect, steps: readonly number[], enc: GPUCommandEncoder): GPUTextureView {
+    const dw = dom.x1 - dom.x0, dh = dom.y1 - dom.y0;
+    if (dw <= 0 || dh <= 0 || dw > JFA_MAX_DOMAIN || dh > JFA_MAX_DOMAIN || steps.length + 1 > JFA_MAX_PASSES) return this.noSeeds();
+    this.ensureJfaPipelines();
+    this.ensureJfaScratch(dw, dh);
+    const views = this.jfaViews!;
+    const pd = this.jfaParamData;
+    pd.fill(0);
+    pd[0] = dom.x0; pd[1] = dom.y0; pd[2] = dw; pd[3] = dh;
+    for (let i = 0; i < steps.length; i++) {
+      const o = (i + 1) * 64;
+      pd[o] = dw; pd[o + 1] = dh; pd[o + 2] = steps[i];
+    }
+    this.device.queue.writeBuffer(this.jfaParamsBuf!, 0, pd, 0, (steps.length + 1) * 64);
+    const gx = Math.ceil(dw / 8), gy = Math.ceil(dh / 8);
+    // ONE compute pass for the whole flood (each dispatch is its own usage scope, so the ping-pong between dispatches
+    // is legal and synchronised) — the per-pass fixed cost dominated small floods
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.jfaInitPipeline!);
+    pass.setBindGroup(0, this.device.createBindGroup({
+      layout: this.jfaInitBGL!,
+      entries: [{ binding: 0, resource: src.createView() }, { binding: 1, resource: views[0] }, { binding: 2, resource: this.jfaSlot(0) }],
+    }));
+    pass.dispatchWorkgroups(gx, gy);
+    pass.setPipeline(this.jfaStepPipeline!);
+    for (let i = 0; i < steps.length; i++) {
+      pass.setBindGroup(0, this.jfaStepBindGroup(i));   // step i reads views[i % 2], writes the other
+      pass.dispatchWorkgroups(gx, gy);
+    }
+    pass.end();
+    const cur = steps.length % 2;
+    this.stats.floods++;
+    this.stats.jfaDispatches += steps.length + 1;
+    this.stats.jfaTexels += (steps.length + 1) * dw * dh;
+    this.touchJfaScratch();
+    return views[cur];
+  }
+
+  private jfaSlot(i: number): GPUBufferBinding {
+    return { buffer: this.jfaParamsBuf!, offset: i * 256, size: 16 };
+  }
+
+  /** Flood step i's bind group (cached per scratch allocation: its views and params slot never change). */
+  private jfaStepBindGroup(i: number): GPUBindGroup {
+    let bg = this.jfaStepBGs[i];
+    if (!bg) {
+      const v = this.jfaViews!, c = i % 2;
+      bg = this.device.createBindGroup({
+        layout: this.jfaStepBGL!,
+        entries: [{ binding: 0, resource: v[c] }, { binding: 1, resource: v[1 - c] }, { binding: 2, resource: this.jfaSlot(i + 1) }],
+      });
+      this.jfaStepBGs[i] = bg;
+    }
+    return bg;
+  }
+
+  private ensureJfaPipelines(): void {
+    if (this.jfaInitPipeline) return;
+    const mk = (code: string, inEntry: GPUBindGroupLayoutEntry) => {
+      const bgl = this.device.createBindGroupLayout({
+        entries: [
+          inEntry,
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32uint' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ],
+      });
+      const pipeline = this.device.createComputePipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' },
+      });
+      return { bgl, pipeline };
+    };
+    const init = mk(WGSL_JFA_INIT, { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } });
+    const step = mk(WGSL_JFA_STEP, { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'uint' } });
+    this.jfaInitBGL = init.bgl; this.jfaInitPipeline = init.pipeline;
+    this.jfaStepBGL = step.bgl; this.jfaStepPipeline = step.pipeline;
+    this.jfaParamsBuf = this.device.createBuffer({ size: JFA_MAX_PASSES * 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  }
+
+  /** The pooled scratch pair, at least dw × dh. Grown in 64-texel steps to the largest domain seen (both axes) —
+   *  unless that would exceed the budget while the domain itself fits it (then sized to the domain). */
+  private ensureJfaScratch(dw: number, dh: number): void {
+    if (this.jfaTex && dw <= this.jfaCapW && dh <= this.jfaCapH) return;
+    const up = (v: number) => Math.ceil(v / 64) * 64;
+    let cw = up(Math.max(dw, this.jfaCapW)), ch = up(Math.max(dh, this.jfaCapH));
+    if (cw * ch > this.jfaScratchBudgetTexels && dw * dh <= this.jfaScratchBudgetTexels) { cw = up(dw); ch = up(dh); }
+    this.releaseJfaScratch();
+    const mk = () => this.device.createTexture({
+      size: [cw, ch], format: 'r32uint', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+    });
+    const a = mk(), b = mk();
+    this.jfaTex = [a, b];
+    this.jfaViews = [a.createView(), b.createView()];
+    this.jfaCapW = cw; this.jfaCapH = ch;
+    this.stats.jfaScratchAllocs++;
+  }
+
+  /** Bytes the pooled flood scratch holds now (diagnostics / tests). */
+  public get jfaScratchBytes(): number { return this.jfaTex ? this.jfaCapW * this.jfaCapH * 8 : 0; }
+
+  private touchJfaScratch(): void {
+    this.jfaLastUse = Date.now();
+    if (this.jfaTimer !== null) return;
+    const check = () => {
+      this.jfaTimer = null;
+      if (!this.jfaTex) return;
+      const idle = Date.now() - this.jfaLastUse;
+      if (idle >= JFA_IDLE_MS) { this.releaseJfaScratch(); return; }
+      this.jfaTimer = setTimeout(check, JFA_IDLE_MS - idle);
+      (this.jfaTimer as { unref?: () => void }).unref?.();
+    };
+    this.jfaTimer = setTimeout(check, JFA_IDLE_MS);
+    (this.jfaTimer as { unref?: () => void }).unref?.();
+  }
+
+  /** Free the pooled flood scratch (deferred past the submitted work that may still read it). */
+  public releaseJfaScratch(): void {
+    if (!this.jfaTex) return;
+    const [a, b] = this.jfaTex;
+    this.jfaTex = null; this.jfaViews = null; this.jfaCapW = 0; this.jfaCapH = 0; this.jfaStepBGs = [];
+    const done = () => { a.destroy(); b.destroy(); };
+    try { this.device.queue.onSubmittedWorkDone().then(done, () => { /* device lost */ }); } catch { done(); }
+  }
+
+  /** The 1×1 "no seed in reach" stand-in (edge factor 1) bound when a dispatch reads no distance. */
+  private noSeeds(): GPUTextureView {
+    if (this.noSeedsView) return this.noSeedsView;
+    this.noSeedsTex = this.device.createTexture({
+      size: [1, 1], format: 'r32uint', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.device.queue.writeTexture({ texture: this.noSeedsTex }, new Uint32Array([0xFFFFFFFF]), { bytesPerRow: 4 }, [1, 1]);
+    this.noSeedsView = this.noSeedsTex.createView();
+    return this.noSeedsView;
   }
 
   public destroy(): void {
@@ -665,6 +1030,14 @@ export class DitherEngine {
     this.blueNoiseTexture = null;
     this._readBuf = null;
     this._readBufSize = 0;
+    if (this.jfaTimer !== null) { clearTimeout(this.jfaTimer); this.jfaTimer = null; }
+    this.releaseJfaScratch();
+    this.jfaParamsBuf?.destroy();
+    this.jfaParamsBuf = null;
+    this.noSeedsTex?.destroy();
+    this.noSeedsTex = null;
+    this.noSeedsView = null;
+    this.curSeedsView = null;
   }
 
   // ─── Bayer Ordered Dithering ────────────────────────────────────
@@ -690,6 +1063,7 @@ export class DitherEngine {
         { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: outTex.createView() },
         { binding: 2, resource: { buffer: this.paramsBuf } },
+        { binding: 7, resource: this.curSeedsView! },
       ],
     });
 
@@ -702,7 +1076,7 @@ export class DitherEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var srcTex: texture_2d<f32>;
       @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 9>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 10>;
 
       // Bayer matrix computation (procedural, no lookup texture needed)
       // Computes the Bayer threshold for a given (x, y) at a given matrix level.
@@ -772,7 +1146,6 @@ export class DitherEngine {
 
         // Edge effects: es.x = fade strength multiplier, es.y = coverage shrink, es.z = edge factor.
         let es = edgeState(coords);
-        let effStrength = strength * es.x;
         // Density: drop whole Bayer TILES near the edge. ALL-OR-NOTHING per tile (edge factor
         // evaluated once at the tile centre), and a dropped tile renders the PAPER state (BG in
         // duotone / white in quantize) — the dot is REMOVED, leaving the pattern sparser. (Rev 2,
@@ -801,10 +1174,12 @@ export class DitherEngine {
         let isDuotone = params[4].x > 0.5;
         let duotoneBias = params[4].w;
         var dithered: vec3<f32>;
+        var duoSmooth = 0.0;   // the duotone level before quantizing: the flat tone its pattern averages to
         if (isDuotone) {
           // Shrink: ramp the bias toward the direction-aware landing extreme near the edge —
           // positive shrink makes the dots (whichever phase they are) shrink away.
-          let ditheredLum = quantize(mix(duotoneBias, shrinkTargetBias(duotoneBias), es.y) + bias, colorLevels);
+          duoSmooth = mix(duotoneBias, shrinkTargetBias(duotoneBias), es.y);
+          let ditheredLum = quantize(duoSmooth + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         } else if (perChannel) {
           // Shrink (quantize mode): pull values toward paper-white (or ink-black when negative).
@@ -821,7 +1196,7 @@ export class DitherEngine {
           dithered = vec3<f32>(ditheredLum);
         }
 
-        let col = applyColorMapping(src.rgb, dithered, src.a, effStrength);
+        let col = applyColorMapping(src.rgb, dithered, src.a, strength, es.x, duoSmooth);
         textureStore(output, coords, col);
       }
     `;
@@ -831,6 +1206,7 @@ export class DitherEngine {
         { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'uint' } },   // content-edge seeds
       ],
     });
 
@@ -872,6 +1248,7 @@ export class DitherEngine {
         { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: outTex.createView() },
         { binding: 2, resource: { buffer: this.paramsBuf } },
+        { binding: 7, resource: this.curSeedsView! },
       ],
     });
 
@@ -884,7 +1261,7 @@ export class DitherEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var srcTex: texture_2d<f32>;
       @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 9>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 10>;
 
       fn luminance(c: vec3<f32>) -> f32 {
         return dot(c, vec3<f32>(0.299, 0.587, 0.114));
@@ -1095,7 +1472,6 @@ export class DitherEngine {
 
         // Edge effects: es.x = fade strength multiplier, es.y = coverage shrink, es.z = edge factor.
         let es = edgeState(coords);
-        let effStrength = strength * es.x;
         // Density: drop whole screen CELLS near the edge — ALL-OR-NOTHING per dot (edge factor
         // evaluated once at the cell centre), and a dropped cell renders the PAPER state so the
         // pattern gets SPARSER (rev 2, 2026-09-15 — strength-0 dropout wrongly revealed the
@@ -1119,11 +1495,13 @@ export class DitherEngine {
         let isDuotone = params[4].x > 0.5;
         let duotoneBias = params[4].w;
         var dithered: vec3<f32>;
+        var duoSmooth = 0.0;   // the duotone level before quantizing: the flat tone its pattern averages to
         if (isDuotone) {
           // Shrink: ramp the bias toward the direction-aware landing extreme — positive shrink
           // always makes the DOTS smaller until they vanish (rev 4: with bias > 0.5 the dots are
           // the BG phase, so the ramp goes toward all-FG; the old toward-0 rule GREW them).
-          let ditheredLum = quantize(mix(duotoneBias, shrinkTargetBias(duotoneBias), es.y) + bias, colorLevels);
+          duoSmooth = mix(duotoneBias, shrinkTargetBias(duotoneBias), es.y);
+          let ditheredLum = quantize(duoSmooth + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         } else if (perChannel) {
           let tq = shrinkTargetValue();
@@ -1138,7 +1516,7 @@ export class DitherEngine {
           dithered = vec3<f32>(ditheredLum);
         }
 
-        let col = applyColorMapping(src.rgb, dithered, src.a, effStrength);
+        let col = applyColorMapping(src.rgb, dithered, src.a, strength, es.x, duoSmooth);
         textureStore(output, coords, col);
       }
     `;
@@ -1148,6 +1526,7 @@ export class DitherEngine {
         { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'uint' } },   // content-edge seeds
       ],
     });
 
@@ -1178,6 +1557,7 @@ export class DitherEngine {
         { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: outTex.createView() },
         { binding: 2, resource: { buffer: this.paramsBuf } },
+        { binding: 7, resource: this.curSeedsView! },
       ],
     });
 
@@ -1190,7 +1570,7 @@ export class DitherEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var srcTex: texture_2d<f32>;
       @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 9>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 10>;
 
       // PCG hash for deterministic random from pixel coord + seed
       fn pcgHash(input: u32) -> u32 {
@@ -1237,7 +1617,6 @@ export class DitherEngine {
 
         // Edge effects. Stochastic pattern: "density" IS coverage here, so it folds into shrink.
         let es = edgeState(coords);
-        let effStrength = strength * es.x;
         // Stochastic pattern: density IS coverage, so its nearness folds into shrink's
         // (multiplicative survival — matches the old two-factor multiply for positive shrink).
         let nTot = 1.0 - (1.0 - es.y) * (1.0 - (1.0 - es.z) * params[7].w);
@@ -1245,8 +1624,10 @@ export class DitherEngine {
         let isDuotone = params[4].x > 0.5;
         let duotoneBias = params[4].w;
         var dithered: vec3<f32>;
+        var duoSmooth = 0.0;   // the duotone level before quantizing: the flat tone its pattern averages to
         if (isDuotone) {
-          let ditheredLum = quantize(mix(duotoneBias, shrinkTargetBias(duotoneBias), nTot) + bias, colorLevels);
+          duoSmooth = mix(duotoneBias, shrinkTargetBias(duotoneBias), nTot);
+          let ditheredLum = quantize(duoSmooth + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         } else if (perChannel) {
           let tq = shrinkTargetValue();
@@ -1261,7 +1642,7 @@ export class DitherEngine {
           dithered = vec3<f32>(ditheredLum);
         }
 
-        let col = applyColorMapping(src.rgb, dithered, src.a, effStrength);
+        let col = applyColorMapping(src.rgb, dithered, src.a, strength, es.x, duoSmooth);
         textureStore(output, coords, col);
       }
     `;
@@ -1271,6 +1652,7 @@ export class DitherEngine {
         { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'uint' } },   // content-edge seeds
       ],
     });
 
@@ -1302,6 +1684,7 @@ export class DitherEngine {
         { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: outTex.createView() },
         { binding: 2, resource: { buffer: this.paramsBuf } },
+        { binding: 7, resource: this.curSeedsView! },
         { binding: 3, resource: this.blueNoiseTexture!.createView() },
         { binding: 4, resource: this.blueNoiseSampler! },
       ],
@@ -1323,7 +1706,7 @@ export class DitherEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var srcTex: texture_2d<f32>;
       @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 9>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 10>;
       @group(0) @binding(3) var bnTex: texture_2d<f32>;
       @group(0) @binding(4) var bnSamp: sampler;
 
@@ -1363,15 +1746,16 @@ export class DitherEngine {
 
         // Edge effects. Stochastic pattern: "density" IS coverage here, so it folds into shrink.
         let es = edgeState(coords);
-        let effStrength = strength * es.x;
         // Stochastic pattern: density IS coverage — folds into shrink's nearness.
         let nTot = 1.0 - (1.0 - es.y) * (1.0 - (1.0 - es.z) * params[7].w);
 
         let isDuotone = params[4].x > 0.5;
         let duotoneBias = params[4].w;
         var dithered: vec3<f32>;
+        var duoSmooth = 0.0;   // the duotone level before quantizing: the flat tone its pattern averages to
         if (isDuotone) {
-          let ditheredLum = quantize(mix(duotoneBias, shrinkTargetBias(duotoneBias), nTot) + bias, colorLevels);
+          duoSmooth = mix(duotoneBias, shrinkTargetBias(duotoneBias), nTot);
+          let ditheredLum = quantize(duoSmooth + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         } else if (perChannel) {
           let tq = shrinkTargetValue();
@@ -1386,7 +1770,7 @@ export class DitherEngine {
           dithered = vec3<f32>(ditheredLum);
         }
 
-        let col = applyColorMapping(src.rgb, dithered, src.a, effStrength);
+        let col = applyColorMapping(src.rgb, dithered, src.a, strength, es.x, duoSmooth);
         textureStore(output, coords, col);
       }
     `;
@@ -1396,6 +1780,7 @@ export class DitherEngine {
         { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'uint' } },   // content-edge seeds
         { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
       ],

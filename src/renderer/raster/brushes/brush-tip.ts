@@ -13,6 +13,30 @@ import { BrushTip, BrushTipParametric, BrushTipImage } from './brush-preset';
 /** Resolution (px) of generated parametric tip textures. */
 const PARAMETRIC_TIP_SIZE = 128;
 
+/** The base64 payload of `data` — a raw base64 string, or a `data:image/...;base64,` URL (what a browser
+ *  FileReader.readAsDataURL hands the brush editor). atob() on the whole URL threw, so an uploaded dual-brush /
+ *  stroke texture silently became the hard-circle fallback. */
+export function base64Payload(data: string): string {
+  if (!data.startsWith('data:')) return data;
+  const comma = data.indexOf(',');
+  return comma >= 0 ? data.slice(comma + 1) : data;
+}
+
+/**
+ * A cache key for a texture's image data. The old keys used the first 32 characters, which are the SAME for every
+ * PNG data URL ("data:image/png;base64,iVBORw0KGg"), so a newly uploaded texture kept showing the old one. FNV-1a
+ * over the length and up to ~4k evenly spaced characters plus the last 64 (cheap for a multi-MB string).
+ */
+export function textureDataKey(prefix: string, data: string): string {
+  let h = 0x811c9dc5 ^ data.length;
+  const n = data.length;
+  const step = Math.max(1, Math.floor(n / 4096));
+  const mix = (c: number) => { h ^= c; h = Math.imul(h, 0x01000193); };
+  for (let i = 0; i < n; i += step) mix(data.charCodeAt(i));
+  for (let i = Math.max(0, n - 64); i < n; i++) mix(data.charCodeAt(i));
+  return `${prefix}_${n}_${(h >>> 0).toString(36)}`;
+}
+
 export class BrushTipGenerator {
   private device: GPUDevice;
 
@@ -130,7 +154,7 @@ export class BrushTipGenerator {
     // For now, decode synchronously via a temp canvas.
     // This is called once per preset load, not per frame.
     try {
-      const binary = atob(tip.imageData);
+      const binary = atob(base64Payload(tip.imageData));
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
@@ -155,7 +179,7 @@ export class BrushTipGenerator {
     if (cached) return cached;
 
     try {
-      const binary = atob(tip.imageData);
+      const binary = atob(base64Payload(tip.imageData));
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       const blob = new Blob([bytes], { type: 'image/png' });
@@ -199,7 +223,7 @@ export class BrushTipGenerator {
     if (cached) return cached;
 
     try {
-      const binary = atob(base64Data);
+      const binary = atob(base64Payload(base64Data));
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       const blob = new Blob([bytes], { type: 'image/png' });

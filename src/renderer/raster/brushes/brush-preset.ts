@@ -3,6 +3,8 @@
  * No GPU state, no runtime handles. Pure data.
  */
 
+import type { CanvasGrainType } from '../canvas-grain';
+
 // ─── Control Point for transfer curves ─────────────────────────────
 /** A point on a dynamics transfer curve (normalized 0-1 on both axes). */
 export interface ControlPoint {
@@ -51,13 +53,18 @@ export interface BrushDynamics {
 }
 
 // ─── Paper / Canvas Texture ────────────────────────────────────────
+/** The brush's OWN texture (per preset; the global "Brush Grain" is separate and stacks with it). Each dab's tip
+ *  alpha is modulated by the tiling texture, sampled in canvas texels (BrushStampPipeline, binding 13). */
 export interface BrushTexture {
-  /** Base64-encoded tiling grayscale image. */
+  /** Base64 (or a data: URL) tiling grayscale image. Empty = use the built-in `grain` pattern. */
   imageData: string;
-  scale: number;       // texture scale relative to dab (1 = 1:1)
+  /** A built-in paper pattern (CanvasGrainManager) used when `imageData` is empty. Default 'cold-press'. */
+  grain?: Exclude<CanvasGrainType, 'none'>;
+  scale: number;       // texture tile size multiplier (1 = the image's native pixels)
   strength: number;    // 0-1 mix with the dab alpha
+  /** multiply: tip × texture. subtract: the texture's dark areas are cut out of the tip (harder at soft edges). */
   mode: 'multiply' | 'subtract';
-  /** true = texture stays fixed in canvas space; false = follows stroke. */
+  /** true = the texture is anchored to the canvas (strokes line up); false = anchored at each stroke's start. */
   fixedToCanvas: boolean;
 }
 
@@ -66,9 +73,11 @@ export type BlendMode = 'normal' | 'multiply' | 'screen' | 'overlay';
 
 export interface BrushBlending {
   mode: BlendMode;
-  /** Max opacity for the entire stroke (0-1). */
+  /** The stroke's CEILING (0-1): the most coverage one stroke can reach, however often it passes over a spot. */
   opacity: number;
-  /** Per-dab opacity / flow (0-1). */
+  /** How much each dab deposits (0-1): overlapping dabs BUILD UP toward the opacity ceiling. 1 = a dab reaches the
+   *  ceiling at once (the stroke's coverage is the max of its dabs). On the direct paths (erasers, Multiply / Screen /
+   *  Overlay) opacity × flow is the dab strength. */
   flow: number;
 }
 

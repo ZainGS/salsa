@@ -132,8 +132,10 @@ describe('Shell frame structure (source guards)', () => {
     expect(cartridge).toContain("depthStencil: { format: SHELL_DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'always' }");
     expect(cartridge).toContain('writeMask: 0');
     expect(renderer).toContain('this.viewer.resetDepth(pass, w, h, 0, 0, w, heroDepthBottom)');
-    // …and the renderer puts the full-canvas viewport back after the hero and after the tile batch
-    expect(renderer.match(/pass\.setViewport\(0, 0, w, h, 0, 1\)/g)?.length).toBe(2);
+    // …and the renderer puts the full-canvas viewport back after the hero, after the tile batch and after the cart
+    // launch's posed disc (drawn in its grown viewport, after a depth reset over it)
+    expect(renderer.match(/pass\.setViewport\(0, 0, w, h, 0, 1\)/g)?.length).toBe(3);
+    expect(renderer).toContain('this.viewer.resetDepth(pass, w, h, r.x, r.y, r.w, r.h)');
     expect(renderer).toContain('pass.setScissorRect(0, 0, w, h)');
   });
 

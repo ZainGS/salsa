@@ -14,6 +14,8 @@
 
 import {
   BrushPreset,
+  BrushTip,
+  BrushTipParametric,
   evaluateCurve,
   LINEAR_CURVE,
 } from './brush-preset';
@@ -21,7 +23,7 @@ import { BrushStabilizer, StabilizedPoint } from './brush-stabilizer';
 import { stabilizationForPointer } from './brush-input-settings';
 import type { BrushStabilization } from './brush-preset';
 import { BrushStampPipeline, StampParams, TexelRect } from './brush-stamp-pipeline';
-import { BrushTipGenerator } from './brush-tip';
+import { BrushTipGenerator, textureDataKey } from './brush-tip';
 import { CanvasGrainManager } from '../canvas-grain';
 import { rgbToHsb, hsbToRgb } from '../../../utils/color';
 import { StrokeTextureRenderer, StrokeVertex } from './stroke-texture-renderer';
@@ -55,6 +57,23 @@ export function strokeStripBounds(vertices: readonly StrokeVertex[]): TexelRect 
   }
   const pad = hw + 1;
   return { x0: Math.floor(x0 - pad), y0: Math.floor(y0 - pad), x1: Math.ceil(x1 + pad), y1: Math.ceil(y1 + pad) };
+}
+
+const CANVAS_ORIGIN: [number, number] = [0, 0];
+
+/** The soft eraser's tip hardness cap: a soft eraser is soft-edged even with a hard brush (a softer tip stays). */
+export const SOFT_ERASER_HARDNESS = 0.3;
+
+/**
+ * The tip the eraser TOOL erases with (erase mode set by the tool, not an Eraser-category preset's own tip):
+ * soft (1) caps a parametric tip's hardness at SOFT_ERASER_HARDNESS, hard (3) makes it fully hard (the stamp
+ * shader also cuts image tips to a crisp silhouette). Same shape (roundness / angle). Other modes: the tip as is.
+ */
+export function eraserTip(tip: BrushTip, mode: number): BrushTip {
+  if (tip.type !== 'parametric') return tip;
+  if (mode === 3 && tip.hardness < 1) return { ...tip, hardness: 1 };
+  if (mode === 1 && tip.hardness > SOFT_ERASER_HARDNESS) return { ...tip, hardness: SOFT_ERASER_HARDNESS };
+  return tip;
 }
 
 export class BrushEngine {
@@ -96,6 +115,13 @@ export class BrushEngine {
 
   // Dual brush texture (cached GPU texture loaded from preset)
   private dualBrushTexture: GPUTexture | null = null;
+
+  // The preset's own Texture (BrushPreset.texture): an uploaded image (loaded async here) - a built-in pattern
+  // comes from the grain manager's cache instead. strokeAnchor = the stroke's first dab (stroke-anchored texture).
+  private brushTextureImage: GPUTexture | null = null;
+  private strokeAnchor: [number, number] = [0, 0];
+  /** The eraser tool's variant of the preset tip (eraserTip), memoised per source tip values + mode. */
+  private _eraserTip: { src: BrushTipParametric; h: number; r: number; a: number; mode: number; tip: BrushTip } | null = null;
 
   // Stroke texture renderer (for charcoal/crayon/marker brushes)
   private strokeTextureRenderer: StrokeTextureRenderer;
@@ -174,7 +200,7 @@ export class BrushEngine {
     // Pre-load dual brush texture if configured
     this.dualBrushTexture = null;
     if (preset.dualBrush?.enabled && preset.dualBrush.textureData) {
-      const key = `dual_${preset.id}_${preset.dualBrush.textureData.slice(0, 32)}`;
+      const key = textureDataKey('dual', preset.dualBrush.textureData);
       // Check cache first (sync), then async-load if missing
       const cached = this.tipGenerator.getCachedTexture(key);
       if (cached) {
@@ -192,7 +218,7 @@ export class BrushEngine {
     // Pre-load stroke texture if configured
     this.strokeTextureGpu = null;
     if (preset.strokeTexture?.enabled && preset.strokeTexture.textureData) {
-      const key = `stroke_${preset.id}_${preset.strokeTexture.textureData.slice(0, 32)}`;
+      const key = textureDataKey('stroke', preset.strokeTexture.textureData);
       const cached = this.tipGenerator.getCachedTexture(key);
       if (cached) {
         this.strokeTextureGpu = cached;
@@ -204,6 +230,44 @@ export class BrushEngine {
         }).catch(console.warn);
       }
     }
+
+    // Pre-load the brush's own Texture: an uploaded image async, a built-in pattern generated now (not mid-stroke)
+    this.brushTextureImage = null;
+    const tx = preset.texture;
+    if (tx && tx.strength > 0) {
+      if (tx.imageData) {
+        const key = textureDataKey('tex', tx.imageData);
+        const cached = this.tipGenerator.getCachedTexture(key);
+        if (cached) {
+          this.brushTextureImage = cached;
+        } else {
+          this.tipGenerator.loadGrayscaleTextureAsync(key, tx.imageData, 256).then(tex => {
+            if (this.preset === preset) this.brushTextureImage = tex;
+          }).catch(console.warn);
+        }
+      } else {
+        this.grainManager?.getTextureFor(tx.grain ?? 'cold-press');
+      }
+    }
+  }
+
+  /** The texture of the preset's own Texture block for this dab (null = none / still loading). */
+  private resolveBrushTexture(): GPUTexture | null {
+    const tx = this.preset.texture;
+    if (!tx || !(tx.strength > 0)) return null;
+    if (tx.imageData) return this.brushTextureImage;
+    return this.grainManager?.getTextureFor(tx.grain ?? 'cold-press') ?? null;
+  }
+
+  /** The tip a dab stamps with: the preset's, or the eraser tool's soft / hard variant of it (eraserTip). */
+  private dabTip(mode: number): BrushTip {
+    const tip = this.preset.tip;
+    if (this.eraseModeOverride === null || tip.type !== 'parametric' || (mode !== 1 && mode !== 3)) return tip;
+    const m = this._eraserTip;
+    if (m && m.src === tip && m.h === tip.hardness && m.r === tip.roundness && m.a === tip.angle && m.mode === mode) return m.tip;
+    const out = eraserTip(tip, mode);
+    this._eraserTip = { src: tip, h: tip.hardness, r: tip.roundness, a: tip.angle, mode, tip: out };
+    return out;
   }
 
   /**
@@ -286,6 +350,7 @@ export class BrushEngine {
     this._smudgeReadbackPending = false;
     this._dirty = null;               // fresh stroke → fresh dirty-rect accumulation (E5 tail)
     this._maxDabRadius = 0;
+    this.strokeAnchor = [firstPoint.x, firstPoint.y];   // a stroke-anchored brush texture starts here
 
     // Begin wet-stroke: snapshot the canvas and prepare the stroke accumulation layer
     // (lock transparency on the wet path is applied in the accum → layer composite, against the layer's alpha)
@@ -381,7 +446,8 @@ export class BrushEngine {
           this.strokeVertices,
           accumTex,
           this.strokeTextureGpu,
-          [this.strokeColor[0], this.strokeColor[1], this.strokeColor[2], this.strokeColor[3]],
+          // Opacity is the strip's coverage (the stroke ceiling, as for dabs); the dab-only settings don't apply.
+          [this.strokeColor[0], this.strokeColor[1], this.strokeColor[2], this.strokeColor[3] * Math.max(0, Math.min(1, this.preset.blending.opacity))],
           st.texelsPerUnit,
           st.edgeSoftness,
         );
@@ -396,7 +462,9 @@ export class BrushEngine {
     const weSettings = we?.enabled
       ? { edgeDarkness: we.edgeDarkness, edgeWidth: we.edgeWidth, strength: we.strength }
       : undefined;
-    const bleedEnd = (bl?.enabled && !bl.perDab)
+    // A stroke-texture brush's per-dab bleed would spread the dab preview the strip replaces: it bleeds the strip
+    // once at the end instead.
+    const bleedEnd = (bl?.enabled && (!bl.perDab || st?.enabled))
       ? { radius: bl.radius, strength: bl.strength }
       : undefined;
     this.stampPipeline.endStroke(weSettings, bleedEnd);
@@ -677,8 +745,10 @@ export class BrushEngine {
     const diameter = (this.preset.minSize + (this.preset.maxSize - this.preset.minSize) * sizeFactor) * sizeJitter * velocitySizeFactor * this.brushSizeScale;
     const radius = Math.max(1, diameter / 2);
 
-    // Final per-dab alpha = preset opacity × flow × dynamics
-    let alpha = this.preset.blending.opacity * this.preset.blending.flow * opacityFactor * flowFactor;
+    // Opacity × opacity pressure = the dab's coverage CEILING; flow × flow pressure = how much of the way there one
+    // dab goes (the stamp shader builds overlapping dabs up toward the ceiling). Flow 1 = the old max-of-dabs stroke.
+    let alpha = this.preset.blending.opacity * opacityFactor;
+    const flow = Math.max(0, Math.min(1, this.preset.blending.flow * flowFactor));
 
     // ── Color jitter ──
     const jitter = this.preset.colorJitter;
@@ -752,8 +822,10 @@ export class BrushEngine {
       else if (blendMode === 'overlay') mode = 6;
     }
 
-    // Get tip texture
-    const tipTexture = this.tipGenerator.getTipTexture(this.preset.tip);
+    // Get tip texture (the eraser tool's soft / hard variant while erasing)
+    const tipTexture = this.tipGenerator.getTipTexture(this.dabTip(mode));
+    const brushTexture = this.resolveBrushTexture();
+    const tx = this.preset.texture;
 
     // ── Dual brush per-dab rotation ──
     let dualRotation = 0;
@@ -767,6 +839,7 @@ export class BrushEngine {
       cy: dabY,
       radius,
       color: [r, g, b, Math.max(0, Math.min(1, alpha))],
+      flow,
       rotation: rotationOffset,
       mode,
       aspect: this.aspectCorrection,
@@ -783,6 +856,12 @@ export class BrushEngine {
       dualBrushBlendOp: dual?.blendOp === 'subtract' ? 1 : dual?.blendOp === 'minimum' ? 2 : 0,
       dualBrushTileMode: dual?.tileMode === 'canvas-tiling' ? 1 : 0,
       dualBrushRotation: dualRotation,
+      // The preset's own texture
+      brushTexture,
+      brushTextureScale: tx?.scale ?? 1,
+      brushTextureStrength: brushTexture ? Math.max(0, Math.min(1, tx?.strength ?? 0)) : 0,
+      brushTextureMode: tx?.mode === 'subtract' ? 1 : 0,
+      brushTextureOrigin: tx?.fixedToCanvas === false ? this.strokeAnchor : CANVAS_ORIGIN,
     };
 
     // Stroke prediction: collect the dab for the provisional pass instead of stamping it (no smudge pickup — the
@@ -793,7 +872,7 @@ export class BrushEngine {
     }
 
     const bl = this.preset?.bleed;
-    const bleedPerDab = (bl?.enabled && bl.perDab)
+    const bleedPerDab = (bl?.enabled && bl.perDab && !this.preset.strokeTexture?.enabled)
       ? { radius: bl.radius, strength: bl.strength }
       : undefined;
     this.stampPipeline.stampWithPingPong(this.targetTexture, params, bleedPerDab);

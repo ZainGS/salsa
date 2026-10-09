@@ -34,6 +34,10 @@ export interface StampKernelParams {
   minX: number; minY: number; radius: number; mode: number; rotation: number; cx: number; cy: number; flags: number;
   color: [number, number, number, number];
   aspect: [number, number];
+  /** Per-dab deposit (aspect.z in the shader; default 1 = the max-of-dabs wet stroke). */
+  flow?: number;
+  /** The preset's own texture (binding 13 / 14): scale, strength, mode (0 multiply, 1 subtract), origin. */
+  brushTex?: { tex: CpuTexture; scale: number; strength: number; mode: number; origin: [number, number] } | null;
 }
 
 const f32 = (b: Uint8Array) => new Float32Array(b.buffer, b.byteOffset, b.byteLength >> 2);
@@ -61,7 +65,8 @@ function sampleR8(t: CpuTexture, u: number, v: number): number {
   return (g(x0, y0) * (1 - fx) + g(x0 + 1, y0) * fx) * (1 - fy) + (g(x0, y0 + 1) * (1 - fx) + g(x0 + 1, y0 + 1) * fx) * fy;
 }
 
-/** CPU port of the stamp shader's per-texel body (grain / dual / selection disabled — strength 0 / dummy mask). */
+/** CPU port of the stamp shader's per-texel body (grain / dual / selection disabled — strength 0 / dummy mask;
+ *  the brush texture, flow build-up and every mode but Screen / Overlay ported). */
 export function stampKernel(
   src: CpuTexture, dst: CpuTexture, tip: CpuTexture, p: StampKernelParams, threadsX: number, threadsY: number,
 ): void {
@@ -76,29 +81,44 @@ export function stampKernel(
       const rdx = dx * c - dy * s, rdy = dx * s + dy * c;
       const d = Math.sqrt(rdx * rdx + rdy * rdy);
       if (d > r) continue;
-      const tipA = sampleR8(tip, (rdx / r) * 0.5 + 0.5, (rdy / r) * 0.5 + 0.5);
-      if (tipA <= 0.001) continue;
-      const brushA = p.color[3] * tipA;
+      const rawTip = sampleR8(tip, (rdx / r) * 0.5 + 0.5, (rdy / r) * 0.5 + 0.5);
+      if (rawTip <= 0.001) continue;
+      let tipA = rawTip;
+      const bt = p.brushTex;
+      if (bt && bt.strength > 0.001) {
+        const s = Math.max(bt.scale, 0.01);
+        const tv = sampleR8Repeat(bt.tex, (ix - bt.origin[0]) / (bt.tex.width * s), (iy - bt.origin[1]) / (bt.tex.height * s));
+        tipA = bt.mode > 0.5 ? Math.max(0, tipA - (1 - tv) * bt.strength) : tipA * (1 + (tv - 1) * bt.strength);
+      }
+      const flow = p.flow ?? 1;
+      const coverage = p.color[3] * tipA;
+      const brushA = coverage * flow;
       const ex = load(src, ix, iy);
       let out: number[] = ex;
       if (p.mode === 0) {
         if (wet) {
-          const newA = Math.max(ex[3], brushA);
+          let newA = ex[3];
           let rgb = [p.color[0], p.color[1], p.color[2]];
-          if (ex[3] > 0.001 && ex[3] >= brushA) rgb = [ex[0], ex[1], ex[2]];
-          else if (ex[3] > 0.001) {
-            const t = (brushA - ex[3]) / Math.max(brushA, 0.001);
-            rgb = [0, 1, 2].map(i => ex[i] + (p.color[i] - ex[i]) * t);
-          }
+          if (coverage > ex[3]) {
+            newA = ex[3] * (1 - flow) + coverage * flow;
+            if (ex[3] > 0.001) {
+              const t = (newA - ex[3]) / Math.max(newA, 0.001);
+              rgb = [0, 1, 2].map(i => ex[i] + (p.color[i] - ex[i]) * t);
+            }
+          } else if (ex[3] > 0.001) rgb = [ex[0], ex[1], ex[2]];
           out = [...rgb, newA];
         } else {
           const outA = brushA + ex[3] * (1 - brushA);
           out = outA <= 0 ? [0, 0, 0, 0]
             : [...[0, 1, 2].map(i => (p.color[i] * brushA + ex[i] * ex[3] * (1 - brushA)) / outA), outA];
         }
-      } else if (p.mode === 1) {
-        const newA = ex[3] * (1 - brushA);
-        const rgb = ex[3] > 0 ? [0, 1, 2].map(i => ex[i] * (newA / ex[3])) : [1, 1, 1];
+      } else if (p.mode === 1 || p.mode === 2 || p.mode === 3) {
+        // 1 fade, 2 clear (any coverage clears), 3 hard edge (the bare tip's silhouette at opacity x flow)
+        const smooth = (e0: number, e1: number, x: number) => { const t = clampN((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+        const k = p.mode === 1 ? brushA : p.mode === 2 ? Math.ceil(brushA) : p.color[3] * flow * smooth(0.2, 0.5, rawTip);
+        const newA = ex[3] * (1 - k);
+        const gone = p.mode === 3 ? [0, 0, 0] : [1, 1, 1];
+        const rgb = p.mode !== 1 && newA <= 0 ? gone : ex[3] > 0 ? [0, 1, 2].map(i => ex[i] * (newA / ex[3])) : p.mode === 1 ? [1, 1, 1] : [ex[0], ex[1], ex[2]];
         out = [...rgb, newA];
       } else if (p.mode === 4) {
         const rgb = [0, 1, 2].map(i => ex[i] + (ex[i] * p.color[i] - ex[i]) * brushA);
@@ -254,15 +274,85 @@ function forCompositorTexels(out: CpuTexture, tx: number, ty: number, region: Ar
   for (let y = y0; y < Math.min(y1, y0 + ty); y++) for (let x = x0; x < Math.min(x1, x0 + tx); x++) f(x, y);
 }
 
-/** CPU port of the compositor's blend step (displacement off — the mirror throws on a displaced layer). */
+// Frame Link displacement (the compositor's computeDisplacement / computeDisplacementAt, u32 maths wrapped like WGSL;
+// pcgHash is the shared port further down)
+const hash2Dfloat = (x: number, y: number): number => Math.fround(Math.fround(pcgHash((x + pcgHash(y)) >>> 0)) / 4294967295);
+const fract = (v: number) => v - Math.floor(v);
+const lerpD = (a: number, b: number, t: number) => a * (1 - t) + b * t;
+function gradientNoise(px: number, py: number): number {
+  const ix = Math.floor(px) | 0, iy = Math.floor(py) | 0;
+  const fx = fract(px), fy = fract(py);
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2Dfloat(ix >>> 0, iy >>> 0), b = hash2Dfloat((ix + 1) >>> 0, iy >>> 0);
+  const c = hash2Dfloat(ix >>> 0, (iy + 1) >>> 0), d = hash2Dfloat((ix + 1) >>> 0, (iy + 1) >>> 0);
+  return lerpD(lerpD(a, b, ux), lerpD(c, d, ux), uy) * 2 - 1;
+}
+/** WGSL u32(f32): truncation, saturated to [0, 2^32 - 1]. */
+const f32ToU32 = (v: number) => (v <= 0 || v !== v ? 0 : v >= 4294967295 ? 4294967295 : Math.trunc(v));
+function displacementAt(p: Float32Array, px: number, py: number, frame: number): [number, number] {
+  const type = Math.trunc(p[4]), amplitude = p[5], freq = p[6], speed = p[7], dir = p[8], phase = p[9];
+  const flags = f32ToU32(p[11]), texW = p[18], texH = p[19];
+  if (type === 0 || amplitude < 0.001) return [0, 0];
+  const doX = (flags & 1) !== 0, doY = (flags & 2) !== 0;
+  const nx = px / texW, ny = py / texH;
+  const cs = Math.cos(dir), sn = Math.sin(dir);
+  let dx = 0, dy = 0;
+  if (type === 1) {
+    const wave = Math.sin((nx * -sn + ny * cs) * freq * 6.283185 + frame * speed + phase);
+    const ax = doX ? wave * amplitude : 0, ay = doY ? wave * amplitude : 0;
+    dx = ax * cs - ay * sn; dy = ax * sn + ay * cs;
+  } else if (type === 2) {
+    const fIdx = (f32ToU32(frame) + f32ToU32(p[17])) >>> 0;
+    dx = doX ? (hash2Dfloat(fIdx, 0) * 2 - 1) * amplitude : 0;
+    dy = doY ? (hash2Dfloat(fIdx, 1) * 2 - 1) * amplitude : 0;
+  } else if (type === 3) {
+    const cx = p[12], cy = p[13];
+    const dist = Math.hypot(nx - cx, ny - cy);
+    const wave = Math.sin(dist * freq * 6.283185 - frame * speed + phase);
+    const rx = nx - cx + 0.0001, ry = ny - cy + 0.0001, rl = Math.hypot(rx, ry) || 1;
+    dx = doX ? (rx / rl) * wave * amplitude : 0; dy = doY ? (ry / rl) * wave * amplitude : 0;
+  } else if (type === 4) {
+    const nX = gradientNoise(nx * freq + frame * speed, ny * freq + phase);
+    const nY = gradientNoise(nx * freq + phase + 100, ny * freq + frame * speed + 100);
+    dx = doX ? nX * amplitude : 0; dy = doY ? nY * amplitude : 0;
+  } else if (type === 5) {
+    const octaves = Math.trunc(p[14]), lac = p[15], pers = p[16];
+    let tFreq = freq, tAmp = 1, sx = 0, sy = 0, maxAmp = 0;
+    for (let oi = 0; oi < 4 && oi < octaves; oi++) {
+      sx += gradientNoise(nx * tFreq + frame * speed, ny * tFreq + phase) * tAmp;
+      sy += gradientNoise(nx * tFreq + phase + 50, ny * tFreq + frame * speed + 50) * tAmp;
+      maxAmp += tAmp; tFreq *= lac; tAmp *= pers;
+    }
+    dx = doX ? (sx / Math.max(maxAmp, 0.001)) * amplitude : 0; dy = doY ? (sy / Math.max(maxAmp, 0.001)) * amplitude : 0;
+  }
+  return [dx, dy];
+}
+/** CPU port of the compositor's computeDisplacement: params[0].w = the Loop to Fit cross-fade length (0 = off). */
+export function frameLinkDisplacement(p: Float32Array, px: number, py: number): [number, number] {
+  const frame = p[10], loopLen = p[3];
+  const d = displacementAt(p, px, py, frame);
+  if (loopLen < 0.5) return d;
+  const e = displacementAt(p, px, py, frame - loopLen), t = frame / loopLen;
+  return [lerpD(d[0], e[0], t), lerpD(d[1], e[1], t)];
+}
+/** WGSL round(): half to even. */
+const roundEven = (v: number) => { const r = Math.round(v); return Math.abs(v % 1) === 0.5 && r % 2 !== 0 ? r - 1 : r; };
+
+/** CPU port of the compositor's blend step, Frame Link displacement included. */
 export function layerBlendKernel(
   accum: CpuTexture, layer: CpuTexture, out: CpuTexture, params: Float32Array, tx: number, ty: number, region: ArrayLike<number> | null,
 ): void {
-  if (params[4] !== 0 && params[5] >= 0.001) throw new Error('cpu-gpu-mirror: layer displacement is not mirrored');
   const mode = Math.trunc(params[0]), opacity = params[1], clipped = params[2] > 0.5;
   const blend = LAYER_BLENDS[mode] ?? LAYER_BLENDS[0];
+  const displaced = params[4] !== 0 && params[5] >= 0.001;
   forCompositorTexels(out, tx, ty, region, (x, y) => {
-    const dst = load(accum, x, y), src = load(layer, x, y);
+    let sx = x, sy = y;
+    if (displaced) {
+      const d = frameLinkDisplacement(params, x, y);
+      sx = Math.max(0, Math.min(out.width - 1, x + roundEven(d[0])));
+      sy = Math.max(0, Math.min(out.height - 1, y + roundEven(d[1])));
+    }
+    const dst = load(accum, x, y), src = load(layer, sx, sy);
     let srcA = src[3] * opacity;
     if (clipped) srcA *= dst[3];
     if (srcA <= 0.001) { store(out, x, y, dst); return; }
@@ -302,9 +392,67 @@ export function grainOverlayKernel(
   });
 }
 
-// ── Bayer ordered dither (dither-engine.ts) — edge effects (fade / shrink / density dropout, all three edge modes),
-// duotone / quantize / per-channel, invert and the params[8] dispatch region. Doubles instead of f32 and JS rounding
-// (WGSL round() is half-to-even): good for path-vs-path identity checks, not a bit-exact GPU reference. ──
+// ── Content-edge jump flood (dither-engine.ts WGSL_JFA_INIT / WGSL_JFA_STEP, 2026-10-09). Integer-only, so these
+// ports ARE bit-exact with the GPU (checked on real D3D12 through the Dawn-node harness). Seeds: x | y << 16,
+// relative to the flood domain; JFA_NONE = no seed. ──
+
+export const JFA_NONE = 0xFFFFFFFF;
+
+/** CPU port of JFA-INIT: jp = (domain x0, y0, w, h) in source texels; every UNPAINTED (alpha < 0.004) texel seeds. */
+export function jfaInitKernel(src: CpuTexture, out: CpuTexture, jp: ArrayLike<number>, tx: number, ty: number): void {
+  const o = u32(out.data);
+  const W = Math.min(jp[2], tx), H = Math.min(jp[3], ty);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const a = src.data[((y + jp[1]) * src.width + x + jp[0]) * 4 + 3] / 255;
+    o[y * out.width + x] = a >= 0.004 ? JFA_NONE : (x | (y << 16)) >>> 0;
+  }
+}
+
+/** CPU port of JFA-STEP: jp = (domain w, h, step); the nearest of the 3x3 candidates `step` apart (first wins ties). */
+export function jfaStepKernel(inT: CpuTexture, out: CpuTexture, jp: ArrayLike<number>, tx: number, ty: number): void {
+  const I = u32(inT.data), O = u32(out.data);
+  const DW = jp[0], DH = jp[1], s = jp[2];
+  const W = Math.min(DW, tx), H = Math.min(DH, ty);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let best = JFA_NONE, bestD = Infinity;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const qx = x + dx * s, qy = y + dy * s;
+      if (qx < 0 || qy < 0 || qx >= DW || qy >= DH) continue;
+      const v = I[qy * inT.width + qx];
+      if (v === JFA_NONE) continue;
+      const ex = (v & 0xFFFF) - x, ey = (v >>> 16) - y, d = ex * ex + ey * ey;
+      if (d < bestD) { bestD = d; best = v; }
+    }
+    O[y * out.width + x] = best;
+  }
+}
+
+/** The whole flood on the CPU: the nearest-unpainted-texel seeds of `src` over `dom` (row stride = the domain width),
+ *  with the engine's step schedule (ditherEdgeJfaSteps). */
+export function edgeSeedsCpu(src: CpuTexture, dom: { x0: number; y0: number; x1: number; y1: number }, steps: readonly number[]): Uint32Array {
+  const w = dom.x1 - dom.x0, h = dom.y1 - dom.y0;
+  const mk = (): CpuTexture => {
+    const t: CpuTexture = { width: w, height: h, format: 'r32uint', bpp: 4, data: new Uint8Array(w * h * 4), destroyed: false, createView: () => ({ texture: t }), destroy: () => { /* */ } };
+    return t;
+  };
+  let a = mk(), b = mk();
+  jfaInitKernel(src, a, [dom.x0, dom.y0, w, h], w, h);
+  for (const s of steps) { jfaStepKernel(a, b, [w, h, s], w, h); [a, b] = [b, a]; }
+  return u32(a.data).slice();
+}
+
+/** The content edge factor from a distance (texel centres) to the nearest unpainted texel: measured from the texel
+ *  boundary (d - 0.5), ramp 1 - (1 - t)^1.5 over t = that / radius (WGSL edgeFactor). Infinity = no seed = 1. */
+export function edgeRamp(dist: number, radius: number): number {
+  const t = clampN((dist - 0.5) / radius, 0, 1);
+  const u = 1 - t;
+  return 1 - u * Math.sqrt(u);
+}
+
+// ── Bayer ordered dither (dither-engine.ts) — edge effects (fade / shrink / density dropout, all three edge modes;
+// the content distance read from the flood seeds at binding 7, params[9] = their domain), duotone / quantize /
+// per-channel, invert and the params[8] dispatch region. Doubles instead of f32 and JS rounding (WGSL round() is
+// half-to-even): good for path-vs-path identity checks, not a bit-exact GPU reference. ──
 
 function pcgHash(v: number): number {
   const state = (Math.imul(v >>> 0, 747796405) + 2891336453) >>> 0;
@@ -317,24 +465,17 @@ function edgeCellRand(cx: number, cy: number, seed: number): number {
 const clampN = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const mixN = (a: number, b: number, t: number) => a + (b - a) * t;
 
-/** CPU port of the Bayer dither shader: `src` → `out`, params = the engine's 36-float uniform block. */
-export function ditherBayerKernel(src: CpuTexture, out: CpuTexture, p: Float32Array, tx: number, ty: number): void {
+/** CPU port of the Bayer dither shader: `src` → `out`, params = the engine's 40-float uniform block, `seeds` = the
+ *  content-edge flood result bound at binding 7 (null = none: every content factor is 1). */
+export function ditherBayerKernel(src: CpuTexture, out: CpuTexture, p: Float32Array, tx: number, ty: number, seeds: CpuTexture | null = null): void {
   const W = out.width, H = out.height;
-  const alphaAt = (x: number, y: number) => src.data[(clampN(y, 0, src.height - 1) * src.width + clampN(x, 0, src.width - 1)) * 4 + 3] / 255;
+  const S = seeds ? u32(seeds.data) : null;
   const edgeFactor = (x: number, y: number, radius: number) => {
-    let cov = 1, count = 1;
-    for (let ring = 0; ring < 3; ring++) {
-      const r = radius * ((ring + 1) / 3);
-      for (let k = 0; k < 8; k++) {
-        const ang = Math.fround((k + ring * 0.5) * 0.7853981634);
-        const ox = Math.cos(ang) * r, oy = Math.sin(ang) * r;
-        const px = clampN(x + Math.trunc(ox + Math.sign(ox) * 0.5), 0, src.width - 1);
-        const py = clampN(y + Math.trunc(oy + Math.sign(oy) * 0.5), 0, src.height - 1);
-        cov += alphaAt(px, py) >= 0.004 ? 1 : 0;
-        count++;
-      }
-    }
-    return clampN((cov / count - 0.5) * 2, 0, 1);
+    const ox = Math.trunc(p[36]), oy = Math.trunc(p[37]);
+    const lx = clampN(x - ox, 0, Math.trunc(p[38]) - ox - 1), ly = clampN(y - oy, 0, Math.trunc(p[39]) - oy - 1);
+    const v = S && seeds ? S[ly * seeds.width + lx] : JFA_NONE;
+    if (v === JFA_NONE) return 1;
+    return edgeRamp(Math.hypot((v & 0xFFFF) - lx, (v >>> 16) - ly), radius);
   };
   const edgeCanvas = (x: number, y: number, radius: number) =>
     clampN(Math.min(Math.min(x, y), Math.min(src.width - 1 - x, src.height - 1 - y)) / radius, 0, 1);
@@ -382,19 +523,21 @@ export function ditherBayerKernel(src: CpuTexture, out: CpuTexture, p: Float32Ar
     }
     const tq = esh < 0 ? 0 : 1;
     let d: number[];
+    let duoSmooth = 0;   // the duotone level before quantizing
     if (p[16] > 0.5) {
       const db = p[19], tS = db > 0.5 ? 1 : 0, tb = esh < 0 ? 1 - tS : tS;
-      const v = quantize(mixN(db, tb, es[1]) + bias, levels); d = [v, v, v];
+      duoSmooth = mixN(db, tb, es[1]);
+      const v = quantize(duoSmooth + bias, levels); d = [v, v, v];
     } else if (perChannel) {
       d = [0, 1, 2].map(i => quantize(mixN(c[i], tq, es[1]) + bias, levels));
     } else {
       const v = quantize(mixN(lum(c), tq, es[1]) + bias, levels); d = [v, v, v];
     }
-    // applyColorMapping
+    // applyColorMapping (duotone: Strength = pattern vs flat tone, Tint × edge fade = how much replaces the original)
     let res = [0, 1, 2].map(i => mixN(c[i], d[i], eff));
     let a = c[3];
     if (p[16] > 0.5) {
-      const t = lum(d), k = eff * p[18];
+      const t = mixN(duoSmooth, lum(d), strength), k = es[0] * p[18];
       res = [0, 1, 2].map(i => mixN(c[i], mixN(p[24 + i], p[20 + i], t), k));
       a = mixN(c[3], mixN(p[27], p[23], t), k);
     } else if (p[17] > 0.5) {
@@ -443,12 +586,16 @@ export function createCpuDevice() {
   const runDispatch = (pipeline: { code: string }, bg: { entries: Array<{ binding: number; resource: any }> }, gx: number, gy: number) => {
     const res = (i: number) => bg.entries.find(e => e.binding === i)?.resource;
     const tex = (i: number) => (res(i).texture ?? res(i)) as CpuTexture;
-    const buf = (i: number) => (res(i).buffer as CpuBuffer).data;
+    const buf = (i: number) => { const r = res(i); const d = (r.buffer as CpuBuffer).data; return r.offset ? d.subarray(r.offset) : d; };
     const tx = gx * 8, ty = gy * 8;
     counters.dispatchThreads += tx * ty;
     const code = pipeline.code;
-    if (code.includes('bayerThreshold')) {   // Bayer ordered dither (src binding 0 → output binding 1, params[8] = region)
-      ditherBayerKernel(tex(0), tex(1), f32(buf(2)), tx, ty);
+    if (code.includes('JFA-INIT')) {   // content-edge flood, seeding pass (params slot: domain origin + size)
+      jfaInitKernel(tex(0), tex(1), new Int32Array(buf(2).buffer, buf(2).byteOffset, 4), tx, ty);
+    } else if (code.includes('JFA-STEP')) {   // content-edge flood, one step (params slot: domain size + step)
+      jfaStepKernel(tex(0), tex(1), new Int32Array(buf(2).buffer, buf(2).byteOffset, 4), tx, ty);
+    } else if (code.includes('bayerThreshold')) {   // Bayer ordered dither (src binding 0 → output binding 1, params[8] = region, seeds binding 7)
+      ditherBayerKernel(tex(0), tex(1), f32(buf(2)), tx, ty, res(7) ? tex(7) : null);
     } else if (code.includes('blendSoftLight')) {   // layer compositor blend step (params[5] = region in the BRUSH-5 variant)
       const p = f32(buf(3));
       layerBlendKernel(tex(0), tex(1), tex(2), p, tx, ty, code.includes('params[5]') ? p.subarray(20, 24) : null);
@@ -474,9 +621,11 @@ export function createCpuDevice() {
       wetEdgesKernel(tex(0), tex(1), p[0], p[1], p[2]);
     } else if (code.includes('tipSamp')) {
       const p = f32(buf(3)), c = f32(buf(4)), a = f32(buf(5));
+      const bt = res(14) ? f32(buf(14)) : null;
       stampKernel(tex(0), tex(1), tex(6), {
         minX: p[0], minY: p[1], radius: p[2], mode: p[3], rotation: p[4], cx: p[5], cy: p[6], flags: p[7],
-        color: [c[0], c[1], c[2], c[3]], aspect: [a[0], a[1]],
+        color: [c[0], c[1], c[2], c[3]], aspect: [a[0], a[1]], flow: a.length > 2 ? a[2] : 1,
+        brushTex: bt && bt[1] > 0.001 ? { tex: tex(13), scale: bt[0], strength: bt[1], mode: bt[2], origin: [bt[4], bt[5]] } : null,
       }, tx, ty);
     } else if (code.includes('strength < 0.99')) {   // bleed (checked before composite: its comments mention accumTex)
       const p = f32(buf(2));

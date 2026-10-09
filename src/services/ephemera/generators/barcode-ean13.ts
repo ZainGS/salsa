@@ -127,7 +127,8 @@ export class BarcodeEAN13Generator implements IEphemeraGenerator {
     return [
       { key: 'value',       label: 'Value (12 digits)', type: 'text',  default: '590123412345',  group: 'Data' },
       { key: 'showText',    label: 'Show digits',       type: 'toggle',default: true,            group: 'Data' },
-      { key: 'fontSize',    label: 'Font size',         type: 'range', default: 11, min: 6, max: 18, step: 1, group: 'Data' },
+      { key: 'fontSize',    label: 'Font size',         type: 'range', default: 11, min: 6, max: 18, step: 1, group: 'Data',
+        showIf: { key: 'showText', truthy: true } },
       { key: 'height',      label: 'Bar height',        type: 'range', default: 80, min: 20, max: 200, step: 4, group: 'Size' },
       { key: 'moduleWidth', label: 'Module width',      type: 'range', default: 2,  min: 1,  max: 5,   step: 0.5, group: 'Size' },
       { key: 'quietZone',   label: 'Quiet zone',        type: 'range', default: 20, min: 7,  max: 40,  step: 1, group: 'Size' },

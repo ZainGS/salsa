@@ -20,6 +20,7 @@
 import { GPUPipelineCache, type PipelineHandle } from '../core/gpu-pipeline-cache';
 import type { ArmatureBgMode, ArmatureBgOptions } from '../../types/armature-3d';
 import { SkyDomePass } from './sky-dome-pass';
+import { WAVY_PATTERN_WGSL } from './shaders/wavy-pattern-wgsl';
 import type { SkyDomeView } from './sky-dome';
 
 // --- Shaders ---
@@ -49,25 +50,9 @@ struct Uniforms {
 }                               // total: 64 bytes
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-// Domain-warped wave — two passes of sinusoidal warping create organic ribbons.
-fn wave(uv: vec2<f32>) -> f32 {
-    // First warp layer
-    let w1 = vec2<f32>(
-        sin(uv.y * 2.1 + sin(uv.x * 1.4) * 1.1 + u.time * 0.48),
-        sin(uv.x * 2.6 + sin(uv.y * 1.8) * 0.9 + u.time * 0.32),
-    );
-    let p1 = uv + w1 * 0.55;
-
-    // Second warp layer (finer detail)
-    let w2 = vec2<f32>(
-        sin(p1.y * 3.5 + u.time * 0.20),
-        sin(p1.x * 3.1 + u.time * 0.28),
-    );
-    let p2 = p1 + w2 * 0.28;
-
-    let raw = sin(p2.x * 3.14159 * 1.7 + p2.y * 2.3 + u.time * 0.24) * 0.5 + 0.5;
-    return smoothstep(0.3, 0.7, raw);
-}
+// Domain-warped wave (wavy_wave: two passes of sinusoidal warping, organic ribbons) + the soft checker field
+// (wavy_checker): the shared WAVY_PATTERN_WGSL, also drawn on the Shell's FrogCart discs.
+${WAVY_PATTERN_WGSL}
 
 // Per-cell pseudo-random in [0,1).
 fn hash21(p: vec2<f32>) -> f32 {
@@ -100,7 +85,7 @@ fn main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             return mix(u.color1, u.color2, uv.y);
         }
         case 2u: {                                           // wavy
-            let t = wave(aUV * 22.0);
+            let t = wavy_wave(aUV * 22.0, u.time);
             return mix(u.color1, u.color2, t);
         }
         case 3u: {                                           // dim overlay
@@ -120,10 +105,8 @@ fn main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
             // Green/yellow checkerboard with FUZZY borders: a smooth sin·sin checker field, soft-stepped
             // so cells blur into each other (cell centers stay full color; borders feather).
-            let PI = 3.14159265;
-            let cf = sin(p.x * CELLS * PI) * sin(p.y * CELLS * PI);   // + in color1 cells, − in color2
             let BLUR = 0.03;                                         // higher = fuzzier borders
-            var col = mix(u.color2.rgb, u.color1.rgb, smoothstep(-BLUR, BLUR, cf));
+            var col = mix(u.color2.rgb, u.color1.rgb, wavy_checker(p * CELLS, BLUR));   // 1 in color1 cells, 0 in color2
 
             // Flowers in a hashed subset of cells, each spinning organically.
             let h = hash21(cell);

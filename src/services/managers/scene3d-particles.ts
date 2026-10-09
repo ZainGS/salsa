@@ -21,6 +21,9 @@ export const DELETE_PARTICLE_EMITTER_UNDO = 'Delete particle emitter';
 export class Scene3DParticles {
   private _emitters = new Map<string, ParticleEmitter3D>();
   private _tickCb: (() => boolean) | null = null;
+  /** Timeline subscription (rewind = restart the non-looping bursts), made lazily once the timeline exists. */
+  private _timelineUnsub: (() => void) | null = null;
+  private _lastFrame = -1;
 
   /** `pushUndo` (the scene's 3D undo stack) makes remove() ONE undoable step, like a mesh delete. */
   constructor(private readonly ctx: ManagerContext, private readonly pushUndo?: (cmd: Command3D) => void) {}
@@ -80,7 +83,46 @@ export class Scene3DParticles {
   }
 
   setConfig(id: string, config: ParticleEmitterConfig): void {
-    this._emitters.get(id)?.setConfig(config);
+    const e = this._emitters.get(id);
+    if (!e) return;
+    e.setConfig(config);   // re-arms a non-looping burst too
+    this._ensureTick();
+    this.ctx.scheduleRender();
+  }
+
+  /** Restart every emitter (a non-looping one fires its burst again). `onlyOneShot` leaves looping emitters alone
+   *  (what a timeline rewind does: a looping stream has no start to go back to). */
+  restartAll(onlyOneShot = false): void {
+    let any = false;
+    for (const e of this._emitters.values()) {
+      if (onlyOneShot && e.config.loop) continue;
+      e.restart();
+      any = true;
+    }
+    if (any) this.ctx.scheduleRender();
+  }
+
+  /** The timeline frame moved: going BACK (rewind, Stop, a loop wrap, scrubbing left) restarts the one-shot bursts. */
+  onTimelineFrame(frame: number): void {
+    const prev = this._lastFrame;
+    this._lastFrame = frame;
+    if (prev >= 0 && frame < prev) this.restartAll(true);
+  }
+
+  private _attachTimeline(): void {
+    if (this._timelineUnsub) return;
+    const timeline = this.ctx.rasterLayerManager?.getTimeline?.();
+    if (!timeline) return;
+    this._lastFrame = timeline.getCurrentFrame();
+    this._timelineUnsub = timeline.on((ev: { type: string; frame?: number }) => {
+      if (ev.type === 'frame-changed') this.onTimelineFrame(ev.frame ?? timeline.getCurrentFrame());
+    });
+  }
+
+  private _detachTimeline(): void {
+    this._timelineUnsub?.();
+    this._timelineUnsub = null;
+    this._lastFrame = -1;
   }
 
   getAll(): ParticleEmitter3D[] {
@@ -109,18 +151,23 @@ export class Scene3DParticles {
       const now = performance.now();
       const dt = Math.min((now - lastTime) / 1000, 0.1);   // clamp to 100 ms
       lastTime = now;
-      for (const e of this._emitters.values()) e.tick(dt);
-      const hasActive = this._emitters.size > 0;
-      if (!hasActive) {
+      if (!this._timelineUnsub) this._attachTimeline();   // the timeline may not exist yet when the first emitter lands
+      let active = false;
+      for (const e of this._emitters.values()) { e.tick(dt); if (e.isActive) active = true; }
+      if (this._emitters.size === 0) {
         this.ctx.webgpuRenderer.removePreRenderCallback(this._tickCb!);
         this._tickCb = null;
+        this._detachTimeline();
+        return false;
       }
-      return hasActive;
+      // A finished one-shot burst stops asking for frames (it stays registered: a restart / config change wakes it).
+      return active;
     };
     this.ctx.webgpuRenderer.addPreRenderCallback(this._tickCb, 'particles');
   }
 
   private _stopTick(): void {
+    this._detachTimeline();
     if (!this._tickCb) return;
     this.ctx.webgpuRenderer.removePreRenderCallback(this._tickCb);
     this._tickCb = null;

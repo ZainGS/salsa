@@ -145,6 +145,27 @@ describe('mesh generator live settings', () => {
     expect(p.editMesh!.vertices.length).toBe(6);
   });
 
+  it('a flat circle (height 0, the Add Mesh default since 2026-10-09) is ONE n-gon and regenerates flat', () => {
+    const em = EditMesh.fromCircle(0.5, 16, 0);
+    expect(em.vertices.length).toBe(16);
+    expect(em.faces.length).toBe(1);
+    expect(em.getFaceVertices(0).length).toBe(16);
+    const m = new Mesh3D(isvc, 0, 0, 0, { primitive: 'custom', geometry: em.compile() });
+    m.editMesh = em;
+    withGen(m, 'circle', { radius: 0.5, segments: 16, height: 0 });
+    regen(m, { segments: 8 });
+    expect(m.editMesh!.faces.length).toBe(1);
+    expect(m.editMesh!.vertices.length).toBe(8);
+    expect(maxY(m)).toBeCloseTo(0, 6);
+    // an older circle saved with a height keeps it
+    const old = new Mesh3D(isvc, 0, 0, 0, { primitive: 'custom', geometry: EditMesh.fromCircle(0.5, 16, 0.2).compile() });
+    old.editMesh = EditMesh.fromCircle(0.5, 16, 0.2);
+    withGen(old, 'circle', { radius: 0.5, segments: 16, height: 0.2 });
+    regen(old, { segments: 6 });
+    expect(maxY(old)).toBeCloseTo(0.2, 4);
+    expect(old.editMesh!.faces.length).toBe(8);
+  });
+
   it('blend shapes or material slots freeze the settings; a modifier-stack change does not', () => {
     const m = withGen(new Mesh3D(isvc, 0, 0, 0, { primitive: 'tube', path: [[0, 0, 0], [0, 1, 0]], radii: [0.1] }), 'tube', { path: [[0, 0, 0], [0, 1, 0]], radii: [0.1] });
     m.invalidateModifierCache();

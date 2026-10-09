@@ -31,7 +31,7 @@
  * texture replaces it, as before).
  */
 
-import { DitherEngine, type DitherConfig, type DitherTexelRect } from '../effects/dither-engine';
+import { DitherEngine, ditherConfigActive, type DitherConfig, type DitherTexelRect } from '../effects/dither-engine';
 import { isWasmReady } from '../../../wasm/wasm-bindings';
 import {
   rasterContentSeq, rasterTextureDirtySince, rasterTextureUid, rasterTextureWrittenAt,
@@ -192,9 +192,9 @@ export class LayerDitherCache {
     this.unsubStroke = unsub;
   }
 
-  /** Is this layer's dither one the cache serves (enabled, visible strength)? */
+  /** Is this layer's dither one the cache serves (it changes pixels: ditherConfigActive)? */
   public static active(cfg: DitherConfig | undefined | null): cfg is DitherConfig {
-    return !!cfg && cfg.enabled && cfg.strength > 0.001;
+    return ditherConfigActive(cfg);
   }
 
   /** A version string of a cache texture (changes on every write to it); null for a texture that is not one. */

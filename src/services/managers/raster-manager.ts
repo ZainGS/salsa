@@ -314,13 +314,16 @@ export class RasterManager {
         this.ctx.scheduleRender();
     }
 
-    setMagicWandOptions(opts: { tolerance?: number; contiguous?: boolean; referenceLayerId?: string }): void {
-        let refTex: GPUTexture | undefined;
-        if (opts.referenceLayerId && this.layerMgr) {
-            const refLayer = this.layerMgr.getLayerById(opts.referenceLayerId);
-            refTex = refLayer?.texture ?? undefined;
+    /** Same contract as ShapeManager.setMagicWandOptions (mode = the wand's New / Add / Subtract; a referenceLayerId
+     *  key that is empty / undefined clears the reference layer). */
+    setMagicWandOptions(opts: { tolerance?: number; contiguous?: boolean; referenceLayerId?: string; mode?: 'new' | 'add' | 'subtract' }): void {
+        const wand: { tolerance?: number; contiguous?: boolean; mode?: 'new' | 'add' | 'subtract'; referenceLayerTexture?: GPUTexture | null } =
+            { tolerance: opts.tolerance, contiguous: opts.contiguous, mode: opts.mode };
+        if ('referenceLayerId' in opts) {
+            const refLayer = opts.referenceLayerId ? this.layerMgr?.getLayerById(opts.referenceLayerId) : undefined;
+            wand.referenceLayerTexture = refLayer?.texture ?? null;
         }
-        this._rasterSelectionService?.setMagicWandOptions({ tolerance: opts.tolerance, contiguous: opts.contiguous, referenceLayerTexture: refTex });
+        this._rasterSelectionService?.setMagicWandOptions(wand);
     }
 
     // ── Transform convenience ────────────────────────────────────────

@@ -50,7 +50,9 @@ export interface ParticleEmitterConfig {
   turbulence?:      number;          // default 0
   /** Emit direction in local space (normalized). Default = +Y. */
   direction?:       [number, number, number]; // default [0, 1, 0]
-  /** Whether the emitter loops. If false, emits one burst then stops. */
+  /** Whether the emitter loops. If false it emits ONE burst then stops: `maxParticles` particles in total, spawned
+   *  at `emitRate`, after which the live ones age out and nothing new spawns until restart() (a timeline rewind, a
+   *  config change, or a reload). */
   loop?:            boolean;         // default true
   /** Layer index into the shared texture_2d_array atlas (0 = white default). */
   textureIndex?:    number;          // default 0
@@ -135,6 +137,7 @@ export class ParticleEmitter3D extends Shape {
   private _pool!: Float32Array;          // CPU particle state, P floats each
   private _count  = 0;                   // current live count
   private _emitAccum = 0;               // fractional particles to emit
+  private _emitted = 0;                 // particles spawned since the last restart (Loop off stops at maxParticles)
   private _gpuData!: Float32Array;      // compact GPU upload buffer
   private _activeCount = 0;             // how many entries are valid in _gpuData
 
@@ -182,6 +185,7 @@ export class ParticleEmitter3D extends Shape {
     this._gpuData = new Float32Array(this._cfg.maxParticles * PARTICLE_GPU_FLOATS);
     this._count   = 0;
     this._emitAccum = 0;
+    this._emitted = 0;
   }
 
   // ── Public API ────────────────────────────────────────────────────
@@ -194,6 +198,21 @@ export class ParticleEmitter3D extends Shape {
     this._applyConfig({ ...this._cfg, ...partial });
     this.gpuDirty = true;
   }
+
+  /** Start over: drop the live particles and re-arm emission (a non-looping emitter fires its burst again). */
+  restart(): void {
+    this._count = 0;
+    this._emitAccum = 0;
+    this._emitted = 0;
+    this.gpuDirty = true;
+  }
+
+  /** Loop off: the burst has been fully emitted (nothing new spawns until restart()). Always false when looping. */
+  get burstDone(): boolean { return !this._cfg.loop && this._emitted >= this._cfg.maxParticles; }
+
+  /** Still changing on screen: looping, still emitting its burst, or particles alive. A finished one-shot burst
+   *  is idle, so the tick loop can stop asking for frames. */
+  get isActive(): boolean { return this._cfg.loop || !this.burstDone || this._count > 0; }
 
   // ── Type / scene-graph overrides ──────────────────────────────────
 
@@ -252,13 +271,16 @@ export class ParticleEmitter3D extends Shape {
     this._count = writeIdx;
 
     // ── Spawn new particles ───────────────────────────────────────
-    if (cfg.loop || this._emitAccum >= 0) {
+    // Loop off = ONE burst: at most maxParticles spawned in total since the last restart, then the live ones age out.
+    if (cfg.loop || this._emitted < cfg.maxParticles) {
       this._emitAccum += cfg.emitRate * dt;
-      const toSpawn = Math.floor(this._emitAccum);
+      let toSpawn = Math.floor(this._emitAccum);
       this._emitAccum -= toSpawn;
+      if (!cfg.loop) toSpawn = Math.min(toSpawn, cfg.maxParticles - this._emitted);
 
       for (let n = 0; n < toSpawn && this._count < cfg.maxParticles; n++) {
         this._spawnOne();
+        this._emitted++;
       }
     }
 

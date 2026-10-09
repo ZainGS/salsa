@@ -149,6 +149,11 @@ function encodeCode128B(value: string): string {
 
 // ── SVG rendering ───────────────────────────────────────────────────
 
+/** Code 128B accepts &, < and > — escape them so the human-readable line can't break the SVG. */
+function escapeXml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function patternToSvg(
   bits: string,
   w: number, h: number,
@@ -230,7 +235,8 @@ export class BarcodeCode128Generator implements IEphemeraGenerator {
     return [
       { key: 'value',      label: 'Value',        type: 'text',   default: 'FROGMARKS',  group: 'Data' },
       { key: 'showText',   label: 'Show text',    type: 'toggle', default: true,          group: 'Data' },
-      { key: 'fontSize',   label: 'Font size',    type: 'range',  default: 11, min: 6, max: 18, step: 1, group: 'Data' },
+      { key: 'fontSize',   label: 'Font size',    type: 'range',  default: 11, min: 6, max: 18, step: 1, group: 'Data',
+        showIf: { key: 'showText', truthy: true } },
       { key: 'height',     label: 'Bar height',   type: 'range',  default: 80, min: 20, max: 200, step: 4, group: 'Size' },
       { key: 'moduleWidth',label: 'Module width', type: 'range',  default: 2,  min: 1,  max: 5,   step: 0.5, group: 'Size' },
       { key: 'quietZone',  label: 'Quiet zone',   type: 'range',  default: 20, min: 4,  max: 40,  step: 2, group: 'Size' },
@@ -252,7 +258,8 @@ export class BarcodeCode128Generator implements IEphemeraGenerator {
     const bits = encodeCode128B(value);
     if (!bits) return `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="${height}"><text x="10" y="${height/2}" fill="red" font-size="12">Invalid input</text></svg>`;
 
+    // patternToSvg takes (w, h): the bar height is h. These were swapped, so Bar height did nothing (audit 2026-10-09)
     const totalWidth = quietZone * 2 + bits.length * moduleWidth;
-    return patternToSvg(bits, height, totalWidth, quietZone, moduleWidth, barColor, bgColor, showText, value, fontSize);
+    return patternToSvg(bits, totalWidth, height, quietZone, moduleWidth, barColor, bgColor, showText, escapeXml(value), fontSize);
   }
 }

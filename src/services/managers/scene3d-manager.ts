@@ -11624,8 +11624,8 @@ export class Scene3DManager {
         return this._cloth.createLiveClothSim(grid, physics, mode, proxy);
     }
 
-    enableLiveCloth(meshId: string, stepsPerFrame?: number): boolean {
-        return this._cloth.enableLiveCloth(meshId, stepsPerFrame);
+    enableLiveCloth(meshId: string, stepsPerFrame?: number, opts?: { mode?: 'hang' | 'drape'; proxy?: DrapeProxy }): boolean {
+        return this._cloth.enableLiveCloth(meshId, stepsPerFrame, opts);
     }
 
     async disableLiveCloth(meshId: string, bakeCurrentPose = false): Promise<boolean> {

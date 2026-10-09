@@ -264,6 +264,48 @@ describe('A2 — pen / finger: drags of the selection are the tool’s (claimed)
   });
 });
 
+describe('Drag Lock (setMeshEditDragLock3D) — no press-drag moves geometry; a press only selects', () => {
+  for (const pointerType of ['mouse', 'pen', 'touch']) {
+    it(`${pointerType}: a drag from an unselected vertex / the selection moves nothing (vertex mode); the press still selects`, () => {
+      const t = setup();
+      t.c.setTool('select');
+      t.c.setMode('vertex');
+      t.c.dragMovesSelection = false;   // what the host sets with the lock (setDragLock)
+      t.c.dragLock = true;
+      const top = t.faceWhere(v => v.y > 0);
+      const [a, b] = t.em().getFaceVertices(top);
+      const p0 = t.pos();
+      const drag = (vi: number, id: number, shiftKey = false) => {
+        const at = t.vertexAt(vi);
+        const down = t.fire('pointerdown', { pointerType, pointerId: id, clientX: at.x, clientY: at.y, shiftKey });
+        if (t.c.dragLock) expect(isPointerEventClaimed(down)).toBe(false);   // locked: a finger / pen drag is the camera's
+        t.fire('pointermove', { pointerType, pointerId: id, clientX: at.x + 40, clientY: at.y + 10, shiftKey });
+        t.flush();
+        t.fire('pointerup', { pointerType, pointerId: id, clientX: at.x + 40, clientY: at.y + 10, shiftKey });
+      };
+      drag(a, 11);                                  // an unselected vertex
+      expect(t.pos()).toEqual(p0);
+      if (pointerType === 'mouse') expect([...t.meshEdit.getSelection(t.mesh.id)!.vertices]).toEqual([a]);   // selected on the press
+      t.meshEdit.selectVertex(t.mesh.id, a);
+      t.meshEdit.selectVertex(t.mesh.id, b, true);
+      drag(a, 12);                                  // the selection
+      drag(b, 13, true);                            // an additive press on the selection
+      expect(t.pos()).toEqual(p0);
+      expect(t.c.transform.active).toBe(false);
+      expect(t.undo.stackSize).toBe(0);
+      // a tap still selects
+      const at = t.vertexAt(b);
+      t.fire('pointerdown', { pointerType, pointerId: 14, clientX: at.x, clientY: at.y });
+      t.fire('pointerup', { pointerType, pointerId: 14, clientX: at.x, clientY: at.y });
+      expect([...t.meshEdit.getSelection(t.mesh.id)!.vertices]).toEqual([b]);
+      // unlocked again: the old single-vertex drag is back
+      t.c.dragLock = false;
+      drag(a, 15);
+      expect(t.pos()).not.toEqual(p0);
+    });
+  }
+});
+
 describe('B — pickElementAt', () => {
   it('returns the vertex / edge / face under the point (by mode) and whether it is selected; null off the mesh', () => {
     const t = setup();

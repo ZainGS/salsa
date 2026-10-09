@@ -83,6 +83,12 @@ export class CanvasGrainManager {
     return this.settings.strength;
   }
 
+  /** The (cached, lazily generated) texture of a built-in pattern regardless of the active setting — a brush's own
+   *  Texture (BrushPreset.texture.grain) reuses these. Null for 'none'. */
+  public getTextureFor(type: CanvasGrainType): GPUTexture | null {
+    return type === 'none' ? null : this.getOrGenerate(type);
+  }
+
   /** Get the list of available built-in grain types (for UI). */
   public static getAvailableTypes(): CanvasGrainType[] {
     return ['none', 'cold-press', 'hot-press', 'canvas-linen', 'rough', 'watercolor', 'newsprint'];

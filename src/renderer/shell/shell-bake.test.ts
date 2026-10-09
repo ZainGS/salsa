@@ -25,7 +25,7 @@ function homeSpecs(hoveredId: string | null = null): ShellTileSpec[] {
     mk('system:illustrator', { billboardKey: 'system:illustrator' }),
     mk('__add_cart__', { kind: 'empty', billboardKey: '__download__' }),
     mk('system:settings', { billboardKey: 'system:settings' }),
-    mk('__demo_cart__', { kind: 'remote', cd: true }),
+    mk('cart-1', { kind: 'remote', cd: true }),
   ];
 }
 function homeModel(w = 1600, h = 1000, theme = SHELL_THEMES.polygon, hovered: string | null = null, zoom = 0.85): ShellRenderModel {

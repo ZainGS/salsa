@@ -17,6 +17,7 @@
 
 import { clampTextureExtent } from '../../core/gpu-capabilities';
 import { gpuCrumb } from '../../core/gpu-diagnostics';
+import { readbackToRgba } from '../../core/canvas-format';
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -64,8 +65,18 @@ export interface GlowParams {
   radius: number;
   /** Glow intensity multiplier. Default: 1.5. */
   intensity: number;
-  /** Glow color [r, g, b] in 0–1. Default: same as text color. */
-  color?: [number, number, number];
+  /** Glow color [r, g, b] in 0–1 (a 4th alpha entry is ignored). Default: same as text color. */
+  color?: [number, number, number] | [number, number, number, number];
+  /** @deprecated Legacy key: Frogmarks wrote the glow colour here before 2026-10-09 (the engine read only `color`).
+   *  Still honoured when `color` is unset, so documents saved then load their colour — see {@link resolveGlowColor}. */
+  glowColor?: [number, number, number] | [number, number, number, number];
+}
+
+/** The glow tint to use: `color`, else the legacy `glowColor`, else null (= the text's own colour). */
+export function resolveGlowColor(p: Partial<GlowParams> | null | undefined): [number, number, number] | null {
+  const c = p?.color ?? p?.glowColor;
+  if (!Array.isArray(c) || c.length < 3 || !c.slice(0, 3).every(v => typeof v === 'number' && Number.isFinite(v))) return null;
+  return [c[0], c[1], c[2]];
 }
 
 export interface WaveParams {
@@ -717,6 +728,25 @@ export class TextEffectEngine {
     return current;
   }
 
+  /**
+   * Read a texture this engine made (rgba8unorm, COPY_SRC — captureText / apply / applyChain results) back as
+   * tightly packed straight-alpha RGBA, e.g. to draw a panel preview into a 2D canvas. The texture is not destroyed.
+   */
+  public async readPixels(texture: GPUTexture, width = texture.width, height = texture.height): Promise<Uint8ClampedArray<ArrayBuffer>> {
+    const w = Math.max(1, Math.min(width, texture.width)), h = Math.max(1, Math.min(height, texture.height));
+    const bytesPerRow = Math.ceil((w * 4) / 256) * 256;
+    const buf = this.device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    try {
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToBuffer({ texture }, { buffer: buf, bytesPerRow, rowsPerImage: h }, { width: w, height: h });
+      this.device.queue.submit([enc.finish()]);
+      await buf.mapAsync(GPUMapMode.READ);
+      return readbackToRgba(new Uint8Array(buf.getMappedRange()), w, h, bytesPerRow, 'rgba8unorm');
+    } finally {
+      buf.destroy();
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════
   //  Chromatic Aberration
   // ═══════════════════════════════════════════════════════════════
@@ -827,8 +857,9 @@ export class TextEffectEngine {
     const temp = this.createOutputTexture(w, h);
 
     // Horizontal pass: src → temp
+    const tint = resolveGlowColor(p);
     const paramsH = new Float32Array([p.radius, p.intensity, 0, 0,
-      p.color?.[0] ?? -1, p.color?.[1] ?? -1, p.color?.[2] ?? -1, 0]);
+      tint?.[0] ?? -1, tint?.[1] ?? -1, tint?.[2] ?? -1, 0]);
     this.device.queue.writeBuffer(this.paramBuf, 0, paramsH);
 
     const bgH = this.device.createBindGroup({
@@ -843,7 +874,7 @@ export class TextEffectEngine {
 
     // Vertical pass: temp → dst (also composites original on top)
     const paramsV = new Float32Array([p.radius, p.intensity, 1, 0,
-      p.color?.[0] ?? -1, p.color?.[1] ?? -1, p.color?.[2] ?? -1, 0]);
+      tint?.[0] ?? -1, tint?.[1] ?? -1, tint?.[2] ?? -1, 0]);
     this.device.queue.writeBuffer(this.paramBuf, 0, paramsV);
 
     const bgV = this.device.createBindGroup({

@@ -122,7 +122,8 @@ export interface SceneState {
   shapeVisibility?: Record<string, boolean>;
   /** Pause all AnimationPlayer3D / NLA / cloth / particles while active (pause menus). */
   frozen?: boolean;
-  /** GPU Gaussian blur (≈px) on the world beneath the UI while active. */
+  /** Modal strength 0..1 (values above 1 = 1): > 0 dims the world beneath the UI with the layer's backgroundOverlay
+   *  colour (fading in up to 0.5) and blurs it (GPU Gaussian, weight = the strength) while this state is active. */
   worldBlur?: number;
   /** Actions run once when this state becomes active. */
   onEnter?: Action[];

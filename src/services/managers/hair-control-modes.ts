@@ -75,11 +75,69 @@ export function hairGatheredOf(p: { hairMode?: unknown; gather?: unknown; tailSt
     return t !== 'none' || b !== 'none';
 }
 
-/** Styled-hair keys that only shape the LOOSE crown locks — inert while the hair is gathered (hairGatheredOf). */
-export const HAIR_GATHERED_INERT: readonly string[] = ['sideLength', 'lockFlick', 'lockJitter', 'lockLayers', 'lockSpike'];
+/** Styled-hair keys that only shape the LOOSE crown locks — inert while the hair is gathered (hairGatheredOf).
+ *  hairLength / sideLength then only rescale the uv.v reference (vRef), not one vertex position. lockJitter is the
+ *  exception: the Choppy fringe reads it too (hairControlVisibleFor). */
+export const HAIR_GATHERED_INERT: readonly string[] = ['hairLength', 'sideLength', 'lockFlick', 'lockJitter', 'lockLayers', 'lockSpike'];
 
-/** hairControlVisible + the in-mode conditions (gathered hair). Use this when the full params are at hand. */
-export function hairControlVisibleFor(key: string, p: { hairMode?: unknown; gather?: unknown; tailStyle?: unknown; bunStyle?: unknown }): boolean {
+/** Chunky / Cards keys a BUZZ cut skips: generateHair then builds only the buzz cap (+ facial hair). */
+export const HAIR_BUZZ_INERT: readonly string[] = [
+    'verticalOffset', 'backLength', 'spikeCap', 'spikePattern', 'spikeLength', 'spikeJitter',
+    'scalpLength', 'lengthFront', 'lengthSide', 'lengthBack', 'scalpBluntness',
+    'curlType', 'curlAmount', 'curlFreq', 'curlPhaseJitter', 'layering', 'chop',
+    'partingStyle', 'partingPosition', 'partingWidth', 'bangCount', 'bangLength', 'bangCurve', 'bangPointiness', 'bangOffset',
+    'sideLock', 'sideLockLength', 'sideLockWidth', 'sideLockCount',
+    'tailStyle', 'tailHeight', 'tailSpread', 'tailLength', 'tailThickness', 'tailTaper', 'tailStartTaper', 'tailCurl', 'tailTip',
+    'frontDrape', 'frontDrapeSide', 'frontDrapeOrigin', 'frontDrapeLength', 'frontDrapeWaveX', 'frontDrapeWaveZ',
+    'frontDrapeStrays', 'frontDrapeStrayX', 'frontDrapeStrayZ', 'bunStyle', 'bunSize',
+    'cardWidth', 'cardsPerClump', 'cardSegments', 'cardifyCap', 'capLayers', 'cardDetail',
+];
+
+/** The params hairControlVisibleFor reads (a panel passes its HairParams; absent = the generator defaults). */
+export type HairControlParams = { [key: string]: unknown };
+
+/** hairControlVisible + the in-mode conditions (gathered hair, buzz cut, bang count, fringe shape, spikes, tails /
+ *  front drape / cardified cap, facial hair). Use this when the full params are at hand. Every rule mirrors a
+ *  generateHair / buildLockHair gate; hair-control-modes.test.ts verifies them by perturbing each key per scenario. */
+export function hairControlVisibleFor(key: string, p: HairControlParams): boolean {
     if (!hairControlVisible(key, p.hairMode)) return false;
-    return !(HAIR_GATHERED_INERT.includes(key) && hairGatheredOf(p));
+    const mode = hairControlModeOf(p.hairMode);
+    const str = (v: unknown, d: string): string => String(v ?? d).toLowerCase().trim();
+    const num = (v: unknown, d: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+    const tails = str(p.tailStyle, 'none') !== 'none';
+    if (str(p.facialHair, 'none') === 'none' && (key === 'beardLength' || key === 'beardDensity')) return false;
+    if (mode === 'locks') {
+        const fringe = str(p.fringeStyle, 'choppy');
+        if (HAIR_GATHERED_INERT.includes(key) && hairGatheredOf(p)) return key === 'lockJitter' && fringe === 'choppy';
+        if (key === 'fringeHeight') return fringe !== 'none';
+        if (key === 'fringeSide') return fringe === 'swept' || fringe === 'parted';
+        if (key === 'lockFlick') return num(p.lockSpike, 0) <= 0.01;            // spiky crown locks never flick
+        const form = str(p.tailForm, 'bundle');
+        if (key === 'tailTaper') return tails && form !== 'drill';            // the drill curl has its own taper
+        if (key === 'tailLocks') return tails && form === 'bundle';
+        if (key === 'drillTurns') return tails && form === 'drill';
+        if (key.startsWith('tail') && key !== 'tailStyle') return tails;
+        return true;
+    }
+    // Chunky / Cards (the legacy build)
+    if (p.buzzCut === true) return !HAIR_BUZZ_INERT.includes(key);
+    const bangs = Math.round(num(p.bangCount, 6)) > 0;
+    const spiky = p.spikeCap === true;
+    const drape = num(p.frontDrape, 0) > 0;
+    const cardCap = p.cardifyCap === true && !spiky;                          // the spike cap replaces the card cap
+    if (key === 'frontDrapeStrayX' || key === 'frontDrapeStrayZ') return drape && num(p.frontDrapeStrays, 0) >= 0.5;
+    if (key.startsWith('frontDrape') && key !== 'frontDrape') return drape;
+    switch (key) {
+        case 'partingPosition': case 'partingWidth': return bangs && str(p.partingStyle, 'parted') !== 'fringe';
+        case 'partingStyle': case 'bangLength': case 'bangCurve': case 'bangPointiness': case 'bangOffset':
+        case 'verticalOffset': return bangs;                                   // verticalOffset only lifts the bang hairline
+        case 'tailThickness': return tails || drape || spiky;                 // the drape + the spike tufts size from it
+        case 'tailTaper': case 'tailTip': return tails || drape;
+        case 'cardWidth': case 'cardsPerClump': case 'cardSegments': return tails || drape;   // card tails / drape only
+        case 'cardDetail': return tails || drape || cardCap;
+        case 'cardifyCap': return !spiky;
+        case 'capLayers': return cardCap;
+    }
+    if (key.startsWith('tail') && key !== 'tailStyle') return tails;
+    return true;
 }

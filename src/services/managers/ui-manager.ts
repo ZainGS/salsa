@@ -102,6 +102,11 @@ export interface UIEphemeraAdapter {
   isVisible(id: string): boolean;
 }
 
+/** A modal state's dim opacity factor for its worldBlur strength s (0..1): 0 → 1 over s 0..0.5, full above. */
+export function worldDimFactor(s: number): number {
+  return Math.max(0, Math.min(1, s * 2));
+}
+
 export class UIManager {
   private readonly ctx: ManagerContext;
   private readonly _layers = new Map<string, UILayerRec>();
@@ -641,8 +646,11 @@ export class UIManager {
       const st = cur ? rec.data.stateMachine.states.find((s) => s.id === cur) : null;
       if (!st || !st.worldBlur || st.worldBlur <= 0) continue;   // only MODAL states (worldBlur) dim the world
       const c = rec.data.backgroundOverlay?.color ?? [0, 0, 0, 0.55];
-      return { color: [c[0], c[1], c[2], c[3]], mode: 0, dir: [0, 0], progress: 0, soft: 0,
-               blur: Math.max(Math.min(st.worldBlur, 1), this._dynamicBlur) };
+      const s = Math.min(st.worldBlur, 1);
+      // The dim fades in over the first half of the strength (full colour from 0.5 — every value the old 0–20 slider
+      // could save, and the kit's 0.55, look as before); the blur grows over the whole 0–1 range.
+      return { color: [c[0], c[1], c[2], c[3] * worldDimFactor(s)], mode: 0, dir: [0, 0], progress: 0, soft: 0,
+               blur: Math.max(s, this._dynamicBlur) };
     }
     // Dynamic setWorldBlur effect without a modal state: blur-only overlay (no dim).
     if (this._dynamicBlur > 0.001) {

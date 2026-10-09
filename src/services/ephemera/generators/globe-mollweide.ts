@@ -91,15 +91,20 @@ export class GlobeMollweideGenerator implements IEphemeraGenerator {
   getParamSchema(): EphemeraParamSchema[] {
     return [
       { key: 'size',        label: 'Size',           type: 'range',  default: 200, min: 60,  max: 400, step: 4,   group: 'Size' },
-      { key: 'latLines',    label: 'Latitude lines', type: 'range',  default: 6,   min: 2,   max: 18,  step: 1,   group: 'Grid' },
-      { key: 'lonLines',    label: 'Longitude lines',type: 'range',  default: 12,  min: 3,   max: 24,  step: 1,   group: 'Grid' },
-      { key: 'rotationY',   label: 'Spin (Y)',        type: 'range',  default: 0,   min: -180,max: 180, step: 1,   group: 'Rotation' },
+      { key: 'latLines',    label: 'Latitude lines', type: 'range',  default: 6,   min: 2,   max: 18,  step: 1,   group: 'Grid',
+        showIf: { key: 'style', notEquals: 'filled' } },
+      { key: 'lonLines',    label: 'Longitude lines',type: 'range',  default: 12,  min: 3,   max: 24,  step: 1,   group: 'Grid',
+        showIf: { key: 'style', notEquals: 'filled' } },
+      { key: 'rotationY',   label: 'Spin (Y)',        type: 'range',  default: 0,   min: -180,max: 180, step: 1,   group: 'Rotation',
+        showIf: { key: 'style', notEquals: 'filled' } },
       { key: 'style',       label: 'Style',          type: 'select', default: 'outline',
         options: [{ value: 'outline', label: 'Outline only' }, { value: 'filled', label: 'Filled' }, { value: 'filled-outline', label: 'Filled + grid' }] },
       { key: 'strokeWidth', label: 'Line weight',    type: 'range',  default: 1,   min: 0.5, max: 3,   step: 0.25, group: 'Appearance' },
       { key: 'strokeColor', label: 'Line color',     type: 'color',  default: '#000000', group: 'Appearance' },
-      { key: 'fillColor',   label: 'Fill color',     type: 'color',  default: '#000000', group: 'Appearance' },
-      { key: 'showEquator', label: 'Bold equator',   type: 'toggle', default: true, group: 'Appearance' },
+      { key: 'fillColor',   label: 'Fill color',     type: 'color',  default: '#000000', group: 'Appearance',
+        showIf: { key: 'style', notEquals: 'outline' } },
+      { key: 'showEquator', label: 'Bold equator',   type: 'toggle', default: true, group: 'Appearance',
+        showIf: { key: 'style', notEquals: 'filled' } },
       { key: 'bgColor',     label: 'Background',     type: 'color',  default: 'transparent', group: 'Appearance' },
     ];
   }

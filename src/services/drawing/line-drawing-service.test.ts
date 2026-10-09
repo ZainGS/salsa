@@ -141,3 +141,28 @@ describe('LineDrawingService press-drag-release', () => {
         expect(t.children).toHaveLength(0);
     });
 });
+
+describe('LineDrawingService arrowhead defaults (UI dead-controls audit 2026-10-09)', () => {
+    it('a new line takes the default arrowhead styles AND size', () => {
+        const t = setup();
+        t.svc.defaultArrowEnd = 'triangle';
+        t.svc.setDefaultArrowSize(14);
+        t.down(100, 100);
+        t.up(300, 200);
+        const line = t.children[0];
+        expect(line.arrowEnd).toBe('triangle');
+        expect(line.arrowSize).toBe(14);
+    });
+
+    it('defaults to size 6 and ignores a bad size', () => {
+        const t = setup();
+        expect(t.svc.defaultArrowSize).toBe(6);
+        t.svc.setDefaultArrowSize(0);
+        t.svc.setDefaultArrowSize(NaN);
+        t.svc.setDefaultArrowSize(-3);
+        expect(t.svc.defaultArrowSize).toBe(6);
+        t.down(100, 100);
+        t.up(300, 200);
+        expect(t.children[0].arrowSize).toBe(6);
+    });
+});

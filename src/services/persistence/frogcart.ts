@@ -13,12 +13,36 @@
  *     audio.json             ← [{ assetId, file, mime }] — sound registry (only when the cart has audio)
  *     audio/<n>              ← the sound bytes the playSound actions reference (importFrogcart re-registers
  *                              them as object URLs, so a published cart's audio Just Works in the Player)
+ *     cd-art.webp|png        ← (1.1) the cart's DISC ART: a square image printed on its Shell CD (manifest.cdArt);
+ *                              absent = the disc prints its seeded pattern (manifest.cdPattern)
+ *
+ * Version 1.1 (2026-10-09) adds cdArt + cdPattern (+ the cd-art entry). Readers ignore unknown entries / fields, so a
+ * 1.0 reader loads a 1.1 cart and a 1.0 cart loads here (no disc art; the Shell derives a pattern from its id).
  *
  * Pure module (fflate only) — unit-tested round-trip; ShapeManager provides the export/import entry points.
  */
 
 import { zipSync, unzipSync, strToU8, strFromU8, type Zippable } from 'fflate';
 import type { UILayerData } from '../../ui/ui-types';
+import { normalizeCartDiscPatternRef, type CartDiscPatternRef } from '../../renderer/3d/cd-disc/cart-disc-pattern';
+import { CD_DISC_ART_MAX_BYTES, CD_DISC_ART_SIZE } from '../../renderer/3d/cd-disc/cd-disc-art';
+
+/** The manifest version this build writes. */
+export const FROGCART_VERSION = '1.1';
+
+/** manifest.cdArt: where the disc art sits in the zip. */
+export interface FrogcartCdArt {
+  /** The zip entry ('cd-art.webp' / 'cd-art.png'). */
+  file: string;
+  mime: string;
+  /** Edge of the square art (px). */
+  sizePx: number;
+}
+
+/** The disc art entry name for a mime type. */
+export function frogcartCdArtFile(mime: string): string {
+  return mime === 'image/png' ? 'cd-art.png' : mime === 'image/jpeg' ? 'cd-art.jpg' : 'cd-art.webp';
+}
 
 export interface FrogcartMeta {
   title: string;
@@ -27,6 +51,13 @@ export interface FrogcartMeta {
   tags?: string[];
   /** Data-URL or bundled path of a thumbnail (optional; packProject already embeds one in the scene manifest). */
   thumbnail?: string;
+  /** The disc art: a square image (renderCDDiscArt: 512 px, cropped by the export dialog), stored as cd-art.*.
+   *  Null / omitted = no image (the disc prints its pattern). At most CD_DISC_ART_MAX_BYTES (2 MB). */
+  cdArt?: Blob | null;
+  /** Edge (px) of cdArt (default CD_DISC_ART_SIZE). */
+  cdArtSizePx?: number;
+  /** The disc pattern's seed (+ optional pinned family): what the disc prints without art. */
+  cdPattern?: CartDiscPatternRef | null;
 }
 
 export interface FrogcartManifest {
@@ -39,6 +70,10 @@ export interface FrogcartManifest {
   thumbnail: string | null;
   createdAt: string;
   tags: string[];
+  /** (1.1) The disc art entry; null / absent = none. */
+  cdArt?: FrogcartCdArt | null;
+  /** (1.1) The disc pattern seed; absent = derive one from the cart's id. */
+  cdPattern?: CartDiscPatternRef | null;
 }
 
 export interface FrogcartPlayerConfig {
@@ -100,12 +135,17 @@ export interface FrogcartUnpacked {
   scenePackage: Blob;
   /** Bundled sound assets (empty when the cart has none) — re-register these so playSound actions work. */
   sounds: FrogcartSound[];
+  /** The disc art (null when the cart has none). */
+  cdArt: Blob | null;
 }
 
 /** Build a `.frogcart` blob (spec §Export API). */
 export async function packFrogcart(input: FrogcartPackInput): Promise<Blob> {
+  const art = input.meta.cdArt ?? null;
+  if (art && art.size > CD_DISC_ART_MAX_BYTES) throw new RangeError(`packFrogcart: the disc art is ${art.size} bytes (max ${CD_DISC_ART_MAX_BYTES})`);
+  const artMime = art ? (art.type || 'image/png') : '';
   const manifest: FrogcartManifest = {
-    version: '1.0',
+    version: FROGCART_VERSION,
     frogmarksPlayerMinVersion: '1.0.0',
     sceneId: input.sceneId ?? `cart-${Math.random().toString(36).slice(2, 10)}`,
     title: input.meta.title,
@@ -114,6 +154,8 @@ export async function packFrogcart(input: FrogcartPackInput): Promise<Blob> {
     thumbnail: input.meta.thumbnail ?? null,
     createdAt: input.createdAt ?? new Date().toISOString(),
     tags: input.meta.tags ?? [],
+    cdArt: art ? { file: frogcartCdArtFile(artMime), mime: artMime, sizePx: input.meta.cdArtSizePx ?? CD_DISC_ART_SIZE } : null,
+    cdPattern: normalizeCartDiscPatternRef(input.meta.cdPattern),
   };
   const playerConfig: FrogcartPlayerConfig = { ...DEFAULT_PLAYER_CONFIG, ...(input.playerConfig ?? {}) };
   const sceneBytes = new Uint8Array(await input.scenePackage.arrayBuffer());
@@ -130,6 +172,8 @@ export async function packFrogcart(input: FrogcartPackInput): Promise<Blob> {
     files['audio.json'] = [strToU8(JSON.stringify(registry)), { level: 6 }];
     input.sounds.forEach((s, i) => { files[`audio/${i}`] = [s.bytes, { level: 0 }]; });
   }
+  // Images are already compressed — store the art.
+  if (art && manifest.cdArt) files[manifest.cdArt.file] = [new Uint8Array(await art.arrayBuffer()), { level: 0 }];
   const zipped = zipSync(files);
   return new Blob([zipped as unknown as BlobPart], { type: 'application/zip' });
 }
@@ -165,5 +209,15 @@ export async function unpackFrogcart(file: Blob): Promise<FrogcartUnpacked> {
     uiLayers,
     scenePackage: new Blob([sceneBytes as unknown as BlobPart], { type: 'application/zip' }),
     sounds,
+    cdArt: frogcartCdArtBlob(manifest, entries),
   };
+}
+
+/** The disc art of an unzipped cart (manifest.cdArt → its entry), or null (none / missing / over the size cap). */
+export function frogcartCdArtBlob(manifest: Pick<FrogcartManifest, 'cdArt'>, entries: Record<string, Uint8Array>): Blob | null {
+  const a = manifest.cdArt;
+  if (!a || typeof a !== 'object' || typeof a.file !== 'string') return null;
+  const bytes = entries[a.file];
+  if (!bytes || !bytes.length || bytes.length > CD_DISC_ART_MAX_BYTES) return null;
+  return new Blob([bytes as unknown as BlobPart], { type: typeof a.mime === 'string' && a.mime ? a.mime : 'image/png' });
 }

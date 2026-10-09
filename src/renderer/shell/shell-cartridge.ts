@@ -22,10 +22,13 @@ import type { ViewerSpec } from './shell-layout';
 import type { ShellThumbnailAtlas } from './shell-thumbnails';
 import type { Billboard3DGeometry } from '../3d/billboard-3d';
 import { shellGpuCached } from './shell-gpu-cache';
+import {
+  SHELL_DEPTH_FORMAT, shellCartLayouts, shellCDPipeline, uploadShellCDMesh, cdIdlePose, cdPoseModel, writeCDUniforms,
+  type CDFace, type CDPose,
+} from './shell-cd';
 
-/** The Shell's depth format: the viewer's 3D pipelines write it, and every 2D Shell pipeline declares it (compare
- *  'always', no write) so all of them can draw in ONE render pass. */
-export const SHELL_DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
+export { SHELL_DEPTH_FORMAT };
+export type { CDFace, CDPose };
 const WHITE: readonly [number, number, number, number] = [1, 1, 1, 1];
 
 // Uniform layout: mvp(64) + model(64) + body(16) + label(16) + light(16) + uvRect(16) + sideColor(16) = 208.
@@ -300,163 +303,6 @@ function buildDisc(R: number, D: number, segs: number): { verts: Float32Array; i
   return { verts: new Float32Array(v), indices: new Uint16Array(idx) };
 }
 
-// Iridescent "CD" for FrogCart tiles: a silver/chrome annulus with a diffraction
-// rainbow that sweeps as it spins. Same vertex layout + uniform as the coin.
-// See docs/specs/shell-cd.md.
-const CD_SHADER = /* wgsl */ `
-struct U {
-  mvp: mat4x4<f32>,
-  model: mat4x4<f32>,
-  bodyColor: vec4<f32>,
-  labelColor: vec4<f32>,
-  lightDir: vec4<f32>,   // xyz unused here; w = useThumb (0/1) for cover art (P2)
-  uvRect: vec4<f32>,     // cover-art atlas rect (P2)
-};
-@group(0) @binding(0) var<uniform> u: U;
-@group(1) @binding(0) var thumbTex: texture_2d<f32>;
-@group(1) @binding(1) var thumbSmp: sampler;
-
-struct VsOut {
-  @builtin(position) pos: vec4<f32>,
-  @location(0) wn: vec3<f32>,     // world normal
-  @location(1) wp: vec3<f32>,     // world position
-  @location(2) lxy: vec2<f32>,    // local position (disc plane) for radial bands
-  @location(3) uv: vec2<f32>,
-  @location(4) isFront: f32,
-};
-
-@vertex
-fn vs(
-  @location(0) position: vec3<f32>,
-  @location(1) normal: vec3<f32>,
-  @location(2) uv: vec2<f32>,
-  @location(3) isFront: f32,
-) -> VsOut {
-  var out: VsOut;
-  out.pos = u.mvp * vec4<f32>(position, 1.0);
-  out.wn = (u.model * vec4<f32>(normal, 0.0)).xyz;
-  out.wp = (u.model * vec4<f32>(position, 1.0)).xyz;
-  out.lxy = position.xy;
-  out.uv = uv;
-  out.isFront = isFront;
-  return out;
-}
-
-fn bump3y(x: vec3<f32>, yoffset: vec3<f32>) -> vec3<f32> {
-  return clamp((vec3<f32>(1.0) - x * x) - yoffset, vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-// Zucconi-6 spectral approximation: a visible wavelength (nm) → RGB.
-fn spectral_zucconi6(w: f32) -> vec3<f32> {
-  let x = clamp((w - 400.0) / 300.0, 0.0, 1.0);
-  let c1 = vec3<f32>(3.54585104, 2.93225262, 2.41593945);
-  let x1 = vec3<f32>(0.69549072, 0.49228336, 0.27699880);
-  let y1 = vec3<f32>(0.02312639, 0.15225084, 0.52607955);
-  let c2 = vec3<f32>(3.90307140, 3.21182957, 3.96587128);
-  let x2 = vec3<f32>(0.11748627, 0.86755042, 0.66077860);
-  let y2 = vec3<f32>(0.84897130, 0.88445281, 0.73949448);
-  return bump3y(c1 * (vec3<f32>(x) - x1), y1) + bump3y(c2 * (vec3<f32>(x) - x2), y2);
-}
-
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let n = normalize(in.wn);
-  let viewDir = normalize(vec3<f32>(0.0, 0.0, 6.5) - in.wp);   // camera fixed in drawCD
-  let L = normalize(vec3<f32>(-0.3, 0.45, 1.0));               // a fixed key light
-  let fres = pow(1.0 - abs(dot(n, viewDir)), 3.0);
-
-  let r = length(in.lxy);
-
-  // Physically-based diffraction grating (Alan Zucconi's CD-ROM shader). CD
-  // tracks are circular, so a slit's TANGENT is the radial direction rotated
-  // 90°. Measuring the light/view angles against that tangent (not the normal)
-  // is what makes the rainbow a RADIAL band, not concentric rings: the reflected
-  // colour is the sum of every visible wavelength satisfying |sinθL−sinθV|=n·w/d.
-  let radial = normalize(in.lxy + vec2<f32>(1e-5, 0.0));
-  let tangentLocal = vec3<f32>(-radial.y, radial.x, 0.0);
-  let T = normalize((u.model * vec4<f32>(tangentLocal, 0.0)).xyz);
-  let uu = abs(dot(L, T) - dot(viewDir, T));                   // |sinθL − sinθV|
-  let DGRATING = 2400.0;                                       // grating gap (nm) — tune
-  var rainbow = vec3<f32>(0.0);
-  for (var k = 1; k <= 8; k = k + 1) {
-    rainbow = rainbow + spectral_zucconi6(uu * DGRATING / f32(k));
-  }
-  rainbow = clamp(rainbow, vec3<f32>(0.0), vec3<f32>(1.0));
-
-  // Dark steel base + a specular glint + the additive diffraction rainbow.
-  var col = vec3<f32>(0.26, 0.28, 0.33);
-  col = col + pow(max(0.0, dot(reflect(-L, n), viewDir)), 24.0) * 0.5;   // specular
-  col = col + fres * 0.18;
-  col = col + rainbow * smoothstep(0.33, 0.42, r);            // radial rainbow, outside hub
-
-  // Hub: bright silver clamping ring around the hole.
-  let hub = 1.0 - smoothstep(0.28, 0.34, r);
-  col = mix(col, vec3<f32>(0.62, 0.64, 0.70), hub * 0.9);
-
-  // Cover art (P2): sample unconditionally (textureSample requires uniform
-  // control flow — it can't live inside the per-fragment isFront branch), then
-  // composite on the front face only.
-  let auv = mix(u.uvRect.xy, u.uvRect.zw, in.uv);
-  let tex = textureSample(thumbTex, thumbSmp, auv);
-  if (in.isFront > 0.5 && u.lightDir.w > 0.5) {
-    col = mix(col, tex.rgb, tex.a * 0.7);
-  }
-
-  return vec4<f32>(col, 1.0);
-}
-`;
-
-/** Build a thin annulus (CD): outer radius R, hole radius rHole, thickness D.
- *  Top ring isFront=1 (UVs map the outer disc to [0,1]² for cover art); bottom
- *  + rims isFront=0. Rendered with cullMode 'none', so winding is forgiving. */
-function buildCD(R: number, D: number, rHole: number, segs: number): { verts: Float32Array; indices: Uint16Array } {
-  const hd = D / 2, TAU = Math.PI * 2;
-  const v: number[] = [];
-  const idx: number[] = [];
-  const push = (
-    px: number, py: number, pz: number,
-    nx: number, ny: number, nz: number,
-    uu: number, vv: number, isFront: number,
-  ): number => { v.push(px, py, pz, nx, ny, nz, uu, vv, isFront); return v.length / 9 - 1; };
-  const uvx = (x: number) => x / R * 0.5 + 0.5;
-  const uvy = (y: number) => -y / R * 0.5 + 0.5;
-
-  // Top ring (+Z, isFront=1) — UVs span the outer disc for cover art.
-  const ti: number[] = [], to: number[] = [];
-  for (let i = 0; i < segs; i++) {
-    const a = (i / segs) * TAU, c = Math.cos(a), s = Math.sin(a);
-    ti.push(push(c * rHole, s * rHole, hd, 0, 0, 1, uvx(c * rHole), uvy(s * rHole), 1));
-    to.push(push(c * R, s * R, hd, 0, 0, 1, uvx(c * R), uvy(s * R), 1));
-  }
-  for (let i = 0; i < segs; i++) { const j = (i + 1) % segs; idx.push(ti[i], to[i], to[j], ti[i], to[j], ti[j]); }
-
-  // Bottom ring (−Z, isFront=0).
-  const bi: number[] = [], bo: number[] = [];
-  for (let i = 0; i < segs; i++) {
-    const a = (i / segs) * TAU, c = Math.cos(a), s = Math.sin(a);
-    bi.push(push(c * rHole, s * rHole, -hd, 0, 0, -1, 0, 0, 0));
-    bo.push(push(c * R, s * R, -hd, 0, 0, -1, 0, 0, 0));
-  }
-  for (let i = 0; i < segs; i++) { const j = (i + 1) % segs; idx.push(bi[i], bo[j], bo[i], bi[i], bi[j], bo[j]); }
-
-  // Outer rim (outward normal) + inner rim / hole wall (inward normal).
-  for (let i = 0; i < segs; i++) {
-    const a0 = (i / segs) * TAU, a1 = ((i + 1) / segs) * TAU;
-    const c0 = Math.cos(a0), s0 = Math.sin(a0), c1 = Math.cos(a1), s1 = Math.sin(a1);
-    const o0 = push(c0 * R, s0 * R, hd, c0, s0, 0, 0, 0, 0);
-    const o1 = push(c1 * R, s1 * R, hd, c1, s1, 0, 0, 0, 0);
-    const o2 = push(c0 * R, s0 * R, -hd, c0, s0, 0, 0, 0, 0);
-    const o3 = push(c1 * R, s1 * R, -hd, c1, s1, 0, 0, 0, 0);
-    idx.push(o0, o2, o1, o1, o2, o3);
-    const k0 = push(c0 * rHole, s0 * rHole, hd, -c0, -s0, 0, 0, 0, 0);
-    const k1 = push(c1 * rHole, s1 * rHole, hd, -c1, -s1, 0, 0, 0, 0);
-    const k2 = push(c0 * rHole, s0 * rHole, -hd, -c0, -s0, 0, 0, 0, 0);
-    const k3 = push(c1 * rHole, s1 * rHole, -hd, -c1, -s1, 0, 0, 0, 0);
-    idx.push(k0, k1, k2, k1, k3, k2);
-  }
-  return { verts: new Float32Array(v), indices: new Uint16Array(idx) };
-}
-
 // Depth inside the Shell's single render pass: ONE depth buffer, cleared once to 1.0. The hero viewer and the per-tile
 // batch both use the full [0, 1] range, exactly as when each had its own pass + depth clear (so every depth value, and
 // every depth-test outcome, is what it was). The hero only writes depth inside its viewport; if a 3D tile's rect
@@ -494,6 +340,9 @@ export class CartridgeViewer {
   private readonly _u = new Float32Array(UNIFORM_SIZE / 4);
   /** Reusable vec3 for translate / scale (was an array literal per call). */
   private readonly _v3: [number, number, number] = [0, 0, 0];   // plain numbers (doubles), like the literals they replace
+  /** Reusable idle pose + hero CD face (per-frame draws: no allocation). */
+  private readonly _pose: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
+  private readonly _face: CDFace = { art: null, pattern: null };
 
   private pipeline!: GPURenderPipeline;
   private billboardPipeline!: GPURenderPipeline;
@@ -540,17 +389,7 @@ export class CartridgeViewer {
   private build(): void {
     const dev = this.device, fmt = this.format;
     // Pipelines + layouts are kept per device across Shell mounts (shell-gpu-cache.ts); buffers / bind groups are per mount.
-    const bgl = shellGpuCached(dev, 'cart.bgl', () => dev.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
-    }));
-    const thumbBGL = shellGpuCached(dev, 'cart.thumbBGL', () => dev.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
-      ],
-    }));
-    const layout = shellGpuCached(dev, 'cart.layout', () => dev.createPipelineLayout({ bindGroupLayouts: [bgl, thumbBGL] }));
-    const sampler = shellGpuCached(dev, 'cart.sampler', () => dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }));
+    const { bgl, thumbBGL, layout, sampler } = shellCartLayouts(dev);   // shared with the export preview (shell-cd.ts)
 
     this.uniformBuf = dev.createBuffer({
       size: UNIFORM_SIZE,
@@ -610,7 +449,7 @@ export class CartridgeViewer {
     this.sketchbook = this.upload(buildBox(3.2, 2.4, 0.3));
     this.box = this.upload(buildBox(1.7, 1.7, 1.7));   // a cube → Package Designer's cardboard box
     this.disc = this.upload(buildDisc(1.0, 0.34, 48));
-    this.cd = this.upload(buildCD(1.0, 0.05, 0.17, 48));
+    this.cd = uploadShellCDMesh(dev);   // the shared CD-disc mesh (real CD hole: SHELL_CD_HOLE_RATIO)
 
     // Coin + CD pipelines (same layout), sharing a pool of per-draw uniform
     // buffers — one buffer can't back multiple draws within a single frame.
@@ -624,16 +463,7 @@ export class CartridgeViewer {
         depthStencil,
       });
     });
-    this.cdPipeline = shellGpuCached(dev, `cart.cd|${fmt}`, () => {
-      const cdModule = dev.createShaderModule({ code: CD_SHADER });
-      return dev.createRenderPipeline({
-        layout,
-        vertex: { module: cdModule, entryPoint: 'vs', buffers: [vbufLayout] },
-        fragment: { module: cdModule, entryPoint: 'fs', targets: [{ format: fmt }] },
-        primitive: { topology: 'triangle-list', cullMode: 'none' },
-        depthStencil,
-      });
-    });
+    this.cdPipeline = shellCDPipeline(dev, fmt);
     this.depthResetPipeline = shellGpuCached(dev, `cart.depthReset|${fmt}`, () => {
       const m = dev.createShaderModule({ code: DEPTH_RESET_SHADER });
       return dev.createRenderPipeline({
@@ -745,6 +575,27 @@ export class CartridgeViewer {
   }
 
   /**
+   * The hero viewer CD's idle pose at timeSec (a 'cd' spec): the full Y whirl (± 30° sway on the 3D themes) + the
+   * appear spin-up, the -24° tilt, the bob, the ×1.2 size with the appear pop-in. A spec the viewer is not showing yet
+   * (it switches on its next render) counts as just appeared. The cart launch starts from this pose.
+   */
+  cdViewerIdlePose(spec: ViewerSpec, timeSec: number, out: CDPose): CDPose {
+    const key = spec.billboardKey ?? ('#' + spec.kind);
+    const age = key === this.appearKey ? Math.max(0, timeSec - this.appearStart) : 0;
+    const gt = Math.min(age / 0.30, 1);
+    const c1 = 1.70158, c3 = c1 + 1;
+    const grow = 1 + c3 * Math.pow(gt - 1, 3) + c1 * Math.pow(gt - 1, 2);   // easeOutBack
+    const extraSpin = 1.3 * Math.PI * 2 * (1 - Math.exp(-age / 0.4));
+    out.x = 0;
+    out.y = Math.sin(timeSec * Math.PI) * 0.12;
+    out.tilt = -24 * Math.PI / 180;
+    out.spin = spec.swayOnly ? Math.sin(timeSec * 0.5) * 0.5236 : (timeSec % 12) / 12 * Math.PI * 2 + extraSpin;
+    out.roll = 0;
+    out.scale = 1.2 * grow * (spec.scale ?? 1);
+    return out;
+  }
+
+  /**
    * Draw the viewer into the top region of the canvas, inside the caller's render pass (color already holds the
    * background; the pass's depth buffer was cleared to 1.0). `region` is the top viewer rectangle in device px.
    * `timeSec` drives idle animation. Leaves the pass viewport set to `region`: the caller resets
@@ -757,6 +608,8 @@ export class CartridgeViewer {
     timeSec: number,
     thumb: UV | null,
     fade = 1,   // hero fade-in opacity (0→1); applied to billboards via bodyColor.a. 1 = fully opaque (default).
+    cdPose: CDPose | null = null,   // a 'cd' spec: override the idle motion (the cart launch); null = idle
+    blurArc = 0,                    // a 'cd' spec: the print's rotational blur (radians)
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
 
@@ -782,7 +635,10 @@ export class CartridgeViewer {
 
     // ── animation ──
     mat4.identity(this.model);
-    if (spec.floaty) {
+    if (isCD && !spec.floaty) {
+      // The CD: its idle pose (cdViewerIdlePose, the same maths as before) or the launch's override.
+      cdPoseModel(this.model, cdPose ?? this.cdViewerIdlePose(spec, timeSec, this._pose));
+    } else if (spec.floaty) {
       // Weightless "facing you" float (the hero logo): gentle sway + nod + roll
       // + bob + drift, no full spin — so the logo always reads front-on but never
       // sits still. The slightly-offset frequencies trace a lazy figure-8.
@@ -823,17 +679,24 @@ export class CartridgeViewer {
     this.project(region);
 
     // ── uniforms ──
-    const u = this._u; u.fill(0);
-    u.set(this.mvp, 0);
-    u.set(this.model, 16);
-    const body = spec.bodyColor, label = spec.labelColor;
-    // For billboards bodyColor.a is the fade opacity; for the cartridge/box meshes keep the spec's alpha.
-    this.set4(32, body[0], body[1], body[2], isBillboard ? fade : body[3]);
-    this.set4(36, label[0], label[1], label[2], label[3]);
-    this.set4(40, 0.4, 0.7, 0.6, thumb ? 1 : 0); // light dir (xyz) + useThumb (w)
-    this.setUV(44, thumb); // uvRect
-    const side = spec.sideColor;
-    if (side) this.set4(48, side[0], side[1], side[2], side[3]); else this.set4(48, 1, 1, 1, 1); // sideColor (billboard)
+    const u = this._u;
+    if (isCD) {
+      // The hero CD prints the cart's face like its tile: the art (thumb = its atlas cell), else its seeded pattern.
+      const face = this._face; face.art = thumb; face.pattern = spec.cdPattern ?? null;
+      writeCDUniforms(u, this.mvp, this.model, face, blurArc);
+    } else {
+      u.fill(0);
+      u.set(this.mvp, 0);
+      u.set(this.model, 16);
+      const body = spec.bodyColor, label = spec.labelColor;
+      // For billboards bodyColor.a is the fade opacity; for the cartridge/box meshes keep the spec's alpha.
+      this.set4(32, body[0], body[1], body[2], isBillboard ? fade : body[3]);
+      this.set4(36, label[0], label[1], label[2], label[3]);
+      this.set4(40, 0.4, 0.7, 0.6, thumb ? 1 : 0); // light dir (xyz) + useThumb (w)
+      this.setUV(44, thumb); // uvRect
+      const side = spec.sideColor;
+      if (side) this.set4(48, side[0], side[1], side[2], side[3]); else this.set4(48, 1, 1, 1, 1); // sideColor (billboard)
+    }
     this.device.queue.writeBuffer(this.uniformBuf, 0, u);
 
     // Constrain to the top viewer region. Viewport y is from the top in WebGPU.
@@ -936,39 +799,28 @@ export class CartridgeViewer {
 
   /**
    * Draw a FrogCart CD (iridescent annulus) into a tile's screen rect, inside the caller's render pass (over the 2D
-   * tiles). `cover` is the cover-art atlas rect (Phase 2; null = holographic only). `slot` indexes
-   * the shared per-draw uniform pool.
+   * tiles). `face` = what the disc prints: the cart's art (its atlas rect), else its seeded pattern, else nothing (the
+   * bare holographic disc). `slot` indexes the shared per-draw uniform pool. `pose` overrides the idle motion
+   * (cdIdlePose: whirl + tilt + bob) for one frame — the hook for an animation that takes the disc over (e.g. the
+   * cart launch); null / omitted = idle. blurArc (radians) smears the print along the disc's rotation (the launch's
+   * spin-up blur; 0 = sharp).
    */
   drawCD(
     pass: GPURenderPassEncoder,
     region: ViewerRegion,
-    cover: UV | null,
+    face: CDFace | null,
     timeSec: number,
     slot: number,
+    pose?: CDPose | null,
+    blurArc = 0,
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
     if (slot >= this.discUniformBufs.length) { this.warnPoolFull(); return; }
 
-    const phase = slot * 1.7;
-    const tilt = -26 * Math.PI / 180;                  // see the face + the sheen
-    const spin = timeSec * 0.55 + phase;               // continuous Y whirl
-    const bob = Math.sin(timeSec * 1.1 + phase) * 0.06;
-
-    mat4.identity(this.model);
-    this.translate(0, bob, 0);
-    mat4.rotateX(this.model, this.model, tilt);
-    mat4.rotateY(this.model, this.model, spin);
-    this.scale(1.75, 1.75, 1.75);
+    cdPoseModel(this.model, pose ?? cdIdlePose(timeSec, slot * 1.7, this._pose));
     this.project(region);
-
-    const u = this._u; u.fill(0);
-    u.set(this.mvp, 0);
-    u.set(this.model, 16);
-    this.set4(32, 0.72, 0.74, 0.80, 1);                // chrome silver base
-    this.set4(36, 0.9, 0.9, 0.95, 1);                  // (label unused)
-    this.set4(40, 0.3, 0.6, 0.7, cover ? 1 : 0);       // w = use cover art
-    this.setUV(44, cover);
-    this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
+    writeCDUniforms(this._u, this.mvp, this.model, face, blurArc);
+    this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, this._u);
 
     pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
     pass.setPipeline(this.cdPipeline);

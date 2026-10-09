@@ -39,8 +39,14 @@ export interface ShellSlot {
   type: ShellSlotType;
   name: string;
   description?: string;
-  /** base64 PNG cached here for instant dashboard load (no cart unpack). */
+  /** base64 PNG cached here for instant dashboard load (no cart unpack). For a cart: its DISC ART (a 256 px square,
+   *  from the .frogcart's cd-art entry), printed on its Shell CD. */
   thumbnailDataUrl?: string;
+  /** Carts: the disc pattern seed (from manifest.cdPattern, else a hash of the cart's sceneId) — what the CD prints
+   *  without art. Absent = a hash of the slot id. */
+  cdPattern?: { seed: number; family?: 'checker' | 'stripes' | 'dots' };
+  /** Carts: the disc art + pattern have been read from the cart file (install, or the one-time idle backfill). */
+  artChecked?: boolean;
 
   // ── system only ──
   /** Well-known system app key, e.g. 'illustrator' | 'settings'. */

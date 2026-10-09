@@ -57,7 +57,8 @@ export class RainbowStripGenerator implements IEphemeraGenerator {
           { value: 'smooth', label: 'Smooth gradient' },
           { value: 'banded', label: 'Bands'           },
         ], group: 'Spectrum' },
-      { key: 'segments',  label: 'Bands',     type: 'range',  default: 7,   min: 3,  max: 16,   step: 1,  group: 'Spectrum' },
+      { key: 'segments',  label: 'Bands',     type: 'range',  default: 7,   min: 3,  max: 16,   step: 1,  group: 'Spectrum',
+        showIf: { key: 'style', equals: 'banded' } },
       { key: 'vertical',  label: 'Vertical',  type: 'toggle', default: false,                            group: 'Spectrum' },
     ];
   }

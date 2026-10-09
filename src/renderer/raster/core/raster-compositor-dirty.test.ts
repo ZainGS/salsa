@@ -335,8 +335,8 @@ describe('incremental layer composite == full composite, after every step', () =
 
   // A displacement reads other texels and moves with the frame number, so it never takes the region passes: it is the
   // legacy full composite — but only when the frame, its params, the layer list or the layers' pixels changed.
-  // (The CPU mirror has no displacement port, so these run at amplitude 0: the pixels stay comparable while every
-  // decision input is exercised.)
+  // (These run at amplitude 0 — the decision inputs are what is exercised here; the displacement itself, which the
+  // CPU mirror now ports, is covered by frame-link-loop.test.ts.)
   it('a displacement animation (Frame Link) takes the full legacy composite, skipped while nothing it reads changed', async () => {
     const w = await makeWorld(6, 64, 48, 2);
     let anim = { enabled: true, type: 'wave', amplitude: 0, frequency: 3, speed: 0.1 };

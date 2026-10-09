@@ -93,11 +93,13 @@ describe('golden: the all-features output of the merged template (frozen at phas
   // deleted. These are the sha256 of that normalised text. A DELIBERATE template / helper-library change updates
   // them (the failure prints the new hash); an accidental one fails here. Every snapshot change is a pixel change
   // somewhere: verify it like one (shader-split.md §6.4).
+  // 2026-10-09: cd_lighting (style 7, the CD Kit disc) moved onto the shared CD_DISC_WGSL (cd-disc-wgsl.ts) and gained
+  // the clear hub ring (no label inside the stacking-ring radius); verified on Dawn (all 768 keys compile; face render).
   const cases: [string, boolean, boolean, string][] = [
-    ['T + shadow', true, true, '3549a6b33265d4a94f2b20e50b3a7c66ea6df9fff8de1a2946fbe62a821425b5'],
-    ['T', true, false, 'a2720b4772c919704a8ccb68c04fa9e0c406858a3822083a3b7d635aee072479'],
-    ['U + shadow', false, true, 'c788fd0f432d800c17cdd2c24881f9d9ff272d99a71afe2abe5142901401bbf6'],
-    ['U', false, false, 'e5d8d2aeee65c985d7e7dcf5e6aa089cbbcacfac79484ce73bd5052a0e424f05'],
+    ['T + shadow', true, true, '9a775f2e1858cd647199bc1eed3d43e0ac6d332b293245a57e26f61890f0bd34'],
+    ['T', true, false, '0a50d4a3d23dfd167aacb2296e250b99c1ea906f3cbbb388e46fab611a6d3432'],
+    ['U + shadow', false, true, '4b8944d7057d7c05d9f0619bb8f103907c4e7969b2578d2d186e0a97504693d3'],
+    ['U', false, false, '8206b4b496ad97d1ae808157bae24f8a4fa5bba2ef8da5e0db58057edf524053'],
   ];
   for (const [name, tex, shadow, sha] of cases) {
     it(`${name} (tex ${tex}, shadow ${shadow})`, () => {
@@ -110,10 +112,10 @@ describe('golden: the all-features output of the merged template (frozen at phas
   // _PLAIN[_SHADOW_MODERN]): equal on 2026-10-08 after normalisation, up to the order of four constant lets in the
   // pattern block (p8Fast / gUvFw before winWL / gUvM). Frozen the same way.
   const plainCases: [string, boolean, boolean, string][] = [
-    ['PLAIN T + shadow', true, true, '0a1ad08beee62eac536b69b9802830808cafc000847f41ce92b3e8a4950558f9'],
-    ['PLAIN T', true, false, '7dd1fbea888536e09ce48e5b378a8d6feaf163135332762efced3be9dd83ed2d'],
-    ['PLAIN U + shadow', false, true, 'cc02753c0aa7545d96e7582caa66da9f8b1c9d4e1d6cbd4ca3975b18cc1374bc'],
-    ['PLAIN U', false, false, '0436d50274f52609582029389ea389945e5addc1d4d2a625df375faa273705b3'],
+    ['PLAIN T + shadow', true, true, 'bc8581b37fa70448df5858dfe0c866368be645cffa32348ae70a55957ace1bf2'],
+    ['PLAIN T', true, false, 'a0dae8a119f3542f7ac157b02859b238b9163e45c88c5cdec3d759a60414c5e6'],
+    ['PLAIN U + shadow', false, true, '85eecc997ca2e22c31f1bf172a0d3bf26250daf08be960aa21ea769b58a88c78'],
+    ['PLAIN U', false, false, 'ec8ce8151b881505484ba537a1c0038799796fc48474a68d93bc3743169e6ee0'],
   ];
   for (const [name, tex, shadow, sha] of plainCases) {
     it(`${name} (tex ${tex}, shadow ${shadow})`, () => {

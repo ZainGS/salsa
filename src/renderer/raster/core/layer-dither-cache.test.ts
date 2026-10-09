@@ -20,7 +20,7 @@ vi.mock('../../../wasm/wasm-bindings', () => ({
 
 import { createCpuDevice, installGpuGlobals, CpuTexture } from '../cpu-gpu-mirror';
 import { RasterCompositor, LayerBlendMode, type CompositorLayerInfo } from './raster-compositor';
-import { DitherEngine, defaultDitherConfig, type DitherConfig } from '../effects/dither-engine';
+import { DitherEngine, defaultDitherConfig, ditherEdgeJfaCone, type DitherConfig } from '../effects/dither-engine';
 import { markRasterCompositeDirty } from './raster-composite-dirty';
 import { noteRasterStrokeBegin, noteRasterStrokeEnd } from '../raster-stroke-activity';
 import { RasterLayerManager } from '../../../services/raster-layer-manager';
@@ -144,9 +144,98 @@ describe('Layer dither cache: ordered dirty-rect re-dither is identical to a ful
     expect(DitherEngine.rectReach(cfgOf({ edgeWidth: 20 }), 512)).toBe(0);                 // no amount: no taps
     expect(DitherEngine.rectReach(cfgOf({ edgeWidth: 0, edgeDensity: 1 }), 512)).toBe(0);  // width 0 = off
     expect(DitherEngine.rectReach(cfgOf({ edgeWidth: 20, edgeFade: 1, edgeMode: 'canvas' }), 512)).toBe(0);
-    expect(DitherEngine.rectReach(cfgOf({ edgeWidth: 20, edgeFade: 1 }), 512)).toBe(22);
+    expect(DitherEngine.rectReach(cfgOf({ edgeWidth: 20, edgeFade: 1 }), 512)).toBe(ditherEdgeJfaCone(20));   // 24
     const ht = DitherEngine.rectReach(cfgOf({ algorithm: 'halftone_dot', halftoneFrequency: 32, edgeWidth: 10, edgeDensity: 0.5 }), 512);
-    expect(ht).toBeGreaterThanOrEqual(12 + 16 * 0.71);   // taps + about one 16-px cell
+    expect(ht).toBeGreaterThanOrEqual(ditherEdgeJfaCone(10) + 16 * 0.71);   // the flood cone + about one 16-px cell
+  });
+});
+
+/** A SOLID patch over `r` (one colour, full alpha) or, 1 time in 3, an erased ellipse in it — no specks, so the
+ *  distance to the paint boundary gets large (paint() above leaves 8% transparent specks: every distance is tiny). */
+function paintSolid(gpu: ReturnType<typeof createCpuDevice>, tex: CpuTexture, r: { x0: number; y0: number; x1: number; y1: number }, rnd: () => number): void {
+  const w = r.x1 - r.x0, h = r.y1 - r.y0;
+  const erase = rnd() < 0.34;
+  const px = new Uint8Array(w * h * 4);
+  const cur = (x: number, y: number, c: number) => tex.data[((r.y0 + y) * tex.width + r.x0 + x) * 4 + c];
+  const col = [rnd() * 255, rnd() * 255, rnd() * 255];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const o = (y * w + x) * 4;
+    const inside = ((x + 0.5 - w / 2) / (w / 2)) ** 2 + ((y + 0.5 - h / 2) / (h / 2)) ** 2 <= 1;
+    if (erase) { for (let c = 0; c < 4; c++) px[o + c] = inside ? 0 : cur(x, y, c); continue; }
+    px[o] = col[0]; px[o + 1] = col[1]; px[o + 2] = col[2]; px[o + 3] = 255;
+  }
+  gpu.device.queue.writeTexture({ texture: asGpu(tex), origin: { x: r.x0, y: r.y0 } } as GPUTexelCopyTextureInfo, px, { bytesPerRow: w * 4 }, [w, h]);
+  markRasterCompositeDirty(r, asGpu(tex));
+}
+
+describe('Layer dither cache: wide content-edge bands (jump-flood distance) stay exact under dirty-rect re-dithers', () => {
+  const WIDE: Array<[string, Partial<DitherConfig>]> = [
+    ['width 1 shrink', { bayerLevel: 1, edgeWidth: 1, edgeShrink: 0.9 }],
+    ['width 2.5 fade, quantize per channel', { bayerLevel: 2, edgeWidth: 2.5, edgeFade: 0.8, perChannel: true, colorLevels: 3 }],
+    ['width 17 density + shrink', { bayerLevel: 2, edgeWidth: 17, edgeDensity: 0.8, edgeShrink: 0.5, edgeSeed: 3 }],
+    ['width 64 fade + density, both', { bayerLevel: 1, edgeWidth: 64, edgeFade: 0.6, edgeDensity: 0.6, edgeMode: 'both' }],
+    ['width 300 (past the layer) negative shrink, duotone', {
+      bayerLevel: 3, edgeWidth: 300, edgeShrink: -0.7, colorMode: 'duotone', duotoneBias: 0.4,
+      foregroundColor: [0.2, 0.1, 0.5, 1], backgroundColor: [1, 1, 0.8, 1],
+    }],
+  ];
+  for (const [name, patch] of WIDE) {
+    it(name, () => {
+      const gpu = createCpuDevice();
+      const W = 150, H = 104;
+      const rnd = rng(name.length * 131 + 7);
+      const tex = gpu.mkTex(W, H, 'rgba8unorm');
+      paintSolid(gpu, tex, { x0: 6, y0: 5, x1: W - 9, y1: H - 4 }, () => 0.9);   // one big solid blob first
+      const cfg = cfgOf(patch);
+      const comp = new RasterCompositor(gpu.device);
+      const out = gpu.mkTex(W, H, 'rgba8unorm');
+      const layers = [layerOf(tex, cfg, 'L1')];
+      comp.composite(layers, asGpu(out));
+      expect(same(out.data, fullDither(gpu, tex, cfg))).toBe(true);
+      for (let step = 0; step < 14; step++) {
+        const k = rnd();
+        // dabs (mostly small: what a stroke reports), erasing included (paint() leaves holes)
+        const r = k < 0.8 ? (() => { const x = Math.floor(rnd() * (W - 12)), y = Math.floor(rnd() * (H - 12)); return { x0: x, y0: y, x1: x + 3 + Math.floor(rnd() * 9), y1: y + 3 + Math.floor(rnd() * 9) }; })() : randRect(rnd, W, H);
+        if (rnd() < 0.7) paintSolid(gpu, tex, r, rnd); else paint(gpu, tex, r, rnd);
+        comp.composite(layers, asGpu(out));
+        expect(diffCount(out.data, fullDither(gpu, tex, cfg)), `step ${step}`).toBe(0);
+      }
+      expect(comp.ditherCacheStats.rectRedithers).toBeGreaterThan(0);
+    });
+  }
+
+  it('the flood reach matters: half the reach and a wide band diverges (the test can see it)', () => {
+    const gpu = createCpuDevice();
+    const W = 150, H = 104;
+    const rnd = rng(606);
+    const tex = gpu.mkTex(W, H, 'rgba8unorm');
+    paintSolid(gpu, tex, { x0: 6, y0: 5, x1: W - 9, y1: H - 4 }, () => 0.9);
+    const cfg = cfgOf({ bayerLevel: 2, edgeWidth: 30, edgeFade: 1 });
+    const comp = new RasterCompositor(gpu.device);
+    const out = gpu.mkTex(W, H, 'rgba8unorm');
+    const layers = [layerOf(tex, cfg, 'L1')];
+    comp.composite(layers, asGpu(out));
+    const real = DitherEngine.rectReach;
+    // halve the CACHE's grow only (the engine's flood domain keeps the real reach): the re-dithered rect misses
+    // pixels whose band reaches the change
+    let inCache = true;
+    vi.spyOn(DitherEngine, 'rectReach').mockImplementation((c, w) => {
+      const v = real.call(DitherEngine, c, w);
+      return inCache ? Math.ceil(v / 2) : v;
+    });
+    const origApply = DitherEngine.prototype.applyRegion;
+    vi.spyOn(DitherEngine.prototype, 'applyRegion').mockImplementation(function (this: DitherEngine, ...a) {
+      inCache = false;
+      try { return origApply.apply(this, a); } finally { inCache = true; }
+    });
+    let diverged = false;
+    for (let step = 0; step < 30 && !diverged; step++) {
+      const x = 20 + Math.floor(rnd() * (W - 40)), y = 20 + Math.floor(rnd() * (H - 40));
+      paintSolid(gpu, tex, { x0: x, y0: y, x1: x + 6, y1: y + 6 }, () => 0.1);   // a small erased dab
+      comp.composite(layers, asGpu(out));
+      if (diffCount(out.data, fullDither(gpu, tex, cfg)) > 0) diverged = true;
+    }
+    expect(diverged).toBe(true);
   });
 });
 

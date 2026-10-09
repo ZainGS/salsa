@@ -1,7 +1,7 @@
 import { RasterTextureManager } from '../renderer/raster/raster-texture-manager';
 import { RasterCanvas } from '../renderer/raster/raster-canvas';
 import { LayerBlendMode } from '../renderer/raster/core/raster-compositor';
-import { DitherConfig } from '../renderer/raster/effects/dither-engine';
+import { DitherConfig, ditherConfigActive } from '../renderer/raster/effects/dither-engine';
 import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation, type AnimationCel } from '../animation';
 import { EventEmitter } from '../renderer/util/event-emitter';
 import { bumpGpuPixelEpoch } from '../renderer/raster/gpu-pixel-epoch';
@@ -90,6 +90,25 @@ export type RasterLayer = {
 export interface RasterCompositionItem {
   id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean;
   ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation; animated?: boolean;
+}
+
+/**
+ * Merge Down's target: the nearest paint layer below `upperIdx` (layers are bottom-first) IN THE SAME STACK — folders,
+ * references, vector layers and the 3D scene are skipped. Package / system-owned layers are not part of the artboard
+ * stack (they composite onto their package and the host Layers panel hides them), so an artboard layer never merges
+ * into one, and a package layer only into its own package's layers. -1 = nothing to merge into.
+ */
+export function findMergeDownTargetIndex(
+  layers: ReadonlyArray<{ type?: LayerEntryType; packageOwnerId?: string; systemOwner?: string }>,
+  upperIdx: number,
+): number {
+  const upper = layers[upperIdx];
+  if (!upper || (upper.type ?? 'layer') !== 'layer') return -1;
+  for (let i = upperIdx - 1; i >= 0; i--) {
+    const l = layers[i];
+    if ((l.type ?? 'layer') === 'layer' && l.packageOwnerId === upper.packageOwnerId && l.systemOwner === upper.systemOwner) return i;
+  }
+  return -1;
 }
 
 export class RasterLayerManager {
@@ -940,7 +959,7 @@ export class RasterLayerManager {
     const l = this.layers.find(x => x.id === id);
     if (!l?.manager || !l.texture) return false;
     const cfg = l.ditherConfig;
-    if (!cfg || !cfg.enabled || !(cfg.strength > 0.001)) return false;
+    if (!ditherConfigActive(cfg)) return false;
     if ((l.manager.getTexture?.() ?? null) !== l.texture) return false;   // an animation cel: not this history's texture
     await l.manager.pushSnapshot?.({ noCoalesce: true });   // BEFORE (a dedup no-op when it is already the current entry)
     const tex = l.texture;
@@ -1853,9 +1872,7 @@ export class RasterLayerManager {
     const upper = this.layers[upperIdx];
     if ((upper.type ?? 'layer') !== 'layer') return null;
 
-    // Find nearest paintable layer below
-    let lowerIdx = upperIdx - 1;
-    while (lowerIdx >= 0 && (this.layers[lowerIdx].type ?? 'layer') !== 'layer') lowerIdx--;
+    const lowerIdx = findMergeDownTargetIndex(this.layers, upperIdx);
     if (lowerIdx < 0) return null;
     const lower = this.layers[lowerIdx];
 

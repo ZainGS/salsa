@@ -181,18 +181,20 @@ export class WarningLabelGenerator implements IEphemeraGenerator {
           { value: 'biohazard',    label: 'Biohazard'    },
           { value: 'high-voltage', label: 'High Voltage' },
         ],
-      },
+        showIf: { key: 'showSymbol', truthy: true } },
       { key: 'labelText',   label: 'Label text',    type: 'text',   default: 'CAUTION',                      group: 'Text' },
       { key: 'subText',     label: 'Sub-text',      type: 'text',   default: 'Read all instructions before use', group: 'Text' },
       { key: 'fontSize',    label: 'Font size',     type: 'range',  default: 22,   min: 8,  max: 48, step: 1, group: 'Text' },
       { key: 'showSymbol',  label: 'Show symbol',   type: 'toggle', default: true,                           group: 'Symbol' },
       { key: 'showStripes', label: 'Hazard stripes',type: 'toggle', default: true,                           group: 'Symbol' },
       { key: 'borderWidth', label: 'Border width',  type: 'range',  default: 10,   min: 2,  max: 24, step: 1, group: 'Appearance' },
-      { key: 'stripeWidth', label: 'Stripe width',  type: 'range',  default: 8,    min: 3,  max: 24, step: 1, group: 'Appearance' },
+      { key: 'stripeWidth', label: 'Stripe width',  type: 'range',  default: 8,    min: 3,  max: 24, step: 1, group: 'Appearance',
+        showIf: { key: 'showStripes', truthy: true } },
       { key: 'cornerRadius',label: 'Corner radius', type: 'range',  default: 4,    min: 0,  max: 20, step: 1, group: 'Appearance' },
       { key: 'fgColor',     label: 'Foreground',    type: 'color',  default: '#000000',                      group: 'Color' },
       { key: 'bgColor',     label: 'Background',    type: 'color',  default: '#f5c800',                      group: 'Color' },
-      { key: 'altColor',    label: 'Stripe alt',    type: 'color',  default: '#f5c800',                      group: 'Color' },
+      { key: 'altColor',    label: 'Stripe alt',    type: 'color',  default: '#f5c800',                      group: 'Color',
+        showIf: { key: 'showStripes', truthy: true } },
     ];
   }
 

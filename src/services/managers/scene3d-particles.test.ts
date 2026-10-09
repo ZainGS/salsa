@@ -152,3 +152,110 @@ describe('§5.1 Scene3DParticles (extracted subsystem)', () => {
     expect(env.preRenderCbs.size).toBe(0);
   });
 });
+
+// Audit 2026-10-09 §2 #20: Loop off emitted forever (the spawn gate was always true). Loop off = ONE burst of
+// maxParticles particles spawned at emitRate, then the live ones age out; a timeline rewind / config change re-arms it.
+describe('ParticleEmitter3D Loop off = one burst', () => {
+  function makeTimelineCtx() {
+    const env = makeCtx();
+    const listeners: Array<(e: { type: string; frame?: number }) => void> = [];
+    let frame = 1;
+    const timeline = {
+      getCurrentFrame: () => frame,
+      on: (l: (e: { type: string; frame?: number }) => void) => { listeners.push(l); return () => { listeners.splice(listeners.indexOf(l), 1); }; },
+      go: (f: number) => { frame = f; for (const l of [...listeners]) l({ type: 'frame-changed', frame: f }); },
+      listeners,
+    };
+    (env.ctx as unknown as { rasterLayerManager: unknown }).rasterLayerManager = { getTimeline: () => timeline };
+    return { ...env, timeline };
+  }
+  const tickAll = (cbs: Set<() => boolean>) => { let r = false; for (const cb of cbs) r = cb() || r; return r; };
+  const cfg = { loop: false, maxParticles: 20, emitRate: 100, lifetime: [0.5, 0.5] as [number, number] };
+
+  it('spawns maxParticles in total, then stops; the live ones die out', () => {
+    const env = makeCtx();
+    const p = new Scene3DParticles(env.ctx);
+    const e = p.get(p.add(0, 0, 0, cfg))!;
+    e.tick(0.1);                       // 10 spawned
+    e.buildGPUData();
+    expect(e.activeCount).toBe(10);
+    expect(e.burstDone).toBe(false);
+    e.tick(0.1); e.tick(0.1);          // capped at 20 total
+    e.buildGPUData();
+    expect(e.activeCount).toBe(20);
+    expect(e.burstDone).toBe(true);
+    for (let i = 0; i < 10; i++) e.tick(0.1);   // 1 s later: every particle (0.5 s life) is gone, none respawned
+    e.buildGPUData();
+    expect(e.activeCount).toBe(0);
+    expect(e.isActive).toBe(false);
+  });
+
+  it('a looping emitter keeps emitting (live count refills after the first generation dies)', () => {
+    const env = makeCtx();
+    const p = new Scene3DParticles(env.ctx);
+    const e = p.get(p.add(0, 0, 0, { ...cfg, loop: true }))!;
+    for (let i = 0; i < 20; i++) e.tick(0.1);
+    e.buildGPUData();
+    expect(e.activeCount).toBeGreaterThan(0);
+    expect(e.burstDone).toBe(false);
+    expect(e.isActive).toBe(true);
+  });
+
+  it('the tick loop stops requesting frames once the burst is over', () => {
+    const env = makeCtx();
+    const p = new Scene3DParticles(env.ctx);
+    const e = p.get(p.add(0, 0, 0, cfg))!;
+    for (let i = 0; i < 12; i++) e.tick(0.1);
+    expect(e.isActive).toBe(false);
+    expect(tickAll(env.preRenderCbs)).toBe(false);
+    expect(env.preRenderCbs.size).toBe(1);   // still registered: a restart wakes it
+  });
+
+  it('a config change re-arms the burst', () => {
+    const env = makeCtx();
+    const p = new Scene3DParticles(env.ctx);
+    const id = p.add(0, 0, 0, cfg);
+    const e = p.get(id)!;
+    for (let i = 0; i < 12; i++) e.tick(0.1);
+    expect(e.burstDone).toBe(true);
+    const before = env.calls.scheduleRender;
+    p.setConfig(id, { emitRate: 200 });
+    expect(e.burstDone).toBe(false);
+    expect(env.calls.scheduleRender).toBeGreaterThan(before);
+    e.tick(0.05);
+    e.buildGPUData();
+    expect(e.activeCount).toBe(10);
+  });
+
+  it('a timeline rewind restarts one-shot emitters only (moving forward does not)', () => {
+    const env = makeTimelineCtx();
+    const p = new Scene3DParticles(env.ctx);
+    const once = p.get(p.add(0, 0, 0, cfg))!;
+    const loop = p.get(p.add(0, 0, 0, { ...cfg, loop: true }))!;
+    tickAll(env.preRenderCbs);                            // first tick subscribes to the timeline
+    expect(env.timeline.listeners).toHaveLength(1);
+    for (let i = 0; i < 12; i++) { once.tick(0.1); loop.tick(0.1); }
+    expect(once.burstDone).toBe(true);
+    env.timeline.go(5);                                    // forward: nothing restarts
+    expect(once.burstDone).toBe(true);
+    loop.buildGPUData();
+    const loopLive = loop.activeCount;
+    env.timeline.go(1);                                    // rewind: the burst fires again
+    expect(once.burstDone).toBe(false);
+    loop.buildGPUData();
+    expect(loop.activeCount).toBe(loopLive);               // the looping stream is left alone
+    p.dispose();
+    expect(env.timeline.listeners).toHaveLength(0);        // unsubscribed on teardown
+  });
+
+  it('persistence is unchanged: toJSON writes the config (loop flag), not the runtime burst counter', () => {
+    const env = makeCtx();
+    const p = new Scene3DParticles(env.ctx);
+    const e = p.get(p.add(0, 0, 0, cfg))!;
+    e.tick(0.1);
+    const json = e.toJSON();
+    expect(json.config.loop).toBe(false);
+    expect(Object.keys(json)).not.toContain('_emitted');
+    expect(Object.keys(json.config)).not.toContain('emitted');
+  });
+});

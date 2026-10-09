@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { UIManager } from './ui-manager';
+import { UIManager, worldDimFactor } from './ui-manager';
 import type { ManagerContext } from './manager-context';
 import type { UIStateMachine, UIEvent } from '../../ui/ui-types';
 
@@ -419,6 +419,32 @@ describe('UIManager — pointer hit-testing', () => {
     expect(ui.getActiveOverlay()!.blur).toBeCloseTo(0.8, 5);
     ui.goToState(id, 'title');                    // non-modal → overlay gone, blur reset (not sticky)
     expect(ui.getActiveOverlay()).toBeNull();
+  });
+
+  it('Dim world strength (audit 2026-10-09): 0..1 changes the look across the range; >= 0.5 is the full dim colour', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const m = machine();
+    ui.setStateMachine(id, m);
+    ui.updateUILayer(id, { backgroundOverlay: { color: [0, 0, 0, 0.6] } });
+    ui.setInteractive(true);
+    const at = (v: number) => {
+      m.states[1].worldBlur = v;
+      ui.goToState(id, 'title');
+      ui.goToState(id, 'game');
+      const ov = ui.getActiveOverlay()!;
+      return { alpha: ov.color[3], blur: ov.blur };
+    };
+    const a = at(0.1), b = at(0.3), c = at(0.5), d = at(1), old = at(8);
+    expect(a.alpha).toBeCloseTo(0.12, 5);
+    expect(b.alpha).toBeCloseTo(0.36, 5);
+    expect(c.alpha).toBeCloseTo(0.6, 5);
+    expect(d.alpha).toBeCloseTo(0.6, 5);
+    expect([a.blur, b.blur, c.blur, d.blur]).toEqual([0.1, 0.3, 0.5, 1].map(v => expect.closeTo(v, 5)));
+    expect(old).toEqual(d);                        // an old save's 1..20 = full strength, as before
+    expect(worldDimFactor(0)).toBe(0);
+    expect(worldDimFactor(0.25)).toBe(0.5);
   });
 });
 

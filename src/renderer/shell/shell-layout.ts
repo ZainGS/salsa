@@ -13,6 +13,8 @@
  * See docs/specs/shell-ui-upgrade.md.
  */
 
+import type { CartDiscPatternRef } from '../3d/cd-disc/cart-disc-pattern';
+
 export type Rgba = [number, number, number, number];
 
 /** Synthetic tile id for the previous/next page arrows. */
@@ -30,6 +32,8 @@ export interface ShellTileSpec {
   discIcon?: string;
   /** When true, this tile renders as a spinning iridescent CD (FrogCarts). */
   cd?: boolean;
+  /** CD tiles: the cart's seeded disc pattern (printed when the cart has no art in the thumbnail atlas). */
+  cdPattern?: CartDiscPatternRef;
   /** When set, this tile renders as a spinning Billboard3D cutout of this
    *  atlas-key icon (Install Cart → download arrow). */
   billboardKey?: string;
@@ -50,6 +54,8 @@ export interface RenderTile {
   discIcon?: string;
   /** When true, render a spinning iridescent CD instead of a flat tile (carts). */
   cd?: boolean;
+  /** CD tiles: the cart's seeded disc pattern (ShellTileSpec.cdPattern). */
+  cdPattern?: CartDiscPatternRef;
   /** Atlas-key for a spinning Billboard3D cutout tile (Install Cart). */
   billboardKey?: string;
 }
@@ -142,6 +148,8 @@ export interface ViewerSpec {
   floaty?: boolean;
   /** 3D themes: idle motion is a gentle ±30° sway, not a full Y-spin (keeps the icons readable). */
   swayOnly?: boolean;
+  /** kind 'cd': the cart's seeded disc pattern, printed when it has no art (the art is viewerThumbId's atlas cell). */
+  cdPattern?: CartDiscPatternRef;
 }
 
 export interface ShellRenderModel {
@@ -556,6 +564,7 @@ export function computeShellLayout(
       kind: spec.kind,
       discIcon: spec.discIcon,
       cd: spec.cd,
+      cdPattern: spec.cdPattern,
       billboardKey: spec.billboardKey,
       rect: [x, y, tileSize, tileSize],
       fill: fillFor(spec.kind, theme),

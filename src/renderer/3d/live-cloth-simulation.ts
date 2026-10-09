@@ -25,6 +25,28 @@ const DEFAULT_PHYSICS: ClothPhysicsConfig = {
     gravity: 9.8, damping: 0.98, stiffness: 30, thickness: 0, solidifyRounded: false,
 };
 
+/** The live cloth sim's wind clock advances 1/60 s per rendered frame (LiveClothSimulation._tick). */
+export const WIND_ZONE_FRAMES_PER_SECOND = 60;
+
+/**
+ * A wind zone as the live sim reads it. Older Frogmarks saves (before 2026-10-09) stored the inspector's values as
+ * they were: `falloff` a 0–1 number (never read: the zone was uniform) and a nested `pulse: { period, phase }` in
+ * FRAMES and cycle FRACTIONS (never read either). They map to falloff 'none' (what they did) and to pulsePeriod
+ * seconds / pulsePhase radians (what the user set), unless the flat fields are already there.
+ */
+export function resolveWindZone(z: WindZone): WindZone {
+    const legacy = z as WindZone & { falloff?: unknown; pulse?: { period?: unknown; phase?: unknown } | null };
+    const falloff: WindZone['falloff'] = legacy.falloff === 'linear' ? 'linear' : 'none';
+    let pulsePeriod = z.pulsePeriod, pulsePhase = z.pulsePhase;
+    const p = legacy.pulse;
+    if (pulsePeriod === undefined && p && typeof p.period === 'number' && p.period > 0) {
+        pulsePeriod = p.period / WIND_ZONE_FRAMES_PER_SECOND;
+        pulsePhase = typeof p.phase === 'number' ? p.phase * 2 * Math.PI : 0;
+    }
+    if (falloff === z.falloff && pulsePeriod === z.pulsePeriod && pulsePhase === z.pulsePhase) return z;
+    return { ...z, falloff, pulsePeriod, pulsePhase };
+}
+
 const STEPS_CONVERGING = 4;
 const STEPS_CONVERGED  = 2;
 const CONVERGE_EPSILON = 0.001;
@@ -270,7 +292,7 @@ export class LiveClothSimulationImpl implements LiveClothHandle {
     }
 
     setWindZones(zones: WindZone[]): void {
-        this._windZones = zones;
+        this._windZones = zones.map(resolveWindZone);   // (older saves: numeric falloff / nested pulse)
         // Break convergence so zone changes are visible immediately
         this._converged = false;
     }
@@ -380,7 +402,7 @@ export class LiveClothSimulationImpl implements LiveClothHandle {
 
         this._frameCount++;
         // ~16 ms per rAF at 60 fps
-        this._windTime += 1 / 60;
+        this._windTime += 1 / WIND_ZONE_FRAMES_PER_SECOND;
 
         // Evaluate wind zones and push per-vertex forces to the GPU.
         // Uses _lastPositions from the most recent readback (rate-limited below).

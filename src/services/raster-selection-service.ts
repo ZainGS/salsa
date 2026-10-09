@@ -19,7 +19,25 @@ type ScaleHandle = 'topLeft' | 'top' | 'topRight' | 'left' | 'right' | 'bottomLe
 export interface MagicWandOptions {
   tolerance: number;     // 0–255
   contiguous: boolean;   // true = connected region only
-  referenceLayerTexture?: GPUTexture;  // sample colors from another layer
+  referenceLayerTexture?: GPUTexture | null;  // sample colors from another layer (null / unset = the active layer)
+  /** The wand's own New / Add / Subtract (its options panel). Unset = the shared selection mode (setMode). */
+  mode?: SelectionMode;
+}
+
+/**
+ * The mode one selection press uses: Alt held = subtract, Shift held = add (Photoshop convention, for every selection
+ * tool), otherwise the wand's own mode for the magic wand, else the shared selection mode.
+ */
+export function resolveSelectionMode(
+  tool: SelectionTool,
+  mods: { shiftKey?: boolean; altKey?: boolean },
+  selectionMode: SelectionMode,
+  wandMode?: SelectionMode,
+): SelectionMode {
+  if (mods.altKey) return 'subtract';
+  if (mods.shiftKey) return 'add';
+  if (tool === 'magic-wand' && wandMode) return wandMode;
+  return selectionMode;
 }
 
 export class RasterSelectionService {
@@ -30,6 +48,8 @@ export class RasterSelectionService {
   private activeTool: SelectionTool = 'rect';
   private selectionMode: SelectionMode = 'new';
   private feather: number = 0;
+  /** The mode of the press in progress (resolveSelectionMode at pointer-down: modifiers / wand mode / shared mode). */
+  private pressMode: SelectionMode = 'new';
 
   // Magic wand options
   private magicWandOptions: MagicWandOptions = {
@@ -118,7 +138,9 @@ export class RasterSelectionService {
   public setMagicWandOptions(opts: Partial<MagicWandOptions>): void {
     if (opts.tolerance !== undefined) this.magicWandOptions.tolerance = opts.tolerance;
     if (opts.contiguous !== undefined) this.magicWandOptions.contiguous = opts.contiguous;
-    if (opts.referenceLayerTexture !== undefined) this.magicWandOptions.referenceLayerTexture = opts.referenceLayerTexture;
+    // An explicit key clears it too (Reference: None) — undefined used to keep the previous layer's texture.
+    if ('referenceLayerTexture' in opts) this.magicWandOptions.referenceLayerTexture = opts.referenceLayerTexture ?? null;
+    if (opts.mode !== undefined) this.magicWandOptions.mode = opts.mode;
   }
 
   public getMagicWandOptions(): MagicWandOptions {
@@ -354,6 +376,9 @@ export class RasterSelectionService {
     const texel = this.toTexelCoords(ev);
     this.dragStartTexel = texel;
     this.dragCurrentTexel = texel;
+    // A finger press arrives as a plain record without modifier keys: the panel's mode.
+    this.pressMode = resolveSelectionMode(this.activeTool, ev, this.selectionMode, this.magicWandOptions.mode);
+    const combining = this.pressMode !== 'new';
 
     const info = engine.getSelectionInfo();
 
@@ -395,8 +420,9 @@ export class RasterSelectionService {
       this.emitChanged();
     }
 
-    // ── Existing selection (not transforming): click inside → start transform
-    if (info.hasSelection && info.bounds && !info.isTransforming) {
+    // ── Existing selection (not transforming): click inside → start transform. Not while adding / subtracting:
+    // that press builds onto the selection (a Subtract click is inside it by nature).
+    if (!combining && info.hasSelection && info.bounds && !info.isTransforming) {
       const b = info.bounds;
       if (texel.x >= b.x && texel.x <= b.x + b.w && texel.y >= b.y && texel.y <= b.y + b.h) {
         await engine.beginTransform();
@@ -540,12 +566,12 @@ export class RasterSelectionService {
       await engine.selectMagicWand(
         texel.x, texel.y,
         opts.tolerance, opts.contiguous,
-        this.selectionMode,
-        opts.referenceLayerTexture,
+        this.pressMode,
+        opts.referenceLayerTexture ?? undefined,
       );
     } else if (this.activeTool === 'lasso') {
       if (this.lassoPoints.length >= 3) {
-        await engine.selectLasso(this.lassoPoints, this.selectionMode);
+        await engine.selectLasso(this.lassoPoints, this.pressMode);
       }
       this.lassoPoints = [];
       engine.dragLassoPoints = null;
@@ -559,12 +585,12 @@ export class RasterSelectionService {
 
       if (w > 1 && h > 1) {
         if (this.activeTool === 'rect') {
-          await engine.selectRect({ x, y, w, h }, this.feather, this.selectionMode);
+          await engine.selectRect({ x, y, w, h }, this.feather, this.pressMode);
         } else {
-          await engine.selectEllipse({ x, y, w, h }, this.feather, this.selectionMode);
+          await engine.selectEllipse({ x, y, w, h }, this.feather, this.pressMode);
         }
-      } else {
-        // Click without drag → deselect
+      } else if (this.pressMode === 'new') {
+        // Click without drag → deselect (an Add / Subtract click without a drag leaves the selection alone)
         await engine.deselectAll();
       }
     }

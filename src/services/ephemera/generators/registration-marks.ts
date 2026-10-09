@@ -155,8 +155,10 @@ export class RegistrationMarksGenerator implements IEphemeraGenerator {
         ],
       },
       { key: 'markSize',    label: 'Mark size',    type: 'range',  default: 24,  min: 8,   max: 80,  step: 2, group: 'Size' },
-      { key: 'gap',         label: 'Gap',          type: 'range',  default: 8,   min: 2,   max: 30,  step: 1, group: 'Size' },
-      { key: 'strokeWidth', label: 'Line weight',  type: 'range',  default: 1,   min: 0.25,max: 3,   step: 0.25, group: 'Appearance' },
+      { key: 'gap',         label: 'Gap',          type: 'range',  default: 8,   min: 2,   max: 30,  step: 1, group: 'Size',
+        showIf: { key: 'style', equals: 'crop-corners' } },
+      { key: 'strokeWidth', label: 'Line weight',  type: 'range',  default: 1,   min: 0.25,max: 3,   step: 0.25, group: 'Appearance',
+        showIf: { key: 'style', notEquals: 'halftone-patch' } },
       { key: 'color',       label: 'Color',        type: 'color',  default: '#000000',              group: 'Appearance' },
       { key: 'bgColor',     label: 'Background',   type: 'color',  default: 'transparent',          group: 'Appearance' },
     ];

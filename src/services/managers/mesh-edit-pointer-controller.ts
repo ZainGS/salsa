@@ -199,6 +199,10 @@ export class MeshEditPointerController {
    *  moves the whole selection on the view plane (an element grab, source 'drag': live, one undo step on release, a
    *  2nd finger / right click / Esc / pointercancel cancels). A drag that starts elsewhere keeps the old behaviour. */
   dragMovesSelection = true;
+  /** Drag Lock (host toggle, setMeshEditDragLock3D): NO press-drag moves geometry — neither the selection nor, in
+   *  vertex mode, the single vertex under the pointer. A press then only selects (on press for the mouse, on release
+   *  for a finger / pen), a finger / pen drag stays the camera's. The gizmo / mirror-plane handles still work. */
+  dragLock = false;
   /** LIVE OP PREVIEW (setMeshEditOpPreview3D): the host shows the last face op (extrude / inset / subdivide) as a
    *  preview. A face-mode tap then RE-TARGETS it: the preview is reverted first so the tap is resolved against the mesh
    *  before the op, the selection changes as usual, and the op re-runs on the new face selection with the same params
@@ -485,7 +489,7 @@ export class MeshEditPointerController {
     }
     // A press ON the selection waits: a drag moves the selection, a click selects as usual (on release). An ADDITIVE
     // press on it waits too (even without drag-moves-selection): the click toggles the element off, a drag never does.
-    const dragSel = this.dragMovesSelection && !this.opPreview && this._canDragVertex();
+    const dragSel = this.dragMovesSelection && !this.dragLock && !this.opPreview && this._canDragVertex();
     if ((dragSel || additive) && this._hasSelection() && this._isSelectedAt(px, py)) {
       this._selPress = { id: e.pointerId ?? 0, clientX: e.clientX, clientY: e.clientY, px, py, additive, img: this._lastPickImg, drag: dragSel };
       try { this._canvas.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
@@ -497,7 +501,7 @@ export class MeshEditPointerController {
       if (vi >= 0) {
         this._meshEdit.selectVertex(this._meshId, vi, additive);
         this._onSelectionChange?.();
-        this._beginVertexDrag(vi, px, py, e.pointerId);
+        if (!this.dragLock) this._beginVertexDrag(vi, px, py, e.pointerId);
         this._scheduleRender();
       }
     } else {
@@ -513,7 +517,7 @@ export class MeshEditPointerController {
     this._rect = this._canvas.getBoundingClientRect();
     const at = this._toCanvasPx(e.clientX, e.clientY);
     let drag: 'selection' | 'vertex' | null = null;
-    if (this._tool !== 'knife' && !this.opPreview && this._canDragVertex()) {
+    if (this._tool !== 'knife' && !this.opPreview && !this.dragLock && this._canDragVertex()) {
       if (this.dragMovesSelection) { if (this._hasSelection() && this._isSelectedAt(at.x, at.y)) drag = 'selection'; }
       else if (this._mode === 'vertex' && this._pickVertex(at.x, at.y) >= 0) drag = 'vertex';
     }
@@ -543,7 +547,7 @@ export class MeshEditPointerController {
       }
       // (an additive press without drag-moves-selection) the old press: a vertex-mode drag picks the vertex up from
       // the PRESS point — already selected, so the selection is unchanged — else nothing
-      const vi = this._mode === 'vertex' && this._canDragVertex() ? this._pickVertex(sp.px, sp.py) : -1;
+      const vi = this._mode === 'vertex' && !this.dragLock && this._canDragVertex() ? this._pickVertex(sp.px, sp.py) : -1;
       if (vi < 0) {
         if (this._canvas) { try { this._canvas.releasePointerCapture(sp.id); } catch { /* gone */ } }
         return;

@@ -296,6 +296,27 @@ export { CD_CASE, CD_LID_OPEN_RAD, cdKitAssembly, cdComponentView, CD_ALL_PIECES
 export type { CDPiece, CDKitPose, CDComponent, CDComponentView } from './packaging/cd/cd-kit-assembly';
 export { generateCDDisc, CD_DISC } from './packaging/cd/cd-disc-geometry';
 export { cdPrintSpec, CD_PRINT_PIECES, CD_DISC_SAFE_R } from './packaging/cd/cd-print';
+// FrogCart disc art (docs/specs/frogcart-cd-art-and-launch.md Part B): fitting, the seeded pattern, the live preview.
+export {
+  cdDiscArtCropRect, cdDiscArtUVRect, cdDiscArtPanBy, cdDiscArtZoomTo, cdDiscArtGuides, clampCDDiscArtFit, renderCDDiscArt,
+  CD_DISC_ART_FIT_DEFAULT, CD_DISC_ART_MAX_ZOOM, CD_DISC_ART_MIN_ZOOM, CD_DISC_ART_SIZE, CD_DISC_ART_MAX_BYTES, cdDiscArtDrawRects,
+} from './renderer/3d/cd-disc/cd-disc-art';
+export type { CDDiscArtFit, CDDiscArtCrop, CDDiscArtSource, RenderCDDiscArtOptions } from './renderer/3d/cd-disc/cd-disc-art';
+export {
+  cartDiscPattern, cartDiscSeedFromId, randomCartDiscSeed, CART_DISC_PALETTES, CART_DISC_FAMILIES,
+} from './renderer/3d/cd-disc/cart-disc-pattern';
+export type { CartDiscFamily, CartDiscPatternRef, CartDiscPattern } from './renderer/3d/cd-disc/cart-disc-pattern';
+export { CD_DISC_HOLE_RATIO, CD_DISC_ART_INNER_RATIO, SHELL_CD_HOLE_RATIO } from './renderer/3d/cd-disc/cd-disc-geometry';
+export type { CartDiscPreview, CartDiscPreviewOptions } from './renderer/shell/cart-disc-preview';
+export type { CDPose, CDFace } from './renderer/shell/shell-cd';
+// Shell cart launch (docs/specs/frogcart-cd-art-and-launch.md Part A) — sm.shell.launchSlot → the cart for the Player.
+export { LAUNCH as SHELL_LAUNCH, launchPose, spinDownPose, frontYawTarget, returnRevealAlpha, prefersReducedMotion } from './renderer/shell/shell-launch';
+export type { LaunchPose, LaunchClock, ShellLaunchPresenter, ShellLaunchBeginOptions } from './renderer/shell/shell-launch';
+export { ShellLaunchError } from './services/managers/shell-launch-flow';
+export type { ShellLaunchResult, ShellLaunchErrorCode } from './services/managers/shell-launch-flow';
+export type { ShellLaunchOptions, ShellSlotMenuEvent } from './services/managers/shell-ui-manager';
+export { probeFrogcart } from './services/managers/shell-import';
+export type { FrogcartProbe } from './services/managers/shell-import';
 // Vector paths (docs/specs/vector-paths.md) — the pen tool commits these; anchors are the source data.
 export { PathNode } from './scene-graph/shapes/path-node';
 export type { PathAnchor } from './scene-graph/shapes/path-node';

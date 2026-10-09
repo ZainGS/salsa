@@ -626,7 +626,10 @@ export class Scene3DCloth {
         return createLiveClothSimulation(device, fullGrid, fullPhysics, mode, proxy);
     }
 
-    enableLiveCloth(meshId: string, stepsPerFrame?: number): boolean {
+    /** Start the live sim on a cloth mesh. Without `opts.mode` it continues in the SAVED mode (hang when none) with no
+     *  collision proxy — the Cloth builder passes the picked Hang / Drape mode and its Collision proxy (audit
+     *  2026-10-09: the first press on an existing cloth ran the saved mode without the proxy). */
+    enableLiveCloth(meshId: string, stepsPerFrame?: number, opts?: { mode?: 'hang' | 'drape'; proxy?: DrapeProxy }): boolean {
         const node = this.ctx.sceneGraph.findNodeById(meshId);
         if (!(node instanceof ClothMesh3D)) return false;
 
@@ -640,11 +643,11 @@ export class Scene3DCloth {
             ? new Float32Array(node.simState.positions)
             : undefined;
 
-        const mode: 'hang' | 'drape' = node.simState.simulationMode !== 'none'
+        const mode: 'hang' | 'drape' = opts?.mode ?? (node.simState.simulationMode !== 'none'
             ? node.simState.simulationMode as 'hang' | 'drape'
-            : 'hang';
+            : 'hang');
 
-        const handle = createLiveClothSimulation(device, cfg, phys, mode, undefined, initPositions);
+        const handle = createLiveClothSimulation(device, cfg, phys, mode, opts?.proxy, initPositions);
         if (!handle) return false;
 
         handle.onPoseBufferChange = (buf) => {
@@ -676,6 +679,7 @@ export class Scene3DCloth {
         this._liveClothHandles.set(meshId, handle);
 
         node.setLiveConfig({
+            ...node.liveConfig,   // (keeps the wind zones)
             enabled: true,
             stepsPerFrame: stepsPerFrame ?? DEFAULT_CLOTH_LIVE.stepsPerFrame,
         } satisfies ClothLiveConfig);

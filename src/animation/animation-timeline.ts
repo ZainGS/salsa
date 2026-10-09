@@ -106,6 +106,10 @@ export class AnimationTimeline {
     return this.state.frameCount;
   }
 
+  /** The play range, 1-based inclusive (cheap — no state copy, unlike getState()). */
+  public getPlayRangeStart(): number { return this.state.playRangeStart; }
+  public getPlayRangeEnd(): number { return this.state.playRangeEnd; }
+
   public getCurrentFrame(): number {
     return this.state.currentFrame;
   }

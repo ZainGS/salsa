@@ -31,7 +31,7 @@ import type { ShellRenderModel } from './shell-layout';
 import { GRID_CURVE } from './shell-layout';
 import { ShellLabelAtlas } from './shell-text';
 import { ShellThumbnailAtlas } from './shell-thumbnails';
-import { CartridgeViewer, SHELL_DEPTH_FORMAT, type ViewerRegion } from './shell-cartridge';
+import { CartridgeViewer, SHELL_DEPTH_FORMAT, type ViewerRegion, type CDFace } from './shell-cartridge';
 import { ShellHtmlLayer } from './shell-html-layer';
 import type { RenderTile } from './shell-layout';
 import type { LabelEntry, LabelRequest } from './shell-text';
@@ -44,6 +44,14 @@ import {
 } from './shell-perf';
 import { GpuFrameTimer } from '../core/gpu-frame-timer';
 import { whenStylesheetLoaded } from './shell-chrome-logic';
+import { cdIdlePose, type CDPose } from './shell-cd';
+import {
+  LAUNCH, launchPose, spinDownPose, type LaunchClock, type LaunchPose, type ShellLaunchBeginOptions, type ShellLaunchPresenter,
+} from './shell-launch';
+import {
+  launchRegion, launchCDPose, settleCDPose, viewerLaunchCDPose, viewerSettleCDPose, tilePressPose, chooseLaunchStage, LAUNCH_BLUR_ARC,
+  type LaunchRegion, type LaunchStage,
+} from './shell-launch-pose';
 
 export const FONT_FAMILY = '"Bungee", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 
@@ -1176,6 +1184,18 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 `;
 
+/** A launch fade colour ('#rgb' / '#rrggbb') as 0..1 rgb into `out` (written as-is to the swapchain, like the CSS
+ *  colour the Player paints). Anything else → the Player's #0a0a0a. */
+export function parseLaunchColor(css: string, out: [number, number, number]): [number, number, number] {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec((css ?? '').trim());
+  let hex = m ? m[1] : '0a0a0a';
+  if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
+  out[0] = parseInt(hex.slice(0, 2), 16) / 255;
+  out[1] = parseInt(hex.slice(2, 4), 16) / 255;
+  out[2] = parseInt(hex.slice(4, 6), 16) / 255;
+  return out;
+}
+
 // Win9x window frame as a chrome overlay: raised bevel + green title bar (+ a
 // raised close button with a black ✕) + a separator, with a TRANSPARENT interior
 // so the region's existing content (panel, viewer, …) shows through. Instanced.
@@ -1292,7 +1312,7 @@ const GRID_UP: readonly [number, number, number] = [0, 1, 0];
 /** Every 2D Shell pipeline: the pass has a depth attachment (for the 3D viewer), which they neither test nor write. */
 const SHELL_2D_DEPTH: GPUDepthStencilState = { format: SHELL_DEPTH_FORMAT, depthWriteEnabled: false, depthCompare: 'always' };
 
-export class ShellRenderer {
+export class ShellRenderer implements ShellLaunchPresenter {
   private device: GPUDevice;
   private context: GPUCanvasContext;
   private format: GPUTextureFormat;
@@ -1489,6 +1509,7 @@ export class ShellRenderer {
 
   /** Normalized pointer position (-1..1 from canvas center), drives parallax. */
   setPointer(nx: number, ny: number): void {
+    if (this._reducedMotion) { this.pointerTarget = [0, 0]; return; }   // no parallax with reduced motion
     this.pointerTarget = [Math.max(-1, Math.min(1, nx)), Math.max(-1, Math.min(1, ny))];
   }
 
@@ -1508,6 +1529,210 @@ export class ShellRenderer {
   cancelModeFade(): void { this._fade = null; }
   get modeFadeActive(): boolean { return this._fade !== null; }
 
+  // ── Cart launch (ShellLaunchPresenter; docs/specs/frogcart-cd-art-and-launch.md Part A) ──
+  // SPLIT (2026-10-09): the tapped tray tile only presses (×0.94 and back) and then holds still at its idle pose, dimmed
+  // with the rest of the Shell; the top hero viewer — which the tap switched to that cart's CD — plays the flick, the
+  // spin-up and the fade, drawn over the dim. When the viewer is hidden / too small (phone layout, the project grid)
+  // the tile plays it all itself in a grown viewport (the 'tile' stage). Error / Esc → the spin-down hands the disc back
+  // to its idle motion and the tile whirls on from where it paused. Everything is computed from the clock inside
+  // render(): nothing is rebuilt per frame.
+  private _launch: {
+    opts: ShellLaunchBeginOptions;
+    clock: LaunchClock;
+    phase: 'launch' | 'black' | 'settling';
+    /** Which disc plays the launch (chooseLaunchStage, decided at the tap). */
+    stage: LaunchStage;
+    /** The launching disc's idle bob at the tap (eased out by the flick). */
+    y0: number;
+    /** The tray tile's idle pose at the tap ('viewer' stage: it holds it, pressed). */
+    tileIdle0: CDPose | null;
+    settleStart: number;
+    from: LaunchPose | null;
+    last: LaunchPose | null;
+    blackSent: boolean;
+  } | null = null;
+  private readonly _launchCD: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
+  private readonly _launchTilePose: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
+  private readonly _launchIdle: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
+  private readonly _launchRegion: LaunchRegion = { x: 0, y: 0, w: 0, h: 0, k: 1, offX: 0, offY: 0 };
+  private readonly _launchRgb: [number, number, number] = [0.04, 0.04, 0.04];
+  /** Per cart tile: seconds its idle clock runs behind (it held still for a launch that then failed / was cancelled). */
+  private readonly _tileTimeOffset = new Map<string, number>();
+  /** The launch's 2 scrims (dim under the disc, final fade over everything) need their own uniform buffers. */
+  private launchDimBuf!: GPUBuffer;
+  private launchDimBindGroup!: GPUBindGroup;
+  private launchFadeBuf!: GPUBuffer;
+  private launchFadeBindGroup!: GPUBindGroup;
+  /** prefers-reduced-motion: the tile discs / cutouts hold still (their idle clock is frozen) and parallax rests. */
+  private _reducedMotion = false;
+  private _calmTime = 0;
+
+  /** True from beginLaunch until the spin-down settled — INCLUDING while black (the host is opening the Player). */
+  get launchActive(): boolean { return this._launch !== null; }
+  /** The launch reached black (the loop is stopped; cancelLaunch fades back in). */
+  get launchBlack(): boolean { return this._launch?.phase === 'black'; }
+  /** Which disc plays the current launch (null: none). */
+  get launchStage(): LaunchStage | null { return this._launch?.stage ?? null; }
+
+  setReducedMotion(on: boolean): void {
+    if (on === this._reducedMotion) return;
+    this._reducedMotion = on;
+    this._calmTime = performance.now() / 1000;
+    if (on) { this.pointerTarget = [0, 0]; }
+    if (!this.running) this.render();
+  }
+
+  /** This frame's launch state (prepareLaunchFrame; reused: no allocation per frame).
+   *  tile = drawn LATER in its grown viewport ('tile' stage); pressTile = drawn in place with its press pose ('viewer'
+   *  stage); viewer = the hero viewer's CD is drawn after the dim with the launch pose. */
+  private readonly _lf: {
+    on: boolean; tile: RenderTile | null; pressTile: RenderTile | null; viewer: boolean; slot: number;
+    pose: LaunchPose | null; blur: number; goBlack: boolean; settled: boolean;
+  } = { on: false, tile: null, pressTile: null, viewer: false, slot: -1, pose: null, blur: 0, goBlack: false, settled: false };
+
+  /** The hero viewer region's height (device px), and whether the viewer is drawn at all. */
+  private viewerHeightPx(h: number): number { return Math.max(0, (this.model?.viewerFraction ?? 0) * h); }
+  private viewerVisible(): boolean {
+    const m = this.model;
+    return !!m?.viewer && !m.projectGrid && this.dbg.hero && this._heroReady && !this._loadingDots;
+  }
+
+  /** Evaluate the launch for this frame: the timeline pose (dim / fade), and which disc draws how. */
+  private prepareLaunchFrame(nowMs: number, now: number, w: number, h: number): void {
+    const lf = this._lf;
+    const L = this._launch;
+    lf.on = !!L; lf.tile = null; lf.pressTile = null; lf.viewer = false; lf.slot = -1;
+    lf.pose = null; lf.blur = 0; lf.goBlack = false; lf.settled = false;
+    if (!L) return;
+    const found = this.findLaunchTile(L.opts.slotId);
+    const reduced = !!L.clock.reducedMotion;
+    const m = this.model;
+    const viewerSpec = L.stage === 'viewer' && m?.viewer?.kind === 'cd' && this.viewerVisible() ? m.viewer : null;
+    const region = L.stage === 'tile' && found
+      ? launchRegion(found.tile.rect as [number, number, number, number], w, h, undefined, this._launchRegion) : null;
+    const viewerIdle = viewerSpec ? this.viewer.cdViewerIdlePose(viewerSpec, now, this._launchIdle) : null;
+    if (L.phase === 'launch') {
+      const t = nowMs - L.opts.startMs;
+      const lp = launchPose(t, L.clock);
+      if (region) launchCDPose(lp, t, L.y0, region, this._launchCD);
+      if (viewerIdle) viewerLaunchCDPose(lp, t, L.y0, viewerIdle.scale, this._launchCD);
+      if (L.tileIdle0) tilePressPose(t, L.tileIdle0, this._launchTilePose);
+      lf.pose = lp;
+      lf.goBlack = lp.black;
+    } else if (L.phase === 'black') {
+      lf.pose = L.last;
+      if (L.tileIdle0) tilePressPose(LAUNCH.pressMs, L.tileIdle0, this._launchTilePose);
+    } else if (L.from) {
+      const t = nowMs - L.settleStart;
+      if (region && found) {
+        const idle = cdIdlePose(this.tileClock(now), found.slot * 1.7, this._launchIdle);
+        const sd = settleCDPose(t, L.from, idle, region, reduced, this._launchCD);
+        lf.pose = sd.pose; lf.settled = sd.done;
+      } else if (viewerIdle) {
+        const sd = viewerSettleCDPose(t, L.from, viewerIdle, reduced, this._launchCD);
+        lf.pose = sd.pose; lf.settled = sd.done;
+      } else {
+        const sd = spinDownPose(t, L.from, { reducedMotion: reduced });
+        lf.pose = sd.pose; lf.settled = sd.done;
+      }
+    }
+    if (lf.pose) { L.last = lf.pose; lf.blur = lf.pose.blur * LAUNCH_BLUR_ARC; }
+    if (!lf.settled) {
+      if (found && region) { lf.tile = found.tile; lf.slot = found.slot; }
+      if (viewerIdle) lf.viewer = true;
+      // the tray tile holds its pressed idle pose until the launch fails / is cancelled (then it whirls on)
+      if (found && L.tileIdle0 && L.phase !== 'settling') { lf.pressTile = found.tile; lf.slot = found.slot; }
+    }
+    if (lf.pose && L.phase !== 'black') {
+      try { L.opts.onFrame?.(lf.pose); } catch (e) { console.warn('[Shell] launch onFrame failed:', e); }
+    }
+  }
+
+  /** After the frame was submitted: report black (and stop the loop there) / a settled spin-down. */
+  private finishLaunchFrame(): void {
+    const L = this._launch, lf = this._lf;
+    if (!L || !lf.on) return;
+    if (lf.goBlack && L.phase === 'launch') {
+      L.phase = 'black';
+      if (L.last) L.last = { ...L.last, fade: 1, black: true };
+      this.stop();
+      if (!L.blackSent) { L.blackSent = true; try { L.opts.onBlack(); } catch (e) { console.warn('[Shell] launch onBlack failed:', e); } }
+    } else if (lf.settled && L.phase === 'settling') {
+      this._launch = null;
+      try { L.opts.onFrame?.({ ...(L.last as LaunchPose), dim: 0, fade: 0, chromeOpacity: 1 }); } catch { /* host */ }
+      try { L.opts.onSettled(); } catch (e) { console.warn('[Shell] launch onSettled failed:', e); }
+    }
+  }
+
+  /** The idle clock (s) of the 3D tiles: frozen with reduced motion. */
+  private tileClock(now: number): number { return this._reducedMotion ? this._calmTime : now; }
+  /** A cart tile's idle clock (s): tileClock, minus the time it held still for a launch that did not happen. */
+  private cartTileClock(id: string, now: number): number { return this.tileClock(now) - (this._tileTimeOffset.get(id) ?? 0); }
+
+  /** The tapped CD tile in the current model + its 3D draw slot (the slot also phases its idle whirl). */
+  private findLaunchTile(slotId: string): { tile: RenderTile; slot: number } | null {
+    const tiles = this.model?.tiles;
+    if (!tiles) return null;
+    let slot = 0;
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i];
+      if (!t.cd && !t.billboardKey && !t.discIcon) continue;
+      if (t.cd && t.id === slotId) return { tile: t, slot };
+      slot++;
+    }
+    return null;
+  }
+
+  beginLaunch(opts: ShellLaunchBeginOptions): void {
+    const found = this.findLaunchTile(opts.slotId);
+    const startSec = opts.startMs / 1000;
+    const tileIdle0 = found ? cdIdlePose(this.cartTileClock(opts.slotId, startSec), found.slot * 1.7) : null;
+    const m = this.model;
+    // The viewer takes the launch over when it shows THIS cart's CD (the host switched it at the tap) and is big
+    // enough; reduced motion has no disc motion at all (the fade only), so it stays on the tile path.
+    const stage: LaunchStage = opts.reducedMotion ? 'tile' : chooseLaunchStage({
+      viewerShowsCart: m?.viewer?.kind === 'cd' && m.viewerThumbId === opts.slotId,
+      viewerVisible: this.viewerVisible(),
+      viewerW: this.canvas.width, viewerH: this.viewerHeightPx(this.canvas.height), tileH: found ? found.tile.rect[3] : 0,
+    });
+    const idle0 = stage === 'viewer' && m?.viewer
+      ? this.viewer.cdViewerIdlePose(m.viewer, startSec, { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 }) : tileIdle0;
+    this._launch = {
+      opts, stage,
+      clock: { yaw0: idle0?.spin ?? 0, tilt0: idle0?.tilt, readyAtMs: null, skippedAtMs: null, reducedMotion: opts.reducedMotion },
+      phase: 'launch', y0: idle0?.y ?? 0, tileIdle0: stage === 'viewer' ? tileIdle0 : null,
+      settleStart: 0, from: null, last: null, blackSent: false,
+    };
+    parseLaunchColor(opts.fadeColor, this._launchRgb);
+    this.start();
+  }
+
+  markLaunchReady(nowMs: number): void {
+    const L = this._launch;
+    if (L && L.phase === 'launch' && L.clock.readyAtMs === null) L.clock = { ...L.clock, readyAtMs: nowMs - L.opts.startMs };
+  }
+
+  skipLaunch(nowMs: number): void {
+    const L = this._launch;
+    if (L && L.phase === 'launch' && L.clock.skippedAtMs == null) L.clock = { ...L.clock, skippedAtMs: nowMs - L.opts.startMs };
+  }
+
+  cancelLaunch(nowMs: number): void {
+    const L = this._launch;
+    if (!L || L.phase === 'settling') return;
+    const last = L.last ?? launchPose(Math.max(0, nowMs - L.opts.startMs), L.clock);
+    // From black (the host could not open the Player): fade back in from full black.
+    L.from = L.phase === 'black' ? { ...last, fade: 1, black: false } : last;
+    // The tray tile held still since the tap: its idle clock now runs that much behind, so it whirls on from there.
+    if (L.tileIdle0 && !this._reducedMotion) {
+      const id = L.opts.slotId;
+      this._tileTimeOffset.set(id, (this._tileTimeOffset.get(id) ?? 0) + Math.max(0, nowMs - L.opts.startMs) / 1000);
+    }
+    L.phase = 'settling';
+    L.settleStart = nowMs;
+    this.start();
+  }
+
   /** Arm the `shell:grid-first-frame` / `shell:thumbs-ready` User Timing marks (the host calls it at the flip). */
   armGridMarks(): void { this._gridMarks = 1; }
   private _gridMarks: 0 | 1 | 2 = 0;
@@ -1517,6 +1742,7 @@ export class ShellRenderer {
 
   start(): void {
     if (this.running || this.destroyed) return;
+    if (this._launch?.phase === 'black') return;   // the launch stopped the loop at black (cancelLaunch restarts it)
     this.running = true;
     this.lastTime = performance.now() / 1000;
     const tick = (ts: number) => {
@@ -1568,6 +1794,9 @@ export class ShellRenderer {
   // Reused per-frame scratch objects (no allocation in render()).
   private readonly _uv: ThumbUV = { u0: 0, v0: 0, u1: 0, v1: 0 };
   private readonly _region: ViewerRegion = { x: 0, y: 0, w: 0, h: 0 };
+  /** Reusable CD tile face + its atlas rect (per-frame: no allocation). */
+  private readonly _cdFace: CDFace = { art: null, pattern: null };
+  private readonly _cdUv: ThumbUV = { u0: 0, v0: 0, u1: 0, v1: 0 };
   private readonly _eye: [number, number, number] = [0, 0, 0];
 
   setModel(model: ShellRenderModel): void {
@@ -1777,6 +2006,11 @@ export class ShellRenderer {
     this.scrimBuf = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const bgl = this.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
     this.scrimBindGroup = this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: this.scrimBuf } }] });
+    // The cart launch's dim (under the disc) + final fade (over everything): same pipeline, their own buffers.
+    this.launchDimBuf = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.launchDimBindGroup = this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: this.launchDimBuf } }] });
+    this.launchFadeBuf = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.launchFadeBindGroup = this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: this.launchFadeBuf } }] });
     this.scrimPipeline = this.pipe('scrim', SCRIM_SHADER, (module) => ({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
       vertex: { module, entryPoint: 'vs' },
@@ -2244,6 +2478,9 @@ export class ShellRenderer {
     const dt = Math.min(0.05, Math.max(0, now - this.lastTime));
     this.lastTime = now;
     this.tickAnim(dt);
+    this.prepareLaunchFrame(nowMs, now, w, h);
+    const lf = this._lf;
+    const tileNow = this.tileClock(now);   // the 3D tiles' idle clock (frozen with reduced motion)
 
     // globals + themed ink/accent colors + flags (rainbow patterns, dark blend)
     {
@@ -2495,7 +2732,8 @@ export class ShellRenderer {
         // const fade = this._heroFadeStart > 0 ? Math.min((now - this._heroFadeStart) / 0.5, 1) : 1;
         const heroFade = 1;
         const thumb = m.viewerThumbId ? this.thumbAtlas.touch(m.viewerThumbId, uv) : null;   // the framed hero/selection → keep resident
-        this.viewer.render(pass, region, m.viewer, now, thumb, heroFade);
+        // A cart launch on the viewer draws its CD LATER, over the dim (see the launch block below).
+        if (!lf.viewer) this.viewer.render(pass, region, m.viewer, now, thumb, heroFade);
       }
       // else: hero hidden (draw nothing) until revealHero() — no untextured/white card flash while the logo loads.
       pass.setViewport(0, 0, w, h, 0, 1);   // back to the full canvas for the 2D UI
@@ -2620,15 +2858,23 @@ export class ShellRenderer {
         if (!t.cd && !t.billboardKey && !t.discIcon) continue;
         region.x = t.rect[0]; region.y = t.rect[1]; region.w = t.rect[2]; region.h = t.rect[3];
         if (t.cd) {
-          this.viewer.drawCD(pass, region, null, now, discSlot);  // null cover = holographic (P1)
+          // 'tile' launch stage: the launching disc is drawn LATER, over the dim, in its grown viewport (its uniform
+          // slot stays reserved). 'viewer' stage: the tapped tile holds its pressed idle pose, here, under the dim.
+          if (lf.tile === t) { discSlot++; continue; }
+          // The cart's disc print: its art (an atlas cell, from slot.thumbnailDataUrl) once decoded, else its seeded
+          // pattern (the pattern also shows while the art decodes).
+          const face = this._cdFace;
+          face.art = this.thumbAtlas.touch(t.id, this._cdUv);
+          face.pattern = t.cdPattern ?? null;
+          this.viewer.drawCD(pass, region, face, this.cartTileClock(t.id, now), discSlot, lf.pressTile === t ? this._launchTilePose : null);
           discSlot++;
         } else if (t.billboardKey) {
           const icon = this.thumbAtlas.touch(t.billboardKey, uv);   // system-app / cart icon — always drawn → keep resident
-          this.viewer.drawBillboard(pass, region, t.billboardKey, icon, now, discSlot, m.billboardOutline, m.backdropGrid);
+          this.viewer.drawBillboard(pass, region, t.billboardKey, icon, tileNow, discSlot, m.billboardOutline, m.backdropGrid);
           discSlot++;
         } else if (t.discIcon) {
           const icon = this.thumbAtlas.touch(t.discIcon, uv);   // disc-icon tile — always drawn → keep resident
-          this.viewer.drawDisc(pass, region, icon, now, discSlot);
+          this.viewer.drawDisc(pass, region, icon, tileNow, discSlot);
           discSlot++;
         }
       }
@@ -2649,9 +2895,61 @@ export class ShellRenderer {
       pass.setBindGroup(0, this.scrimBindGroup);
       pass.draw(3);
     }
+
+    // ── Cart launch: dim scrim → depth reset → the posed CD (the hero viewer's, or the tile's in its grown viewport)
+    //    → the final fade over everything ──
+    if (lf.on && lf.pose) {
+      const lp = lf.pose, rgb = this._launchRgb;
+      if (lp.dim > 0.001) {
+        const sd = this.scratch('launchDim', 12);
+        sd[0] = rgb[0]; sd[1] = rgb[1]; sd[2] = rgb[2]; sd[3] = 1;
+        sd[4] = rgb[0]; sd[5] = rgb[1]; sd[6] = rgb[2]; sd[7] = 1;
+        sd[8] = lp.dim; sd[9] = 0; sd[10] = 0; sd[11] = 0;
+        this.device.queue.writeBuffer(this.launchDimBuf, 0, sd, 0, 12);
+        pass.setPipeline(this.scrimPipeline);
+        pass.setBindGroup(0, this.launchDimBindGroup);
+        pass.draw(3);
+      }
+      const t = lf.tile;
+      let drew = false;
+      if (lf.viewer && m.viewer && lp.fade < 0.999) {
+        // the hero viewer's CD, bright over the dim: its own region, depth reset there first (the tiles / chrome below
+        // may have written depth into it)
+        const vh = Math.min(h, Math.ceil(this.viewerHeightPx(h)));
+        this.viewer.resetDepth(pass, w, h, 0, 0, w, vh);
+        const vr = this._region;
+        vr.x = 0; vr.y = 0; vr.w = w; vr.h = this.viewerHeightPx(h);
+        const thumb = m.viewerThumbId ? this.thumbAtlas.touch(m.viewerThumbId, uv) : null;
+        this.viewer.render(pass, vr, m.viewer, now, thumb, 1, this._launchCD, lf.blur);
+        drew = true;
+      } else if (t && lp.fade < 0.999) {
+        const r = this._launchRegion;
+        // the neighbouring tiles' discs wrote depth inside the grown viewport: clear it there first
+        this.viewer.resetDepth(pass, w, h, r.x, r.y, r.w, r.h);
+        const face = this._cdFace;
+        face.art = this.thumbAtlas.touch(t.id, this._cdUv);
+        face.pattern = t.cdPattern ?? null;
+        const vr = this._region;
+        vr.x = r.x; vr.y = r.y; vr.w = r.w; vr.h = r.h;
+        this.viewer.drawCD(pass, vr, face, tileNow, lf.slot, this._launchCD, lf.blur);
+        drew = true;
+      }
+      if (drew) pass.setViewport(0, 0, w, h, 0, 1);
+      if (lp.fade > 0.001) {
+        const fd = this.scratch('launchFade', 12);
+        fd[0] = rgb[0]; fd[1] = rgb[1]; fd[2] = rgb[2]; fd[3] = 1;
+        fd[4] = rgb[0]; fd[5] = rgb[1]; fd[6] = rgb[2]; fd[7] = 1;
+        fd[8] = Math.min(1, lp.fade); fd[9] = 0; fd[10] = 0; fd[11] = 0;
+        this.device.queue.writeBuffer(this.launchFadeBuf, 0, fd, 0, 12);
+        pass.setPipeline(this.scrimPipeline);
+        pass.setBindGroup(0, this.launchFadeBindGroup);
+        pass.draw(3);
+      }
+    }
     pass.end();
 
     this.device.queue.submit([encoder.finish()]);
+    this.finishLaunchFrame();
 
     // User Timing: the first grid frame after a home → illustrations flip, then the frame where every on-screen
     // card that has a thumbnail shows it.
@@ -2685,6 +2983,9 @@ export class ShellRenderer {
     this.gridBuf.destroy();
     this.windowBuf.destroy();
     this.scrimBuf?.destroy();
+    this.launchDimBuf?.destroy();
+    this.launchFadeBuf?.destroy();
+    this._launch = null;
     this.wireGridVB?.destroy();
     this.wireGridIB?.destroy();
     this.wireGridUBO?.destroy();

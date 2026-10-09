@@ -17,7 +17,10 @@ import { createPackagingHost } from '../packaging/packaging-host-impl';
 import { PackagingComposite } from '../packaging/packaging-composite';
 import { createCDKit, rebuildCDKitUnderRoot, setCDKitScrub, setCDPieceArt, setCDTrayClear, setCDTrayCardFold, removeCDKit, CD_MM_TO_WORLD, type CDKitHost, type CDKitState, type CDPieceMaterial } from '../packaging/cd/cd-kit';
 import { cdComponentView, CD_ALL_PIECES, type CDPiece, type CDComponent } from '../packaging/cd/cd-kit-assembly';
-import { cdPrintSpec, CD_PRINT_PIECES, type CDPrintSpec } from '../packaging/cd/cd-print';
+import { cdPrintSpec, CD_PRINT_PIECES, CD_DISC_SAFE_R, type CDPrintSpec } from '../packaging/cd/cd-print';
+import { renderCDDiscArt, type CDDiscArtFit } from '../renderer/3d/cd-disc/cd-disc-art';
+import { createCartDiscPreview, type CartDiscPreview, type CartDiscPreviewOptions } from '../renderer/shell/cart-disc-preview';
+import { CART_DISC_TOOLS, type CartDiscTools } from '../renderer/3d/cd-disc/cart-disc-tools';
 import { buildPrintPdf, rgbaToRgb } from '../packaging/print-pdf';
 import { SceneAuthoringAPI } from './scene-authoring-api';
 import { AssetLibrary } from './assets/asset-library';
@@ -76,7 +79,7 @@ import { removeVectorLayerWithContent, recoverOrphanedVectorContent, type Vector
 import { OnionSkinConfig } from '../animation';
 import { ConnectorService, SnapResult } from './connector-service';
 import { LayerBlendMode, RasterCompositor, type CompositorLayerInfo } from '../renderer/raster/core/raster-compositor';
-import { DitherConfig, DitherAlgorithm, DitherColorMode, defaultDitherConfig, DitherEngine, DITHER_ALGORITHMS } from '../renderer/raster/effects/dither-engine';
+import { DitherConfig, DitherAlgorithm, DitherColorMode, defaultDitherConfig, DitherEngine, DITHER_ALGORITHMS, ditherEdgeWidth } from '../renderer/raster/effects/dither-engine';
 import { TextEffectEngine, TextEffectType, TextEffectConfig, TextEffectParams, TextCaptureConfig, ChromaticAberrationParams, GlowParams, WaveParams, GlitchParams, OutlineParams, CustomShaderParams, CustomShaderCompileResult, defaultChromaticAberration, defaultGlow, defaultWave, defaultGlitch, defaultOutline, defaultCustomShader } from '../renderer/raster/effects/text-effect-engine';
 import type { FrameLinkAnimation, FrameLinkAnimationType, FrameLinkLoopMode } from '../animation';
 import { DEFAULT_FRAME_LINK_ANIMATION } from '../animation';
@@ -2037,19 +2040,16 @@ class ShapeManager {
     /**
      * Configure the magic wand options on the selection service.
      * These are used when the magic wand is the active selection tool
-     * and the user clicks on the canvas.
+     * and the user clicks on the canvas. `mode` = the wand's New / Add / Subtract (Shift / Alt held on a click still
+     * override it). A `referenceLayerId` key that is empty / undefined clears the reference layer.
      */
-    public setMagicWandOptions(opts: { tolerance?: number; contiguous?: boolean; referenceLayerId?: string }): void {
-        let refTex: GPUTexture | undefined;
-        if (opts.referenceLayerId && this.rasterLayerManager) {
-            const refLayer = this.rasterLayerManager.getLayerById(opts.referenceLayerId);
-            refTex = refLayer?.texture ?? undefined;
+    public setMagicWandOptions(opts: { tolerance?: number; contiguous?: boolean; referenceLayerId?: string; mode?: 'new' | 'add' | 'subtract' }): void {
+        const wand: Parameters<RasterSelectionService['setMagicWandOptions']>[0] = { tolerance: opts.tolerance, contiguous: opts.contiguous, mode: opts.mode };
+        if ('referenceLayerId' in opts) {
+            const refLayer = opts.referenceLayerId ? this.rasterLayerManager?.getLayerById(opts.referenceLayerId) : undefined;
+            wand.referenceLayerTexture = refLayer?.texture ?? null;
         }
-        this.rasterSelectionService?.setMagicWandOptions({
-            tolerance: opts.tolerance,
-            contiguous: opts.contiguous,
-            referenceLayerTexture: refTex,
-        });
+        this.rasterSelectionService?.setMagicWandOptions(wand);
     }
 
     // ── Transform Convenience Methods ───────────────────────────────
@@ -2705,7 +2705,8 @@ class ShapeManager {
      * behaves near the layer's CONTENT edge (where the painted alpha ends: a stroke's outline,
      * a filled shape's rim).
      *
-     * - `width`: px band the effects ramp across. **0 disables all three** (the default).
+     * - `width`: px band the effects ramp across, 0..DITHER_EDGE_WIDTH_MAX (4096; wider clamps, NaN / negative = 0).
+     *   **0 disables all three** (the default). Any width ramps smoothly (a jump-flood distance since 2026-10-09).
      * - `fade` (0–1): the dither fades back to the original toward the edge (pattern dissolves).
      * - `shrink` (-1..1): dot-size ramp at the edge. POSITIVE shrinks the dots until they vanish
      *   at the boundary — direction-aware (rev 4): it shrinks whichever color currently forms the
@@ -2731,7 +2732,7 @@ class ShapeManager {
      */
     public setDitherEdgeEffects(opts: { width?: number; fade?: number; shrink?: number; density?: number; mode?: 'content' | 'canvas' | 'both'; seed?: number }): void {
         const cfg = this.getDitherConfig();
-        if (opts.width !== undefined) cfg.edgeWidth = Math.max(0, Math.min(512, opts.width));
+        if (opts.width !== undefined) cfg.edgeWidth = ditherEdgeWidth({ edgeWidth: opts.width });   // 0..DITHER_EDGE_WIDTH_MAX; NaN / negative = 0
         if (opts.fade !== undefined) cfg.edgeFade = Math.max(0, Math.min(1, opts.fade));
         if (opts.shrink !== undefined) cfg.edgeShrink = Math.max(-1, Math.min(1, opts.shrink));   // signed: negative = grow
         if (opts.density !== undefined) cfg.edgeDensity = Math.max(0, Math.min(1, opts.density));
@@ -3294,10 +3295,12 @@ class ShapeManager {
         return [];
     }
 
-    /** Set default arrowhead styles for newly drawn lines. */
-    public setDefaultArrowheads(arrowStart: ArrowheadStyle, arrowEnd: ArrowheadStyle): void {
+    /** Set default arrowhead styles (and, optionally, size — a multiple of the stroke width; Line.arrowSize) for
+     *  newly drawn lines. The host's Arrowhead Size slider did nothing before the size argument (audit 2026-10-09). */
+    public setDefaultArrowheads(arrowStart: ArrowheadStyle, arrowEnd: ArrowheadStyle, arrowSize?: number): void {
         this.lineDrawingService.defaultArrowStart = arrowStart;
         this.lineDrawingService.defaultArrowEnd = arrowEnd;
+        if (arrowSize !== undefined) this.lineDrawingService.setDefaultArrowSize(arrowSize);
     }
 
     /** Stroke colour (hex) for newly drawn lines / arrows — the host's current colour (they drew a fixed grey). */
@@ -4434,11 +4437,20 @@ class ShapeManager {
         this._stampCDKit(s);   // persist the new scrub
         return true;
     }
-    /** Map an uploaded image onto one printed piece (frontInsert / trayCard / disc / booklet). */
-    public setCDPieceArt3D(rootId: string, piece: CDPiece, source: File | Blob | ImageBitmap): Promise<boolean> {
+    /** Map an uploaded image onto one printed piece (frontInsert / trayCard / disc / booklet). The image COVERS the
+     *  piece (cropped to its print aspect, never stretched); `fit` zooms / pans the crop (cd-disc-art.ts — the same
+     *  fitting as a .frogcart's disc art). The stored art is the crop, so the print export is unstretched too. */
+    public async setCDPieceArt3D(rootId: string, piece: CDPiece, source: File | Blob | ImageBitmap, fit?: Partial<CDDiscArtFit>): Promise<boolean> {
         const s = this._cdKits.get(rootId);
-        if (!s) return Promise.resolve(false);
-        return setCDPieceArt(this._cdKitHost, s, piece, source);
+        if (!s) return false;
+        let art: File | Blob | ImageBitmap = source;
+        let aspect = 0;
+        try { const spec = cdPrintSpec(piece); aspect = spec.widthMm / spec.heightMm; } catch { /* not a printed piece: as is */ }
+        if (aspect > 0) {
+            try { art = await renderCDDiscArt(source, fit, { aspect, maxSize: 4096, mime: 'image/png' }); }
+            catch (e) { console.warn('[CDKit] art fit failed; uploading the image as is', e); }
+        }
+        return setCDPieceArt(this._cdKitHost, s, piece, art);
     }
     /** Delete a CD kit (whole subtree). */
     public deleteCDKit3D(rootId: string): boolean {
@@ -4614,6 +4626,12 @@ class ShapeManager {
                 const bmp = await createImageBitmap(await mgr.exportToBlob('image/png'));
                 ctx.drawImage(bmp, 0, 0, spec.widthPx, spec.heightPx);
             } catch (e) { console.warn('[CDKit] print: art draw failed', e); }
+        }
+        if (piece === 'disc') {
+            // The clear hub ring: no ink inside the stacking-ring safe radius (as the 3D disc shows it).
+            const c = spec.widthPx / 2, r = CD_DISC_SAFE_R / 25.4 * spec.dpi;
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath(); ctx.arc(c, c, r, 0, Math.PI * 2); ctx.fill();
         }
         if (opts?.marks) this._drawCDPrintMarks(ctx, spec);
         return { canvas, ctx, spec };
@@ -8382,6 +8400,10 @@ class ShapeManager {
      *  constrainAxis3D X / Y / Z apply while it runs). Elsewhere a drag keeps its old meaning. Default ON. */
     public setMeshEditDragMovesSelection3D(on: boolean): void { this._meshEditPointerController.dragMovesSelection = !!on; }
     public getMeshEditDragMovesSelection3D(): boolean { return this._meshEditPointerController.dragMovesSelection; }
+    /** Edit Mesh Drag Lock: no press-drag moves geometry (neither the selection nor a single vertex); a press only
+     *  selects, navigation and the gizmo handles still work. Default OFF. */
+    public setMeshEditDragLock3D(on: boolean): void { this._meshEditPointerController.dragLock = !!on; }
+    public getMeshEditDragLock3D(): boolean { return this._meshEditPointerController.dragLock; }
 
     /** The vertex / edge / face (the current selection mode) under a client (CSS) point in Edit Mesh, and whether it is
      *  selected — null when nothing is in reach or no mesh is in Edit Mesh. Edges are half-edge indices (what
@@ -12121,8 +12143,36 @@ class ShapeManager {
         if (effects.length === 0) return captured;
 
         const result = engine.applyChain(captured.texture, effects);
-        // captured.texture was consumed by applyChain if effects > 0
+        // applyChain never destroys its source: free the capture (it leaked one texture per call before 2026-10-09)
+        if (result !== captured.texture) captured.texture.destroy();
         return { texture: result, width: captured.width, height: captured.height };
+    }
+
+    /**
+     * Draw effected text into a 2D `<canvas>` (resized to the result) — the balloon panel's Text Effects preview.
+     * Captures → effects → reads back → draws; every GPU texture it makes is destroyed. Resolves false without a
+     * GPU / text-effect engine or 2D context.
+     */
+    public async previewEffectedTextToCanvas(
+        canvas: HTMLCanvasElement,
+        textConfig: TextCaptureConfig,
+        effects: TextEffectConfig[],
+    ): Promise<boolean> {
+        const engine = this.getTextEffectEngine();
+        const ctx = canvas?.getContext?.('2d');
+        if (!engine || !ctx) return false;
+        const result = this.createEffectedText(textConfig, effects);
+        if (!result) return false;
+        try {
+            const px = await engine.readPixels(result.texture, result.width, result.height);
+            const w = Math.min(result.width, result.texture.width), h = Math.min(result.height, result.texture.height);
+            if (canvas.width !== w) canvas.width = w;
+            if (canvas.height !== h) canvas.height = h;
+            ctx.putImageData(new ImageData(px, w, h), 0, 0);
+            return true;
+        } finally {
+            result.texture.destroy();
+        }
     }
 
     /**
@@ -15233,9 +15283,28 @@ class ShapeManager {
     private _uiPlayerMode = false;
     public get isUIPlayerModeActive(): boolean { return this._uiPlayerMode; }
 
+    /**
+     * A LIVE 3D preview of a cart's Shell disc in `canvas` (the export dialog's "Disc art" field): the Shell's own CD
+     * shader + idle motion, on this editor's GPU device, in its own canvas + rAF loop (never the editor's). Update it
+     * with setPattern / setArt / setFit; dispose() on close. Null while the GPU is not ready (or the canvas has no
+     * WebGPU context). See renderer/shell/cart-disc-preview.ts.
+     */
+    public createCartDiscPreview(canvas: HTMLCanvasElement | OffscreenCanvas, opts?: CartDiscPreviewOptions): CartDiscPreview | null {
+        let device: GPUDevice | null = null;
+        try { device = this.webgpuRenderer?.getDevice() ?? null; } catch { device = null; }
+        if (!device) return null;
+        try { return createCartDiscPreview(device, canvas, opts); }
+        catch (e) { console.warn('[frogcart] disc preview unavailable:', e); return null; }
+    }
+
+    /** The disc-art helpers for the export UI: fit / pan / zoom maths, guides, renderArt (the cart's disc Blob),
+     *  pattern seeds (renderer/3d/cd-disc/cart-disc-tools.ts). */
+    public get cartDisc(): CartDiscTools { return CART_DISC_TOOLS; }
+
     /** Export the current project as a `.frogcart` Blob — the full project package wrapped with the frogcart
      *  manifest, the pre-parsed state machines, and the Player config (spec §Export API). The host triggers the
-     *  download / upload. */
+     *  download / upload. Disc (1.1): `meta.cdArt` = the disc image (renderCDDiscArt's square Blob; null / omitted =
+     *  none: the disc prints its pattern), `meta.cdPattern` = the pattern seed (omitted = derived from the cart id). */
     public async exportFrogcart(meta: FrogcartMeta, playerConfig?: Partial<FrogcartPlayerConfig>): Promise<Blob> {
         const scenePackage = await this.packProject();
         const stateMachineJSON = this.ui.listUILayers().length ? JSON.stringify(this.ui.serialize()) : null;
@@ -15255,6 +15324,17 @@ class ShapeManager {
      *  auto-enter Player mode — call `enterUIPlayerMode(config.initialState)` when hosting playback. */
     public async importFrogcart(file: File | Blob): Promise<{ manifest: FrogcartManifest; playerConfig: FrogcartPlayerConfig }> {
         const { manifest, playerConfig, scenePackage, sounds } = await unpackFrogcart(file);
+        // ★ A cart is NOT a document (frogcart-cd-art-and-launch.md, autosave risk): restoring it replaces the engine's
+        // whole document, but the document id still named the illustration open before (the Shell → Player and
+        // dashboard → Player paths). Any save from here on — a stroke debounce, a timer the host left running, a
+        // deferred / explicit saveNow, a tab-hide flush, a save after exitUIPlayerMode — would have written the CART's
+        // scene into that illustration. Drop the id first (synchronously, before the restore's load guard — as
+        // startBlankDocument does): every save then has no target and is skipped (DocumentPersistence: "no document
+        // id"), until the host opens a document (loadDocument / enableAutoSave / setCurrentDocId / startBlankDocument).
+        // Autosave stops too: there is nothing to save. A malformed cart threw above, leaving the open document as it was.
+        this.disableAutoSave();
+        this.currentDocId = '';
+        this.currentDocName = manifest.title || 'FrogCart';
         await this.unpackProject(scenePackage);
         // Re-register bundled audio as object URLs — the cart's playSound actions work with no host wiring.
         if (sounds.length && typeof URL !== 'undefined' && URL.createObjectURL) {
