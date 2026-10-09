@@ -609,13 +609,13 @@ export function gridProjectX(cx: number, viewportW: number): { sc: number; projX
   return { sc, projX: viewportW / 2 + (cx - viewportW / 2) * sc };
 }
 
-// Fixed-size cards (mobile-parity UI-14): every card is the same size whatever the project count; more projects
-// add identical cards, left-aligned, wrapping to new rows, scrolled vertically. All sizes are CSS px × DPR
-// (the layout works in canvas device px).
+// Width-only card size (mobile-parity UI-14 + columns-first fit): every card is the same size whatever the project
+// count; more projects add identical cards, left-aligned, wrapping to new rows, scrolled vertically. All sizes are
+// CSS px × DPR (the layout works in canvas device px).
 
-/** Card width (CSS px) on a wide viewport. */
+/** MINIMUM card width (CSS px) on a wide viewport (cards widen up to fill whole rows). */
 export const PROJECT_TILE_W_CSS = 220;
-/** Card width (CSS px) when the viewport is narrower than {@link PROJECT_TILE_COMPACT_BELOW_CSS}. */
+/** Minimum card width (CSS px) when the viewport is narrower than {@link PROJECT_TILE_COMPACT_BELOW_CSS}. */
 export const PROJECT_TILE_W_COMPACT_CSS = 180;
 /** Viewport width (CSS px) below which the compact card width is used. */
 export const PROJECT_TILE_COMPACT_BELOW_CSS = 900;
@@ -725,9 +725,10 @@ export function projectCardTitleH(item: Pick<ProjectGridItem, 'rect' | 'titleH'>
 }
 
 /**
- * Lay out the illustrations thumbnail grid: FIXED-size cards (220 CSS px wide, 180 under 900 CSS px, × `dpr`;
- * aspect {@link PROJECT_TILE_ASPECT}) in left-aligned rows that wrap, with vertical `scrollY` applied. The card
- * size never depends on the project count. `topMargin` (device px) is where the first row starts — the caller
+ * Lay out the illustrations (and packaging) thumbnail grid: cols = how many MINIMUM-width cards fit (220 CSS px,
+ * 180 under 900 CSS px, × `dpr`), then card width = (usable − gap·(cols − 1)) / cols so full rows reach the right
+ * margin exactly; aspect {@link PROJECT_TILE_ASPECT}; left-aligned rows that wrap, vertical `scrollY` applied. The
+ * card size depends on the viewport width only, never on the project count. `topMargin` (device px) is where the first row starts — the caller
  * passes the chip row's bottom + a gap; omitted → a default single chip row. Returns the cards (base rects,
  * pre-curve) + total content height for scroll clamping.
  */
@@ -743,13 +744,18 @@ export function computeProjectGrid(
   const sideMargin = projectGridSideMargin(viewportW, d);
   const usableW = Math.max(1, viewportW - 2 * sideMargin);
   const cssW = viewportW / d;
-  // Fixed card width; only a viewport narrower than one card shrinks it (never stretches it).
-  const tileW = Math.min(usableW, (cssW < PROJECT_TILE_COMPACT_BELOW_CSS ? PROJECT_TILE_W_COMPACT_CSS : PROJECT_TILE_W_CSS) * d);
-  const tileH = Math.round(tileW * PROJECT_TILE_ASPECT);
-  const titleH = Math.max(PROJECT_TITLE_H_CSS * d, tileH * 0.10);
   const gap = PROJECT_GAP_CSS * d;
   const rowGap = PROJECT_ROW_GAP_CSS * d;
-  const cols = Math.max(1, Math.floor((usableW + gap) / (tileW + gap)));
+  // Columns first (CSS `repeat(auto-fill, minmax(min, 1fr))`): as many columns of the MINIMUM card width as fit,
+  // then the cards widen so a full row ends exactly on the right margin (no right-hand gap). The size depends on
+  // the width only — 1–2 projects keep it and sit at the left (never stretched across). A viewport narrower than
+  // one minimum card gets one card shrunk to fit. No max cap: flooring keeps a card < min + (min + gap) / cols,
+  // i.e. ≲ 1.5× min from 2 columns up; only a 1-column (phone portrait) layout goes full-width.
+  const minW = (cssW < PROJECT_TILE_COMPACT_BELOW_CSS ? PROJECT_TILE_W_COMPACT_CSS : PROJECT_TILE_W_CSS) * d;
+  const cols = Math.max(1, Math.floor((usableW + gap) / (minW + gap)));
+  const tileW = (usableW - gap * (cols - 1)) / cols;
+  const tileH = Math.round(tileW * PROJECT_TILE_ASPECT);
+  const titleH = Math.max(PROJECT_TITLE_H_CSS * d, tileH * 0.10);
   if (viewportW <= 0 || viewportH <= 0 || ids.length === 0) {
     return { items: [], contentHeight: 0, cols, tileW, tileH };
   }

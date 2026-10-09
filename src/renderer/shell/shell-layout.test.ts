@@ -23,26 +23,40 @@ const ids = (n: number) => Array.from({ length: n }, (_, i) => `p${i}`);
 /** Deterministic stand-in for canvas measureText: 0.6 em per character. */
 const measure = (text: string, fontPx: number) => text.length * fontPx * 0.6;
 
-describe('computeProjectGrid — fixed-size cards (UI-14)', () => {
-  const sizes: [number, number][] = [[390, 844], [800, 1280], [1280, 800], [1920, 1080]];
+describe('computeProjectGrid — columns-first cards (UI-14, no right gap)', () => {
+  // phone portrait / phone landscape / tablet portrait / tablet landscape / desktop
+  const sizes: [number, number][] = [[390, 844], [844, 390], [800, 1280], [1280, 800], [1920, 1080]];
 
   for (const dpr of [1, 2]) {
     for (const [cssW, cssH] of sizes) {
       const W = cssW * dpr, H = cssH * dpr;
-      it(`${cssW}×${cssH} @${dpr}x: card size is constant for 1, 3 and 12 projects`, () => {
-        const expectedW = (cssW < 900 ? PROJECT_TILE_W_COMPACT_CSS : PROJECT_TILE_W_CSS) * dpr;
-        for (const n of [1, 3, 12]) {
+      it(`${cssW}×${cssH} @${dpr}x: same card size for 1, 2, 3 and 12 projects; ≥ the minimum; full rows end on the right margin`, () => {
+        const minW = (cssW < 900 ? PROJECT_TILE_W_COMPACT_CSS : PROJECT_TILE_W_CSS) * dpr;
+        const gap = 12 * dpr;
+        const margin = projectGridSideMargin(W, dpr);
+        const usable = W - 2 * margin;
+        const ref = computeProjectGrid(W, H, ids(12), 0, dpr);
+        // cols = floor((usable + gap) / (min + gap)); tileW = (usable − gap·(cols − 1)) / cols
+        expect(ref.cols).toBe(Math.max(1, Math.floor((usable + gap) / (minW + gap))));
+        expect(ref.tileW).toBeCloseTo((usable - gap * (ref.cols - 1)) / ref.cols, 6);
+        expect(ref.tileW).toBeGreaterThanOrEqual(minW - 1e-6);
+        expect(ref.tileH).toBe(Math.round(ref.tileW * PROJECT_TILE_ASPECT));
+        // A full row reaches the right margin exactly (the old fixed-size layout left a gap there).
+        const lastInRow0 = ref.items[ref.cols - 1];
+        expect(lastInRow0.rect[0] + lastInRow0.rect[2]).toBeCloseTo(W - margin, 6);
+        for (const n of [1, 2, 3, 12]) {
           const g = computeProjectGrid(W, H, ids(n), 0, dpr);
           expect(g.items).toHaveLength(n);
-          expect(g.tileW).toBe(expectedW);
-          expect(g.tileH).toBe(Math.round(expectedW * PROJECT_TILE_ASPECT));
-          for (const it of g.items) {
-            expect(it.rect[2]).toBe(expectedW);
-            expect(it.rect[3]).toBe(g.tileH);
-            // Every card stays inside the viewport horizontally (left-aligned, no overflow).
-            expect(it.rect[0]).toBeGreaterThanOrEqual(0);
-            expect(it.rect[0] + it.rect[2]).toBeLessThanOrEqual(W);
-          }
+          expect(g.cols).toBe(ref.cols);
+          expect(g.tileW).toBe(ref.tileW);   // never stretched for a short list
+          expect(g.tileH).toBe(ref.tileH);
+          g.items.forEach((it, i) => {
+            expect(it.rect[2]).toBe(ref.tileW);
+            expect(it.rect[3]).toBe(ref.tileH);
+            // Left-aligned at the column positions of a full row; never past the right margin.
+            expect(it.rect[0]).toBeCloseTo(margin + (i % g.cols) * (ref.tileW + gap), 6);
+            expect(it.rect[0] + it.rect[2]).toBeLessThanOrEqual(W - margin + 1e-6);
+          });
         }
       });
 
@@ -63,6 +77,56 @@ describe('computeProjectGrid — fixed-size cards (UI-14)', () => {
     expect(computeProjectGrid(1920, 1080, ids(12), 0).cols).toBe(7);
   });
 
+  it('worked widths: phone full-width, tablet + desktop cards a little over the minimum', () => {
+    const w = (W: number, H: number) => { const g = computeProjectGrid(W, H, ids(12), 0); return [g.cols, g.tileW]; };
+    // 390: margin 16 → usable 358 → 1 col of 358 (was 180 + a 178 px right gap)
+    expect(w(390, 844)[0]).toBe(1); expect(w(390, 844)[1]).toBeCloseTo(358, 6);
+    // 844 (phone landscape): margin 25.32 → usable 793.36 → 4 cols of 189.34
+    expect(w(844, 390)[0]).toBe(4); expect(w(844, 390)[1]).toBeCloseTo((793.36 - 36) / 4, 6);
+    // 800 (tablet portrait): margin 24 → usable 752 → 3 cols of 242.67
+    expect(w(800, 1280)[0]).toBe(3); expect(w(800, 1280)[1]).toBeCloseTo((752 - 24) / 3, 6);
+    // 1280 (tablet landscape): margin 38.4 → usable 1203.2 → 5 cols of 231.04
+    expect(w(1280, 800)[0]).toBe(5); expect(w(1280, 800)[1]).toBeCloseTo((1203.2 - 48) / 5, 6);
+    // 1920: margin 48 → usable 1824 → 7 cols of 250.29 (≈ 1.14× the 220 minimum)
+    expect(w(1920, 1080)[0]).toBe(7); expect(w(1920, 1080)[1]).toBeCloseTo((1824 - 72) / 7, 6);
+  });
+
+  it('from 2 columns up a card stays under ~1.5× the minimum (no cap needed)', () => {
+    for (let W = 300; W <= 3000; W += 7) {
+      const g = computeProjectGrid(W, 900, ids(3), 0);
+      if (g.cols < 2) continue;
+      const minW = W < 900 ? PROJECT_TILE_W_COMPACT_CSS : PROJECT_TILE_W_CSS;
+      expect(g.tileW).toBeGreaterThanOrEqual(minW - 1e-6);
+      expect(g.tileW).toBeLessThan(1.5 * minW + 12 / 2 + 1e-6);
+    }
+  });
+
+  it('the last partial row keeps the card size and starts at the left margin', () => {
+    const W = 1280, H = 800;
+    const g = computeProjectGrid(W, H, ids(7), 0);   // 5 + 2
+    const x0 = projectGridSideMargin(W);
+    const row1 = g.items.slice(5);
+    expect(row1).toHaveLength(2);
+    expect(row1[0].rect[0]).toBeCloseTo(x0, 6);
+    expect(row1[1].rect[0]).toBeCloseTo(g.items[1].rect[0], 6);
+    for (const it of row1) { expect(it.rect[2]).toBe(g.tileW); expect(it.rect[3]).toBe(g.tileH); }
+    expect(row1[1].rect[1]).toBe(row1[0].rect[1]);
+  });
+
+  it('rotation recomputes the columns and refits the right edge (portrait ↔ landscape)', () => {
+    for (const dpr of [1, 2]) {
+      const P = computeProjectGrid(800 * dpr, 1280 * dpr, ids(10), 0, dpr);
+      const L = computeProjectGrid(1280 * dpr, 800 * dpr, ids(10), 0, dpr);
+      expect(L.cols).toBeGreaterThan(P.cols);
+      for (const [g, W] of [[P, 800 * dpr], [L, 1280 * dpr]] as const) {
+        const last = g.items[g.cols - 1];
+        expect(last.rect[0] + last.rect[2]).toBeCloseTo(W - projectGridSideMargin(W, dpr), 6);
+      }
+      // Back to portrait → the identical layout (pure function of the size).
+      expect(computeProjectGrid(800 * dpr, 1280 * dpr, ids(10), 0, dpr)).toEqual(P);
+    }
+  });
+
   it('left-aligned and wraps into rows of `cols` identical cards', () => {
     const W = 1280, H = 800;
     const g = computeProjectGrid(W, H, ids(12), 0);
@@ -75,10 +139,12 @@ describe('computeProjectGrid — fixed-size cards (UI-14)', () => {
     const pitch = rowStarts[1].rect[1] - rowStarts[0].rect[1];
     expect(pitch).toBeGreaterThan(g.tileH);
     for (let r = 1; r < rows; r++) expect(rowStarts[r].rect[1] - rowStarts[r - 1].rect[1]).toBeCloseTo(pitch, 6);
-    // One project sits at the left (not stretched across / centred).
-    const one = computeProjectGrid(W, H, ids(1), 0);
-    expect(one.items[0].rect[0]).toBeCloseTo(x0, 6);
-    expect(one.items[0].rect[2]).toBe(g.tileW);
+    // One / two projects sit at the left (not stretched across / centred), at the full-row card size.
+    for (const n of [1, 2]) {
+      const few = computeProjectGrid(W, H, ids(n), 0);
+      expect(few.items[0].rect[0]).toBeCloseTo(x0, 6);
+      for (const it of few.items) expect(it.rect[2]).toBe(g.tileW);
+    }
   });
 
   it('content height grows with rows; scrollY shifts every card up', () => {

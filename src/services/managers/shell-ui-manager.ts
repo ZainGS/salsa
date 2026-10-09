@@ -1410,7 +1410,7 @@ export class ShellUIManager {
 
   /** Illustrations mode: build the curved thumbnail grid (one card per project)
    *  plus the floating Back / New Project chips, and clamp the scroll.
-   *  Cards are a FIXED size (CSS px × DPR, mobile-parity UI-14); chips are sized
+   *  Card size follows the width only (min CSS px × DPR, widened so full rows fill the width; UI-14); chips are sized
    *  from their measured labels so they never clip. */
   private buildProjectGrid(model: ShellRenderModel): void {
     this.gridScrollY = this.layoutProjectGrid(model, this.gridScrollY, this.view.hoveredSlotId);
