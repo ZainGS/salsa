@@ -30,20 +30,20 @@ export const LAUNCH = {
    *  (2026-10-09: was easeOutCubic in 550 ms — it stopped too abruptly; quart + longer = a long gentle settle.) */
   flickOmega0: (4 * 1.5 * 2 * Math.PI) / 1200,
   /** The flick turns at least this many turns (and less than one more) to the front. */
-  flickTurns: 2,
+  flickTurns: 1,
   /** The flick (2026-10-09): CRUISE at this speed (fast quick turns), then SETTLE — ease out (quart, from that
    *  speed to rest) over flickSettleMs. Every flick: the same speed + the same settle; only the cruise varies (to land
-   *  on the front). With flickTurns 2 the turn is 2–3 turns. */
-  flickCruiseRevPerSec: 5,
-  flickSettleMs: 1000,
+   *  on the front). With flickTurns 1 the turn is 1–2 turns. */
+  flickCruiseRevPerSec: 4,   // (2026-10-09: fewer, slower turns — 1–2 turns — at about the same timing)
+  flickSettleMs: 667,
   /** The settle eases out PAST the front by this much (2026-10-09), then snaps back to face the viewer. */
-  flickOvershootDeg: 12,
+  flickOvershootDeg: 15,
   /** The snap back is a RUBBER BAND (2026-10-09): an underdamped spring released from the stretched overshoot — it
    *  pulls back with growing speed, swings a few degrees past the front the other way and settles. This long. */
-  flickSnapMs: 450,
+  flickSnapMs: 300,
   /** The spring: damping ratio (lower = bouncier) and natural period. */
   flickSnapZeta: 0.45,
-  flickSnapPeriodMs: 280,
+  flickSnapPeriodMs: 187,
   /** The pull-back starts at this fraction of the settle — the overshoot is almost at rest (stretched). */
   flickSnapAt: 0.93,
   /** The disc flies from its viewer / tile to the canvas centre over this long (easeOutQuart: it moves at once and
