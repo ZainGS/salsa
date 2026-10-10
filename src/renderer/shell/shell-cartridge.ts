@@ -382,6 +382,7 @@ export class CartridgeViewer {
   private _cdFaceK = 0;            // 0 idle .. 1 facing (tilt / bob blend)
   private _cdFaceKey = '';
   private _cdPopStart = -1;
+  private _cdSkipNextAppear = false;
   private static readonly CD_IDLE_W = (Math.PI * 2) / 12;   // the old whirl: one turn / 12 s
 
   private depthTex: GPUTexture | null = null;
@@ -594,6 +595,13 @@ export class CartridgeViewer {
    * appear spin-up, the -24° tilt, the bob, the ×1.2 size with the appear pop-in. A spec the viewer is not showing yet
    * (it switches on its next render) counts as just appeared. The cart launch starts from this pose.
    */
+  /** Count `spec` as shown long ago: no appear pop-in / spin-up the next time it renders (the cart RETURN — its disc
+   *  is already there). */
+  skipAppear(spec: ViewerSpec, timeSec: number): void {
+    this.appearKey = spec.billboardKey ?? ('#' + spec.kind);
+    this.appearStart = timeSec - 10;
+  }
+
   cdViewerIdlePose(spec: ViewerSpec, timeSec: number, out: CDPose): CDPose {
     const key = spec.billboardKey ?? ('#' + spec.kind);
     const age = key === this.appearKey ? Math.max(0, timeSec - this.appearStart) : 0;
@@ -611,6 +619,20 @@ export class CartridgeViewer {
     out.roll = 0;
     out.scale = 1.2 * grow * pop * (spec.scale ?? 1);
     return out;
+  }
+
+  /** Resume the CD from its face-on return pose. */
+  syncCDYaw(yaw: number, timeSec: number, facing: boolean): void {
+    const TAU = Math.PI * 2;
+
+    this._cdYaw = TAU * Math.round(yaw / TAU);
+    this._cdVel = 0;
+    this._cdLastT = timeSec;
+    this._cdTween = null;
+    this._cdFacing = facing;
+    this._cdFaceK = facing ? 1 : 0;
+
+    this._cdSkipNextAppear = true;
   }
 
   /** Advance the hero CD's motion to timeSec (once per render; cdViewerIdlePose reads the result). */
@@ -691,7 +713,17 @@ export class CartridgeViewer {
     const curKey = spec.billboardKey ?? ('#' + spec.kind);
     const justAppeared = curKey !== this.appearKey;
     if (justAppeared) { this.appearKey = curKey; this.appearStart = timeSec; }
-    if (isCD && !cdPose) this._advanceCD(spec, timeSec, justAppeared, thumb);
+    if (isCD && !cdPose) {
+      const suppressAppear = this._cdSkipNextAppear;
+      this._cdSkipNextAppear = false;
+
+      this._advanceCD(
+        spec,
+        timeSec,
+        justAppeared && !suppressAppear,
+        thumb,
+      );
+    }
     const age = Math.max(0, timeSec - this.appearStart);
     const gt = Math.min(age / 0.30, 1);                    // grow over ~0.3s
     const c1 = 1.70158, c3 = c1 + 1;

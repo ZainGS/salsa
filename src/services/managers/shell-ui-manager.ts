@@ -257,6 +257,9 @@ export class ShellUIManager {
   private _launchFlow: ShellLaunchFlow | null = null;
   /** The cart whose launch the top viewer is playing (its CD is shown there whatever is hovered); null = none. */
   private _launchViewerId: string | null = null;
+  /** The cart the last launch opened (kept across the Player round trip: this manager outlives the Shell scene) — the
+   *  RETURN animation (playReturnAnimation) brings its disc home. One-shot. */
+  private _lastLaunchedSlotId: string | null = null;
   /** The loader of the launch being started (launchSlot's opts.loadCart, else readCartBinary). */
   private _launchLoader: ((slotId: string) => Promise<ArrayBuffer | Uint8Array | Blob | null>) | null = null;
   /** Long-press tracker for cart tiles (touch / pen) → onSlotMenu. */
@@ -744,6 +747,7 @@ export class ShellUIManager {
   /** Drives the hover lift on grid tiles. Pass null to clear. */
   setHoveredSlot(slotId: string | null): void {
     if (this.view.hoveredSlotId === slotId) return;
+    this.cutReturn();   // a hover change ends the return wind-down (the hover facing takes over)
     this.view.hoveredSlotId = slotId;
     this.onChange.emit('hover');
   }
@@ -1239,7 +1243,27 @@ export class ShellUIManager {
     this.clusterCountEl = count;
     row.appendChild(count);
     row.appendChild(iconBtn('ⓘ', 'info', 'What is a .frogcart?', MAT_INFO));
-    wrap.appendChild(row);
+    // Support (2026-10-10): a separate square box with a heart, to the right of the cluster — opens Buy Me a Coffee.
+    const MAT_HEART = 'M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z';
+    const heart = document.createElement('a');
+    heart.href = 'https://buymeacoffee.com/frogmarks';
+    heart.target = '_blank'; heart.rel = 'noopener noreferrer';
+    heart.title = 'Support Frogmarks'; heart.setAttribute('aria-label', 'Support Frogmarks on Buy Me a Coffee');
+    // a drawn WHITE heart on every theme (2026-10-10: the red emoji contrasted too much; a text ❤ can render as the
+    // red emoji on some platforms, so it's always the SVG)
+    heart.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="display:block" aria-hidden="true"><path d="${MAT_HEART}"/></svg>`;
+    // a very slightly grey white; light pink on hover / keyboard focus
+    const HEART = '#e6e6e6', HEART_HOVER = '#ffb6c8';
+    const setHeart = (c: string) => () => { heart.style.color = c; };
+    heart.onmouseenter = setHeart(HEART_HOVER); heart.onmouseleave = setHeart(HEART);
+    heart.onfocus = setHeart(HEART_HOVER); heart.onblur = setHeart(HEART);
+    heart.style.cssText = `box-sizing:border-box;display:flex;align-items:center;justify-content:center;flex:0 0 44px;width:44px;height:44px;background:var(--panel);${winBevel}color:var(--ink);font-size:17px;line-height:1;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,0.18);`;
+    const top = document.createElement('div');
+    top.style.cssText = 'display:flex;align-items:center;gap:6px;';   // (the cluster row is 44 px: 30 px buttons + 5 px padding + 2 px bevel, ×2)
+    top.appendChild(row);
+    heart.style.color = HEART;   // (after cssText: it sets color: var(--ink))
+    top.appendChild(heart);
+    wrap.appendChild(top);
 
     const panel = document.createElement('div');
     panel.style.cssText = `display:none;box-sizing:border-box;width:min(300px, calc(100vw - 32px));background:var(--panel);${winBevel}padding:12px 14px;color:var(--ink);font-size:13px;line-height:1.5;box-shadow:0 4px 14px rgba(0,0,0,0.22);`;
@@ -1437,7 +1461,7 @@ export class ShellUIManager {
         onFrame: (pose) => this.applyLaunchChrome(pose.chromeOpacity),
         onSettled: () => { this.applyLaunchChrome(null); endViewer(); },
       }).then(
-        (r) => { this.applyLaunchChrome(0); return r; },
+        (r) => { this.applyLaunchChrome(0); this._lastLaunchedSlotId = slotId; return r; },
         (e: unknown) => {
           // The presenter fades the chrome back in through onSettled; with none (or an instant failure) restore it now.
           if (!this.launchPresenterActive()) { this.applyLaunchChrome(null); endViewer(); }
@@ -1447,6 +1471,43 @@ export class ShellUIManager {
     } finally {
       this._launchLoader = null;   // the flow called the loader synchronously in start()
     }
+  }
+
+  /**
+   * The RETURN from the Player (call right after initializeScene when the Shell comes back from a cart the Shell
+   * launched): the launched cart's disc starts at the centre in the launch's end state and winds down home over
+   * LAUNCH.returnSpinDownMs while the host fades in from black. The Shell stays usable: any tap / key / wheel / hover
+   * change cuts it to idle. Plays once; false (= the plain fade-in) with reduced motion, no launched cart, no scene, or
+   * when the cart's tile is not on screen.
+   */
+  playReturnAnimation(): boolean {
+    const id = this._lastLaunchedSlotId;
+    this._lastLaunchedSlotId = null;
+    const r = this.renderer as unknown as { beginReturn?: (o: { slotId: string; startMs: number; onFrame?: (p: { chromeOpacity: number }) => void; onSettled: () => void }) => boolean } | null;
+    if (!id || !r?.beginReturn || this.reducedMotion || this.view.mode !== 'shell' || !this.cartKindOf(id)) return false;
+    // the viewer shows THAT cart's CD while it comes home (cleared when the return ends)
+    this.view.selectedSlotId = id;
+    this._launchViewerId = id;
+    this.rebuildAndRender();
+    // the cluster fades back in with the dim — but stays clickable (the return does not lock the Shell)
+    const chrome = (o: number | null) => { if (this.clusterEl) this.clusterEl.style.opacity = o === null ? '' : String(Math.max(0, Math.min(1, o))); };
+    const done = () => {
+      chrome(null);
+      if (this._launchViewerId === id && !this._launchFlow?.busy) { this._launchViewerId = null; this.rebuildAndRender(); }
+    };
+    const ok = r.beginReturn({
+      slotId: id, startMs: performance.now(),
+      onFrame: (p) => chrome(p.chromeOpacity >= 0.999 ? null : p.chromeOpacity),
+      onSettled: done,
+    });
+    if (!ok) done();
+    return ok;
+  }
+
+  /** End a playing return wind-down at once (the disc snaps to its idle pose). */
+  cutReturn(): boolean {
+    const r = this.renderer as unknown as { cutReturn?: () => boolean } | null;
+    return r?.cutReturn?.() ?? false;
   }
 
   /** A launch is running (animating, loading, fading, spinning down) or has reached black — the Shell ignores
@@ -2049,6 +2110,7 @@ export class ShellUIManager {
     // the click the browser fires on release is swallowed so a scroll doesn't open a card.
     this.boundPointerDown = (e) => {
       // Long-press a cart (touch / pen) → its Play / Remove sheet (onSlotMenu). Every press resets the tracker.
+      this.cutReturn();   // any press ends the return wind-down (the Shell is usable at once)
       if (this.isLaunching) { this._longPress.cancel(); return; }
       let pressed: string | null = null;
       if (this.view.mode === 'shell') {
@@ -2131,6 +2193,7 @@ export class ShellUIManager {
       if (id) this.handleActivate(id);
     };
     this.boundKeyDown = (e) => {
+      this.cutReturn();
       // Esc during a launch cancels it (spin-down, no toast); nothing else reacts while it runs.
       if (this.isLaunching) {
         if (e.key === 'Escape' && this.cancelLaunch()) e.preventDefault();
@@ -2145,6 +2208,7 @@ export class ShellUIManager {
     // Wheel: Ctrl/⌘+wheel zooms tile size; plain wheel pages horizontally.
     this.boundWheel = (e) => {
       e.preventDefault();
+      this.cutReturn();
       if (this.isLaunching) return;
       // Illustrations grid: plain wheel scrolls the grid vertically.
       if (this.view.mode === 'illustrations') {

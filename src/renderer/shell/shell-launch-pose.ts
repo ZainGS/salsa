@@ -88,22 +88,37 @@ export function nearestTurn(a: number, target: number): number {
  */
 export function settleCDPose(
   tMs: number, from: LaunchPose, idle: CDPose, region: Pick<LaunchRegion, 'k' | 'offX' | 'offY'>,
-  reducedMotion: boolean, out: CDPose, sizeScale = 1, baseScale: number = CD_TILE_SCALE,
+  reducedMotion: boolean, out: CDPose, sizeScale = 1, baseScale: number = CD_TILE_SCALE, durationMs?: number, holdFaceOn = false,
 ): { pose: LaunchPose; done: boolean } {
-  const T = spinDownDurationMs(reducedMotion);
-  const sd = spinDownPose(tMs, from, { tilt0: idle.tilt, reducedMotion });
+  const T = durationMs ?? spinDownDurationMs(reducedMotion);
+  const sd = spinDownPose(tMs, from, { tilt0: idle.tilt, reducedMotion, durationMs: T });
   const e = easeOutCubic(clamp01(tMs / T));
   // where the decaying spin would stop, and the whole turn nearest it
   const natEnd = from.spin + ((from.spinRate * T) / 3 / 1000) * TAU;
   const rollFix = TAU * Math.round(natEnd / TAU) - natEnd;
   const yawIdle = nearestTurn(from.yaw, idle.spin);
+
+  const u = clamp01(tMs / T);
+  const yawT = holdFaceOn
+    ? easeOutCubic(clamp01((u - 0.75) / 0.25))
+    : e;
+
   out.x = region.offX;
   out.y = region.offY + idle.y * e * region.k;
   out.tilt = sd.pose.tilt;
-  out.spin = from.yaw + (yawIdle - from.yaw) * e;
+  //out.spin = from.yaw + (yawIdle - from.yaw) * e;
+  out.spin = holdFaceOn
+  ? from.yaw
+  : lerpAngleShortest(from.yaw, yawIdle, e);
+  
   out.roll = CD_SPIN_DIR * (sd.pose.spin + rollFix * e);
   out.scale = baseScale * (1 + (sd.pose.scale - 1) * sizeScale) * region.k;
   return sd;
+}
+
+function lerpAngleShortest(a: number, b: number, t: number): number {
+  const delta = Math.atan2(Math.sin(b - a), Math.cos(b - a));
+  return a + delta * t;
 }
 
 /** The export preview's launch: the flick + spin-up for this long, then the spin-down back to idle. */
@@ -194,8 +209,20 @@ export function flightCDPose(lp: LaunchPose, y0: number, idleScale: number, out:
 }
 
 /** The spin-down: the disc flies back to its source (lp.travel → 0) onto its idle pose there now (`idle`). */
-export function flightSettleCDPose(tMs: number, from: LaunchPose, idle: CDPose, reducedMotion: boolean, out: CDPose): { pose: LaunchPose; done: boolean } {
-  return settleCDPose(tMs, from, idle, UNIT_REGION, reducedMotion, out, 0, idle.scale);
+export function flightSettleCDPose(
+  tMs: number,
+  from: LaunchPose,
+  idle: CDPose,
+  reducedMotion: boolean,
+  out: CDPose,
+  durationMs?: number,
+  holdFaceOn = false,
+): { pose: LaunchPose; done: boolean } {
+  return settleCDPose(
+    tMs, from, idle, UNIT_REGION,
+    reducedMotion, out, 0, idle.scale,
+    durationMs, holdFaceOn,
+  );
 }
 
 /**
@@ -206,4 +233,16 @@ export function tilePressPose(tMs: number, idle0: CDPose, out: CDPose): CDPose {
   out.x = idle0.x; out.y = idle0.y; out.tilt = idle0.tilt; out.spin = idle0.spin; out.roll = idle0.roll;
   out.scale = idle0.scale * launchPressScale(tMs);
   return out;
+}
+
+/**
+ * The launch's END state, where the RETURN from the Player starts: at the flight target (travel 1), face-on (yaw on
+ * the front turn nearest `idleYaw`, tilt −6°), grown, rolling at full speed (blur on), the dim at dimMax, no fade (the
+ * host's fade-in from black covers the first ~0.4 s). The renderer then settles it home over LAUNCH.returnSpinDownMs.
+ */
+export function launchEndPose(idleYaw: number): LaunchPose {
+  return {
+    yaw: TAU * Math.round(idleYaw / TAU), tilt: LAUNCH.tiltEndDeg * Math.PI / 180, scale: LAUNCH.growScale, travel: 1,
+    spin: 0, spinRate: LAUNCH.spinMaxRevPerSec, blur: 1, dim: LAUNCH.dimMax, fade: 0, chromeOpacity: 0, black: false,
+  };
 }

@@ -255,6 +255,37 @@ describe('ShellRenderer launch presenter', () => {
     expect(rm.launchStage).toBe('tile');
   });
 
+  // it('RETURN: starts at the launch end state (centre, face-on, full spin, dim), winds home over returnSpinDownMs, no input lock', () => {
+  //   const r = renderer('b');
+  //   const onSettled = vi.fn(), onFrame = vi.fn();
+  //   expect((r as unknown as { beginReturn(o: object): boolean }).beginReturn({ slotId: 'b', startMs: 10_000, onSettled, onFrame })).toBe(true);
+  //   expect(r.launchActive).toBe(false);                    // the Shell stays usable
+  //   expect((r as unknown as { returnActive: boolean }).returnActive).toBe(true);
+  //   r.prepareLaunchFrame(10_000, 10, 1920, 1080);
+  //   expect(r._lf.fly).toBe(true);
+  //   expect(r._lf.pose!.dim).toBeCloseTo(LAUNCH.dimMax);
+  //   expect(r._lf.pose!.travel).toBeCloseTo(1);
+  //   expect(r._lf.blur).toBeGreaterThan(0);
+  //   r.prepareLaunchFrame(10_000 + LAUNCH.returnSpinDownMs / 2, 10.45, 1920, 1080);
+  //   expect(r._lf.settled).toBe(false);                     // longer than the 550 ms error spin-down
+  //   r.prepareLaunchFrame(10_000 + LAUNCH.returnSpinDownMs, 10.9, 1920, 1080);
+  //   expect(r._lf.settled).toBe(true);
+  //   expect(r._lf.pose!.dim).toBeCloseTo(0);
+  //   r.finishLaunchFrame();
+  //   expect(onSettled).toHaveBeenCalledTimes(1);
+  //   expect((r as unknown as { returnActive: boolean }).returnActive).toBe(false);
+  // });
+
+  // it('RETURN: any input cuts it straight to idle; a slot not on screen plays nothing', () => {
+  //   const r = renderer('b') as R & { beginReturn(o: object): boolean; cutReturn(): boolean };
+  //   const onSettled = vi.fn();
+  //   r.beginReturn({ slotId: 'b', startMs: 10_000, onSettled });
+  //   expect(r.cutReturn()).toBe(true);
+  //   expect(onSettled).toHaveBeenCalledTimes(1);
+  //   expect(r.cutReturn()).toBe(false);
+  //   expect(renderer(null).beginReturn.call(renderer(null), { slotId: 'gone', startMs: 0, onSettled })).toBe(false);
+  // });
+
   it('parseLaunchColor: #rrggbb / #rgb, else the Player black', () => {
     const o: [number, number, number] = [0, 0, 0];
     expect(parseLaunchColor('#0a0a0a', o)).toEqual([10 / 255, 10 / 255, 10 / 255]);

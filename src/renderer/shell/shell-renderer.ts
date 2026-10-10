@@ -49,7 +49,7 @@ import {
   LAUNCH, launchPose, spinDownPose, type LaunchClock, type LaunchPose, type ShellLaunchBeginOptions, type ShellLaunchPresenter,
 } from './shell-launch';
 import {
-  launchFlightTarget, launchFlightRegion, flightCDPose, flightSettleCDPose, tilePressPose, chooseLaunchStage, LAUNCH_BLUR_ARC,
+  launchFlightTarget, launchFlightRegion, flightCDPose, flightSettleCDPose, tilePressPose, chooseLaunchStage, launchEndPose, LAUNCH_BLUR_ARC,
   type LaunchRect, type LaunchStage,
 } from './shell-launch-pose';
 
@@ -1549,6 +1549,8 @@ export class ShellRenderer implements ShellLaunchPresenter {
     from: LaunchPose | null;
     last: LaunchPose | null;
     blackSent: boolean;
+    /** The RETURN from the Player (beginReturn): settles from the launch's end state; input stays live (cutReturn). */
+    returning?: boolean;
   } | null = null;
   private readonly _launchCD: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
   private readonly _launchTilePose: CDPose = { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 };
@@ -1570,7 +1572,9 @@ export class ShellRenderer implements ShellLaunchPresenter {
   private _calmTime = 0;
 
   /** True from beginLaunch until the spin-down settled — INCLUDING while black (the host is opening the Player). */
-  get launchActive(): boolean { return this._launch !== null; }
+  get launchActive(): boolean { return this._launch !== null && !this._launch.returning; }
+  /** The return-from-the-Player wind-down is playing (the Shell is usable meanwhile; any input cuts it, cutReturn). */
+  get returnActive(): boolean { return !!this._launch?.returning; }
   /** The launch reached black (the loop is stopped; cancelLaunch fades back in). */
   get launchBlack(): boolean { return this._launch?.phase === 'black'; }
   /** Which disc plays the current launch (null: none). */
@@ -1634,7 +1638,8 @@ export class ShellRenderer implements ShellLaunchPresenter {
     } else if (L.from) {
       const t = nowMs - L.settleStart;
       // the disc flies back to its source (travel → 0) while it spins down onto its idle pose there
-      const sd = srcIdle ? flightSettleCDPose(t, L.from, srcIdle, reduced, this._launchCD) : spinDownPose(t, L.from, { reducedMotion: reduced });
+      const dur = L.returning ? LAUNCH.returnSpinDownMs : undefined;   // the return winds down longer than an error
+      const sd = srcIdle ? flightSettleCDPose(t, L.from, srcIdle, reduced, this._launchCD, dur, !!L.returning,) : spinDownPose(t, L.from, { reducedMotion: reduced, durationMs: dur });
       lf.pose = sd.pose; lf.settled = sd.done;
     }
     if (lf.pose) { L.last = lf.pose; lf.blur = lf.pose.blur * LAUNCH_BLUR_ARC; }
@@ -1664,6 +1669,17 @@ export class ShellRenderer implements ShellLaunchPresenter {
       this.stop();
       if (!L.blackSent) { L.blackSent = true; try { L.opts.onBlack(); } catch (e) { console.warn('[Shell] launch onBlack failed:', e); } }
     } else if (lf.settled && L.phase === 'settling') {
+      if (L.returning && L.stage === 'viewer' && L.from) {
+        const spec = this.model?.viewer;
+
+        if (spec?.kind === 'cd') {
+          this.viewer.syncCDYaw(
+            L.from.yaw,
+            L.settleStart / 1000 + LAUNCH.returnSpinDownMs / 1000,
+            !!spec.facing,
+          );
+        }
+      }
       this._launch = null;
       try { L.opts.onFrame?.({ ...(L.last as LaunchPose), dim: 0, fade: 0, chromeOpacity: 1 }); } catch { /* host */ }
       try { L.opts.onSettled(); } catch (e) { console.warn('[Shell] launch onSettled failed:', e); }
@@ -1721,6 +1737,51 @@ export class ShellRenderer implements ShellLaunchPresenter {
   skipLaunch(nowMs: number): void {
     const L = this._launch;
     if (L && L.phase === 'launch' && L.clock.skippedAtMs == null) L.clock = { ...L.clock, skippedAtMs: nowMs - L.opts.startMs };
+  }
+
+  /**
+   * The RETURN from the Player: start the launched cart's disc (the hero viewer's CD, else its tile's) in the launch's
+   * END state — at the centre, face-on, grown, at full clockwise spin with blur, the dim at dimMax — and wind it down
+   * home over LAUNCH.returnSpinDownMs (the spin decays, it flies back, the roll lands on a whole turn, the dim lifts).
+   * Unlike a launch it does not lock input (launchActive stays false): cutReturn() snaps it to idle. False when a launch
+   * is running or the slot is not on screen.
+   */
+  beginReturn(o: { slotId: string; startMs: number; onFrame?: (pose: LaunchPose) => void; onSettled: () => void }): boolean {
+    if (this._launch) return false;
+    const found = this.findLaunchTile(o.slotId);
+    const m = this.model;
+    const startSec = o.startMs / 1000;
+    const stage: LaunchStage = chooseLaunchStage({
+      viewerShowsCart: m?.viewer?.kind === 'cd' && m.viewerThumbId === o.slotId,
+      viewerVisible: this.viewerVisible(),
+      viewerW: this.canvas.width, viewerH: this.viewerHeightPx(this.canvas.height), tileH: found ? found.tile.rect[3] : 0,
+    });
+    if (stage === 'tile' && !found) return false;
+    // a fresh mount: the viewer would pop its CD in from nothing — it is already there, coming home
+    if (stage === 'viewer' && m?.viewer) this.viewer.skipAppear(m.viewer, startSec);
+    const idle0 = stage === 'viewer' && m?.viewer
+      ? this.viewer.cdViewerIdlePose(m.viewer, startSec, { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 })
+      : cdIdlePose(this.cartTileClock(o.slotId, startSec), found!.slot * 1.7);
+    const from = launchEndPose(idle0.spin);
+    this._launch = {
+      opts: { slotId: o.slotId, startMs: o.startMs, reducedMotion: false, fadeColor: LAUNCH.fadeColor, onBlack: () => { /* never */ }, onSettled: o.onSettled, onFrame: o.onFrame },
+      stage, clock: { yaw0: idle0.spin, tilt0: idle0.tilt, readyAtMs: null, skippedAtMs: null },
+      phase: 'settling', y0: idle0.y, tileIdle0: null, settleStart: o.startMs, from, last: from, blackSent: true, returning: true,
+    };
+    parseLaunchColor(LAUNCH.fadeColor, this._launchRgb);
+    this.start();
+    return true;
+  }
+
+  /** Cut a playing return straight to the idle Shell (any input does: the Shell is usable during the return). */
+  cutReturn(): boolean {
+    const L = this._launch;
+    if (!L?.returning) return false;
+    this._launch = null;
+    try { L.opts.onFrame?.({ ...(L.last ?? launchEndPose(0)), dim: 0, fade: 0, chromeOpacity: 1, blur: 0 }); } catch { /* host */ }
+    try { L.opts.onSettled(); } catch (e) { console.warn('[Shell] return onSettled failed:', e); }
+    if (!this.running) this.render();
+    return true;
   }
 
   cancelLaunch(nowMs: number): void {

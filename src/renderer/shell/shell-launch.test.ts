@@ -113,7 +113,7 @@ describe('launchPose — the curve', () => {
     expect(launchPose(4000, clock({ readyAtMs: null })).blur).toBeCloseTo(1);
   });
 
-  it('the dim starts at the tap: 0 → 0.88 over 300 ms; the HTML chrome fades with it', () => {
+  it('the dim starts at the tap: 0 → dimMax over 300 ms; the HTML chrome fades with it', () => {
     expect(launchPose(0, clock()).dim).toBe(0);
     const half = launchPose(LAUNCH.dimEndMs / 2, clock());
     expect(half.dim).toBeCloseTo(LAUNCH.dimMax / 2);

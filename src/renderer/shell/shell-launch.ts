@@ -73,7 +73,7 @@ export const LAUNCH = {
   spinMaxRevPerSec: 4,
   dimStartMs: 0,
   dimEndMs: 300,
-  dimMax: 0.88,
+  dimMax: 0.7,
   /** The final fade never starts before this, even when the cart was ready at once. */
   minFadeStartMs: 1600,
   fadeMs: 400,
@@ -84,6 +84,8 @@ export const LAUNCH = {
   /** Reading + validating the cart took longer than this → 'timeout'. */
   timeoutMs: 10_000,
   spinDownMs: 550,
+  /** The RETURN from the Player: the disc winds down from full spin at the centre back home this long (easeOut). */
+  returnSpinDownMs: 900,
   /** Reduced motion: the whole launch is one fade this long (and the spin-down a fade back this long). */
   reducedFadeMs: 240,
   /** The Shell coming back from the Player fades in from black this long (reduced motion: reducedFadeMs). */
@@ -277,8 +279,8 @@ export function spinDownDurationMs(reducedMotion = false): number {
  * decays to a stop (ω = ω0·(1−u)², angle its integral), the disc settles back to its idle size and tilt, the dim and
  * any started fade lift. `done` once it has settled (then the idle animation takes over again).
  */
-export function spinDownPose(t: number, from: LaunchPose, opts: { tilt0?: number; reducedMotion?: boolean } = {}): { pose: LaunchPose; done: boolean } {
-  const T = spinDownDurationMs(opts.reducedMotion);
+export function spinDownPose(t: number, from: LaunchPose, opts: { tilt0?: number; reducedMotion?: boolean; durationMs?: number } = {}): { pose: LaunchPose; done: boolean } {
+  const T = opts.durationMs ?? spinDownDurationMs(opts.reducedMotion);
   const u = clamp01(t / T);
   const e = easeOutCubic(u);
   const tilt0 = opts.tilt0 ?? LAUNCH_TILT0;
