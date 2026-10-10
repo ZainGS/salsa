@@ -56,8 +56,8 @@ describe('launchCDPose', () => {
   it('at the end of the flick: front-facing, grown, bob gone; roll = the disc-axis spin, clockwise seen from the print', () => {
     const r = launchRegion([400, 300, 100, 100], 1920, 1080)!;
     const clock: LaunchClock = { yaw0: 3.3, readyAtMs: null };
-    const lp = launchPose(1500, clock);
-    const p = launchCDPose(lp, 1500, 0.05, r, pose());
+    const lp = launchPose(3000, clock);   // the flick (cruise + settle + spring) is over
+    const p = launchCDPose(lp, 3000, 0.05, r, pose());
     expect(((p.spin % TAU) + TAU) % TAU).toBeCloseTo(0);
     expect(p.scale * r.h).toBeCloseTo(CD_TILE_SCALE * LAUNCH.growScale * 100);
     expect(p.y).toBeCloseTo(0);

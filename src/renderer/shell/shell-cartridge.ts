@@ -600,9 +600,10 @@ export class CartridgeViewer {
     const gt = Math.min(age / 0.30, 1);
     const c1 = 1.70158, c3 = c1 + 1;
     const grow = 1 + c3 * Math.pow(gt - 1, 3) + c1 * Math.pow(gt - 1, 2);   // easeOutBack
-    const pp = this._cdPopStart >= 0 ? (timeSec - this._cdPopStart) / 0.22 : 1;
+    const ps = this._cdPopStart ?? -1;
+    const pp = ps >= 0 ? (timeSec - ps) / 0.22 : 1;
     const pop = pp >= 0 && pp < 1 ? 1 + 0.04 * Math.sin(Math.PI * pp) : 1;
-    const k = this._cdFaceK;
+    const k = this._cdFaceK || 0;
     out.x = 0;
     out.y = Math.sin(timeSec * Math.PI) * 0.12 * (1 - 0.6 * k);
     out.tilt = (-24 + 16 * k) * Math.PI / 180;     // −24° idle → −8° facing

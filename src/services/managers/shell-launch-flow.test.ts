@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { zipSync, strToU8 } from 'fflate';
-import { LAUNCH } from '../../renderer/shell/shell-launch';
+import { LAUNCH, launchBlackAtMs } from '../../renderer/shell/shell-launch';
 import {
   ShellLaunchFlow, ShellLaunchError, launchErrorForProbe, LAUNCH_BLACK_SLACK_MS,
   type ShellLaunchPresenter, type ShellLaunchBeginOptions, type ShellLaunchFlowDeps,
@@ -77,7 +77,7 @@ describe('ShellLaunchFlow — the happy path', () => {
   it('a presenter that never reports black: the fallback timer resolves at the computed black moment (+ slack)', async () => {
     const { flow } = setup();
     const out = track(flow.start('c'));
-    await vi.advanceTimersByTimeAsync(LAUNCH.minFadeStartMs + LAUNCH.fadeMs + LAUNCH_BLACK_SLACK_MS - 5);
+    await vi.advanceTimersByTimeAsync(launchBlackAtMs({ yaw0: 0, readyAtMs: 0 })! + LAUNCH_BLACK_SLACK_MS - 5);
     expect(out.settled).toBe(false);
     await vi.advanceTimersByTimeAsync(10);
     expect(out.value?.slotId).toBe('c');
@@ -209,7 +209,7 @@ describe('ShellLaunchFlow — errors', () => {
   it('once the cart is ready the timeout no longer applies (a slow fade is not a timeout)', async () => {
     const { flow } = setup();
     const out = track(flow.start('c', { timeoutMs: 600 }));
-    await vi.advanceTimersByTimeAsync(LAUNCH.minFadeStartMs + LAUNCH.fadeMs + LAUNCH_BLACK_SLACK_MS + 1);
+    await vi.advanceTimersByTimeAsync(launchBlackAtMs({ yaw0: 0, readyAtMs: 0 })! + LAUNCH_BLACK_SLACK_MS + 1);
     expect(out.value?.slotId).toBe('c');
   });
 });

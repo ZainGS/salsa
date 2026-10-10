@@ -161,7 +161,7 @@ describe('createCartDiscPreview (lifecycle)', () => {
     p.playLaunchPreview({ reducedMotion: false });
     expect(p.launchPreviewActive).toBe(true);
     const last = () => f.uploads[f.uploads.length - 1];
-    p.renderFrame(1.3);                                   // full spin
+    p.renderFrame((LAUNCH_PREVIEW_SPIN_MS - 100) / 1000); // full spin
     expect(last()[CD_BLUR_INDEX]).toBeGreaterThan(0);
     p.renderFrame((LAUNCH_PREVIEW_SPIN_MS + 100) / 1000); // spinning down
     expect(p.launchPreviewActive).toBe(true);
@@ -199,14 +199,14 @@ describe('createCartDiscPreview (lifecycle)', () => {
 });
 
 describe('CartridgeViewer.cdViewerIdlePose', () => {
-  it('is exactly the transform the viewer always drew for a CD (whirl + appear spin, -24 deg, bob, x1.2 pop-in)', () => {
+  it('before any render it is the time whirl, -24 deg, the bob and the x1.2 pop-in (the appear spin + facing are integrated per render)', () => {
     for (const swayOnly of [false, true]) {
       const v = Object.assign(Object.create(CartridgeViewer.prototype), { appearKey: '#cd', appearStart: 3 }) as InstanceType<typeof CartridgeViewer>;
       for (const t of [3, 3.1, 3.4, 9.75]) {
         const spec = { kind: 'cd', bodyColor: [0, 0, 0, 1], labelColor: [0, 0, 0, 1], swayOnly, scale: 1.1 } as never;
         const age = t - 3, gt = Math.min(age / 0.3, 1), c1 = 1.70158, c3 = c1 + 1;
         const grow = 1 + c3 * Math.pow(gt - 1, 3) + c1 * Math.pow(gt - 1, 2);
-        const spin = swayOnly ? Math.sin(t * 0.5) * 0.5236 : (t % 12) / 12 * Math.PI * 2 + 1.3 * Math.PI * 2 * (1 - Math.exp(-age / 0.4));
+        const spin = (t % 12) / 12 * Math.PI * 2;   // (not advanced yet: the plain time whirl)
         const old = mat4.create();
         mat4.translate(old, old, [0, Math.sin(t * Math.PI) * 0.12, 0]);
         mat4.rotateX(old, old, -24 * Math.PI / 180);

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   LAUNCH, LAUNCH_TILT0, frontYawTarget, launchPose, launchSpinRate, launchSpinAngle, launchFadeWindow, launchBlackAtMs,
   spinDownPose, spinDownDurationMs, returnRevealAlpha, prefersReducedMotion, easeOutCubic, smoothstep01, type LaunchClock,
-  flickDurationMs, launchSpinWindow,
+  flickDurationMs, launchSpinWindow, flickAngle,
 } from './shell-launch';
 
 const TAU = Math.PI * 2;
@@ -10,19 +10,20 @@ const DEG = Math.PI / 180;
 const clock = (o: Partial<LaunchClock> = {}): LaunchClock => ({ yaw0: 0.7, readyAtMs: 120, ...o });
 
 describe('frontYawTarget — an even flourish', () => {
-  it('the flick always turns at least 1 and less than 2 full turns (whirl direction), ending front-facing', () => {
+  it('the flick always turns at least flickTurns and less than flickTurns + 1 turns (whirl direction), ending front-facing', () => {
+    const n = LAUNCH.flickTurns;
     for (let y = -20; y <= 40; y += 0.37) {
       const t = frontYawTarget(y);
       const k = t / TAU;
       expect(Math.abs(k - Math.round(k))).toBeLessThan(1e-9);
-      expect(t - y).toBeGreaterThanOrEqual(TAU - 1e-9);
-      expect(t - y).toBeLessThan(2 * TAU + 1e-9);
+      expect(t - y).toBeGreaterThanOrEqual(n * TAU - 1e-9);
+      expect(t - y).toBeLessThan((n + 1) * TAU + 1e-9);
     }
   });
 
-  it('a disc already facing the user makes exactly one turn; turns and the front angle are honoured', () => {
-    expect(frontYawTarget(0)).toBeCloseTo(TAU);
-    expect(frontYawTarget(TAU * 3)).toBeCloseTo(TAU * 4);
+  it('a disc already facing the user makes exactly flickTurns turns; turns and the front angle are honoured', () => {
+    expect(frontYawTarget(0)).toBeCloseTo(LAUNCH.flickTurns * TAU);
+    expect(frontYawTarget(TAU * 3)).toBeCloseTo(TAU * (3 + LAUNCH.flickTurns));
     expect(frontYawTarget(0, 2)).toBeCloseTo(2 * TAU);
     const f = 0.5;
     const t = frontYawTarget(1, 1, f);
@@ -30,39 +31,45 @@ describe('frontYawTarget — an even flourish', () => {
   });
 });
 
-describe('launchPose — the flick (constant start velocity, easeOutCubic)', () => {
+describe('launchPose — the flick (cruise → settle past the front → rubber-band spring back)', () => {
   const yawRate = (c: LaunchClock, t: number) => (launchPose(t + 0.01, c).yaw - launchPose(t, c).yaw) / 0.01;
+  const v = (LAUNCH.flickCruiseRevPerSec * TAU) / 1000;
+  const over = LAUNCH.flickOvershootDeg * DEG;
 
-  it('every flick starts at the same angular velocity ω0, whatever the start yaw', () => {
+  it('every flick starts at the same cruise speed, whatever the start yaw', () => {
     for (const yaw0 of [0, 0.7, 2.1, 4.4, 6.2, 31.4]) {
-      expect(yawRate(clock({ yaw0 }), 0)).toBeCloseTo(LAUNCH.flickOmega0, 3);
+      expect(yawRate(clock({ yaw0 }), 0)).toBeCloseTo(v, 4);
     }
   });
 
-  it('its duration is T = 3Δ/ω0 (1.5 turns ≈ 550 ms, 1–2 turns ≈ 370–730 ms) and it stops front-facing', () => {
-    expect(flickDurationMs(0)).toBeCloseTo((3 * TAU) / LAUNCH.flickOmega0);
-    expect(flickDurationMs(TAU - Math.PI)).toBeCloseTo(550, 0);   // 1.5 turns
+  it('it eases out PAST the front by about the overshoot, springs back and ends exactly front-facing', () => {
     for (let y = 0; y < TAU; y += 0.31) {
-      const T = flickDurationMs(y);
-      expect(T).toBeGreaterThanOrEqual(366);
-      expect(T).toBeLessThan(734);
+      const T = flickDurationMs(y), d = frontYawTarget(y) - y;
       const c = clock({ yaw0: y });
+      // the peak past the front: close to the overshoot (the pull-back starts just before the settle rests)
+      let peak = -Infinity;
+      for (let t = 0; t <= T; t += 2) peak = Math.max(peak, flickAngle(t, y) - d);
+      expect(peak).toBeGreaterThan(over * 0.9);
+      expect(peak).toBeLessThanOrEqual(over + 1e-9);
+      // the spring swings a little past the front the other way (a rubber band), then settles on it
+      let under = Infinity;
+      for (let t = T - LAUNCH.flickSnapMs; t <= T; t += 2) under = Math.min(under, flickAngle(t, y) - d);
+      expect(under).toBeLessThan(0);
+      expect(under).toBeGreaterThan(-over);
       expect(launchPose(T, c).yaw).toBeCloseTo(frontYawTarget(y));
-      expect(Math.abs(yawRate(c, T - 0.02))).toBeLessThan(1e-3);   // ~0 at the end
-      // monotonic
-      let prev = -Infinity;
-      for (let t = 0; t <= T; t += 15) { const v = launchPose(t, c).yaw; expect(v).toBeGreaterThanOrEqual(prev - 1e-12); prev = v; }
+      expect(Math.abs(flickAngle(T - 1, y) - d)).toBeLessThan(0.5 * DEG);
     }
   });
 
-  it('the spin-up starts a beat after the flick ends, and is at full speed by ~1.2 s', () => {
+  it('the spin-up starts at spinOverlapFrac of the flick and reaches full speed after spinRampMs', () => {
     for (const yaw0 of [0, 1.3, 3.9, 6.0]) {
       const sw = launchSpinWindow(yaw0);
-      expect(sw.startMs).toBeCloseTo(flickDurationMs(yaw0) + LAUNCH.spinBeatMs);
+      expect(sw.startMs).toBeCloseTo(flickDurationMs(yaw0) * LAUNCH.spinOverlapFrac);
+      expect(sw.rampMs).toBe(LAUNCH.spinRampMs);
       const c = clock({ yaw0, readyAtMs: null });
       expect(launchPose(sw.startMs - 1, c).spinRate).toBe(0);
       expect(launchPose(sw.startMs + 50, c).spinRate).toBeGreaterThan(0);
-      expect(launchPose(Math.max(LAUNCH.spinFullAtMs, sw.startMs + LAUNCH.spinMinRampMs), c).spinRate).toBeCloseTo(LAUNCH.spinMaxRevPerSec);
+      expect(launchPose(sw.startMs + sw.rampMs, c).spinRate).toBeCloseTo(LAUNCH.spinMaxRevPerSec);
     }
   });
 });
@@ -74,18 +81,18 @@ describe('launchPose — the curve', () => {
     expect(p.tilt).toBeCloseTo(LAUNCH_TILT0);
   });
 
-  it('the flight (travel) eases in-out over 550 ms: tilt −26° → −6°, grown ×1.6, then holds', () => {
+  it('the flight (travel) moves at once and eases out over travelFrac of the flick: tilt → −6°, grown, then holds', () => {
     const c = clock({ yaw0: 2.1 });
-    expect(launchPose(LAUNCH.travelMs / 2, c).travel).toBeCloseTo(0.5);
-    expect(launchPose(LAUNCH.travelMs / 4, c).travel).toBeLessThan(0.25);   // eases in
-    for (const t of [LAUNCH.travelMs, 900, 3000]) {
+    const Tt = flickDurationMs(2.1) * LAUNCH.travelFrac;
+    expect(launchPose(Tt / 10, c).travel).toBeGreaterThan(0.3);            // no ease-in: it moves at once
+    expect(launchPose(Tt / 2, c).travel).toBeCloseTo(1 - Math.pow(0.5, 4)); // easeOutQuart
+    for (const t of [Tt, Tt + 300, 4000]) {
       const p = launchPose(t, c);
       expect(p.travel).toBe(1);
       expect(p.tilt).toBeCloseTo(LAUNCH.tiltEndDeg * DEG);
       expect(p.scale).toBeCloseTo(LAUNCH.growScale);
     }
-    // the press is only very subtle now
-    expect(LAUNCH.pressScale).toBeGreaterThanOrEqual(0.97);
+    expect(LAUNCH.pressScale).toBe(1);   // no press dip
   });
 
   it('spin rate: ω = ωmax(s/ramp)², monotonic, angle = its integral', () => {
@@ -103,7 +110,7 @@ describe('launchPose — the curve', () => {
       for (let t = 0; t < end; t += dt) sum += launchSpinRate(t + dt / 2, sw.startMs, sw.rampMs) * (dt / 1000) * TAU;
       expect(launchSpinAngle(end, sw.startMs, sw.rampMs)).toBeCloseTo(sum, 2);
     }
-    expect(launchPose(2000, clock({ readyAtMs: null })).blur).toBeCloseTo(1);
+    expect(launchPose(4000, clock({ readyAtMs: null })).blur).toBeCloseTo(1);
   });
 
   it('the dim starts at the tap: 0 → 0.88 over 300 ms; the HTML chrome fades with it', () => {
@@ -117,26 +124,24 @@ describe('launchPose — the curve', () => {
 });
 
 describe('launchPose — fade gating', () => {
-  it('a cart that is ready at once fades from minFadeStartMs (1600) to black at 2000 ms', () => {
+  it('a cart that is ready at once fades after the spin has run at full speed for spinHoldMs', () => {
     const c = clock({ readyAtMs: 40 });
-    const F = LAUNCH.minFadeStartMs, B = F + LAUNCH.fadeMs;
-    expect(F).toBe(1600);
-    expect(B).toBe(2000);
+    const sw = launchSpinWindow(c.yaw0);
+    const F = Math.max(LAUNCH.minFadeStartMs, sw.startMs + sw.rampMs + LAUNCH.spinHoldMs), B = F + LAUNCH.fadeMs;
     expect(launchFadeWindow(c)).toEqual({ startMs: F, durationMs: LAUNCH.fadeMs });
     expect(launchPose(F - 1, c).fade).toBe(0);
     expect(launchPose(F + LAUNCH.fadeMs / 2, c).fade).toBeCloseTo(0.5);
     expect(launchPose(B - 1, c).black).toBe(false);
     expect(launchPose(B, c)).toMatchObject({ fade: 1, black: true });
     expect(launchBlackAtMs(c)).toBe(B);
-    // the disc is at full speed for a while before the fade starts
-    expect(launchPose(F - 1, c).spinRate).toBe(LAUNCH.spinMaxRevPerSec);
+    expect(launchPose(F - 1, c).spinRate).toBe(LAUNCH.spinMaxRevPerSec);   // full speed before the fade
   });
 
   it('while loading the disc keeps spinning, never fades and never goes black', () => {
     const c = clock({ readyAtMs: null });
     expect(launchFadeWindow(c)).toBeNull();
     expect(launchBlackAtMs(c)).toBeNull();
-    for (const t of [1200, 2000, 9000]) {
+    for (const t of [3000, 5000, 9000]) {
       const p = launchPose(t, c);
       expect(p.fade).toBe(0);
       expect(p.black).toBe(false);
@@ -174,7 +179,7 @@ describe('skip (a tap during the launch)', () => {
 
   it('a tap after the fade already started changes nothing', () => {
     const c = clock({ readyAtMs: 50 });
-    expect(launchFadeWindow({ ...c, skippedAtMs: LAUNCH.minFadeStartMs + 100 })).toEqual(launchFadeWindow(c));
+    expect(launchFadeWindow({ ...c, skippedAtMs: launchFadeWindow(c)!.startMs + 100 })).toEqual(launchFadeWindow(c));
   });
 });
 
@@ -226,7 +231,7 @@ describe('spinDownPose (error / cancel)', () => {
   });
 
   it('a started fade lifts too; reduced motion settles in 240 ms', () => {
-    const fading = launchPose(LAUNCH.minFadeStartMs + 200, clock({ readyAtMs: 10 }));
+    const fading = launchPose(launchFadeWindow(clock({ readyAtMs: 10 }))!.startMs + 200, clock({ readyAtMs: 10 }));
     expect(fading.fade).toBeGreaterThan(0);
     expect(spinDownPose(LAUNCH.spinDownMs, fading).pose.fade).toBe(0);
     expect(spinDownDurationMs(true)).toBe(LAUNCH.reducedFadeMs);

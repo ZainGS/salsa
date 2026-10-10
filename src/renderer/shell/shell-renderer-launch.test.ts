@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { ShellRenderer, parseLaunchColor } from './shell-renderer';
-import { LAUNCH, type ShellLaunchBeginOptions } from './shell-launch';
+import { LAUNCH, launchBlackAtMs, type ShellLaunchBeginOptions, type LaunchClock } from './shell-launch';
 import { cdIdlePose, CD_TILE_SCALE, type CDPose } from './shell-cd';
 import { CartridgeViewer } from './shell-cartridge';
 import { launchFlightTarget } from './shell-launch-pose';
@@ -87,11 +87,12 @@ describe('ShellRenderer launch presenter', () => {
     const o = opts();
     r.beginLaunch(o);
     r.markLaunchReady(10_050);
-    r.prepareLaunchFrame(10_000 + LAUNCH.minFadeStartMs + LAUNCH.fadeMs / 2, 11.2, 1920, 1080);
+    const B = launchBlackAtMs((r as unknown as { _launch: { clock: LaunchClock } })._launch.clock)!;
+    r.prepareLaunchFrame(10_000 + B - LAUNCH.fadeMs / 2, 11.2, 1920, 1080);
     expect(r._lf.pose!.fade).toBeGreaterThan(0.3);
     r.finishLaunchFrame();
     expect(o.onBlack).not.toHaveBeenCalled();
-    r.prepareLaunchFrame(10_000 + LAUNCH.minFadeStartMs + LAUNCH.fadeMs, 11.4, 1920, 1080);
+    r.prepareLaunchFrame(10_000 + B + 1, 11.4, 1920, 1080);
     expect(r._lf.goBlack).toBe(true);
     r.finishLaunchFrame();
     expect(r.stop).toHaveBeenCalled();
@@ -135,13 +136,13 @@ describe('ShellRenderer launch presenter', () => {
     const r = renderer();
     const o = opts();
     r.beginLaunch(o);
-    r.prepareLaunchFrame(11_300, 11.3, 1920, 1080);
+    r.prepareLaunchFrame(12_400, 12.4, 1920, 1080);
     const roll = r._launchCD.roll;
-    r.cancelLaunch(11_300);
-    r.prepareLaunchFrame(11_300, 11.3, 1920, 1080);
+    r.cancelLaunch(12_400);
+    r.prepareLaunchFrame(12_400, 12.4, 1920, 1080);
     expect(r._launchCD.roll).toBeCloseTo(roll);
     expect(r._lf.blur).toBeGreaterThan(0);
-    r.prepareLaunchFrame(11_300 + LAUNCH.spinDownMs, 11.85, 1920, 1080);
+    r.prepareLaunchFrame(12_400 + LAUNCH.spinDownMs, 12.95, 1920, 1080);
     r.finishLaunchFrame();
     expect(o.onSettled).toHaveBeenCalled();
     expect(o.onBlack).not.toHaveBeenCalled();
@@ -187,9 +188,9 @@ describe('ShellRenderer launch presenter', () => {
     expect(r._launchCD.tilt).toBeCloseTo(v0.tilt);
     expect(r._launchCD.scale).toBeCloseTo(v0.scale);
     expect(r._launchTilePose.spin).toBeCloseTo(tile0.spin);
-    // mid-press: the tile dips; the viewer flicks
+    // no press dip any more (LAUNCH.pressScale 1): the tile just holds while the viewer flicks
     r.prepareLaunchFrame(10_045, 10.045, 1920, 1080);
-    expect(r._launchTilePose.scale).toBeLessThan(tile0.scale);
+    expect(r._launchTilePose.scale).toBeCloseTo(tile0.scale);
     // mid-flight: the viewport is between the viewer region and the centred target
     const src = { x: 0, y: 0, w: 1920, h: 432 };
     const dst = launchFlightTarget(src, v0.scale, 1920, 1080);
@@ -199,11 +200,11 @@ describe('ShellRenderer launch presenter', () => {
     expect(r._launchRegion.h).toBeLessThan(dst.h);
     expect(r._launchRegion.y).toBeGreaterThan(0);
     // after the press the tile is back at ×1 and FROZEN (no whirl / bob) while the disc spins up at the centre
-    r.prepareLaunchFrame(11_300, 11.3, 1920, 1080);
+    r.prepareLaunchFrame(12_400, 12.4, 1920, 1080);
     expect(r._launchTilePose.scale).toBeCloseTo(tile0.scale);
     expect(r._launchTilePose.spin).toBeCloseTo(tile0.spin);
     expect(r._launchTilePose.y).toBeCloseTo(tile0.y);
-    const vNow = r.viewer.cdViewerIdlePose(spec, 11.3, { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 } as CDPose);
+    const vNow = r.viewer.cdViewerIdlePose(spec, 12.4, { x: 0, y: 0, tilt: 0, spin: 0, roll: 0, scale: 1 } as CDPose);
     expect(r._launchCD.scale).toBeCloseTo(vNow.scale);            // the viewport carries the growth
     expect(r._launchRegion.h).toBe(Math.round(dst.h));
     expect(r._launchRegion.y + r._launchRegion.h / 2).toBeCloseTo(540, -1);

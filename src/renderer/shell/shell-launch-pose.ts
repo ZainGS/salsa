@@ -107,7 +107,7 @@ export function settleCDPose(
 }
 
 /** The export preview's launch: the flick + spin-up for this long, then the spin-down back to idle. */
-export const LAUNCH_PREVIEW_SPIN_MS = 1700;
+export const LAUNCH_PREVIEW_SPIN_MS = 2600;   // (the flick + the spin-up + some full speed: 2026-10-09 timing)
 /** The preview canvas is just the disc: its growth is damped to this share of ×1.35 (it would clip otherwise). */
 export const LAUNCH_PREVIEW_SIZE_SCALE = 0.25;
 
