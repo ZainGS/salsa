@@ -25,14 +25,31 @@ export const LAUNCH = {
   /** No press dip (2026-10-09: it felt odd); 1 = off. The instant dim is the tap feedback. */
   pressScale: 1,
   /** A 1.5-turn flick takes this long; every flick starts at the same angular velocity (flickOmega0) and eases out. */
-  flickMs: 950,
+  flickMs: 1200,
   /** The flick's starting angular velocity (rad/ms): easeOutQuart over Δ in T has ω0 = 4Δ/T → 1.5 turns in flickMs.
    *  (2026-10-09: was easeOutCubic in 550 ms — it stopped too abruptly; quart + longer = a long gentle settle.) */
-  flickOmega0: (4 * 1.5 * 2 * Math.PI) / 950,
+  flickOmega0: (4 * 1.5 * 2 * Math.PI) / 1200,
   /** The flick turns at least this many turns (and less than one more) to the front. */
-  flickTurns: 1,
+  flickTurns: 2,
+  /** The flick (2026-10-09): CRUISE at this speed (fast quick turns), then SETTLE — ease out (quart, from that
+   *  speed to rest) over flickSettleMs. Every flick: the same speed + the same settle; only the cruise varies (to land
+   *  on the front). With flickTurns 2 the turn is 2–3 turns. */
+  flickCruiseRevPerSec: 5,
+  flickSettleMs: 1000,
+  /** The settle eases out PAST the front by this much (2026-10-09), then snaps back to face the viewer. */
+  flickOvershootDeg: 12,
+  /** The snap back is a RUBBER BAND (2026-10-09): an underdamped spring released from the stretched overshoot — it
+   *  pulls back with growing speed, swings a few degrees past the front the other way and settles. This long. */
+  flickSnapMs: 450,
+  /** The spring: damping ratio (lower = bouncier) and natural period. */
+  flickSnapZeta: 0.45,
+  flickSnapPeriodMs: 280,
+  /** The pull-back starts at this fraction of the settle — the overshoot is almost at rest (stretched). */
+  flickSnapAt: 0.93,
   /** The disc flies from its viewer / tile to the canvas centre over this long (easeOutQuart: it moves at once and
    *  settles into the centre — an ease-in start looked like a hesitation). */
+  /** (unused since 2026-10-09: the flight now lasts exactly as long as the flick — flickDurationMs — so the disc
+   *  arrives and faces the user in ONE gesture.) */
   travelMs: 850,
   tiltStartDeg: -26,
   tiltEndDeg: -6,
@@ -40,9 +57,19 @@ export const LAUNCH = {
   growScale: 1.6,
   /** The spin-up starts this long after the flick ends… */
   spinBeatMs: 20,
+  /** The spin-up starts at this fraction of the flick (it overlaps the flick's settle: no frame where the disc is
+   *  completely still between the turn and the spin). */
+  spinOverlapFrac: 0.97,
+  /** The flight to the centre lasts this fraction of the flick: the disc arrives a little BEFORE it finishes facing
+   *  the user (2026-10-09). */
+  travelFrac: 0.6,
   /** …and reaches full speed at about this (ramp at least spinMinRampMs). */
   spinFullAtMs: 1200,
   spinMinRampMs: 300,
+  /** The spin-up ramp (2026-10-09: a fixed ramp; the spin no longer has to fit before a fixed fade). */
+  spinRampMs: 500,
+  /** Full-speed spin shown before the fade starts. */
+  spinHoldMs: 400,
   spinMaxRevPerSec: 4,
   dimStartMs: 0,
   dimEndMs: 300,
@@ -128,14 +155,45 @@ export function frontYawTarget(yaw0: number, turns: number = LAUNCH.flickTurns, 
 
 /** The flick's duration for a start yaw: T = 4Δ/ω0 (constant starting angular velocity, easeOutQuart to a stop). */
 export function flickDurationMs(yaw0: number): number {
-  return (4 * (frontYawTarget(yaw0) - yaw0)) / LAUNCH.flickOmega0;
+  const d = frontYawTarget(yaw0) - yaw0 + LAUNCH.flickOvershootDeg * DEG;   // the settle ends PAST the front
+  const v = (LAUNCH.flickCruiseRevPerSec * TAU) / 1000;           // rad/ms
+  const cruise = Math.max(0, (d - (v * LAUNCH.flickSettleMs) / 4) / v);
+  return cruise + LAUNCH.flickSettleMs * LAUNCH.flickSnapAt + LAUNCH.flickSnapMs;
+}
+
+
+
+/** The flick's turn (radians from yaw0) at t ms: cruise at the fast speed, then a quart ease-out to rest exactly on
+ *  the front (the speed is continuous where the settle starts). */
+export function flickAngle(t: number, yaw0: number): number {
+  if (t <= 0) return 0;
+  const d = frontYawTarget(yaw0) - yaw0;
+  const v = (LAUNCH.flickCruiseRevPerSec * TAU) / 1000;
+  const T = flickDurationMs(yaw0);
+  const ts = T - LAUNCH.flickSnapMs;                                   // the snap starts here …
+  const tc = ts - LAUNCH.flickSettleMs * LAUNCH.flickSnapAt;           // … the cruise ended here
+  const settle = (tt: number): number => {                             // the settle (eases toward `over` past the front)
+    const u = (tt - tc) / LAUNCH.flickSettleMs;
+    return v * tc + ((v * LAUNCH.flickSettleMs) / 4) * (1 - Math.pow(1 - u, 4));
+  };
+  if (t >= T) return d;
+  if (t < tc) return v * t;
+  if (t < ts) return settle(t);
+  // the rubber band: an underdamped spring about the front, released from the stretched overshoot (+ its tiny drift)
+  const x0 = settle(ts) - d;                                                          // the stretch (rad)
+  const u0 = v * Math.pow(1 - LAUNCH.flickSnapAt, 3);                                 // the drift (rad/ms)
+  const w = (2 * Math.PI) / LAUNCH.flickSnapPeriodMs, z = LAUNCH.flickSnapZeta;
+  const wd = w * Math.sqrt(1 - z * z);
+  const s = t - ts;
+  const B = (u0 + z * w * x0) / wd;
+  return d + Math.exp(-z * w * s) * (x0 * Math.cos(wd * s) + B * Math.sin(wd * s));
 }
 
 /** When the spin-up starts (the flick's end + a beat) and how long it ramps to full speed. */
 export function launchSpinWindow(yaw0: number): { startMs: number; rampMs: number } {
   // the spin starts once the disc has both finished its flick AND reached the centre (+ a short beat)
-  const startMs = Math.max(flickDurationMs(yaw0), LAUNCH.travelMs) + LAUNCH.spinBeatMs;
-  return { startMs, rampMs: Math.max(LAUNCH.spinMinRampMs, LAUNCH.spinFullAtMs - startMs) };
+  const startMs = flickDurationMs(yaw0) * LAUNCH.spinOverlapFrac;   // overlaps the flick's settle (2026-10-09)
+  return { startMs, rampMs: LAUNCH.spinRampMs };
 }
 
 /** Spin rate (rev/s) at `t` ms after the tap (0 before the spin-up; ωmax·(s/ramp)² during it; ωmax after). */
@@ -167,7 +225,9 @@ export function launchFadeWindow(c: LaunchClock): { startMs: number; durationMs:
   if (c.readyAtMs == null) return null;
   const ready = Math.max(0, c.readyAtMs);
   if (c.reducedMotion) return { startMs: ready, durationMs: LAUNCH.reducedFadeMs };
-  const unskipped = Math.max(LAUNCH.minFadeStartMs, ready);
+  // the fade waits for the spin to reach full speed and run a moment (it may end past 2 s now — 2026-10-09)
+  const sw = launchSpinWindow(c.yaw0);
+  const unskipped = Math.max(LAUNCH.minFadeStartMs, sw.startMs + sw.rampMs + LAUNCH.spinHoldMs, ready);
   const skip = c.skippedAtMs;
   // A skip only counts before the fade would have started anyway (a tap in the middle of the fade changes nothing).
   if (skip != null && skip < unskipped) return { startMs: Math.max(skip, ready), durationMs: LAUNCH.skipFadeMs };
@@ -195,8 +255,8 @@ export function launchPose(t: number, c: LaunchClock): LaunchPose {
     return { yaw: c.yaw0, tilt: tilt0, scale: 1, travel: 0, spin: 0, spinRate: 0, blur: 0, dim: 0, fade, chromeOpacity: 1 - fade, black };
   }
   const flickT = flickDurationMs(c.yaw0);
-  const yaw = c.yaw0 + (frontYawTarget(c.yaw0) - c.yaw0) * easeOutQuart(t / flickT);
-  const travel = easeOutQuart(t / LAUNCH.travelMs);
+  const yaw = c.yaw0 + flickAngle(t, c.yaw0);   // cruise fast, then a long settle to the front
+  const travel = easeOutQuart(t / (flickDurationMs(c.yaw0) * LAUNCH.travelFrac));   // arrives just before the turn ends
   const tilt = tilt0 + (LAUNCH.tiltEndDeg * DEG - tilt0) * travel;
   const press = launchPressScale(t);
   const scale = (1 + (LAUNCH.growScale - 1) * travel) * press;
